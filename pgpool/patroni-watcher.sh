@@ -17,7 +17,7 @@ PCP_PASSWORD="${PGPOOL_ADMIN_PASSWORD}"
 POLL_INTERVAL=2
 
 log() {
-    echo "[patroni-watcher] $*"
+    echo "[patroni-watcher] $*" >&2
 }
 
 run_pcp_command() {
