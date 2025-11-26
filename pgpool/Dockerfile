@@ -4,8 +4,14 @@ USER root
 
 # Force rebuild
 
+# Install jq for patroni-watcher
+RUN apt-get update && apt-get install -y jq && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # Don't copy custom config - let Bitnami generate from env vars
 COPY pool_hba.conf /opt/bitnami/pgpool/conf/pool_hba.conf
+COPY patroni-watcher.sh /usr/local/bin/patroni-watcher.sh
+RUN chmod +x /usr/local/bin/patroni-watcher.sh
 
 # Create wrapper entrypoint to fix missing env var before Bitnami entrypoint runs
 COPY <<'EOF' /entrypoint-wrapper.sh
@@ -50,10 +56,60 @@ EOF
 
 RUN chmod +x /docker-entrypoint-initdb.d/01-add-admin-user.sh
 
+USER root
+
+# Create supervisor script to run both pgpool and patroni-watcher
+COPY <<'EOF' /run-with-watcher.sh
+#!/bin/bash
+set -e
+
+# Trap signals to ensure clean shutdown
+cleanup() {
+  echo "[supervisor] Shutting down..."
+  if [ ! -z "$WATCHER_PID" ]; then
+    kill $WATCHER_PID 2>/dev/null || true
+  fi
+  if [ ! -z "$PGPOOL_PID" ]; then
+    kill $PGPOOL_PID 2>/dev/null || true
+  fi
+  exit 0
+}
+trap cleanup SIGTERM SIGINT
+
+# Start pgpool in background
+echo "[supervisor] Starting pgpool..."
+/opt/bitnami/scripts/pgpool/run.sh &
+PGPOOL_PID=$!
+
+# Wait for pgpool to be ready
+echo "[supervisor] Waiting for pgpool to be ready..."
+for i in {1..30}; do
+  if pgpool -h localhost -p 5432 -c "SELECT 1" 2>/dev/null; then
+    echo "[supervisor] Pgpool is ready"
+    break
+  fi
+  sleep 1
+done
+
+# Start patroni-watcher in background
+echo "[supervisor] Starting patroni-watcher..."
+/usr/local/bin/patroni-watcher.sh &
+WATCHER_PID=$!
+
+# Wait for either process to exit
+wait -n $PGPOOL_PID $WATCHER_PID
+EXIT_CODE=$?
+
+echo "[supervisor] A process exited with code $EXIT_CODE, shutting down..."
+cleanup
+EOF
+
+RUN chmod +x /run-with-watcher.sh
+
 USER 1001
 
 ENTRYPOINT ["/entrypoint-wrapper.sh"]
-CMD ["/opt/bitnami/scripts/pgpool/run.sh"]
+CMD ["/run-with-watcher.sh"]
 
 EXPOSE 5432 9999
 
