@@ -38,17 +38,17 @@ get_patroni_role() {
     local response
     local curl_exit
 
-    # Try to fetch from Patroni API with error capture
-    response=$(curl -sf "http://${host}:8008/patroni" 2>&1)
+    # Try to fetch from Patroni API root endpoint with error capture
+    response=$(curl -sf "http://${host}:8008/" 2>&1)
     curl_exit=$?
 
     if [ $curl_exit -ne 0 ]; then
-        log "DEBUG: curl to ${host}:8008/patroni failed with exit code $curl_exit: $response"
+        log "DEBUG: curl to ${host}:8008/ failed with exit code $curl_exit: $response"
         echo ""
         return
     fi
 
-    # Try to parse JSON
+    # Try to parse JSON to get role
     role=$(echo "$response" | jq -r '.role // empty' 2>&1)
     if [ $? -ne 0 ] || [ -z "$role" ]; then
         log "DEBUG: Failed to parse role from ${host}. Response: $response"
