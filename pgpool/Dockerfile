@@ -2,10 +2,11 @@ FROM railwayapp/pgpool:4
 
 USER root
 
-# Force rebuild 2025-11-27-01-08
+# Force rebuild 2025-11-27-01-16
 
 # Disable pgpool health checks AND sr_check - let patroni-watcher control backends
-ENV PGPOOL_HEALTH_CHECK_PERIOD=0
+ENV PGPOOL_ENABLE_HEALTH_CHECK=no
+ENV PGPOOL_ENABLE_POOL_HBA=on
 ENV PGPOOL_SR_CHECK_PERIOD=0
 
 # Install Python and dependencies for patroni-watcher
@@ -36,18 +37,23 @@ fi
 # Background task to add admin user to pcp.conf after it's created
 if [ -n "${PGPOOL_ADMIN_USERNAME}" ] && [ -n "${PGPOOL_ADMIN_PASSWORD}" ]; then
   (
+    echo "[entrypoint] Will add ${PGPOOL_ADMIN_USERNAME} to pcp.conf after it's created..." >&2
+
     # Wait for pcp.conf to be created by Bitnami's initialization
     for i in {1..60}; do
       if [ -f /opt/bitnami/pgpool/conf/pcp.conf ]; then
-        echo "[entrypoint] Adding ${PGPOOL_ADMIN_USERNAME} to pcp.conf..."
+        echo "[entrypoint] pcp.conf found, adding admin user..." >&2
 
         # Generate MD5 hash for PCP (format: md5<md5(password+username)>)
         HASH=$(echo -n "${PGPOOL_ADMIN_PASSWORD}${PGPOOL_ADMIN_USERNAME}" | md5sum | cut -d' ' -f1)
         echo "${PGPOOL_ADMIN_USERNAME}:md5${HASH}" >> /opt/bitnami/pgpool/conf/pcp.conf
 
-        echo "[entrypoint] Admin user added to pcp.conf successfully"
+        echo "[entrypoint] Admin user ${PGPOOL_ADMIN_USERNAME} added to pcp.conf with hash md5${HASH}" >&2
+        echo "[entrypoint] pcp.conf contents:" >&2
+        cat /opt/bitnami/pgpool/conf/pcp.conf >&2
         break
       fi
+      echo "[entrypoint] Waiting for pcp.conf (attempt $i)..." >&2
       sleep 1
     done
   ) &
