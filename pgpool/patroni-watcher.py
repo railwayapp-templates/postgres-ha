@@ -61,9 +61,10 @@ def run_pcp_command(cmd: str, *args) -> bool:
         )
 
         if result.returncode != 0:
-            logger.warning(f"PCP command failed: {result.stderr.strip()}")
+            logger.warning(f"PCP command failed (exit {result.returncode}): stdout={result.stdout.strip()}, stderr={result.stderr.strip()}")
             return False
 
+        logger.debug(f"PCP command succeeded: {result.stdout.strip()}")
         return True
     except subprocess.TimeoutExpired:
         logger.error(f"PCP command timed out: {cmd}")
@@ -132,13 +133,13 @@ def get_cluster_leader() -> Optional[Dict]:
 def detach_backend(index: int):
     """Detach a backend from pgpool"""
     logger.info(f"Detaching backend {index}")
-    run_pcp_command("pcp_detach_node", "-n", str(index), "-g")
+    run_pcp_command("pcp_detach_node", "-n", str(index))
 
 
 def attach_backend(index: int):
     """Attach a backend to pgpool"""
     logger.info(f"Attaching backend {index}")
-    run_pcp_command("pcp_attach_node", "-n", str(index), "-g")
+    run_pcp_command("pcp_attach_node", "-n", str(index))
 
 
 def sync_pgpool_with_patroni(leader: Dict):
