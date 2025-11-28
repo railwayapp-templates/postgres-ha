@@ -2,7 +2,7 @@ FROM railwayapp/pgpool:4
 
 USER root
 
-# Force rebuild 2025-11-28-fix-pg_md5
+# Force rebuild 2025-11-28-v2-use-md5sum
 
 # Don't try to use ENV vars to disable health checks - Bitnami ignores them
 # We'll modify pgpool.conf directly before starting pgpool
@@ -76,29 +76,26 @@ else
   exit 1
 fi
 
-# Generate pcp.conf using pg_md5
-# Note: pg_md5 without -m outputs just the MD5 hash to stdout
+# Generate pcp.conf using md5sum directly (pg_md5 is unreliable in this image)
 # pcp.conf format is: username:md5hash
 echo "[custom-run] Generating pcp.conf for PCP authentication..." >&2
 USERNAME="${PGPOOL_ADMIN_USERNAME:-admin}"
 
-echo "[custom-run] DEBUG: Running pg_md5 command..." >&2
-# pg_md5 without -m flag outputs the hash to stdout
-HASH=$(/opt/bitnami/pgpool/bin/pg_md5 "${PGPOOL_ADMIN_PASSWORD}" 2>/dev/null)
-EXIT_CODE=$?
+# Use md5sum directly - more reliable than pg_md5 which has issues outputting to stdout
+echo "[custom-run] Generating MD5 hash with md5sum..." >&2
+HASH=$(printf '%s' "${PGPOOL_ADMIN_PASSWORD}" | md5sum | cut -d' ' -f1)
 
-echo "[custom-run] DEBUG: pg_md5 exit code: $EXIT_CODE" >&2
-echo "[custom-run] DEBUG: pg_md5 hash length: ${#HASH}" >&2
+echo "[custom-run] DEBUG: md5sum hash length: ${#HASH}" >&2
+echo "[custom-run] DEBUG: md5sum hash first 8 chars: ${HASH:0:8}..." >&2
 
-if [ $EXIT_CODE -ne 0 ] || [ -z "$HASH" ]; then
-  echo "[custom-run] ERROR: pg_md5 failed, trying with echo+md5sum..." >&2
-  # Fallback: generate MD5 hash manually
-  HASH=$(echo -n "${PGPOOL_ADMIN_PASSWORD}" | md5sum | awk '{print $1}')
-  echo "[custom-run] DEBUG: md5sum hash: ${HASH}" >&2
+if [ -z "$HASH" ] || [ ${#HASH} -ne 32 ]; then
+  echo "[custom-run] ERROR: md5sum failed to generate valid hash" >&2
+  exit 1
 fi
 
 # Write pcp.conf in correct format: username:hash
 echo "${USERNAME}:${HASH}" > /opt/bitnami/pgpool/conf/pcp.conf
+chmod 600 /opt/bitnami/pgpool/conf/pcp.conf
 
 echo "[custom-run] pcp.conf generated successfully" >&2
 echo "[custom-run] DEBUG: pcp.conf contents:" >&2
