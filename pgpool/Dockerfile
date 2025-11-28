@@ -2,7 +2,7 @@ FROM railwayapp/pgpool:4
 
 USER root
 
-# Force rebuild 2025-11-27-05-40
+# Force rebuild 2025-11-28-fix-pg_md5
 
 # Don't try to use ENV vars to disable health checks - Bitnami ignores them
 # We'll modify pgpool.conf directly before starting pgpool
@@ -76,28 +76,29 @@ else
   exit 1
 fi
 
-# Generate pcp.conf using pg_md5 with correct config path
+# Generate pcp.conf using pg_md5
+# Note: pg_md5 without -m outputs just the MD5 hash to stdout
+# pcp.conf format is: username:md5hash
 echo "[custom-run] Generating pcp.conf for PCP authentication..." >&2
 USERNAME="${PGPOOL_ADMIN_USERNAME:-admin}"
 
-# Use pg_md5 with -f flag to specify config file location
 echo "[custom-run] DEBUG: Running pg_md5 command..." >&2
-HASH=$(/opt/bitnami/pgpool/bin/pg_md5 -f /opt/bitnami/pgpool/conf/pgpool.conf -m -u "${USERNAME}" "${PGPOOL_ADMIN_PASSWORD}" 2>&1)
+# pg_md5 without -m flag outputs the hash to stdout
+HASH=$(/opt/bitnami/pgpool/bin/pg_md5 "${PGPOOL_ADMIN_PASSWORD}" 2>/dev/null)
 EXIT_CODE=$?
 
 echo "[custom-run] DEBUG: pg_md5 exit code: $EXIT_CODE" >&2
-echo "[custom-run] DEBUG: pg_md5 output: '${HASH}'" >&2
+echo "[custom-run] DEBUG: pg_md5 hash length: ${#HASH}" >&2
 
 if [ $EXIT_CODE -ne 0 ] || [ -z "$HASH" ]; then
-  echo "[custom-run] ERROR: pg_md5 failed or returned empty output" >&2
-  echo "[custom-run] ERROR: Trying alternative approach..." >&2
-  # Try without -f flag
-  HASH=$(/opt/bitnami/pgpool/bin/pg_md5 -m -u "${USERNAME}" "${PGPOOL_ADMIN_PASSWORD}" 2>&1)
-  echo "[custom-run] DEBUG: Alternative pg_md5 output: '${HASH}'" >&2
+  echo "[custom-run] ERROR: pg_md5 failed, trying with echo+md5sum..." >&2
+  # Fallback: generate MD5 hash manually
+  HASH=$(echo -n "${PGPOOL_ADMIN_PASSWORD}" | md5sum | awk '{print $1}')
+  echo "[custom-run] DEBUG: md5sum hash: ${HASH}" >&2
 fi
 
-# Write pcp.conf
-echo "${HASH}" > /opt/bitnami/pgpool/conf/pcp.conf
+# Write pcp.conf in correct format: username:hash
+echo "${USERNAME}:${HASH}" > /opt/bitnami/pgpool/conf/pcp.conf
 
 echo "[custom-run] pcp.conf generated successfully" >&2
 echo "[custom-run] DEBUG: pcp.conf contents:" >&2
