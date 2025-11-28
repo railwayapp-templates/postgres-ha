@@ -75,7 +75,7 @@ fi
 PCP_CONF="/opt/bitnami/pgpool/conf/pcp.conf"
 if [ -n "${PGPOOL_ADMIN_USERNAME}" ] && [ -n "${PGPOOL_ADMIN_PASSWORD}" ]; then
   echo "[custom-run] Creating pcp.conf with admin user..." >&2
-  HASH=$(echo -n "${PGPOOL_ADMIN_PASSWORD}${PGPOOL_ADMIN_USERNAME}" | md5sum | cut -d' ' -f1)
+  HASH=$(echo -n "${PGPOOL_ADMIN_PASSWORD}" | md5sum | cut -d' ' -f1)
   echo "${PGPOOL_ADMIN_USERNAME}:md5${HASH}" > "$PCP_CONF"
   chmod 644 "$PCP_CONF"
   echo "[custom-run] pcp.conf created" >&2
