@@ -71,16 +71,10 @@ else
   exit 1
 fi
 
-# Bitnami's setup.sh creates pcp.conf, so we don't need to
-echo "[custom-run] Bitnami created pcp.conf during setup" >&2
-echo "[custom-run] PGPOOL_CONF_DIR=${PGPOOL_CONF_DIR}" >&2
-echo "[custom-run] PGPOOL_BIN_DIR=${PGPOOL_BIN_DIR}" >&2
-echo "[custom-run] Searching for pcp.conf..." >&2
-find /opt/bitnami/pgpool -name "pcp.conf" -type f 2>/dev/null | while read f; do echo "[custom-run] Found pcp.conf at: $f" >&2; done
-echo "[custom-run] Listing /opt/bitnami/pgpool/conf/:" >&2
-ls -la /opt/bitnami/pgpool/conf/ >&2 || true
-echo "[custom-run] Listing /opt/bitnami/pgpool/etc/:" >&2
-ls -la /opt/bitnami/pgpool/etc/ >&2 || true
+# Bitnami creates pcp.conf in /etc/ but PCP looks for it in /conf/
+echo "[custom-run] Copying pcp.conf from etc/ to conf/..." >&2
+cp /opt/bitnami/pgpool/etc/pcp.conf /opt/bitnami/pgpool/conf/pcp.conf
+echo "[custom-run] pcp.conf copied successfully" >&2
 
 # Start patroni-watcher in background
 echo "[custom-run] Starting patroni-watcher..." >&2
