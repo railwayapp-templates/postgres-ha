@@ -81,7 +81,20 @@ echo "[custom-run] Generating pcp.conf for PCP authentication..." >&2
 USERNAME="${PGPOOL_ADMIN_USERNAME:-admin}"
 
 # Use pg_md5 with -f flag to specify config file location
-HASH=$(/opt/bitnami/pgpool/bin/pg_md5 -f /opt/bitnami/pgpool/conf/pgpool.conf -m -u "${USERNAME}" "${PGPOOL_ADMIN_PASSWORD}")
+echo "[custom-run] DEBUG: Running pg_md5 command..." >&2
+HASH=$(/opt/bitnami/pgpool/bin/pg_md5 -f /opt/bitnami/pgpool/conf/pgpool.conf -m -u "${USERNAME}" "${PGPOOL_ADMIN_PASSWORD}" 2>&1)
+EXIT_CODE=$?
+
+echo "[custom-run] DEBUG: pg_md5 exit code: $EXIT_CODE" >&2
+echo "[custom-run] DEBUG: pg_md5 output: '${HASH}'" >&2
+
+if [ $EXIT_CODE -ne 0 ] || [ -z "$HASH" ]; then
+  echo "[custom-run] ERROR: pg_md5 failed or returned empty output" >&2
+  echo "[custom-run] ERROR: Trying alternative approach..." >&2
+  # Try without -f flag
+  HASH=$(/opt/bitnami/pgpool/bin/pg_md5 -m -u "${USERNAME}" "${PGPOOL_ADMIN_PASSWORD}" 2>&1)
+  echo "[custom-run] DEBUG: Alternative pg_md5 output: '${HASH}'" >&2
+fi
 
 # Write pcp.conf
 echo "${HASH}" > /opt/bitnami/pgpool/conf/pcp.conf
