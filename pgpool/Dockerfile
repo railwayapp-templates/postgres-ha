@@ -79,10 +79,17 @@ if [ -f /opt/bitnami/pgpool/etc/pcp.conf ]; then
   # Read the first line from Bitnami's pcp.conf (format: username:hash)
   LINE=$(head -n 1 /opt/bitnami/pgpool/etc/pcp.conf)
   USERNAME=$(echo "$LINE" | cut -d':' -f1)
-  HASH=$(echo "$LINE" | cut -d':' -f2)
+  BITNAMI_HASH=$(echo "$LINE" | cut -d':' -f2)
+
+  # Compute what the hash should be using our password
+  OUR_HASH=$(echo -n "${PGPOOL_ADMIN_PASSWORD}${USERNAME}" | md5sum | awk '{print $1}')
+
+  echo "[custom-run] DEBUG: Bitnami hash: $BITNAMI_HASH" >&2
+  echo "[custom-run] DEBUG: Our computed hash: $OUR_HASH" >&2
+  echo "[custom-run] DEBUG: Hashes match: $([ "$BITNAMI_HASH" = "$OUR_HASH" ] && echo 'YES' || echo 'NO')" >&2
 
   # Write to conf directory with md5 prefix
-  echo "${USERNAME}:md5${HASH}" > /opt/bitnami/pgpool/conf/pcp.conf
+  echo "${USERNAME}:md5${BITNAMI_HASH}" > /opt/bitnami/pgpool/conf/pcp.conf
 
   echo "[custom-run] pcp.conf fixed successfully" >&2
   echo "[custom-run] DEBUG: pcp.conf contents:" >&2
