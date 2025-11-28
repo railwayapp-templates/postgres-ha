@@ -83,7 +83,9 @@ mkdir -p /opt/bitnami/pgpool/conf
 
 USERNAME="${PGPOOL_ADMIN_USERNAME:-admin}"
 # Use pgpool's pg_md5 utility to generate the hash (returns just the hash)
-HASH=$(/opt/bitnami/pgpool/bin/pg_md5 -u "${USERNAME}" "${PGPOOL_ADMIN_PASSWORD}")
+# -m flag: produce md5 authentication password
+# -u flag: append username to password before computing hash
+HASH=$(/opt/bitnami/pgpool/bin/pg_md5 -m -u "${USERNAME}" "${PGPOOL_ADMIN_PASSWORD}")
 
 # Write pcp.conf in the format: username:md5hash (with md5 prefix)
 echo "${USERNAME}:md5${HASH}" > /opt/bitnami/pgpool/conf/pcp.conf
