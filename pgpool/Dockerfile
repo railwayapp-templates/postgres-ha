@@ -104,6 +104,13 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT EXIT
 
+# Verify pcp.conf location and contents before starting pgpool
+echo "[custom-run] DEBUG: PGPOOL_CONF_DIR=${PGPOOL_CONF_DIR}" >&2
+echo "[custom-run] DEBUG: Full pcp.conf path: ${PGPOOL_CONF_DIR}/pcp.conf" >&2
+echo "[custom-run] DEBUG: pcp.conf exists: $([ -f "${PGPOOL_CONF_DIR}/pcp.conf" ] && echo 'YES' || echo 'NO')" >&2
+echo "[custom-run] DEBUG: pcp.conf final contents:" >&2
+cat "${PGPOOL_CONF_DIR}/pcp.conf" >&2 || echo "ERROR: Could not read pcp.conf" >&2
+
 # Start pgpool (from original Bitnami run.sh)
 echo "[custom-run] Starting pgpool..." >&2
 info "** Starting Pgpool-II **"
