@@ -71,14 +71,13 @@ else
   exit 1
 fi
 
-# Bitnami creates pcp.conf in /etc/ but PCP looks for it in /conf/
-echo "[custom-run] Copying pcp.conf from etc/ to conf/..." >&2
-echo "[custom-run] DEBUG: Contents of pcp.conf before copy:" >&2
-cat /opt/bitnami/pgpool/etc/pcp.conf >&2
-echo "[custom-run] DEBUG: PGPOOL_ADMIN_USERNAME=${PGPOOL_ADMIN_USERNAME}" >&2
-echo "[custom-run] DEBUG: PGPOOL_ADMIN_PASSWORD length: ${#PGPOOL_ADMIN_PASSWORD}" >&2
-cp /opt/bitnami/pgpool/etc/pcp.conf /opt/bitnami/pgpool/conf/pcp.conf
-echo "[custom-run] pcp.conf copied successfully" >&2
+# Create pcp.conf manually using pg_md5 for proper password hashing
+echo "[custom-run] Creating pcp.conf with proper MD5 hash..." >&2
+mkdir -p /opt/bitnami/pgpool/conf
+echo "${PGPOOL_ADMIN_USERNAME}:$(pg_md5 -m -u ${PGPOOL_ADMIN_USERNAME} ${PGPOOL_ADMIN_PASSWORD})" > /opt/bitnami/pgpool/conf/pcp.conf
+echo "[custom-run] pcp.conf created successfully" >&2
+echo "[custom-run] DEBUG: pcp.conf contents:" >&2
+cat /opt/bitnami/pgpool/conf/pcp.conf >&2
 
 # Start patroni-watcher in background
 echo "[custom-run] Starting patroni-watcher..." >&2
