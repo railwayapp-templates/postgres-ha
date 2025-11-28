@@ -3,13 +3,14 @@ FROM railwayapp/pgpool:4
 USER root
 
 # Force rebuild - restored watcher with retry logic and periodic resync
-ARG CACHE_BUST=2025-11-28-watcher-v2
+ARG CACHE_BUST=2025-11-28-watcher-v3-original
 
 ENV PGPOOL_ENABLE_POOL_HBA=yes
 
-# Python for watcher, netcat for diagnostics
+# Python + requests for watcher, netcat for diagnostics
 RUN apt-get update && apt-get install -y \
     python3 \
+    python3-requests \
     netcat-openbsd \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
