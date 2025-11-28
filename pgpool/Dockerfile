@@ -2,7 +2,8 @@ FROM railwayapp/pgpool:4
 
 USER root
 
-# Force rebuild 2025-11-28-v2-use-md5sum
+# Force rebuild 2025-11-28-v3-md5sum-only
+ARG CACHE_BUST=2025-11-28-14-50
 
 # Don't try to use ENV vars to disable health checks - Bitnami ignores them
 # We'll modify pgpool.conf directly before starting pgpool
