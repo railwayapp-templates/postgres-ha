@@ -1,0 +1,22 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "postgres-patroni/Dockerfile"
+watchPatterns = ["postgres-patroni/**"]
+
+[deploy]
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10
+numReplicas = 1
+
+[variables]
+# PostgreSQL credentials (primary source - other services reference these)
+POSTGRES_USER = "postgres"
+POSTGRES_PASSWORD = "${{secret(32)}}"
+POSTGRES_DB = "railway"
+
+# Patroni configuration
+PATRONI_ENABLED = "false"
+PATRONI_NAME = "postgres-1"
+PATRONI_SCOPE = "railway-pg-ha"
+PATRONI_REPLICATION_PASSWORD = "${{secret(32)}}"
+PATRONI_ETCD_HOSTS = "etcd-1.railway.internal:2379,etcd-2.railway.internal:2379,etcd-3.railway.internal:2379"
