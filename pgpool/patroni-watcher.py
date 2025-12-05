@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Patroni Watcher - Monitors Patroni cluster state and updates Pgpool-II backends
-Polls Patroni REST API and uses PCP to detach/attach backends based on leader changes
+Patroni Watcher - Monitors Patroni cluster and updates Pgpool backends
+Polls Patroni REST API, uses PCP to attach leader and detach replicas
 """
 
 import os
 import sys
 import time
+import socket
 import subprocess
 import logging
-from typing import Optional, Dict, List
 import requests
-from requests.exceptions import RequestException, Timeout, ConnectionError
 
-# Configure logging to stderr
 logging.basicConfig(
     level=logging.INFO,
     format='[patroni-watcher] %(levelname)s: %(message)s',
@@ -22,201 +20,127 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-PATRONI_BACKENDS = [
-    {"name": "postgres-1", "host": "postgres-1.railway.internal", "port": 5432, "index": 0},
-    {"name": "postgres-2", "host": "postgres-2.railway.internal", "port": 5432, "index": 1},
-    {"name": "postgres-3", "host": "postgres-3.railway.internal", "port": 5432, "index": 2},
-]
-
-PCP_HOST = "localhost"
-PCP_PORT = 9898
 PCP_USER = os.environ.get("PGPOOL_ADMIN_USERNAME", "admin")
 PCP_PASSWORD = os.environ.get("PGPOOL_ADMIN_PASSWORD", "")
 POLL_INTERVAL = 2
-PATRONI_TIMEOUT = 3  # seconds for HTTP requests
+PATRONI_TIMEOUT = 3
 
 
-def run_pcp_command(cmd: str, *args) -> bool:
-    """Execute a PCP command with proper environment and error handling"""
+def parse_backend_nodes():
+    """Parse PGPOOL_BACKEND_NODES env var: '0:host1:5432,1:host2:5432,...'"""
+    nodes_str = os.environ.get("PGPOOL_BACKEND_NODES", "")
+    if not nodes_str:
+        logger.error("PGPOOL_BACKEND_NODES not set")
+        sys.exit(1)
+
+    backends = []
+    for node in nodes_str.split(","):
+        parts = node.strip().split(":")
+        if len(parts) >= 3:
+            index, host, port = int(parts[0]), parts[1], int(parts[2])
+            name = host.split(".")[0]  # postgres-1.railway.internal -> postgres-1
+            backends.append({"name": name, "host": host, "port": port, "index": index})
+
+    return backends
+
+
+def run_pcp_command(cmd, *args, retries=3):
+    """Execute PCP command with retry logic"""
+    env = os.environ.copy()
+    env["PCPPASSFILE"] = "/tmp/.pcppass"
+    full_cmd = [cmd, "-h", "localhost", "-p", "9898", "-U", PCP_USER, "-w", *args]
+
+    for attempt in range(retries):
+        try:
+            result = subprocess.run(full_cmd, env=env, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                return True
+            if attempt < retries - 1:
+                time.sleep(0.5)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"PCP command timed out: {cmd}")
+        except Exception as e:
+            logger.warning(f"PCP error: {e}")
+
+    return False
+
+
+def get_patroni_role(host):
+    """Query Patroni REST API for node role (master/replica)"""
     try:
-        env = os.environ.copy()
-        # PCP uses PCPPASSFILE pointing to a password file, not a direct password env var
-        env["PCPPASSFILE"] = "/tmp/.pcppass"
-
-        full_cmd = [
-            cmd,
-            "-h", PCP_HOST,
-            "-p", str(PCP_PORT),
-            "-U", PCP_USER,
-            "-w",
-            *args
-        ]
-
-        logger.debug(f"Running PCP command: {' '.join(full_cmd)}")
-        result = subprocess.run(
-            full_cmd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        if result.returncode != 0:
-            logger.warning(f"PCP command failed (exit {result.returncode}): stdout={result.stdout.strip()}, stderr={result.stderr.strip()}")
-            return False
-
-        logger.debug(f"PCP command succeeded: {result.stdout.strip()}")
-        return True
-    except subprocess.TimeoutExpired:
-        logger.error(f"PCP command timed out: {cmd}")
-        return False
-    except Exception as e:
-        logger.error(f"Error running PCP command {cmd}: {e}")
-        return False
-
-
-def get_patroni_role(host: str, port: int = 8008) -> Optional[str]:
-    """
-    Query Patroni REST API to get the role of a node
-    Returns 'master', 'replica', or None on error
-    """
-    url = f"http://{host}:{port}/"
-
-    try:
-        logger.debug(f"Querying Patroni API: {url}")
-        response = requests.get(url, timeout=PATRONI_TIMEOUT)
-
-        if response.status_code != 200:
-            logger.debug(f"{host}: HTTP {response.status_code}")
-            return None
-
-        data = response.json()
-        role = data.get("role")
-
-        if not role:
-            logger.debug(f"{host}: No 'role' field in response: {data}")
-            return None
-
-        logger.debug(f"{host}: role is '{role}'")
-        return role
-
-    except Timeout:
-        logger.debug(f"{host}: Request timed out after {PATRONI_TIMEOUT}s")
-        return None
-    except ConnectionError as e:
-        logger.debug(f"{host}: Connection error: {e}")
-        return None
-    except requests.exceptions.JSONDecodeError:
-        logger.debug(f"{host}: Invalid JSON response")
-        return None
-    except RequestException as e:
-        logger.debug(f"{host}: Request failed: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"{host}: Unexpected error: {e}")
-        return None
-
-
-def get_cluster_leader() -> Optional[Dict]:
-    """
-    Poll all backends to find the current leader
-    Returns backend dict or None if no leader found
-    """
-    for backend in PATRONI_BACKENDS:
-        role = get_patroni_role(backend["host"])
-
-        if role in ("master", "primary"):
-            return backend
-
+        response = requests.get(f"http://{host}:8008/", timeout=PATRONI_TIMEOUT)
+        if response.status_code == 200:
+            return response.json().get("role")
+    except:
+        pass
     return None
 
 
-def detach_backend(index: int):
-    """Detach a backend from pgpool"""
-    logger.info(f"Detaching backend {index}")
-    run_pcp_command("pcp_detach_node", "-n", str(index))
+def get_cluster_leader(backends):
+    """Find current leader from backends"""
+    for backend in backends:
+        role = get_patroni_role(backend["host"])
+        if role in ("master", "primary"):
+            return backend
+    return None
 
 
-def attach_backend(index: int):
-    """Attach a backend to pgpool"""
-    logger.info(f"Attaching backend {index}")
-    run_pcp_command("pcp_attach_node", "-n", str(index))
-
-
-def sync_pgpool_with_patroni(leader: Dict):
-    """
-    Sync pgpool backends with Patroni state
-    Attach the leader, detach all replicas
-    """
-    leader_name = leader["name"]
-    logger.info(f"Syncing pgpool: leader is {leader_name}")
-
-    for backend in PATRONI_BACKENDS:
-        if backend["name"] == leader_name:
-            attach_backend(backend["index"])
+def sync_pgpool(leader, backends):
+    """Attach leader, detach replicas"""
+    logger.info(f"Syncing: leader is {leader['name']}")
+    for backend in backends:
+        if backend["name"] == leader["name"]:
+            run_pcp_command("pcp_attach_node", "-n", str(backend["index"]))
         else:
-            detach_backend(backend["index"])
+            run_pcp_command("pcp_detach_node", "-n", str(backend["index"]))
 
 
 def wait_for_pgpool():
-    """Wait for pgpool PCP port to be ready"""
-    logger.info("Waiting for pgpool to be ready...")
-
-    for i in range(60):
+    """Wait for pgpool PCP port using socket"""
+    logger.info("Waiting for pgpool...")
+    for _ in range(60):
         try:
-            result = subprocess.run(
-                ["timeout", "2", "bash", "-c", "echo quit | nc localhost 9898"],
-                capture_output=True,
-                timeout=3
-            )
-            if result.returncode == 0:
-                logger.info("Pgpool PCP port is ready")
-                return True
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2)
+                if s.connect_ex(("localhost", 9898)) == 0:
+                    logger.info("Pgpool ready")
+                    return True
         except:
             pass
-
         time.sleep(2)
-
-    logger.error("Timeout waiting for pgpool to be ready")
+    logger.error("Timeout waiting for pgpool")
     return False
 
 
 def main():
-    logger.info("Starting Patroni watcher")
-    logger.info(f"Monitoring backends: {[b['name'] for b in PATRONI_BACKENDS]}")
-    logger.info(f"Poll interval: {POLL_INTERVAL}s")
-
     if not PCP_PASSWORD:
         logger.error("PGPOOL_ADMIN_PASSWORD not set")
         sys.exit(1)
 
-    # Wait for pgpool to be ready
+    backends = parse_backend_nodes()
+    logger.info(f"Monitoring: {[b['name'] for b in backends]}")
+
     if not wait_for_pgpool():
         sys.exit(1)
 
-    last_leader_name = None
+    last_leader = None
 
     while True:
         try:
-            logger.debug("Polling cluster for leader...")
-            current_leader = get_cluster_leader()
+            leader = get_cluster_leader(backends)
 
-            if current_leader is None:
-                logger.warning("No leader found in cluster")
-            elif current_leader["name"] != last_leader_name:
-                logger.info(f"Leader change detected: {last_leader_name or 'none'} -> {current_leader['name']}")
-                sync_pgpool_with_patroni(current_leader)
-                last_leader_name = current_leader["name"]
-            else:
-                logger.debug(f"Leader unchanged: {current_leader['name']}")
+            if leader is None:
+                logger.warning("No leader found")
+            elif leader["name"] != last_leader:
+                logger.info(f"Leader change: {last_leader or 'none'} -> {leader['name']}")
+                sync_pgpool(leader, backends)
+                last_leader = leader["name"]
 
             time.sleep(POLL_INTERVAL)
-
         except KeyboardInterrupt:
-            logger.info("Shutting down...")
             break
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+            logger.error(f"Error: {e}")
             time.sleep(POLL_INTERVAL)
 
 

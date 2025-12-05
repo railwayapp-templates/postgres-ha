@@ -1,7 +1,7 @@
 [build]
 builder = "dockerfile"
-dockerfilePath = "etcd-2/Dockerfile"
-watchPatterns = ["etcd-2/**"]
+dockerfilePath = "etcd/Dockerfile"
+watchPatterns = ["etcd/**"]
 
 [deploy]
 restartPolicyType = "never"
