@@ -6,13 +6,3 @@ watchPatterns = ["etcd/**"]
 [deploy]
 restartPolicyType = "never"
 numReplicas = 1
-
-[variables]
-ETCD_NAME = "etcd-3"
-ETCD_INITIAL_CLUSTER = "etcd-1=http://etcd-1.railway.internal:2380,etcd-2=http://etcd-2.railway.internal:2380,etcd-3=http://etcd-3.railway.internal:2380"
-ETCD_INITIAL_CLUSTER_STATE = "new"
-ETCD_INITIAL_CLUSTER_TOKEN = "railway-pg-ha"
-ETCD_LISTEN_CLIENT_URLS = "http://0.0.0.0:2379"
-ETCD_ADVERTISE_CLIENT_URLS = "http://etcd-3.railway.internal:2379"
-ETCD_LISTEN_PEER_URLS = "http://0.0.0.0:2380"
-ETCD_INITIAL_ADVERTISE_PEER_URLS = "http://etcd-3.railway.internal:2380"
