@@ -3,11 +3,8 @@ set -e
 
 # Patroni mode entrypoint (only runs when PATRONI_ENABLED=true)
 
-MOUNT_DIR="/var/lib/postgresql/data"
-DATA_DIR="$MOUNT_DIR/pgdata"
-CERTS_DIR="$MOUNT_DIR/certs"
-
-mkdir -p "$DATA_DIR"
+DATA_DIR="/var/lib/postgresql/data"
+CERTS_DIR="/etc/postgresql/certs"
 
 echo "=== Patroni Entrypoint ==="
 

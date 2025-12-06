@@ -1,9 +1,8 @@
 #!/bin/bash
 set -e
 
-MOUNT_DIR="/var/lib/postgresql/data"
-DATA_DIR="$MOUNT_DIR/pgdata"
-CERTS_DIR="$MOUNT_DIR/certs"
+DATA_DIR="/var/lib/postgresql/data"
+CERTS_DIR="/etc/postgresql/certs"
 
 # Ensure data directory exists and has correct permissions (Railway mounts as root)
 if [ ! -d "$DATA_DIR" ]; then
