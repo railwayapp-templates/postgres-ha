@@ -1,6 +1,35 @@
 #!/bin/bash
 set -e
 
+DATA_DIR="/var/lib/postgresql/data"
+CERTS_DIR="$DATA_DIR/certs"
+
+echo "Post-bootstrap: generating SSL certificates..."
+
+DAYS="${SSL_CERT_DAYS:-820}"
+mkdir -p "$CERTS_DIR"
+
+# Generate CA
+openssl genrsa -out "$CERTS_DIR/ca.key" 2048
+openssl req -new -x509 -days "$DAYS" -key "$CERTS_DIR/ca.key" -out "$CERTS_DIR/ca.crt" -subj "/CN=PostgreSQL CA"
+
+# Generate server cert
+openssl genrsa -out "$CERTS_DIR/server.key" 2048
+openssl req -new -key "$CERTS_DIR/server.key" -out "$CERTS_DIR/server.csr" -subj "/CN=postgres"
+
+cat > "$CERTS_DIR/v3.ext" <<EOF
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = DNS:localhost,DNS:*.railway.internal,IP:127.0.0.1
+EOF
+
+openssl x509 -req -in "$CERTS_DIR/server.csr" -CA "$CERTS_DIR/ca.crt" -CAkey "$CERTS_DIR/ca.key" \
+    -CAcreateserial -out "$CERTS_DIR/server.crt" -days "$DAYS" -extfile "$CERTS_DIR/v3.ext"
+
+chmod 600 "$CERTS_DIR/server.key"
+chmod 644 "$CERTS_DIR/server.crt" "$CERTS_DIR/ca.crt"
+
 echo "Post-bootstrap: configuring users..."
 
 # Use environment variables directly (set by docker-entrypoint.sh)

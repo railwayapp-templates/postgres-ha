@@ -4,7 +4,7 @@ set -e
 # Patroni mode entrypoint (only runs when PATRONI_ENABLED=true)
 
 DATA_DIR="/var/lib/postgresql/data"
-CERTS_DIR="/etc/postgresql/certs"
+CERTS_DIR="$DATA_DIR/certs"
 
 echo "=== Patroni Entrypoint ==="
 

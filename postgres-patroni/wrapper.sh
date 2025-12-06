@@ -2,7 +2,7 @@
 set -e
 
 DATA_DIR="/var/lib/postgresql/data"
-CERTS_DIR="/etc/postgresql/certs"
+CERTS_DIR="$DATA_DIR/certs"
 
 # Ensure data directory exists and has correct permissions (Railway mounts as root)
 if [ ! -d "$DATA_DIR" ]; then
@@ -62,9 +62,6 @@ EOF
     echo "SSL certificates generated successfully"
 }
 
-# Generate SSL certs
-generate_ssl_certs
-
 # Check for required password on fresh installs
 if [ ! -f "$DATA_DIR/PG_VERSION" ] && [ -z "$POSTGRES_PASSWORD" ]; then
     echo ""
@@ -90,6 +87,8 @@ if [ "${PATRONI_ENABLED:-false}" = "true" ]; then
     exec gosu postgres /docker-entrypoint.sh "$@"
 else
     echo "=== Standalone PostgreSQL mode ==="
+    # Generate SSL certs for standalone mode
+    generate_ssl_certs
     # Standard postgres entrypoint handles user switching internally
     exec docker-entrypoint.sh "$@" \
         -c ssl=on \
