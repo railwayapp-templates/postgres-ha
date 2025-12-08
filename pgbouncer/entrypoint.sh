@@ -31,9 +31,13 @@ if [ -n "${PGBOUNCER_EXTRA_USERS}" ]; then
     done
 fi
 
-# Update pgbouncer.ini with HAProxy host if provided
+# Update pgbouncer.ini with HAProxy host and port if provided
 if [ -n "${HAPROXY_HOST}" ]; then
     sed -i "s/host=haproxy/host=${HAPROXY_HOST}/g" /etc/pgbouncer/pgbouncer.ini
+fi
+
+if [ -n "${HAPROXY_PORT}" ]; then
+    sed -i "s/port=5432/port=${HAPROXY_PORT}/g" /etc/pgbouncer/pgbouncer.ini
 fi
 
 # Update pool settings from environment

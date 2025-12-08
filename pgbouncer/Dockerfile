@@ -6,8 +6,8 @@ RUN apk add --no-cache pgbouncer openssl
 RUN mkdir -p /etc/pgbouncer /var/run/pgbouncer /var/log/pgbouncer /etc/pgbouncer/certs && \
     chown -R nobody:nobody /etc/pgbouncer /var/run/pgbouncer /var/log/pgbouncer
 
-COPY pgbouncer.ini /etc/pgbouncer/pgbouncer.ini
-COPY entrypoint.sh /entrypoint.sh
+COPY pgbouncer/pgbouncer.ini /etc/pgbouncer/pgbouncer.ini
+COPY pgbouncer/entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh && \
     chown nobody:nobody /etc/pgbouncer/pgbouncer.ini /entrypoint.sh
