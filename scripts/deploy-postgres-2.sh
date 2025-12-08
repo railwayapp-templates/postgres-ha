@@ -17,8 +17,8 @@ railway variables --service postgres-2 --set 'POSTGRES_PASSWORD=${{shared.POSTGR
 railway variables --service postgres-2 --set 'POSTGRES_DB=${{shared.POSTGRES_DB}}'
 railway variables --service postgres-2 --set 'PATRONI_REPLICATION_USERNAME=${{shared.PATRONI_REPLICATION_USERNAME}}'
 railway variables --service postgres-2 --set 'PATRONI_REPLICATION_PASSWORD=${{shared.PATRONI_REPLICATION_PASSWORD}}'
-railway variables --service postgres-2 --set POSTGRESQL_DATA_DIR=/var/lib/postgresql/data
 railway variables --service postgres-2 --set PGDATA=/var/lib/postgresql/data
+railway variables --service postgres-2 --set PATRONI_ENABLED=true
 
 echo "Adding volume to postgres-2..."
 railway volume add --service postgres-2 --mount-path /var/lib/postgresql/data 2>/dev/null || echo "Volume already exists"

@@ -34,13 +34,5 @@ railway up --service pgpool --detach 2>&1 || {
 }
 cd ..
 
-# Deploy failover-watcher
-echo "=== Deploying failover-watcher ==="
-cd failover-watcher
-railway up --service failover-watcher --detach 2>&1 || {
-    echo "Service failover-watcher doesn't exist, skipping for now"
-}
-cd ..
-
 echo ""
 echo "Done! Check Railway dashboard for deployment status."

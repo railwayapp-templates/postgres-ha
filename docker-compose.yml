@@ -148,14 +148,3 @@ services:
       - postgres-2
       - postgres-3
 
-  failover-watcher:
-    build: ./failover-watcher
-    container_name: failover-watcher
-    networks:
-      - postgres-ha
-    environment:
-      - CHECK_INTERVAL_MS=5000
-    depends_on:
-      - postgres-1
-      - postgres-2
-      - postgres-3

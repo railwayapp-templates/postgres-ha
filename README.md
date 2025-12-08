@@ -6,7 +6,7 @@ This template deploys a production-ready, highly-available PostgreSQL cluster on
 
 - **3-node PostgreSQL cluster** with streaming replication
 - **Automatic failover** in <10 seconds using Patroni
-- **2 read replicas** for load distribution
+- **2 standby replicas** for automatic failover
 - **Connection pooling** with Pgpool-II (3 replicas for HA)
 - **Transparent routing** - single endpoint for all database connections
 - **Automatic recovery** - failed nodes rejoin as replicas
@@ -20,9 +20,9 @@ Application
 Pgpool-II (3 replicas) ← Load balanced endpoint
     ↓
 PostgreSQL Cluster
-    ├─ postgres-1 (Leader)  ← Writes + Reads
-    ├─ postgres-2 (Replica) ← Reads only
-    └─ postgres-3 (Replica) ← Reads only
+    ├─ postgres-1 (Leader)  ← All queries
+    ├─ postgres-2 (Standby) ← Failover ready
+    └─ postgres-3 (Standby) ← Failover ready
          ↓
     etcd (3 nodes) ← Distributed consensus
 ```
@@ -31,10 +31,9 @@ PostgreSQL Cluster
 
 1. **postgres-1, postgres-2, postgres-3** - PostgreSQL 17 with Patroni orchestration
 2. **etcd-1, etcd-2, etcd-3** - Distributed key-value store for leader election
-3. **pgpool** - Connection pooler and query router (3 replicas)
-4. **failover-watcher** - Monitors cluster and updates Railway env vars
+3. **pgpool** - Connection pooler and query router with built-in failover watcher
 
-**Total**: 8 services, ~10 running containers
+**Total**: 7 services
 
 ## Quick Start
 
@@ -60,9 +59,7 @@ postgresql://railway:${POSTGRES_PASSWORD}@pgpool.railway.internal:5432/railway
 postgresql://railway:${POSTGRES_PASSWORD}@${PGPOOL_TCP_PROXY_DOMAIN}/railway
 ```
 
-Pgpool-II automatically routes:
-- **Write queries** (`INSERT`, `UPDATE`, `DELETE`) → Primary
-- **Read queries** (`SELECT`) → Replicas (load balanced)
+Pgpool-II automatically routes all queries to the current primary node. The `patroni-watcher` process monitors the Patroni cluster and updates Pgpool's backend configuration when leadership changes, ensuring transparent failover.
 
 ## Configuration
 
@@ -78,7 +75,6 @@ Pgpool-II automatically routes:
 | `PATRONI_LOOP_WAIT` | `10` | Health check interval |
 | `PGPOOL_NUM_INIT_CHILDREN` | `32` | Connection pool workers per Pgpool instance |
 | `PGPOOL_MAX_POOL` | `4` | Cached connections per worker |
-| `CHECK_INTERVAL_MS` | `5000` | Failover watcher polling interval |
 
 ### Scaling Pgpool-II
 
@@ -149,22 +145,6 @@ Response:
 }
 ```
 
-### Failover Watcher Logs
-
-Monitor failover events in the `failover-watcher` service logs:
-
-```
-✓ Leader: postgres-1 | Replicas: 2 | Timeline: 1
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔄 Failover detected!
-   Previous leader: postgres-1
-   New leader: postgres-2
-   Timeline: 2
-   Host: postgres-2.railway.internal
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Railway environment variables updated
-```
-
 ## Failover Behavior
 
 ### Automatic Failover (Primary Crashes)
@@ -218,7 +198,7 @@ cd templates/postgres-ha
 docker-compose up -d
 ```
 
-This starts all 8 services on your local machine.
+This starts all services on your local machine.
 
 Connect to the cluster:
 ```bash
@@ -277,8 +257,7 @@ If lag is high (>1GB):
 **Resource allocation**:
 - 3 PostgreSQL: 2 vCPU, 2GB RAM each + 10GB volume
 - 3 etcd: 0.5 vCPU, 512MB RAM each
-- 3 Pgpool: 0.5 vCPU, 512MB RAM each
-- 1 Watcher: 0.5 vCPU, 256MB RAM
+- 1 Pgpool: 0.5 vCPU, 512MB RAM
 
 **Estimated cost (Railway Pro)**:
 - Compute: ~$60-120/month

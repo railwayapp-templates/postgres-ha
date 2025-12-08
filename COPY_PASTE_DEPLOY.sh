@@ -44,11 +44,6 @@ cd /Users/paulocabral/software/railway/mono/templates/postgres-ha/pgpool
 railway up
 # When prompted: Create new service, name it "pgpool"
 
-# 8. Deploy failover-watcher
-cd /Users/paulocabral/software/railway/mono/templates/postgres-ha/failover-watcher
-railway up
-# When prompted: Create new service, name it "failover-watcher"
-
 # Done! Now configure variables in Railway dashboard.
 
 EOF

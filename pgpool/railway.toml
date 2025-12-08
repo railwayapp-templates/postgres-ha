@@ -5,33 +5,4 @@ watchPatterns = ["pgpool/**"]
 
 [deploy]
 restartPolicyType = "always"
-numReplicas = 1
-
-[variables]
-# Pgpool admin credentials
-PGPOOL_ADMIN_USERNAME = "admin"
-PGPOOL_ADMIN_PASSWORD = "${{secret(32)}}"
-
-# Backend configuration - references postgres service variables
-PGPOOL_BACKEND_NODES = "0:postgres-1.railway.internal:5432,1:postgres-2.railway.internal:5432,2:postgres-3.railway.internal:5432"
-
-# PostgreSQL credentials - reference from postgres-1 service
-PGPOOL_POSTGRES_USERNAME = "${{postgres-1.POSTGRES_USER}}"
-PGPOOL_POSTGRES_PASSWORD = "${{postgres-1.POSTGRES_PASSWORD}}"
-PGPOOL_POSTGRES_DATABASE = "${{postgres-1.POSTGRES_DB}}"
-
-# SR check user for replication monitoring
-PGPOOL_SR_CHECK_USER = "${{postgres-1.POSTGRES_USER}}"
-PGPOOL_SR_CHECK_PASSWORD = "${{postgres-1.POSTGRES_PASSWORD}}"
-
-# Health check settings
-PGPOOL_HEALTH_CHECK_USER = "${{postgres-1.POSTGRES_USER}}"
-PGPOOL_HEALTH_CHECK_PASSWORD = "${{postgres-1.POSTGRES_PASSWORD}}"
-PGPOOL_HEALTH_CHECK_DATABASE = "${{postgres-1.POSTGRES_DB}}"
-PGPOOL_HEALTH_CHECK_PERIOD = "3"
-PGPOOL_HEALTH_CHECK_TIMEOUT = "3"
-
-# Enable streaming replication mode
-PGPOOL_BACKEND_CLUSTERING_MODE = "streaming_replication"
-PGPOOL_SR_CHECK_PERIOD = "5"
-PGPOOL_ENABLE_LOAD_BALANCING = "yes"
+numReplicas = 3

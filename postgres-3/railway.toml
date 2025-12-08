@@ -7,31 +7,3 @@ watchPatterns = ["postgres-patroni/**"]
 restartPolicyType = "always"
 restartPolicyMaxRetries = 10
 numReplicas = 1
-
-[variables]
-# PostgreSQL credentials - reference from postgres-1
-POSTGRES_USER = "${{postgres-1.POSTGRES_USER}}"
-POSTGRES_PASSWORD = "${{postgres-1.POSTGRES_PASSWORD}}"
-POSTGRES_DB = "${{postgres-1.POSTGRES_DB}}"
-
-# Standard PG* environment variables (for client compatibility)
-PGUSER = "${{POSTGRES_USER}}"
-PGPASSWORD = "${{POSTGRES_PASSWORD}}"
-PGDATABASE = "${{POSTGRES_DB}}"
-PGHOST = "${{RAILWAY_PRIVATE_DOMAIN}}"
-PGPORT = "5432"
-PGDATA = "/var/lib/postgresql/data"
-
-# Connection URLs
-DATABASE_URL = "postgresql://${{PGUSER}}:${{POSTGRES_PASSWORD}}@${{RAILWAY_PRIVATE_DOMAIN}}:5432/${{PGDATABASE}}"
-DATABASE_PUBLIC_URL = "postgresql://${{PGUSER}}:${{POSTGRES_PASSWORD}}@${{RAILWAY_TCP_PROXY_DOMAIN}}:${{RAILWAY_TCP_PROXY_PORT}}/${{PGDATABASE}}"
-
-# SSL configuration
-SSL_CERT_DAYS = "820"
-
-# Patroni configuration
-PATRONI_ENABLED = "true"
-PATRONI_NAME = "postgres-3"
-PATRONI_SCOPE = "railway-pg-ha"
-PATRONI_REPLICATION_PASSWORD = "${{postgres-1.PATRONI_REPLICATION_PASSWORD}}"
-PATRONI_ETCD_HOSTS = "etcd-1.railway.internal:2379,etcd-2.railway.internal:2379,etcd-3.railway.internal:2379"

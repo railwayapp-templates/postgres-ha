@@ -1,12 +1,15 @@
 #!/bin/bash
-set -e
+# patroni-runner.sh - Wrapper to run Patroni with proper setup
+#
+# This script is called by supervisord to start Patroni.
+# It generates the configuration and starts Patroni.
 
-# Patroni mode entrypoint (only runs when PATRONI_ENABLED=true)
+set -e
 
 DATA_DIR="/var/lib/postgresql/data"
 CERTS_DIR="$DATA_DIR/certs"
 
-echo "=== Patroni Entrypoint ==="
+echo "=== Patroni Runner ==="
 
 # Configuration
 SCOPE="${PATRONI_SCOPE:-railway-pg-ha}"
@@ -61,10 +64,11 @@ etcd:
 
 bootstrap:
   dcs:
-    ttl: ${PATRONI_TTL:-30}
-    loop_wait: ${PATRONI_LOOP_WAIT:-10}
-    retry_timeout: 10
+    ttl: ${PATRONI_TTL:-20}
+    loop_wait: ${PATRONI_LOOP_WAIT:-5}
+    retry_timeout: ${PATRONI_RETRY_TIMEOUT:-5}
     maximum_lag_on_failover: 1048576
+    failsafe_mode: true
     postgresql:
       use_pg_rewind: true
       use_slots: true
@@ -120,34 +124,8 @@ EOF
 
 echo "Starting Patroni (scope: $SCOPE, etcd: $ETCD_HOSTS)"
 
-# Ensure replicator user exists (runs in background after postgres starts)
-(
-    sleep 15  # Wait for postgres to be ready
-    for i in 1 2 3 4 5; do
-        if psql -U postgres -d postgres -c "SELECT 1" 2>/dev/null; then
-            echo "Creating replicator user if not exists..."
-            psql -U postgres -d postgres -c "
-                DO \$\$
-                BEGIN
-                    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPL_USER}') THEN
-                        CREATE ROLE ${REPL_USER} WITH REPLICATION PASSWORD '${REPL_PASS}' LOGIN;
-                        RAISE NOTICE 'Created replicator user';
-                    END IF;
-                END
-                \$\$;
-            " && break
-        fi
-        sleep 5
-    done
-) &
+# Note: Replicator user is created via bootstrap.users (above) during initdb.
+# post_bootstrap.sh provides a safety net to ensure the user exists.
 
-# Cleanup on exit
-cleanup() {
-    echo "Patroni exiting, stopping PostgreSQL..."
-    pkill -9 -f "postgres" 2>/dev/null || true
-    exit 1
-}
-trap cleanup EXIT SIGTERM SIGINT
-
-# Start Patroni
+# Start Patroni (exec to replace this shell process)
 exec patroni /tmp/patroni.yml

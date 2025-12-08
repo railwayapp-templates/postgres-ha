@@ -44,7 +44,6 @@ ETCD_INITIAL_CLUSTER_TOKEN=railway-pg-ha
 ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
 ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
 ETCD_DATA_DIR=/etcd-data
-ETCD_ENABLE_V2=false
 ```
 
 ---
@@ -89,7 +88,6 @@ POSTGRES_PASSWORD=${{shared.POSTGRES_PASSWORD}}
 POSTGRES_DB=${{shared.POSTGRES_DB}}
 PATRONI_REPLICATION_USERNAME=${{shared.PATRONI_REPLICATION_USERNAME}}
 PATRONI_REPLICATION_PASSWORD=${{shared.PATRONI_REPLICATION_PASSWORD}}
-POSTGRESQL_DATA_DIR=/var/lib/postgresql/data
 PGDATA=/var/lib/postgresql/data
 ```
 
@@ -119,28 +117,6 @@ PGPOOL_MAX_POOL=4
 
 ---
 
-## Service 8: Failover Watcher
-
-| Setting | Value |
-|---------|-------|
-| **Name** | `failover-watcher` |
-| **Root Directory** | `templates/postgres-ha/failover-watcher` |
-| **Build** | Dockerfile |
-| **Start Command** | `node src/index.js` |
-| **Replicas** | 1 |
-| **Volume** | None |
-
-### Variables
-
-```bash
-RAILWAY_API_TOKEN=${{shared.RAILWAY_API_TOKEN}}
-RAILWAY_PROJECT_ID=${{shared.RAILWAY_PROJECT_ID}}
-RAILWAY_ENVIRONMENT_ID=${{shared.RAILWAY_ENVIRONMENT_ID}}
-CHECK_INTERVAL_MS=5000
-```
-
----
-
 ## Shared Variables (Set BEFORE Deploying)
 
 Go to Project → Variables → Shared:
@@ -156,10 +132,6 @@ PATRONI_TTL=30
 PATRONI_LOOP_WAIT=10
 PATRONI_ETCD_HOSTS=etcd-1.railway.internal:2379,etcd-2.railway.internal:2379,etcd-3.railway.internal:2379
 
-# For failover watcher (get from Railway project settings)
-RAILWAY_API_TOKEN=<your-project-token>
-RAILWAY_PROJECT_ID=<your-project-id>
-RAILWAY_ENVIRONMENT_ID=<your-environment-id>
 ```
 
 ---
@@ -171,8 +143,7 @@ RAILWAY_ENVIRONMENT_ID=<your-environment-id>
 2. Deploy etcd-1, etcd-2, etcd-3 → Wait for all healthy
 3. Deploy postgres-1, postgres-2, postgres-3 → Wait for all healthy
 4. Deploy pgpool → Wait for healthy
-5. Deploy failover-watcher → Wait for healthy
-6. Test connection ✓
+5. Test connection ✓
 ```
 
 ---

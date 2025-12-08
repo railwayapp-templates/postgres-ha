@@ -6,7 +6,7 @@ Since Railway CLI requires interactive prompts, using the dashboard is actually 
 
 Go to https://railway.app/project/soothing-serenity
 
-Click **"+ New"** 8 times to create these services:
+Click **"+ New"** 7 times to create these services:
 1. `etcd-1`
 2. `etcd-2`
 3. `etcd-3`
@@ -14,7 +14,6 @@ Click **"+ New"** 8 times to create these services:
 5. `postgres-2`
 6. `postgres-3`
 7. `pgpool`
-8. `failover-watcher`
 
 For each service:
 - Click "+ New" → "Empty Service"
@@ -48,9 +47,6 @@ For each service:
 
 ### For pgpool:
 - Root Directory: `templates/postgres-ha/pgpool`
-
-### For failover-watcher:
-- Root Directory: `templates/postgres-ha/failover-watcher`
 
 ---
 
@@ -89,7 +85,7 @@ ETCD_ADVERTISE_CLIENT_URLS=http://etcd-1.railway.internal:2379
 ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
 ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-1.railway.internal:2380
 ETCD_DATA_DIR=/etcd-data
-ETCD_ENABLE_V2=false
+ETCD_ENABLE_V2=true
 ```
 
 ### etcd-2 Variables:
@@ -121,7 +117,6 @@ POSTGRES_PASSWORD=${{shared.POSTGRES_PASSWORD}}
 POSTGRES_DB=${{shared.POSTGRES_DB}}
 PATRONI_REPLICATION_USERNAME=${{shared.PATRONI_REPLICATION_USERNAME}}
 PATRONI_REPLICATION_PASSWORD=${{shared.PATRONI_REPLICATION_PASSWORD}}
-POSTGRESQL_DATA_DIR=/var/lib/postgresql/data
 PGDATA=/var/lib/postgresql/data
 ```
 
@@ -144,16 +139,6 @@ REPLICATION_PASSWORD=${{shared.PATRONI_REPLICATION_PASSWORD}}
 PGPOOL_NUM_INIT_CHILDREN=32
 PGPOOL_MAX_POOL=4
 ```
-
-### failover-watcher Variables:
-```bash
-RAILWAY_API_TOKEN=<get from Project Settings → Tokens>
-RAILWAY_PROJECT_ID=<from URL>
-RAILWAY_ENVIRONMENT_ID=<from URL>
-CHECK_INTERVAL_MS=5000
-```
-
----
 
 ## Step 5: Add Volumes (PostgreSQL only)
 
@@ -188,7 +173,7 @@ Services should auto-deploy once source and variables are set. If not:
 1. Deploy etcd-1, etcd-2, etcd-3 first
 2. Wait for all 3 to be healthy (green)
 3. Then deploy postgres-1, postgres-2, postgres-3
-4. Finally deploy pgpool and failover-watcher
+4. Finally deploy pgpool
 
 ---
 

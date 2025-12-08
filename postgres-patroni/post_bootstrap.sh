@@ -1,8 +1,14 @@
 #!/bin/bash
+# post_bootstrap.sh - Patroni post-bootstrap script
+#
+# Runs ONCE after PostgreSQL initialization on the primary node.
+# Configures users, database, and SSL.
+
 set -e
 
 DATA_DIR="/var/lib/postgresql/data"
-CERTS_DIR="$DATA_DIR/certs"
+SSL_DIR="$DATA_DIR/certs"
+INIT_SSL_SCRIPT="/usr/local/bin/init-ssl.sh"
 
 echo "Post-bootstrap: configuring users..."
 
@@ -55,36 +61,17 @@ if [ -n "$POSTGRES_DB" ] && [ "$POSTGRES_DB" != "postgres" ]; then
 EOSQL
 fi
 
-# Generate SSL certs
+# Generate SSL certificates using unified script
 echo "Post-bootstrap: generating SSL certificates..."
-DAYS="${SSL_CERT_DAYS:-820}"
-mkdir -p "$CERTS_DIR"
-
-openssl genrsa -out "$CERTS_DIR/ca.key" 2048
-openssl req -new -x509 -days "$DAYS" -key "$CERTS_DIR/ca.key" -out "$CERTS_DIR/ca.crt" -subj "/CN=PostgreSQL CA"
-openssl genrsa -out "$CERTS_DIR/server.key" 2048
-openssl req -new -key "$CERTS_DIR/server.key" -out "$CERTS_DIR/server.csr" -subj "/CN=postgres"
-
-cat > "$CERTS_DIR/v3.ext" <<EXTEOF
-authorityKeyIdentifier=keyid,issuer
-basicConstraints=CA:FALSE
-keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
-subjectAltName = DNS:localhost,DNS:*.railway.internal,IP:127.0.0.1
-EXTEOF
-
-openssl x509 -req -in "$CERTS_DIR/server.csr" -CA "$CERTS_DIR/ca.crt" -CAkey "$CERTS_DIR/ca.key" \
-    -CAcreateserial -out "$CERTS_DIR/server.crt" -days "$DAYS" -extfile "$CERTS_DIR/v3.ext"
-
-chmod 600 "$CERTS_DIR/server.key"
-chmod 644 "$CERTS_DIR/server.crt" "$CERTS_DIR/ca.crt"
+bash "$INIT_SSL_SCRIPT"
 
 # Enable SSL via ALTER SYSTEM and reload
 echo "Post-bootstrap: enabling SSL..."
 psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<-EOSQL
     ALTER SYSTEM SET ssl = 'on';
-    ALTER SYSTEM SET ssl_cert_file = '${CERTS_DIR}/server.crt';
-    ALTER SYSTEM SET ssl_key_file = '${CERTS_DIR}/server.key';
-    ALTER SYSTEM SET ssl_ca_file = '${CERTS_DIR}/ca.crt';
+    ALTER SYSTEM SET ssl_cert_file = '${SSL_DIR}/server.crt';
+    ALTER SYSTEM SET ssl_key_file = '${SSL_DIR}/server.key';
+    ALTER SYSTEM SET ssl_ca_file = '${SSL_DIR}/root.crt';
     SELECT pg_reload_conf();
 EOSQL
 

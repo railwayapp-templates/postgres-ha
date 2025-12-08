@@ -63,13 +63,6 @@ sleep 20
 deploy_service "pgpool" "pgpool"
 
 echo ""
-echo "Do you want to deploy the failover watcher? (y/n)"
-read -r response
-if [[ "$response" =~ ^[Yy]$ ]]; then
-    deploy_service "failover-watcher" "failover-watcher"
-fi
-
-echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "✅ Deployment Complete!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

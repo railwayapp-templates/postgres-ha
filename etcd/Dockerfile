@@ -10,7 +10,6 @@ COPY --from=tools /bin/chmod /bin/chmod
 COPY --from=tools /lib/ld-musl-*.so.1 /lib/
 COPY --from=tools /lib/libc.musl-*.so.1 /lib/
 
-ENV ETCD_ENABLE_V2=true
 ENV ETCD_DATA_DIR=/etcd-data/data
 
 COPY entrypoint.sh /entrypoint.sh

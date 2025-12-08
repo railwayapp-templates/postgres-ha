@@ -10,11 +10,10 @@ This guide walks you through deploying the HA PostgreSQL cluster to Railway manu
 
 ## Deployment Overview
 
-We'll deploy **8 services** in this order:
+We'll deploy **7 services** in this order:
 1. etcd-1, etcd-2, etcd-3 (consensus layer - must start first)
 2. postgres-1, postgres-2, postgres-3 (database nodes)
-3. pgpool (connection pooler)
-4. failover-watcher (monitoring - optional)
+3. pgpool (connection pooler with built-in failover watcher)
 
 **Estimated time**: 15-20 minutes
 
@@ -81,7 +80,7 @@ ETCD_ADVERTISE_CLIENT_URLS=http://etcd-1.railway.internal:2379
 ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
 ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-1.railway.internal:2380
 ETCD_DATA_DIR=/etcd-data
-ETCD_ENABLE_V2=false
+ETCD_ENABLE_V2=true
 ```
 
 6. Go to **Settings** → **Deploy**:
@@ -154,7 +153,6 @@ PATRONI_REPLICATION_USERNAME=${{shared.PATRONI_REPLICATION_USERNAME}}
 PATRONI_REPLICATION_PASSWORD=${{shared.PATRONI_REPLICATION_PASSWORD}}
 
 # Data directory
-POSTGRESQL_DATA_DIR=/var/lib/postgresql/data
 PGDATA=/var/lib/postgresql/data
 ```
 
@@ -250,44 +248,7 @@ Pgpool-II configuration:
 
 ---
 
-## Phase 5: Deploy Failover Watcher (Optional)
-
-### Service 8: failover-watcher
-
-1. Click **"+ New Service"**
-2. Select **"Empty Service"**
-3. Name it: `failover-watcher`
-4. Go to **Settings** → **Source**:
-   - Choose "Dockerfile"
-   - Root directory: `templates/postgres-ha/failover-watcher`
-5. Go to **Variables** tab → Add:
-
-```bash
-# Railway API credentials (from shared variables)
-RAILWAY_API_TOKEN=${{shared.RAILWAY_API_TOKEN}}
-RAILWAY_PROJECT_ID=${{shared.RAILWAY_PROJECT_ID}}
-RAILWAY_ENVIRONMENT_ID=${{shared.RAILWAY_ENVIRONMENT_ID}}
-
-# Monitoring interval
-CHECK_INTERVAL_MS=5000
-```
-
-6. Go to **Settings** → **Deploy**:
-   - Start command: `node src/index.js`
-   - Restart policy: Always
-
-7. Click **"Deploy"**
-
-Check logs for:
-```
-Railway PostgreSQL HA Failover Watcher
-Monitoring: http://postgres-1.railway.internal:8008, ...
-✓ Leader: postgres-1 | Replicas: 2 | Timeline: 1
-```
-
----
-
-## Phase 6: Get Connection String
+## Phase 5: Get Connection String
 
 ### For Applications in Same Railway Project (Private)
 
@@ -391,15 +352,7 @@ T+10s  Failover complete
 
 ### Verify New Leader
 
-Check `failover-watcher` logs:
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔄 Failover detected!
-   Previous leader: postgres-1
-   New leader: postgres-2
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Railway environment variables updated
-```
+Check pgpool logs for patroni-watcher output showing the leader change.
 
 Check Patroni:
 ```bash
@@ -457,7 +410,7 @@ Your application should automatically reconnect to the new primary (via pgpool).
 - [ ] postgres-1 shows "I am the leader" in logs
 - [ ] postgres-2 and postgres-3 show "I am a secondary" in logs
 - [ ] pgpool service is healthy (green)
-- [ ] failover-watcher shows "Leader: postgres-1 | Replicas: 2"
+- [ ] pgpool logs show patroni-watcher detecting leader
 - [ ] Can connect via `DATABASE_URL`
 - [ ] Can query database successfully
 - [ ] `pg_stat_replication` shows 2 active replicas

@@ -7,31 +7,42 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo \
     python3 \
     python3-pip \
-    python3-psycopg2 \
-    python3-yaml \
-    python3-requests \
     curl \
+    supervisor \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir --break-system-packages \
+# Install setuptools first (required for ydiff dependency)
+RUN pip3 install --no-cache-dir --break-system-packages setuptools \
+    && pip3 install --no-cache-dir --break-system-packages \
     patroni[etcd]==${PATRONI_VERSION}
 
-# Allow postgres user to manage Railway volume permissions
-RUN echo "postgres ALL=(root) NOPASSWD: /bin/mkdir, /bin/chown, /bin/chmod, /usr/bin/openssl" > /etc/sudoers.d/postgres
+# Allow the postgres user to execute certain commands as root without a password
+RUN echo "postgres ALL=(root) NOPASSWD: /usr/bin/mkdir, /bin/chown, /bin/chmod, /usr/bin/openssl" > /etc/sudoers.d/postgres
 
 RUN mkdir -p /home/postgres /var/run/postgresql \
     && chown -R postgres:postgres /home/postgres /var/run/postgresql
 
-COPY docker-entrypoint.sh /docker-entrypoint.sh
 COPY post_bootstrap.sh /post_bootstrap.sh
 COPY wrapper.sh /usr/local/bin/wrapper.sh
-RUN chmod +x /docker-entrypoint.sh /post_bootstrap.sh /usr/local/bin/wrapper.sh
+COPY init-ssl.sh /usr/local/bin/init-ssl.sh
+
+# Phase 2: Supervisord and watchdog for split-brain prevention (RFC-007)
+COPY supervisord.conf /etc/supervisor/conf.d/patroni.conf
+COPY patroni-runner.sh /usr/local/bin/patroni-runner.sh
+COPY patroni-watchdog.sh /usr/local/bin/patroni-watchdog.sh
+COPY supervisor-exit-handler.sh /usr/local/bin/supervisor-exit-handler.sh
+
+RUN chmod +x /post_bootstrap.sh /usr/local/bin/wrapper.sh /usr/local/bin/init-ssl.sh \
+    /usr/local/bin/patroni-runner.sh /usr/local/bin/patroni-watchdog.sh \
+    /usr/local/bin/supervisor-exit-handler.sh
 
 EXPOSE 5432 8008
 
-HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+# Aggressive health check for faster split-brain detection (Phase 1)
+# - 5s interval with 2 retries = ~15s max detection time
+HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=2 \
     CMD if [ "${PATRONI_ENABLED:-false}" = "true" ]; then \
-            curl -f http://localhost:8008/health || exit 1; \
+            curl -sf http://localhost:8008/health || exit 1; \
         else \
             pg_isready -U ${POSTGRES_USER:-postgres} || exit 1; \
         fi

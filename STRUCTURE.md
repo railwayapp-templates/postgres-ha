@@ -8,9 +8,14 @@ templates/postgres-ha/
 │
 ├── postgres-patroni/                  # PostgreSQL + Patroni service (deploy 3x)
 │   ├── Dockerfile                     # Custom image with PG 17 + Patroni
-│   ├── railway.toml                   # Railway service config (1 replica)
-│   ├── patroni.yml                    # Patroni configuration template
-│   └── docker-entrypoint.sh           # Initialization script
+│   ├── railway.toml                   # Railway service config
+│   ├── wrapper.sh                     # Entry point script
+│   ├── patroni-runner.sh              # Generates patroni.yml and starts Patroni
+│   ├── post_bootstrap.sh              # Runs after PostgreSQL initialization
+│   ├── init-ssl.sh                    # SSL certificate generation
+│   ├── patroni-watchdog.sh            # Monitors Patroni health
+│   ├── supervisor-exit-handler.sh     # Handles process exits
+│   └── supervisord.conf               # Process manager configuration
 │
 ├── etcd-1/                            # etcd node 1
 │   ├── Dockerfile                     # etcd v3.5.16 image
@@ -24,19 +29,13 @@ templates/postgres-ha/
 │   ├── Dockerfile
 │   └── railway.toml                   # Service config with node-3 settings
 │
-├── pgpool/                            # Pgpool-II connection pooler
-│   ├── Dockerfile                     # Pgpool 4.5 alpine image
-│   ├── railway.toml                   # Service config (3 replicas for HA)
-│   ├── pgpool.conf                    # Pgpool configuration
-│   ├── pool_hba.conf                  # Host-based authentication
-│   └── docker-entrypoint.sh           # Password injection script
-│
-└── failover-watcher/                  # Failover monitoring service
-    ├── Dockerfile                     # Node.js 20 alpine
-    ├── railway.toml                   # Service config (1 replica)
-    ├── package.json                   # Node.js dependencies
-    └── src/
-        └── index.js                   # Watcher implementation
+└── pgpool/                            # Pgpool-II connection pooler
+    ├── Dockerfile                     # Pgpool 4.5 alpine image
+    ├── railway.toml                   # Service config
+    ├── pgpool.conf                    # Pgpool configuration
+    ├── pool_hba.conf                  # Host-based authentication
+    ├── patroni-watcher.py             # Monitors Patroni, updates backends via PCP
+    └── run.sh                         # Startup script
 ```
 
 ## Deployment Instructions
@@ -50,8 +49,7 @@ Each subfolder represents a separate Railway service. Deploy in this order:
    - Service 1: Set `PATRONI_NAME=postgres-1`
    - Service 2: Set `PATRONI_NAME=postgres-2`
    - Service 3: Set `PATRONI_NAME=postgres-3`
-3. **pgpool** - Deploy with `numReplicas=3` in railway.toml
-4. **failover-watcher** - Deploy last (optional)
+3. **pgpool** - Deploy last (includes built-in failover watcher)
 
 ### For Local Testing
 
@@ -67,9 +65,14 @@ Connects to: `postgresql://railway:railway@localhost:5432/railway`
 ### postgres-patroni/
 
 - **Dockerfile**: Builds custom image with PostgreSQL 17 + Patroni 4.0.4
-- **patroni.yml**: Patroni config using env var templating for dynamic values
-- **docker-entrypoint.sh**: Sets default env vars and initializes data directory
-- **railway.toml**: Defines build (dockerfile) and deploy settings (1 replica, always restart)
+- **wrapper.sh**: Entry point that initializes SSL and starts supervisord
+- **patroni-runner.sh**: Dynamically generates `patroni.yml` from environment variables and starts Patroni
+- **post_bootstrap.sh**: Runs after PostgreSQL init to create replicator user and configure SSL
+- **init-ssl.sh**: Generates self-signed SSL certificates for PostgreSQL
+- **patroni-watchdog.sh**: Monitors Patroni health via REST API
+- **supervisor-exit-handler.sh**: Handles graceful shutdown of processes
+- **supervisord.conf**: Manages Patroni and watchdog processes
+- **railway.toml**: Defines build and deploy settings (always restart)
 
 ### etcd-1/, etcd-2/, etcd-3/
 
@@ -81,22 +84,13 @@ Connects to: `postgresql://railway:railway@localhost:5432/railway`
 
 - **Dockerfile**: Pgpool 4.5 alpine with custom configs
 - **pgpool.conf**: Backend configuration pointing to postgres-{1,2,3}.railway.internal
-  - Load balancing enabled
+  - Routes all queries to current primary
   - Streaming replication check enabled
   - Health checks every 5 seconds
 - **pool_hba.conf**: Trust local, md5 for network connections
-- **docker-entrypoint.sh**: Injects passwords from env vars into config
+- **patroni-watcher.py**: Monitors Patroni cluster, updates primary backend via PCP
+- **run.sh**: Startup script that injects passwords and starts pgpool + watcher
 - **railway.toml**: **3 replicas** for horizontal scaling
-
-### failover-watcher/
-
-- **package.json**: Node.js project with node-fetch dependency
-- **index.js**:
-  - Polls Patroni cluster API every 5 seconds
-  - Detects leader changes
-  - Updates Railway env vars via GraphQL API
-  - Logs failover events
-- **railway.toml**: 1 replica (stateless, but no benefit to scaling)
 
 ## Key Configuration Points
 

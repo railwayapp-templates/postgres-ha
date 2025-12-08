@@ -85,17 +85,6 @@ cd pgpool
 railway up --service pgpool
 ```
 
-### 5. Deploy Failover Watcher (Optional)
-
-```bash
-./scripts/deploy-failover-watcher.sh
-```
-
-You'll be prompted for:
-- `RAILWAY_API_TOKEN` - Get from Project Settings → Tokens
-- `RAILWAY_PROJECT_ID` - From URL or `railway status`
-- `RAILWAY_ENVIRONMENT_ID` - From URL or `railway status`
-
 ---
 
 ## Verify Deployment
@@ -106,7 +95,7 @@ You'll be prompted for:
 railway status
 ```
 
-Should show 8 services all healthy.
+Should show 7 services all healthy.
 
 ### View Logs
 
@@ -119,9 +108,6 @@ railway logs --service postgres-1
 
 # Pgpool
 railway logs --service pgpool
-
-# Failover watcher
-railway logs --service failover-watcher
 ```
 
 ### Get Connection String
@@ -185,13 +171,10 @@ Should show 2 replicas (postgres-2, postgres-3).
 # Stop the leader
 railway service --service postgres-1 stop
 
-# Watch failover watcher logs
-railway logs --service failover-watcher --follow
+# Watch pgpool logs for failover detection
+railway logs --service pgpool --follow
 
-# Should see:
-# 🔄 Failover detected!
-# Previous leader: postgres-1
-# New leader: postgres-2
+# Should see patroni-watcher detecting new leader
 ```
 
 ### Restart Failed Node
@@ -299,7 +282,6 @@ railway service delete postgres-1
 railway service delete postgres-2
 railway service delete postgres-3
 railway service delete pgpool
-railway service delete failover-watcher
 
 # Or delete entire project (be careful!)
 railway project delete
@@ -316,7 +298,7 @@ railway project delete
 
 2. **Set up monitoring**:
    - Use Railway's built-in metrics
-   - Check failover-watcher logs regularly
+   - Check pgpool logs for patroni-watcher output
 
 3. **Configure backups**:
    - Railway Pro includes automatic volume snapshots

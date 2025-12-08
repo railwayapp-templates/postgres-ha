@@ -10,9 +10,9 @@ echo "Environment: $ENV"
 echo ""
 
 # Service names to create
-SERVICES=("etcd-1" "etcd-2" "etcd-3" "postgres-1" "postgres-2" "postgres-3" "pgpool" "failover-watcher")
+SERVICES=("etcd-1" "etcd-2" "etcd-3" "postgres-1" "postgres-2" "postgres-3" "pgpool")
 
-echo "Creating 8 services..."
+echo "Creating 7 services..."
 echo ""
 
 for service in "${SERVICES[@]}"; do

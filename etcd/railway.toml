@@ -4,5 +4,5 @@ dockerfilePath = "etcd/Dockerfile"
 watchPatterns = ["etcd/**"]
 
 [deploy]
-restartPolicyType = "never"
+restartPolicyType = "always"
 numReplicas = 1
