@@ -5,4 +5,3 @@ watchPatterns = ["etcd/**"]
 
 [deploy]
 restartPolicyType = "always"
-numReplicas = 1

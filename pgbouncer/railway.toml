@@ -1,7 +1,7 @@
 [build]
 builder = "dockerfile"
-dockerfilePath = "pgpool/Dockerfile"
-watchPatterns = ["pgpool/**"]
+dockerfilePath = "pgbouncer/Dockerfile"
+watchPatterns = ["pgbouncer/**"]
 
 [deploy]
 restartPolicyType = "always"

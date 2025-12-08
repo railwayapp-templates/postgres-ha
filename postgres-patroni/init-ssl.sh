@@ -15,6 +15,8 @@ SSL_ROOT_CRT="$SSL_DIR/root.crt"
 
 SSL_V3_EXT="$SSL_DIR/v3.ext"
 
+POSTGRES_CONF_FILE="$PGDATA/postgresql.conf"
+
 # Use sudo to create the directory as root
 sudo mkdir -p "$SSL_DIR"
 
@@ -22,7 +24,7 @@ sudo mkdir -p "$SSL_DIR"
 sudo chown postgres:postgres "$SSL_DIR"
 
 # Generate self-signed 509v3 certificates
-# ref: https://www.postgresql.org/docs/17/ssl-tcp.html#SSL-CERTIFICATE-CREATION
+# ref: https://www.postgresql.org/docs/16/ssl-tcp.html#SSL-CERTIFICATE-CREATION
 
 openssl req -new -x509 -days "${SSL_CERT_DAYS:-820}" -nodes -text -out "$SSL_ROOT_CRT" -keyout "$SSL_ROOT_KEY" -subj "/CN=root-ca"
 
@@ -39,9 +41,17 @@ cat >| "$SSL_V3_EXT" <<EOF
 authorityKeyIdentifier = keyid, issuer
 basicConstraints = critical, CA:TRUE
 keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
-subjectAltName = DNS:localhost,DNS:*.railway.internal,IP:127.0.0.1
+subjectAltName = DNS:localhost
 EOF
 
 openssl x509 -req -in "$SSL_SERVER_CSR" -extfile "$SSL_V3_EXT" -extensions v3_req -text -days "${SSL_CERT_DAYS:-820}" -CA "$SSL_ROOT_CRT" -CAkey "$SSL_ROOT_KEY" -CAcreateserial -out "$SSL_SERVER_CRT"
 
 chown postgres:postgres "$SSL_SERVER_CRT"
+
+# PostgreSQL configuration, enable ssl and set paths to certificate files
+cat >> "$POSTGRES_CONF_FILE" <<EOF
+ssl = on
+ssl_cert_file = '$SSL_SERVER_CRT'
+ssl_key_file = '$SSL_SERVER_KEY'
+ssl_ca_file = '$SSL_ROOT_CRT'
+EOF

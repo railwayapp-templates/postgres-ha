@@ -24,7 +24,9 @@ RUN mkdir -p /home/postgres /var/run/postgresql \
 
 COPY post_bootstrap.sh /post_bootstrap.sh
 COPY wrapper.sh /usr/local/bin/wrapper.sh
-COPY init-ssl.sh /usr/local/bin/init-ssl.sh
+# Single location for init-ssl.sh - matches postgres-ssl template
+# Auto-runs during initdb (standalone), called by post_bootstrap.sh (Patroni)
+COPY --chmod=755 init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
 
 # Phase 2: Supervisord and watchdog for split-brain prevention (RFC-007)
 COPY supervisord.conf /etc/supervisor/conf.d/patroni.conf
@@ -32,7 +34,7 @@ COPY patroni-runner.sh /usr/local/bin/patroni-runner.sh
 COPY patroni-watchdog.sh /usr/local/bin/patroni-watchdog.sh
 COPY supervisor-exit-handler.sh /usr/local/bin/supervisor-exit-handler.sh
 
-RUN chmod +x /post_bootstrap.sh /usr/local/bin/wrapper.sh /usr/local/bin/init-ssl.sh \
+RUN chmod +x /post_bootstrap.sh /usr/local/bin/wrapper.sh \
     /usr/local/bin/patroni-runner.sh /usr/local/bin/patroni-watchdog.sh \
     /usr/local/bin/supervisor-exit-handler.sh
 

@@ -6,6 +6,7 @@
 # continues accepting writes after another node becomes leader.
 #
 # Part of RFC-007: Split-Brain Prevention
+# Enhanced with RFC-008: Watchdog Hardening
 
 set -e
 
@@ -13,6 +14,10 @@ PATRONI_API="${PATRONI_API_URL:-http://localhost:8008/health}"
 CHECK_INTERVAL="${WATCHDOG_CHECK_INTERVAL:-5}"
 FAILURE_THRESHOLD="${WATCHDOG_FAILURE_THRESHOLD:-3}"
 PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+
+# RFC-008: Curl timeout settings to prevent hanging on unresponsive Patroni
+CURL_TIMEOUT="${WATCHDOG_CURL_TIMEOUT:-5}"
+CURL_CONNECT_TIMEOUT="${WATCHDOG_CURL_CONNECT_TIMEOUT:-5}"
 
 failures=0
 consecutive_successes=0
@@ -25,12 +30,13 @@ log "Starting Patroni watchdog"
 log "  API endpoint: $PATRONI_API"
 log "  Check interval: ${CHECK_INTERVAL}s"
 log "  Failure threshold: $FAILURE_THRESHOLD"
+log "  Curl timeout: ${CURL_TIMEOUT}s (connect: ${CURL_CONNECT_TIMEOUT}s)"
 
 # Wait for Patroni to start initially
 sleep 10
 
 while true; do
-    if curl -sf "$PATRONI_API" > /dev/null 2>&1; then
+    if curl -sf --max-time "$CURL_TIMEOUT" --connect-timeout "$CURL_CONNECT_TIMEOUT" "$PATRONI_API" > /dev/null 2>&1; then
         if [ $failures -gt 0 ]; then
             log "Patroni recovered after $failures failures"
         fi

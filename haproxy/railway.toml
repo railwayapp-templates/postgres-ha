@@ -1,7 +1,7 @@
 [build]
 builder = "dockerfile"
-dockerfilePath = "pgpool/Dockerfile"
-watchPatterns = ["pgpool/**"]
+dockerfilePath = "haproxy/Dockerfile"
+watchPatterns = ["haproxy/**"]
 
 [deploy]
 restartPolicyType = "always"

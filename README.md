@@ -83,7 +83,7 @@ Pgpool-II is stateless and can be scaled horizontally:
 ```toml
 # In pgpool/railway.toml
 [deploy]
-numReplicas = 5  # Scale to 5 instances
+multiRegionConfig = { "us-east4-eqdc4a" = { numReplicas = 3 } }
 ```
 
 **Connection capacity**: `numReplicas × num_init_children × max_pool`

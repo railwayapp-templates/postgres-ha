@@ -130,21 +130,37 @@ services:
       - etcd-2
       - etcd-3
 
-  pgpool:
-    build: ./pgpool
-    container_name: pgpool
+  # HAProxy for load balancing and routing to primary/replicas
+  # In Railway: deploy 3+ replicas behind a load balancer
+  haproxy:
+    build: ./haproxy
+    container_name: haproxy
     networks:
       - postgres-ha
     ports:
-      - "5432:5432"
-      - "9999:9999"
-    environment:
-      - POSTGRES_PASSWORD=railway
-      - REPLICATION_PASSWORD=replicator_password
-      - PGPOOL_NUM_INIT_CHILDREN=32
-      - PGPOOL_MAX_POOL=4
+      - "5432:5432"   # Primary (read-write)
+      - "5433:5433"   # Replicas (read-only)
+      - "8404:8404"   # Stats dashboard
     depends_on:
       - postgres-1
       - postgres-2
       - postgres-3
 
+  # PgBouncer for connection pooling
+  # In Railway: deploy 3+ replicas behind a load balancer
+  pgbouncer:
+    build: ./pgbouncer
+    container_name: pgbouncer
+    networks:
+      - postgres-ha
+    ports:
+      - "6432:6432"   # Pooled connections
+    environment:
+      - PGBOUNCER_USER=railway
+      - PGBOUNCER_PASSWORD=railway
+      - HAPROXY_HOST=haproxy
+      - PGBOUNCER_MAX_CLIENT_CONN=1000
+      - PGBOUNCER_DEFAULT_POOL_SIZE=20
+      - PGBOUNCER_POOL_MODE=transaction
+    depends_on:
+      - haproxy

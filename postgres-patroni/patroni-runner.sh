@@ -64,7 +64,7 @@ etcd:
 
 bootstrap:
   dcs:
-    ttl: ${PATRONI_TTL:-20}
+    ttl: ${PATRONI_TTL:-45}
     loop_wait: ${PATRONI_LOOP_WAIT:-5}
     retry_timeout: ${PATRONI_RETRY_TIMEOUT:-5}
     maximum_lag_on_failover: 1048576

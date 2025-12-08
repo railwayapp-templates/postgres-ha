@@ -6,10 +6,6 @@
 
 set -e
 
-DATA_DIR="/var/lib/postgresql/data"
-SSL_DIR="$DATA_DIR/certs"
-INIT_SSL_SCRIPT="/usr/local/bin/init-ssl.sh"
-
 echo "Post-bootstrap: configuring users..."
 
 # Use environment variables
@@ -61,18 +57,8 @@ if [ -n "$POSTGRES_DB" ] && [ "$POSTGRES_DB" != "postgres" ]; then
 EOSQL
 fi
 
-# Generate SSL certificates using unified script
+# Generate SSL certificates - same as standalone mode
 echo "Post-bootstrap: generating SSL certificates..."
-bash "$INIT_SSL_SCRIPT"
-
-# Enable SSL via ALTER SYSTEM and reload
-echo "Post-bootstrap: enabling SSL..."
-psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<-EOSQL
-    ALTER SYSTEM SET ssl = 'on';
-    ALTER SYSTEM SET ssl_cert_file = '${SSL_DIR}/server.crt';
-    ALTER SYSTEM SET ssl_key_file = '${SSL_DIR}/server.key';
-    ALTER SYSTEM SET ssl_ca_file = '${SSL_DIR}/root.crt';
-    SELECT pg_reload_conf();
-EOSQL
+bash /docker-entrypoint-initdb.d/init-ssl.sh
 
 echo "Post-bootstrap completed"

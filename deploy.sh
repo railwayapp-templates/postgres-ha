@@ -88,14 +88,26 @@ sleep 15
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Step 4: Deploy Pgpool-II"
+echo "Step 4: Deploy HAProxy (Load Balancer)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-./scripts/deploy-pgpool.sh
+./scripts/deploy-haproxy.sh
 
 echo ""
-echo "⏳ Waiting for Pgpool to be ready..."
+echo "⏳ Waiting for HAProxy to be ready..."
+sleep 10
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Step 5: Deploy PgBouncer (Connection Pooler)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+./scripts/deploy-pgbouncer.sh
+
+echo ""
+echo "⏳ Waiting for PgBouncer to be ready..."
 sleep 10
 
 echo ""
@@ -106,8 +118,17 @@ echo ""
 echo "Next steps:"
 echo "1. Check service status: railway status"
 echo "2. View logs: railway logs --service <service-name>"
-echo "3. Get connection string: railway variables --service pgpool"
 echo ""
-echo "Connection string (private):"
-echo "postgresql://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@pgpool.railway.internal:5432/\${POSTGRES_DB}"
+echo "Connection endpoints (private network):"
+echo ""
+echo "  Direct to Primary (via HAProxy):"
+echo "  postgresql://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@haproxy.railway.internal:5432/\${POSTGRES_DB}"
+echo ""
+echo "  Direct to Replicas (via HAProxy):"
+echo "  postgresql://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@haproxy.railway.internal:5433/\${POSTGRES_DB}"
+echo ""
+echo "  Pooled connections (via PgBouncer → HAProxy):"
+echo "  postgresql://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@pgbouncer.railway.internal:6432/\${POSTGRES_DB}"
+echo ""
+echo "  HAProxy Stats: http://haproxy.railway.internal:8404/stats"
 echo ""

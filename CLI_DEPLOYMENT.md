@@ -76,7 +76,7 @@ railway logs --service postgres-1
 Or edit `pgpool/railway.toml` and set:
 ```toml
 [deploy]
-numReplicas = 3
+multiRegionConfig = { "us-east4-eqdc4a" = { numReplicas = 3 } }
 ```
 
 Then redeploy:
