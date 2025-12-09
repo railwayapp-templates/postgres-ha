@@ -62,8 +62,10 @@ ensure_users() {
     for i in $(seq 1 60); do
         if pg_isready -h /var/run/postgresql -q 2>/dev/null; then
             sleep 2
-            echo "Ensuring PostgreSQL users are correctly configured..."
-            psql -h /var/run/postgresql -U postgres -d postgres <<-EOSQL
+            echo "Ensuring PostgreSQL users are correctly configured (superuser: ${SUPERUSER})..."
+            # Use the actual superuser, not hardcoded 'postgres'
+            # Connect via Unix socket which uses 'local all all trust' from pg_hba
+            psql -h /var/run/postgresql -U "${SUPERUSER}" -d postgres <<-EOSQL
                 -- Ensure replicator user exists with LOGIN
                 DO \$\$
                 BEGIN
@@ -73,21 +75,6 @@ ensure_users() {
                     ELSE
                         ALTER ROLE ${REPL_USER} WITH REPLICATION LOGIN PASSWORD '${REPL_PASS}';
                         RAISE NOTICE 'Updated user: ${REPL_USER}';
-                    END IF;
-                END
-                \$\$;
-
-                -- Ensure superuser has LOGIN if not postgres
-                DO \$\$
-                BEGIN
-                    IF '${SUPERUSER}' != 'postgres' THEN
-                        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${SUPERUSER}') THEN
-                            CREATE ROLE ${SUPERUSER} WITH SUPERUSER CREATEDB CREATEROLE LOGIN PASSWORD '${SUPERUSER_PASS}';
-                            RAISE NOTICE 'Created superuser: ${SUPERUSER}';
-                        ELSE
-                            ALTER ROLE ${SUPERUSER} WITH SUPERUSER CREATEDB CREATEROLE LOGIN PASSWORD '${SUPERUSER_PASS}';
-                            RAISE NOTICE 'Updated superuser: ${SUPERUSER}';
-                        END IF;
                     END IF;
                 END
                 \$\$;
