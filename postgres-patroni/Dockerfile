@@ -55,9 +55,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
     && rm -rf /var/lib/apt/lists/*
 
+# Install setuptools first (needed for ydiff's legacy setup.py)
+RUN pip3 install --no-cache-dir --break-system-packages setuptools
+
 # Install Patroni and dependencies
 RUN pip3 install --no-cache-dir --break-system-packages \
-    setuptools \
     psycopg2-binary \
     patroni[etcd]==${PATRONI_VERSION}
 
