@@ -135,6 +135,26 @@ EOF
 
 echo "Starting Patroni (scope: $SCOPE, etcd: $ETCD_HOSTS)"
 
+# Debug: Check etcd3 module availability
+echo "=== DEBUG: Checking etcd3 module ==="
+python3 -c "
+import sys
+print('Python:', sys.version)
+try:
+    from patroni.dcs.etcd3 import Etcd3
+    print('etcd3 module: OK')
+except ImportError as e:
+    print('etcd3 module FAILED:', e)
+try:
+    import etcd
+    print('python-etcd: OK')
+except ImportError as e:
+    print('python-etcd FAILED:', e)
+"
+echo "=== Generated config ==="
+cat /tmp/patroni.yml
+echo "=== END config ==="
+
 # Note: Replicator user is created via bootstrap.users (above) during initdb.
 # post_bootstrap.sh provides a safety net to ensure the user exists.
 
