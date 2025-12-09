@@ -35,6 +35,18 @@ monitor_and_mark_bootstrap() {
   done
 }
 
+# CRITICAL: Clean stale data on startup if bootstrap never completed
+# This handles the case where etcd wrote data but cluster never formed
+if [ -d "$DATA_DIR" ] && [ "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then
+  if [ ! -f "$BOOTSTRAP_COMPLETE_MARKER" ]; then
+    log "Found stale data from incomplete bootstrap - cleaning..."
+    rm -rf "${DATA_DIR:?}"/*
+    log "Data directory cleaned, starting fresh"
+  else
+    log "Found data with completed bootstrap marker - preserving"
+  fi
+fi
+
 attempt=1
 while [ $attempt -le $MAX_RETRIES ]; do
   log "Starting etcd (attempt $attempt/$MAX_RETRIES)..."
