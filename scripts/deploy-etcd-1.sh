@@ -16,7 +16,6 @@ railway variables --service etcd-1 --set ETCD_ADVERTISE_CLIENT_URLS="http://etcd
 railway variables --service etcd-1 --set ETCD_LISTEN_PEER_URLS="http://0.0.0.0:2380"
 railway variables --service etcd-1 --set ETCD_INITIAL_ADVERTISE_PEER_URLS="http://etcd-1.railway.internal:2380"
 railway variables --service etcd-1 --set ETCD_DATA_DIR=/etcd-data
-railway variables --service etcd-1 --set ETCD_ENABLE_V2=true
 
 echo "Deploying etcd-1..."
 railway up --service etcd-1 --detach

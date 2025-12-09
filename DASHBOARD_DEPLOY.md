@@ -85,7 +85,6 @@ ETCD_ADVERTISE_CLIENT_URLS=http://etcd-1.railway.internal:2379
 ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
 ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-1.railway.internal:2380
 ETCD_DATA_DIR=/etcd-data
-ETCD_ENABLE_V2=true
 ```
 
 ### etcd-2 Variables:

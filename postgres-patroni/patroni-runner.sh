@@ -68,7 +68,7 @@ restapi:
   listen: 0.0.0.0:8008
   connect_address: ${CONNECT_ADDRESS}:8008
 
-etcd:
+etcd3:
   hosts: ${ETCD_HOSTS}
 
 bootstrap:
