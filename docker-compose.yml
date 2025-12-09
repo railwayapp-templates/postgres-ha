@@ -14,7 +14,9 @@ volumes:
 
 services:
   etcd-1:
-    image: quay.io/coreos/etcd:v3.5.16
+    build:
+      context: .
+      dockerfile: etcd/Dockerfile
     container_name: etcd-1
     networks:
       - postgres-ha
@@ -27,12 +29,13 @@ services:
       - ETCD_ADVERTISE_CLIENT_URLS=http://etcd-1:2379
       - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
       - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-1:2380
-      - ETCD_DATA_DIR=/etcd-data
     volumes:
       - etcd-1-data:/etcd-data
 
   etcd-2:
-    image: quay.io/coreos/etcd:v3.5.16
+    build:
+      context: .
+      dockerfile: etcd/Dockerfile
     container_name: etcd-2
     networks:
       - postgres-ha
@@ -45,12 +48,13 @@ services:
       - ETCD_ADVERTISE_CLIENT_URLS=http://etcd-2:2379
       - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
       - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-2:2380
-      - ETCD_DATA_DIR=/etcd-data
     volumes:
       - etcd-2-data:/etcd-data
 
   etcd-3:
-    image: quay.io/coreos/etcd:v3.5.16
+    build:
+      context: .
+      dockerfile: etcd/Dockerfile
     container_name: etcd-3
     networks:
       - postgres-ha
@@ -63,7 +67,6 @@ services:
       - ETCD_ADVERTISE_CLIENT_URLS=http://etcd-3:2379
       - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
       - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-3:2380
-      - ETCD_DATA_DIR=/etcd-data
     volumes:
       - etcd-3-data:/etcd-data
 
@@ -81,7 +84,7 @@ services:
       - POSTGRES_PASSWORD=railway
       - POSTGRES_DB=railway
       - PATRONI_REPLICATION_PASSWORD=replicator_password
-      - PGDATA=/var/lib/postgresql/data/data
+      - PGDATA=/var/lib/postgresql/data/pgdata
     volumes:
       - postgres-1-data:/var/lib/postgresql/data
     depends_on:
@@ -103,7 +106,7 @@ services:
       - POSTGRES_PASSWORD=railway
       - POSTGRES_DB=railway
       - PATRONI_REPLICATION_PASSWORD=replicator_password
-      - PGDATA=/var/lib/postgresql/data/data
+      - PGDATA=/var/lib/postgresql/data/pgdata
     volumes:
       - postgres-2-data:/var/lib/postgresql/data
     depends_on:
@@ -125,7 +128,7 @@ services:
       - POSTGRES_PASSWORD=railway
       - POSTGRES_DB=railway
       - PATRONI_REPLICATION_PASSWORD=replicator_password
-      - PGDATA=/var/lib/postgresql/data/data
+      - PGDATA=/var/lib/postgresql/data/pgdata
     volumes:
       - postgres-3-data:/var/lib/postgresql/data
     depends_on:
