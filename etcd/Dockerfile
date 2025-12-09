@@ -21,6 +21,8 @@ RUN chmod +x /entrypoint.sh
 RUN mkdir -p /etcd-data && chmod 700 /etcd-data
 
 ENV ETCD_DATA_DIR=/etcd-data
+# Enable gRPC gateway for Patroni etcd3 client compatibility
+ENV ETCD_ENABLE_GRPC_GATEWAY=true
 # Retry settings (5 min total with defaults: 60 retries * 5s delay)
 ENV ETCD_MAX_RETRIES=60
 ENV ETCD_RETRY_DELAY=5
