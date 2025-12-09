@@ -44,10 +44,13 @@ if [ "$HAS_VALID_DATA" = "false" ]; then
     echo "Cleaning data directory (keeping certs)..."
     find "$DATA_DIR" -mindepth 1 -maxdepth 1 ! -name 'certs' -exec rm -rf {} +
 
-    # Clear etcd state
-    FIRST_ETCD="${ETCD_HOSTS%%,*}"
-    echo "Clearing etcd state at $FIRST_ETCD for scope $SCOPE..."
-    curl -s -X DELETE "http://$FIRST_ETCD/v2/keys/service/$SCOPE?recursive=true" 2>/dev/null || true
+    # Only clear etcd state if this is the primary AND explicitly requested
+    # Replicas should NEVER clear etcd state - they need to join the existing cluster
+    if [ "$IS_PRIMARY" = "true" ] && [ "${CLEAR_ETCD_ON_BOOTSTRAP:-false}" = "true" ]; then
+        FIRST_ETCD="${ETCD_HOSTS%%,*}"
+        echo "Clearing etcd state at $FIRST_ETCD for scope $SCOPE..."
+        curl -s -X DELETE "http://$FIRST_ETCD/v2/keys/service/$SCOPE?recursive=true" 2>/dev/null || true
+    fi
 fi
 
 # Generate Patroni configuration
