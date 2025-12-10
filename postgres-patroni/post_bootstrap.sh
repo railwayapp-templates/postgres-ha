@@ -83,6 +83,9 @@ echo "Post-bootstrap: setting up users (connecting as $SUPERUSER)..."
 # Use format() for ALL password operations to ensure proper escaping
 # This prevents SQL injection and handles any special characters correctly
 env -i PATH="$PATH" psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U "$SUPERUSER" -d postgres <<EOSQL
+-- Ensure SCRAM-SHA-256 is used (DCS config may not be applied yet)
+SET password_encryption = 'scram-sha-256';
+
 -- Set password for the superuser (already exists from initdb)
 -- Using format() for proper escaping
 DO \$\$
