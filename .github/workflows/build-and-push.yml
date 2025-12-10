@@ -12,10 +12,15 @@ on:
       - main
     paths:
       - 'postgres-patroni/**'
+      - 'etcd/**'
+      - 'haproxy/**'
+      - 'pgbouncer/**'
+      - 'pgpool/**'
       - '.github/workflows/build-and-push.yml'
 
 env:
   REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
   # Which major version gets the "latest" tag
   LATEST_POSTGRES_MAJOR: 17
 
@@ -60,7 +65,7 @@ jobs:
       - name: Determine image tags
         id: tags
         run: |
-          REPO="${{ env.REGISTRY }}/${{ github.repository }}/postgres-patroni"
+          REPO="${{ env.IMAGE_PREFIX }}/postgres-patroni"
           MAJOR="${{ matrix.postgres_major }}"
           MINOR="${{ steps.pg_version.outputs.minor_version }}"
           VARIANT="${{ matrix.variant }}"
@@ -126,7 +131,7 @@ jobs:
           context: ./etcd
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ github.repository }}/etcd:latest
+          tags: ${{ env.IMAGE_PREFIX }}/etcd:latest
           cache-from: type=gha,scope=etcd
           cache-to: type=gha,mode=max,scope=etcd
 
@@ -159,7 +164,7 @@ jobs:
           context: ./haproxy
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ github.repository }}/haproxy:latest
+          tags: ${{ env.IMAGE_PREFIX }}/haproxy:latest
           cache-from: type=gha,scope=haproxy
           cache-to: type=gha,mode=max,scope=haproxy
 
@@ -192,7 +197,7 @@ jobs:
           context: ./pgbouncer
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ github.repository }}/pgbouncer:latest
+          tags: ${{ env.IMAGE_PREFIX }}/pgbouncer:latest
           cache-from: type=gha,scope=pgbouncer
           cache-to: type=gha,mode=max,scope=pgbouncer
 
@@ -225,6 +230,6 @@ jobs:
           context: ./pgpool
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ github.repository }}/pgpool:latest
+          tags: ${{ env.IMAGE_PREFIX }}/pgpool:latest
           cache-from: type=gha,scope=pgpool
           cache-to: type=gha,mode=max,scope=pgpool
