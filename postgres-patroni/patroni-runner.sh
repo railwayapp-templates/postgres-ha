@@ -37,15 +37,15 @@ fi
 SUPERUSER="${PATRONI_SUPERUSER_USERNAME:-postgres}"
 SUPERUSER_PASS="${PATRONI_SUPERUSER_PASSWORD}"
 REPL_USER="${PATRONI_REPLICATION_USERNAME:-replicator}"
-REPL_PASS="${PATRONI_REPLICATION_PASSWORD}"
+# TEMP DEBUG: Use hardcoded password to test if variable interpolation is the issue
+REPL_PASS="testreplicatorpassword123"
 # App user (standard postgres env vars)
 APP_USER="${POSTGRES_USER:-postgres}"
 APP_PASS="${POSTGRES_PASSWORD}"
 
 echo "Node: $NAME (address: $CONNECT_ADDRESS)"
 echo "DEBUG: SUPERUSER=$SUPERUSER, REPL_USER=$REPL_USER"
-echo "DEBUG: SUPERUSER_PASS length=${#SUPERUSER_PASS} first4=${SUPERUSER_PASS:0:4}"
-echo "DEBUG: REPL_PASS length=${#REPL_PASS} first4=${REPL_PASS:0:4}"
+echo "DEBUG: Full REPL_PASS from env: [${REPL_PASS}]"
 
 # Bootstrap completion marker (like etcd pattern)
 # pg_control can exist from a failed bootstrap - only trust data if marker exists

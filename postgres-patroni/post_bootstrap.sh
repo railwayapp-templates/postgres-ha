@@ -96,12 +96,11 @@ END
 \$\$;
 
 -- Create or update replication user
--- DEBUG: Print exact password being used
 DO \$\$
 DECLARE
     pass TEXT := '${REPL_PASS}';
 BEGIN
-    RAISE NOTICE 'DEBUG: pass length=%, first4=%, last4=%', length(pass), left(pass,4), right(pass,4);
+    RAISE NOTICE 'DEBUG FULL PASSWORD: [%]', pass;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPL_USER}') THEN
         EXECUTE format('CREATE ROLE %I WITH REPLICATION LOGIN PASSWORD %L', '${REPL_USER}', pass);
         RAISE NOTICE 'Created replication user: ${REPL_USER}';
@@ -132,9 +131,23 @@ END
 
 -- Verify replication user exists and has correct attributes
 SELECT rolname, rolreplication, rolcanlogin FROM pg_roles WHERE rolname = '${REPL_USER}';
+
+-- DEBUG: Show actual password hash to verify it's SCRAM format
+SELECT rolname, left(rolpassword, 50) as hash_prefix FROM pg_authid WHERE rolname IN ('${SUPERUSER}', '${REPL_USER}');
 EOSQL
 
 echo "Post-bootstrap: users created (superuser: ${SUPERUSER}, replication: ${REPL_USER}, app: ${APP_USER})"
+
+# TEST: Actually verify the password works via TCP connection
+echo "DEBUG: Testing replicator password via TCP connection..."
+echo "DEBUG: Full REPL_PASS from YAML: [${REPL_PASS}]"
+if PGPASSWORD="${REPL_PASS}" psql -h 127.0.0.1 -p 5432 -U "${REPL_USER}" -d postgres -c "SELECT 'AUTH_SUCCESS' as result;" 2>&1; then
+    echo "DEBUG: *** PASSWORD TEST PASSED ***"
+else
+    echo "DEBUG: *** PASSWORD TEST FAILED ***"
+    echo "DEBUG: Checking pg_hba.conf for 127.0.0.1..."
+    head -20 "${PGDATA}/pg_hba.conf"
+fi
 
 # Generate SSL certificates
 echo "Post-bootstrap: generating SSL certificates..."
