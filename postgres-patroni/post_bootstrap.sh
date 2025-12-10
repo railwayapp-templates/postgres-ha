@@ -58,33 +58,15 @@ fi
 # Extract superuser password too
 SUPERUSER_PASS=$(grep -A2 'superuser:' "$PATRONI_CONFIG" | grep 'password:' | head -1 | sed 's/.*password: *//')
 
-# initdb creates a superuser matching the OS user (always 'postgres' in our container)
-# We connect as 'postgres' first, then create the configured superuser if different
-INITDB_USER="postgres"
-
-echo "Post-bootstrap: setting up users (connecting as $INITDB_USER)..."
+# Patroni passes --username to initdb, so the superuser is whatever is configured
+# (e.g., 'admin' not 'postgres'). Connect as that user.
+echo "Post-bootstrap: setting up users (connecting as $SUPERUSER)..."
 
 # Use env -i to run psql with a completely clean environment
 # This ensures no PG* variables can interfere with the -h flag
-env -i PATH="$PATH" psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U "$INITDB_USER" -d postgres <<EOSQL
--- Create or update the configured superuser if different from postgres
-DO \$\$
-BEGIN
-    IF '${SUPERUSER}' != 'postgres' THEN
-        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${SUPERUSER}') THEN
-            EXECUTE format('CREATE ROLE %I WITH SUPERUSER LOGIN PASSWORD %L', '${SUPERUSER}', '${SUPERUSER_PASS}');
-            RAISE NOTICE 'Created superuser: ${SUPERUSER}';
-        ELSE
-            EXECUTE format('ALTER ROLE %I WITH SUPERUSER PASSWORD %L', '${SUPERUSER}', '${SUPERUSER_PASS}');
-            RAISE NOTICE 'Updated superuser: ${SUPERUSER}';
-        END IF;
-    ELSE
-        -- Just set password for postgres user
-        EXECUTE format('ALTER ROLE postgres WITH PASSWORD %L', '${SUPERUSER_PASS}');
-        RAISE NOTICE 'Set password for postgres user';
-    END IF;
-END
-\$\$;
+env -i PATH="$PATH" psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U "$SUPERUSER" -d postgres <<EOSQL
+-- Set password for the superuser (already exists from initdb)
+ALTER ROLE ${SUPERUSER} WITH PASSWORD '${SUPERUSER_PASS}';
 
 -- Create or update replication user
 DO \$\$
@@ -105,10 +87,6 @@ BEGIN
     -- Skip if app_user is same as superuser (already handled above)
     IF '${APP_USER}' = '${SUPERUSER}' THEN
         RAISE NOTICE 'App user same as superuser, skipping';
-    ELSIF '${APP_USER}' = 'postgres' THEN
-        -- postgres user exists from initdb, just set password
-        EXECUTE format('ALTER ROLE postgres WITH PASSWORD %L', '${APP_PASS}');
-        RAISE NOTICE 'Set password for postgres user';
     ELSIF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${APP_USER}') THEN
         EXECUTE format('CREATE ROLE %I WITH LOGIN PASSWORD %L', '${APP_USER}', '${APP_PASS}');
         RAISE NOTICE 'Created app user: ${APP_USER}';
