@@ -51,13 +51,10 @@ fi
 
 echo "Post-bootstrap: creating replication user..."
 
-# Unset PGHOST/PGPORT to force psql to use Unix socket (Railway sets these)
-# This matches what wrapper.sh does for standalone mode
-unset PGHOST
-unset PGPORT
-
-# Connect using local trust auth (pg_hba has "local all all trust")
-psql -v ON_ERROR_STOP=1 -U postgres -d postgres -c \
+# Force Unix socket connection by explicitly specifying socket directory
+# Railway sets PGHOST which would cause TCP connection - override with -h flag
+# The -h /var/run/postgresql forces local socket (matches "local all all trust" in pg_hba)
+psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -p 5432 -U postgres -d postgres -c \
     "DO \$\$
     BEGIN
         IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPL_USER}') THEN

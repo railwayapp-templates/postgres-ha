@@ -62,44 +62,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine image tags
-        id: tags
-        run: |
-          REPO="${{ env.IMAGE_PREFIX }}/postgres-patroni"
-          MAJOR="${{ matrix.postgres_major }}"
-          MINOR="${{ steps.pg_version.outputs.minor_version }}"
-          VARIANT="${{ matrix.variant }}"
-
-          if [ "$VARIANT" = "slim" ]; then
-            # Slim variant: :17, :17.2, :latest (no suffix)
-            TAGS="${REPO}:${MAJOR}"
-            TAGS="${TAGS},${REPO}:${MINOR}"
-            if [ "$MAJOR" = "${{ env.LATEST_POSTGRES_MAJOR }}" ]; then
-              TAGS="${TAGS},${REPO}:latest"
-            fi
-          else
-            # HA variant: :17-ha, :17.2-ha, :latest-ha
-            TAGS="${REPO}:${MAJOR}-ha"
-            TAGS="${TAGS},${REPO}:${MINOR}-ha"
-            if [ "$MAJOR" = "${{ env.LATEST_POSTGRES_MAJOR }}" ]; then
-              TAGS="${TAGS},${REPO}:latest-ha"
-            fi
-          fi
-
-          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
-          echo "Image tags: ${TAGS}"
-
-      - name: Build and push Docker image
+      - name: Build and push Docker image (slim)
+        if: matrix.variant == 'slim'
         uses: docker/build-push-action@v5
         with:
           context: ./postgres-patroni
           file: ./postgres-patroni/Dockerfile.${{ matrix.postgres_major }}
-          target: ${{ matrix.variant }}
+          target: slim
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=pg${{ matrix.postgres_major }}-${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=pg${{ matrix.postgres_major }}-${{ matrix.variant }}
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.postgres_major }}
+            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ steps.pg_version.outputs.minor_version }}
+            ${{ matrix.postgres_major == env.LATEST_POSTGRES_MAJOR && format('{0}/postgres-patroni:latest', env.IMAGE_PREFIX) || '' }}
+          cache-from: type=gha,scope=pg${{ matrix.postgres_major }}-slim
+          cache-to: type=gha,mode=max,scope=pg${{ matrix.postgres_major }}-slim
+
+      - name: Build and push Docker image (ha)
+        if: matrix.variant == 'ha'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./postgres-patroni
+          file: ./postgres-patroni/Dockerfile.${{ matrix.postgres_major }}
+          target: ha
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.postgres_major }}-ha
+            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ steps.pg_version.outputs.minor_version }}-ha
+            ${{ matrix.postgres_major == env.LATEST_POSTGRES_MAJOR && format('{0}/postgres-patroni:latest-ha', env.IMAGE_PREFIX) || '' }}
+          cache-from: type=gha,scope=pg${{ matrix.postgres_major }}-ha
+          cache-to: type=gha,mode=max,scope=pg${{ matrix.postgres_major }}-ha
 
   # Build other components (etcd, haproxy, pgbouncer, pgpool)
   build-etcd:
