@@ -10,37 +10,24 @@ set -e
 
 echo "Post-bootstrap: starting..."
 
-PATRONI_CONFIG="/tmp/patroni.yml"
 VOLUME_ROOT="${RAILWAY_VOLUME_MOUNT_PATH:-/var/lib/postgresql/data}"
 
-if [ ! -f "$PATRONI_CONFIG" ]; then
-    echo "ERROR: Patroni config not found at $PATRONI_CONFIG"
-    exit 1
-fi
+# CRITICAL: Read credentials from environment variables directly
+# This ensures we use the EXACT same values that Patroni uses
+# (Patroni reads from PATRONI_* env vars, bypassing YAML)
+SUPERUSER="${PATRONI_SUPERUSER_USERNAME:-postgres}"
+SUPERUSER_PASS="${PATRONI_SUPERUSER_PASSWORD}"
+REPL_USER="${PATRONI_REPLICATION_USERNAME:-replicator}"
+REPL_PASS="${PATRONI_REPLICATION_PASSWORD}"
+APP_USER="${POSTGRES_USER:-postgres}"
+APP_PASS="${POSTGRES_PASSWORD}"
 
-# Extract value from YAML: get_yaml_value 'section' 'key'
-# Looks for "section:" then finds "key:" within next 2 lines
-get_yaml_value() {
-    grep -A2 "$1:" "$PATRONI_CONFIG" | grep "$2:" | head -1 | sed 's/.*: *//' | sed 's/^["'"'"']//' | sed 's/["'"'"']$//'
-}
-
-SUPERUSER=$(get_yaml_value 'superuser' 'username')
-SUPERUSER_PASS=$(get_yaml_value 'superuser' 'password')
-REPL_USER=$(get_yaml_value 'replication' 'username')
-REPL_PASS=$(get_yaml_value 'replication' 'password')
-APP_USER=$(get_yaml_value 'app_user' 'username')
-APP_PASS=$(get_yaml_value 'app_user' 'password')
+echo "DEBUG: Reading credentials from environment variables (same source as Patroni)"
 
 echo "DEBUG: SUPERUSER=$SUPERUSER"
 echo "DEBUG: REPL_USER=$REPL_USER"
 echo "DEBUG: REPL_PASS length=${#REPL_PASS}"
 echo "DEBUG: REPL_PASS first4=${REPL_PASS:0:4} last4=${REPL_PASS: -4}"
-
-# Debug: Show what Patroni wrote to pgpass (if it exists)
-if [ -f /tmp/pgpass ]; then
-    echo "DEBUG: Patroni pgpass file contents (passwords masked):"
-    sed 's/:[^:]*$/:***MASKED***/' /tmp/pgpass
-fi
 
 # Validate required credentials
 if [ -z "$SUPERUSER" ]; then
@@ -83,12 +70,12 @@ fi
 
 # 5. CRITICAL TEST: Verify replication connection works (this is what pg_basebackup uses)
 echo "Testing replicator authentication via TCP (replication connection)..."
-if PGPASSWORD="$REPL_PASS" psql -h 127.0.0.1 -U "$REPL_USER" -d "dbname=replication replication=database" -c "IDENTIFY_SYSTEM;" 2>&1; then
+if PGPASSWORD="$REPL_PASS" psql "host=127.0.0.1 port=5432 dbname=postgres user=$REPL_USER replication=database" -c "IDENTIFY_SYSTEM;" 2>&1; then
     echo "SUCCESS: Replication connection test PASSED"
 else
     echo "ERROR: Replication connection test FAILED!"
-    echo "--- pg_hba.conf ---"
-    cat "${PGDATA}/pg_hba.conf" 2>/dev/null || echo "(could not read pg_hba.conf)"
+    echo "--- pg_hba.conf replication lines ---"
+    grep -i replication "${PGDATA}/pg_hba.conf" 2>/dev/null || echo "(could not grep pg_hba.conf)"
     echo "--- END ---"
 fi
 
