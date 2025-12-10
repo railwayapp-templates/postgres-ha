@@ -98,7 +98,6 @@ bootstrap:
         max_wal_senders: 10
         max_replication_slots: 10
         max_connections: 200
-        password_encryption: md5
 
   initdb:
     - encoding: UTF8
@@ -110,10 +109,10 @@ bootstrap:
 
   pg_hba:
     - local all all trust
-    - hostssl replication ${REPL_USER} 0.0.0.0/0 md5
-    - hostssl all all 0.0.0.0/0 md5
-    - host replication ${REPL_USER} 0.0.0.0/0 md5
-    - host all all 0.0.0.0/0 md5
+    - hostssl replication ${REPL_USER} 0.0.0.0/0 scram-sha-256
+    - hostssl all all 0.0.0.0/0 scram-sha-256
+    - host replication ${REPL_USER} 0.0.0.0/0 scram-sha-256
+    - host all all 0.0.0.0/0 scram-sha-256
 
   post_bootstrap: /post_bootstrap.sh
 
