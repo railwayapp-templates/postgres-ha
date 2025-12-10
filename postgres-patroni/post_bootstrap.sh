@@ -38,6 +38,7 @@ fi
 #       password: xxxxx
 REPL_USER=$(grep -A2 'replication:' "$PATRONI_CONFIG" | grep 'username:' | head -1 | sed 's/.*username: *//')
 REPL_PASS=$(grep -A2 'replication:' "$PATRONI_CONFIG" | grep 'password:' | head -1 | sed 's/.*password: *//')
+SUPERUSER=$(grep -A2 'superuser:' "$PATRONI_CONFIG" | grep 'username:' | head -1 | sed 's/.*username: *//')
 
 echo "DEBUG: REPL_USER=${REPL_USER}"
 echo "DEBUG: REPL_PASS length=${#REPL_PASS}"
@@ -49,28 +50,52 @@ if [ -z "$REPL_USER" ] || [ -z "$REPL_PASS" ]; then
     exit 1
 fi
 
-echo "Post-bootstrap: creating replication user..."
+# Extract superuser password too
+SUPERUSER_PASS=$(grep -A2 'superuser:' "$PATRONI_CONFIG" | grep 'password:' | head -1 | sed 's/.*password: *//')
 
-# Debug: show environment
-echo "DEBUG: PGHOST=${PGHOST:-not set}"
-echo "DEBUG: PGPORT=${PGPORT:-not set}"
+# initdb creates a superuser matching the OS user (always 'postgres' in our container)
+# We connect as 'postgres' first, then create the configured superuser if different
+INITDB_USER="postgres"
+
+echo "Post-bootstrap: setting up users (connecting as $INITDB_USER)..."
 
 # Use env -i to run psql with a completely clean environment
 # This ensures no PG* variables can interfere with the -h flag
-env -i PATH="$PATH" psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U postgres -d postgres -c \
-    "DO \$\$
-    BEGIN
-        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPL_USER}') THEN
-            EXECUTE format('CREATE ROLE %I WITH REPLICATION LOGIN PASSWORD %L', '${REPL_USER}', '${REPL_PASS}');
-            RAISE NOTICE 'Created replication user: ${REPL_USER}';
+env -i PATH="$PATH" psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U "$INITDB_USER" -d postgres <<EOSQL
+-- Create or update the configured superuser if different from postgres
+DO \$\$
+BEGIN
+    IF '${SUPERUSER}' != 'postgres' THEN
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${SUPERUSER}') THEN
+            EXECUTE format('CREATE ROLE %I WITH SUPERUSER LOGIN PASSWORD %L', '${SUPERUSER}', '${SUPERUSER_PASS}');
+            RAISE NOTICE 'Created superuser: ${SUPERUSER}';
         ELSE
-            EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', '${REPL_USER}', '${REPL_PASS}');
-            RAISE NOTICE 'Updated existing user: ${REPL_USER}';
+            EXECUTE format('ALTER ROLE %I WITH SUPERUSER PASSWORD %L', '${SUPERUSER}', '${SUPERUSER_PASS}');
+            RAISE NOTICE 'Updated superuser: ${SUPERUSER}';
         END IF;
-    END
-    \$\$;"
+    ELSE
+        -- Just set password for postgres user
+        EXECUTE format('ALTER ROLE postgres WITH PASSWORD %L', '${SUPERUSER_PASS}');
+        RAISE NOTICE 'Set password for postgres user';
+    END IF;
+END
+\$\$;
 
-echo "Post-bootstrap: replication user created"
+-- Create or update replication user
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPL_USER}') THEN
+        EXECUTE format('CREATE ROLE %I WITH REPLICATION LOGIN PASSWORD %L', '${REPL_USER}', '${REPL_PASS}');
+        RAISE NOTICE 'Created replication user: ${REPL_USER}';
+    ELSE
+        EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', '${REPL_USER}', '${REPL_PASS}');
+        RAISE NOTICE 'Updated replication user: ${REPL_USER}';
+    END IF;
+END
+\$\$;
+EOSQL
+
+echo "Post-bootstrap: users created (superuser: ${SUPERUSER}, replication: ${REPL_USER})"
 
 # Generate SSL certificates
 echo "Post-bootstrap: generating SSL certificates..."
