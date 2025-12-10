@@ -68,6 +68,50 @@ if [ "$HAS_VALID_DATA" = "false" ]; then
         rm -rf "$DATA_DIR"/*
     fi
     mkdir -p "$DATA_DIR"
+
+    # CRITICAL: Check for stale etcd state that would prevent bootstrap
+    # If /initialize key exists but no leader, we're stuck - clean it up
+    echo "Checking etcd for stale cluster state..."
+    FIRST_ETCD_HOST="${ETCD_HOSTS%%,*}"
+
+    # Use Python (available from Patroni install) to check/clean etcd
+    python3 << PYEOF
+import sys
+try:
+    import etcd3
+
+    host, port = "${FIRST_ETCD_HOST}".rsplit(":", 1)
+    client = etcd3.client(host=host, port=int(port))
+
+    scope = "${SCOPE}"
+    init_key = f"/service/{scope}/initialize"
+    leader_key = f"/service/{scope}/leader"
+
+    # Check if initialize key exists
+    init_value, _ = client.get(init_key)
+    if init_value is None:
+        print("No /initialize key - fresh cluster, will bootstrap normally")
+        sys.exit(0)
+
+    # Initialize exists - check if there's a leader
+    leader_value, _ = client.get(leader_key)
+    if leader_value is not None:
+        print(f"Leader exists: {leader_value.decode()} - will replicate from it")
+        sys.exit(0)
+
+    # Stale state: initialize exists but no leader
+    print("STALE STATE DETECTED: /initialize exists but no leader!")
+    print("This means a previous cluster died without cleanup.")
+    print("Cleaning etcd state to allow fresh bootstrap...")
+
+    # Delete all keys under /service/{scope}/
+    deleted = client.delete_prefix(f"/service/{scope}/")
+    print(f"Deleted Patroni cluster state from etcd (prefix: /service/{scope}/)")
+
+except Exception as e:
+    print(f"Warning: Could not check/clean etcd state: {e}")
+    print("Proceeding anyway - Patroni may handle it")
+PYEOF
 fi
 
 # Generate Patroni configuration
