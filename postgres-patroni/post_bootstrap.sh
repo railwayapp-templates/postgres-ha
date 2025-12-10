@@ -51,10 +51,17 @@ fi
 
 echo "Post-bootstrap: creating replication user..."
 
-# Force Unix socket connection by explicitly specifying socket directory
-# Railway sets PGHOST which would cause TCP connection - override with -h flag
-# The -h /var/run/postgresql forces local socket (matches "local all all trust" in pg_hba)
-psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -p 5432 -U postgres -d postgres -c \
+# Debug: show what PGHOST is set to
+echo "DEBUG: PGHOST=${PGHOST:-not set}"
+echo "DEBUG: PGPORT=${PGPORT:-not set}"
+echo "DEBUG: PGDATABASE=${PGDATABASE:-not set}"
+
+# Completely clear all PG* environment variables that could interfere
+# Then use explicit socket path
+unset PGHOST PGPORT PGDATABASE PGUSER PGPASSWORD PGHOSTADDR PGSERVICE PGPASSFILE
+
+# Connect via Unix socket (matches "local all all trust" in pg_hba)
+psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U postgres -d postgres -c \
     "DO \$\$
     BEGIN
         IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPL_USER}') THEN
