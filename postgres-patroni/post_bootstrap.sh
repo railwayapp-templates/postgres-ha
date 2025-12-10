@@ -51,17 +51,13 @@ fi
 
 echo "Post-bootstrap: creating replication user..."
 
-# Debug: show what PGHOST is set to
+# Debug: show environment
 echo "DEBUG: PGHOST=${PGHOST:-not set}"
 echo "DEBUG: PGPORT=${PGPORT:-not set}"
-echo "DEBUG: PGDATABASE=${PGDATABASE:-not set}"
 
-# Completely clear all PG* environment variables that could interfere
-# Then use explicit socket path
-unset PGHOST PGPORT PGDATABASE PGUSER PGPASSWORD PGHOSTADDR PGSERVICE PGPASSFILE
-
-# Connect via Unix socket (matches "local all all trust" in pg_hba)
-psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U postgres -d postgres -c \
+# Use env -i to run psql with a completely clean environment
+# This ensures no PG* variables can interfere with the -h flag
+env -i PATH="$PATH" psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U postgres -d postgres -c \
     "DO \$\$
     BEGIN
         IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPL_USER}') THEN
