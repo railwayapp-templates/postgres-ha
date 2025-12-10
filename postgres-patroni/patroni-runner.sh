@@ -36,16 +36,15 @@ fi
 # Credentials - use Patroni-specific env vars
 SUPERUSER="${PATRONI_SUPERUSER_USERNAME:-postgres}"
 SUPERUSER_PASS="${PATRONI_SUPERUSER_PASSWORD}"
-REPL_USER="${PATRONI_REPLICATION_USERNAME:-replicator}"
-REPL_PASS="${PATRONI_REPLICATION_PASSWORD}"
+# Use superuser for replication - eliminates password sync issues
+REPL_USER="$SUPERUSER"
+REPL_PASS="$SUPERUSER_PASS"
 # App user (standard postgres env vars)
 APP_USER="${POSTGRES_USER:-postgres}"
 APP_PASS="${POSTGRES_PASSWORD}"
 
 echo "Node: $NAME (address: $CONNECT_ADDRESS)"
-echo "DEBUG: REPL_USER=$REPL_USER"
-echo "DEBUG: REPL_PASS length=${#REPL_PASS}"
-echo "DEBUG: REPL_PASS first4=${REPL_PASS:0:4} last4=${REPL_PASS: -4}"
+echo "DEBUG: Using superuser '$SUPERUSER' for replication"
 
 # Bootstrap completion marker (like etcd pattern)
 # pg_control can exist from a failed bootstrap - only trust data if marker exists
