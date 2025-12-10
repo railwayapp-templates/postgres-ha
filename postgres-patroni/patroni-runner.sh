@@ -185,9 +185,17 @@ EOF
 
 echo "Starting Patroni (scope: $SCOPE, etcd: $ETCD_HOSTS)"
 
-# DEBUG: Show the authentication section of the YAML Patroni will read
-echo "DEBUG: Authentication section of /tmp/patroni.yml:"
-grep -A10 "authentication:" /tmp/patroni.yml
+# Pre-create pgpass with BOTH superuser AND replication credentials
+# Patroni only writes superuser to pgpass, causing replication auth to fail!
+echo "Creating /tmp/pgpass with replication credentials..."
+cat > /tmp/pgpass <<PGPASS
+*:5432:*:${SUPERUSER}:${SUPERUSER_PASS}
+*:5432:replication:${REPL_USER}:${REPL_PASS}
+*:5432:*:${REPL_USER}:${REPL_PASS}
+PGPASS
+chmod 600 /tmp/pgpass
+echo "DEBUG: pgpass contents:"
+cat /tmp/pgpass
 
 # Start Patroni (exec to replace this shell process)
 exec patroni /tmp/patroni.yml
