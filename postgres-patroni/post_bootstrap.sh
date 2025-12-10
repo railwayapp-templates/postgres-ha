@@ -95,18 +95,15 @@ BEGIN
 END
 \$\$;
 
--- Create or update replication user (skip if same as superuser)
+-- Create or update replication user
 DO \$\$
 BEGIN
-    -- If using superuser for replication, skip - already handled above
-    IF '${REPL_USER}' = '${SUPERUSER}' THEN
-        RAISE NOTICE 'Replication user same as superuser, skipping separate creation';
-    ELSIF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPL_USER}') THEN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPL_USER}') THEN
         EXECUTE format('CREATE ROLE %I WITH REPLICATION LOGIN PASSWORD %L', '${REPL_USER}', '${REPL_PASS}');
         RAISE NOTICE 'Created replication user: ${REPL_USER}';
     ELSE
-        EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', '${REPL_USER}', '${REPL_PASS}');
-        RAISE NOTICE 'Updated replication user password: ${REPL_USER}';
+        EXECUTE format('ALTER ROLE %I WITH REPLICATION LOGIN PASSWORD %L', '${REPL_USER}', '${REPL_PASS}');
+        RAISE NOTICE 'Updated replication user: ${REPL_USER}';
     END IF;
 END
 \$\$;
