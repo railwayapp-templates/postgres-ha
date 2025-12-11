@@ -16,6 +16,8 @@ COPY --from=tools /bin/grep /bin/grep
 COPY --from=tools /bin/sed /bin/sed
 COPY --from=tools /usr/bin/cut /usr/bin/cut
 COPY --from=tools /usr/bin/tr /usr/bin/tr
+COPY --from=tools /usr/bin/head /usr/bin/head
+COPY --from=tools /usr/bin/sort /usr/bin/sort
 COPY --from=tools /lib/ld-musl-*.so.1 /lib/
 COPY --from=tools /lib/libc.musl-*.so.1 /lib/
 
