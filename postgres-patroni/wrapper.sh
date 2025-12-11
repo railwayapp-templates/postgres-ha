@@ -68,10 +68,10 @@ if [ "${PATRONI_ENABLED:-false}" = "true" ]; then
         fi
     fi
 
-    # Run Patroni directly as PID 1
+    # Run Patroni as postgres user (initdb refuses to run as root)
     # Container death = PostgreSQL death (no orphan risk)
     # Orchestrator handles restarts
-    exec /usr/local/bin/patroni-runner.sh
+    exec gosu postgres /usr/local/bin/patroni-runner.sh
 else
     # === Standalone PostgreSQL mode (matches postgres-ssl behavior) ===
 
