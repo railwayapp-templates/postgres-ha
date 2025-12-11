@@ -132,11 +132,15 @@ END
 \$\$;
 
 -- Create postgres superuser for compatibility (many tools expect this user)
+-- Always ensure postgres has SUPERUSER even if created above as app user
 DO \$\$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'postgres') THEN
         EXECUTE format('CREATE ROLE postgres WITH SUPERUSER LOGIN PASSWORD %L', '${SUPERUSER_PASS}');
         RAISE NOTICE 'Created postgres superuser for compatibility';
+    ELSE
+        ALTER ROLE postgres WITH SUPERUSER;
+        RAISE NOTICE 'Ensured postgres has superuser privileges';
     END IF;
 END
 \$\$;
