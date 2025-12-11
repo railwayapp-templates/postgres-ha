@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Patroni Watcher - Monitors Patroni cluster and updates Pgpool backends
-Polls Patroni REST API, uses PCP to attach/detach backends based on Patroni state
+Patroni Watcher - Main process that manages Pgpool and syncs with Patroni cluster.
+Spawns pgpool, monitors its health, and constantly reconciles backend state.
+If this process crashes, the container exits.
 """
 
 import os
 import sys
 import time
-import socket
+import signal
 import subprocess
 import logging
 import requests
@@ -22,8 +23,13 @@ logger = logging.getLogger(__name__)
 # Configuration
 PCP_USER = os.environ.get("PGPOOL_ADMIN_USERNAME", "admin")
 PCP_PASSWORD = os.environ.get("PGPOOL_ADMIN_PASSWORD", "")
+PGPOOL_CONF_DIR = os.environ.get("PGPOOL_CONF_DIR", "/opt/bitnami/pgpool/conf")
+PGPOOL_BIN_DIR = os.environ.get("PGPOOL_BIN_DIR", "/opt/bitnami/pgpool/bin")
 POLL_INTERVAL = 2
 PATRONI_TIMEOUT = 3
+
+# Global pgpool process
+pgpool_process = None
 
 
 def parse_backend_nodes():
@@ -38,7 +44,7 @@ def parse_backend_nodes():
         parts = node.strip().split(":")
         if len(parts) >= 3:
             index, host, port = int(parts[0]), parts[1], int(parts[2])
-            name = host.split(".")[0]  # postgres-1.railway.internal -> postgres-1
+            name = host.split(".")[0]
             backends.append({"name": name, "host": host, "port": port, "index": index})
 
     return backends
@@ -72,7 +78,6 @@ def get_pgpool_node_status(node_index):
     """
     output = run_pcp_command("pcp_node_info", "-n", str(node_index), capture=True)
     if output:
-        # Output format: hostname port status lb_weight role ...
         parts = output.split()
         if len(parts) >= 5:
             try:
@@ -86,17 +91,14 @@ def get_patroni_role(host):
     """Query Patroni REST API for node role (master/replica)"""
     try:
         response = requests.get(f"http://{host}:8008/", timeout=PATRONI_TIMEOUT)
-        # Patroni returns 200 for primary, 503 for replica (healthy but not primary)
-        # Both are valid - check the JSON body for role
         data = response.json()
         role = data.get("role")
         if role:
             return role
-        logger.debug(f"No role in response from {host}: {data}")
     except requests.exceptions.Timeout:
         logger.debug(f"Timeout reaching Patroni at {host}:8008")
-    except requests.exceptions.ConnectionError as e:
-        logger.debug(f"Connection error to {host}:8008: {e}")
+    except requests.exceptions.ConnectionError:
+        logger.debug(f"Connection error to {host}:8008")
     except Exception as e:
         logger.debug(f"Error querying {host}: {e}")
     return None
@@ -116,8 +118,13 @@ def get_cluster_state(backends):
     return state
 
 
-def sync_pgpool(backends, patroni_state):
-    """Sync pgpool backend status with Patroni state, minimizing unnecessary operations"""
+def reconcile_pgpool(backends, patroni_state):
+    """
+    Reconcile pgpool backend status with Patroni state.
+    Always checks and corrects state, not just on changes.
+    """
+    changes_made = False
+
     for backend in backends:
         idx = backend["index"]
         patroni_role = patroni_state.get(idx)
@@ -125,15 +132,19 @@ def sync_pgpool(backends, patroni_state):
 
         # Node is healthy in Patroni
         if patroni_role in ("primary", "standby"):
-            # Only attach if not already up (status 1)
+            # Attach if not up (status != 1)
             if pgpool_status != 1:
-                logger.info(f"Attaching {backend['name']} (patroni: {patroni_role})")
-                run_pcp_command("pcp_attach_node", "-n", str(idx))
+                logger.info(f"Attaching {backend['name']} (patroni: {patroni_role}, pgpool_status: {pgpool_status})")
+                if run_pcp_command("pcp_attach_node", "-n", str(idx)):
+                    changes_made = True
         else:
             # Node is unhealthy in Patroni - detach if up
             if pgpool_status == 1:
                 logger.info(f"Detaching {backend['name']} (patroni: {patroni_role})")
-                run_pcp_command("pcp_detach_node", "-n", str(idx))
+                if run_pcp_command("pcp_detach_node", "-n", str(idx)):
+                    changes_made = True
+
+    return changes_made
 
 
 def get_leader_name(patroni_state, backends):
@@ -144,55 +155,140 @@ def get_leader_name(patroni_state, backends):
     return None
 
 
-def wait_for_pgpool():
-    """Wait for pgpool PCP port using socket"""
-    logger.info("Waiting for pgpool...")
-    for _ in range(60):
+def start_pgpool():
+    """Start pgpool as a subprocess"""
+    global pgpool_process
+
+    pgpool_conf = f"{PGPOOL_CONF_DIR}/pgpool.conf"
+    pcp_conf = f"{PGPOOL_CONF_DIR}/pcp.conf"
+    pgpool_bin = f"{PGPOOL_BIN_DIR}/pgpool"
+
+    logger.info("Starting pgpool...")
+    pgpool_process = subprocess.Popen(
+        [pgpool_bin, "-n", "-f", pgpool_conf, "-F", pcp_conf],
+        stdout=sys.stdout,
+        stderr=sys.stderr
+    )
+    logger.info(f"Pgpool started with PID {pgpool_process.pid}")
+    return pgpool_process
+
+
+def check_pgpool_health():
+    """Check if pgpool process is still running"""
+    global pgpool_process
+    if pgpool_process is None:
+        return False
+
+    poll = pgpool_process.poll()
+    if poll is not None:
+        logger.error(f"Pgpool process exited with code {poll}")
+        return False
+    return True
+
+
+def wait_for_pcp_ready(timeout=60):
+    """Wait for pgpool PCP port to be ready"""
+    import socket
+
+    logger.info("Waiting for pgpool PCP port...")
+    start = time.time()
+    while time.time() - start < timeout:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(2)
                 if s.connect_ex(("localhost", 9898)) == 0:
-                    logger.info("Pgpool ready")
+                    logger.info("Pgpool PCP ready")
                     return True
         except:
             pass
-        time.sleep(2)
-    logger.error("Timeout waiting for pgpool")
+        time.sleep(1)
+
+    logger.error("Timeout waiting for pgpool PCP")
     return False
 
 
+def shutdown(signum, frame):
+    """Handle shutdown signals"""
+    global pgpool_process
+    logger.info(f"Received signal {signum}, shutting down...")
+
+    if pgpool_process:
+        logger.info("Stopping pgpool...")
+        pgpool_process.terminate()
+        try:
+            pgpool_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("Pgpool didn't stop gracefully, killing...")
+            pgpool_process.kill()
+
+    sys.exit(0)
+
+
 def main():
+    global pgpool_process
+
     if not PCP_PASSWORD:
         logger.error("PGPOOL_ADMIN_PASSWORD not set")
         sys.exit(1)
 
-    backends = parse_backend_nodes()
-    logger.info(f"Monitoring: {[b['name'] for b in backends]}")
+    # Setup signal handlers
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
 
-    if not wait_for_pgpool():
+    backends = parse_backend_nodes()
+    logger.info(f"Monitoring backends: {[b['name'] for b in backends]}")
+
+    # Start pgpool
+    start_pgpool()
+
+    # Wait for PCP to be ready
+    if not wait_for_pcp_ready():
+        logger.error("Failed to start pgpool")
+        if pgpool_process:
+            pgpool_process.kill()
         sys.exit(1)
 
-    last_state = {}
+    last_leader = None
+    reconcile_count = 0
 
     while True:
         try:
+            # Check pgpool health first
+            if not check_pgpool_health():
+                logger.error("Pgpool died, exiting...")
+                sys.exit(1)
+
+            # Get current Patroni state
             patroni_state = get_cluster_state(backends)
             leader_name = get_leader_name(patroni_state, backends)
 
-            # Only sync if state actually changed
-            if patroni_state != last_state:
+            # Log leader changes
+            if leader_name != last_leader:
                 if leader_name:
-                    logger.info(f"State change detected, leader: {leader_name}")
+                    logger.info(f"Leader: {leader_name}")
                 else:
-                    logger.warning("No leader found in Patroni")
-                sync_pgpool(backends, patroni_state)
-                last_state = patroni_state.copy()
+                    logger.warning("No leader found in Patroni cluster")
+                last_leader = leader_name
+
+            # Always reconcile - don't skip even if state looks the same
+            reconcile_pgpool(backends, patroni_state)
+
+            # Periodic status log
+            reconcile_count += 1
+            if reconcile_count % 30 == 0:  # Every ~60 seconds
+                healthy = sum(1 for r in patroni_state.values() if r is not None)
+                logger.info(f"Status: {healthy}/{len(backends)} backends healthy, leader: {leader_name or 'none'}")
 
             time.sleep(POLL_INTERVAL)
+
         except KeyboardInterrupt:
-            break
+            shutdown(signal.SIGINT, None)
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"Error in main loop: {e}")
+            # Don't exit on transient errors, but check pgpool is still alive
+            if not check_pgpool_health():
+                logger.error("Pgpool died during error recovery, exiting...")
+                sys.exit(1)
             time.sleep(POLL_INTERVAL)
 
 

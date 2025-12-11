@@ -57,17 +57,12 @@ sr_check_timeout = 30
 sr_check_user = '${SR_USER}'
 sr_check_database = 'postgres'
 
-# Health check - relaxed fallback
-health_check_period = 30
-health_check_timeout = 20
-health_check_max_retries = 3
-health_check_retry_delay = 5
-health_check_user = '${HC_USER}'
-health_check_database = 'postgres'
+# Health check - disabled (patroni-watcher handles backend state via PCP)
+health_check_period = 0
 PGPOOL_EXTRA_EOF
 
 mv /tmp/pgpool.conf.tmp "$PGPOOL_CONF"
-info "Backend configuration generated (sr_check/health_check as fallback)"
+info "Backend configuration generated (health_check disabled, patroni-watcher manages backends)"
 
 # Generate pcp.conf (pg_md5 is unreliable, use md5sum)
 USERNAME="${PGPOOL_ADMIN_USERNAME:-admin}"
@@ -82,9 +77,6 @@ localhost:9898:${USERNAME}:${PGPOOL_ADMIN_PASSWORD}
 EOF
 chmod 600 /tmp/.pcppass
 
-# Start patroni watcher in background
-python3 /opt/patroni-watcher.py &
-
-# Start pgpool
-info "** Starting Pgpool-II **"
-exec "${PGPOOL_BIN_DIR}/pgpool" -n -f "${PGPOOL_CONF_DIR}/pgpool.conf" -F "${PGPOOL_CONF_DIR}/pcp.conf"
+# Start patroni watcher as main process (manages pgpool lifecycle)
+info "** Starting Patroni Watcher (manages Pgpool-II) **"
+exec python3 /opt/patroni-watcher.py
