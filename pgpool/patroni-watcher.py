@@ -76,23 +76,33 @@ def get_patroni_role(host):
     return None
 
 
-def get_cluster_leader(backends):
-    """Find current leader from backends"""
+def get_cluster_state(backends):
+    """Get cluster state - returns (leader, healthy_backends)"""
+    leader = None
+    healthy = []
     for backend in backends:
         role = get_patroni_role(backend["host"])
         if role in ("master", "primary"):
-            return backend
-    return None
+            leader = backend
+            healthy.append(backend)
+        elif role in ("replica", "standby"):
+            healthy.append(backend)
+    return leader, healthy
+
+
+def get_cluster_leader(backends):
+    """Find current leader from backends"""
+    leader, _ = get_cluster_state(backends)
+    return leader
 
 
 def sync_pgpool(leader, backends):
-    """Attach leader, detach replicas"""
+    """Attach all backends - pgpool determines primary/standby from postgres itself"""
     logger.info(f"Syncing: leader is {leader['name']}")
     for backend in backends:
-        if backend["name"] == leader["name"]:
-            run_pcp_command("pcp_attach_node", "-n", str(backend["index"]))
-        else:
-            run_pcp_command("pcp_detach_node", "-n", str(backend["index"]))
+        # Attach all backends, not just leader
+        # Pgpool uses streaming replication check to determine roles
+        run_pcp_command("pcp_attach_node", "-n", str(backend["index"]))
 
 
 def wait_for_pgpool():
@@ -124,18 +134,34 @@ def main():
         sys.exit(1)
 
     last_leader = None
+    last_healthy_count = 0
+    sync_interval = 0  # Force initial sync
 
     while True:
         try:
-            leader = get_cluster_leader(backends)
+            leader, healthy = get_cluster_state(backends)
+            healthy_count = len(healthy)
+
+            # Sync on leader change, healthy node count change, or every 30 seconds
+            should_sync = (
+                (leader and leader["name"] != last_leader) or
+                (healthy_count != last_healthy_count) or
+                (sync_interval >= 15)  # Every 30 seconds (15 * 2s poll interval)
+            )
 
             if leader is None:
                 logger.warning("No leader found")
-            elif leader["name"] != last_leader:
-                logger.info(f"Leader change: {last_leader or 'none'} -> {leader['name']}")
+            elif should_sync:
+                if leader["name"] != last_leader:
+                    logger.info(f"Leader change: {last_leader or 'none'} -> {leader['name']}")
+                elif healthy_count != last_healthy_count:
+                    logger.info(f"Healthy nodes changed: {last_healthy_count} -> {healthy_count}")
                 sync_pgpool(leader, backends)
                 last_leader = leader["name"]
+                last_healthy_count = healthy_count
+                sync_interval = 0
 
+            sync_interval += 1
             time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             break
