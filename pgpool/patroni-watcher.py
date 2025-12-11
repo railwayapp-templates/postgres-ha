@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Patroni Watcher - Monitors Patroni cluster and updates Pgpool backends
-Polls Patroni REST API, uses PCP to attach leader and detach replicas
+Polls Patroni REST API, uses PCP to attach/detach backends based on Patroni state
 """
 
 import os
@@ -44,7 +44,7 @@ def parse_backend_nodes():
     return backends
 
 
-def run_pcp_command(cmd, *args, retries=3):
+def run_pcp_command(cmd, *args, retries=3, capture=False):
     """Execute PCP command with retry logic"""
     env = os.environ.copy()
     env["PCPPASSFILE"] = "/tmp/.pcppass"
@@ -54,7 +54,7 @@ def run_pcp_command(cmd, *args, retries=3):
         try:
             result = subprocess.run(full_cmd, env=env, capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
-                return True
+                return result.stdout.strip() if capture else True
             if attempt < retries - 1:
                 time.sleep(0.5)
         except subprocess.TimeoutExpired:
@@ -62,47 +62,86 @@ def run_pcp_command(cmd, *args, retries=3):
         except Exception as e:
             logger.warning(f"PCP error: {e}")
 
-    return False
+    return None if capture else False
+
+
+def get_pgpool_node_status(node_index):
+    """Get node status from pgpool: returns (status, role) or (None, None)
+    Status: 0=init, 1=up, 2=down, 3=quarantine
+    Role: 0=standby, 1=primary
+    """
+    output = run_pcp_command("pcp_node_info", "-n", str(node_index), capture=True)
+    if output:
+        # Output format: hostname port status lb_weight role ...
+        parts = output.split()
+        if len(parts) >= 5:
+            try:
+                return int(parts[2]), int(parts[4])
+            except (ValueError, IndexError):
+                pass
+    return None, None
 
 
 def get_patroni_role(host):
     """Query Patroni REST API for node role (master/replica)"""
     try:
         response = requests.get(f"http://{host}:8008/", timeout=PATRONI_TIMEOUT)
-        if response.status_code == 200:
-            return response.json().get("role")
-    except:
-        pass
+        # Patroni returns 200 for primary, 503 for replica (healthy but not primary)
+        # Both are valid - check the JSON body for role
+        data = response.json()
+        role = data.get("role")
+        if role:
+            return role
+        logger.debug(f"No role in response from {host}: {data}")
+    except requests.exceptions.Timeout:
+        logger.debug(f"Timeout reaching Patroni at {host}:8008")
+    except requests.exceptions.ConnectionError as e:
+        logger.debug(f"Connection error to {host}:8008: {e}")
+    except Exception as e:
+        logger.debug(f"Error querying {host}: {e}")
     return None
 
 
 def get_cluster_state(backends):
-    """Get cluster state - returns (leader, healthy_backends)"""
-    leader = None
-    healthy = []
+    """Get cluster state from Patroni - returns dict of {index: role}"""
+    state = {}
     for backend in backends:
         role = get_patroni_role(backend["host"])
         if role in ("master", "primary"):
-            leader = backend
-            healthy.append(backend)
+            state[backend["index"]] = "primary"
         elif role in ("replica", "standby"):
-            healthy.append(backend)
-    return leader, healthy
+            state[backend["index"]] = "standby"
+        else:
+            state[backend["index"]] = None
+    return state
 
 
-def get_cluster_leader(backends):
-    """Find current leader from backends"""
-    leader, _ = get_cluster_state(backends)
-    return leader
-
-
-def sync_pgpool(leader, backends):
-    """Attach all backends - pgpool determines primary/standby from postgres itself"""
-    logger.info(f"Syncing: leader is {leader['name']}")
+def sync_pgpool(backends, patroni_state):
+    """Sync pgpool backend status with Patroni state, minimizing unnecessary operations"""
     for backend in backends:
-        # Attach all backends, not just leader
-        # Pgpool uses streaming replication check to determine roles
-        run_pcp_command("pcp_attach_node", "-n", str(backend["index"]))
+        idx = backend["index"]
+        patroni_role = patroni_state.get(idx)
+        pgpool_status, pgpool_role = get_pgpool_node_status(idx)
+
+        # Node is healthy in Patroni
+        if patroni_role in ("primary", "standby"):
+            # Only attach if not already up (status 1)
+            if pgpool_status != 1:
+                logger.info(f"Attaching {backend['name']} (patroni: {patroni_role})")
+                run_pcp_command("pcp_attach_node", "-n", str(idx))
+        else:
+            # Node is unhealthy in Patroni - detach if up
+            if pgpool_status == 1:
+                logger.info(f"Detaching {backend['name']} (patroni: {patroni_role})")
+                run_pcp_command("pcp_detach_node", "-n", str(idx))
+
+
+def get_leader_name(patroni_state, backends):
+    """Get the name of the current leader"""
+    for backend in backends:
+        if patroni_state.get(backend["index"]) == "primary":
+            return backend["name"]
+    return None
 
 
 def wait_for_pgpool():
@@ -133,35 +172,22 @@ def main():
     if not wait_for_pgpool():
         sys.exit(1)
 
-    last_leader = None
-    last_healthy_count = 0
-    sync_interval = 0  # Force initial sync
+    last_state = {}
 
     while True:
         try:
-            leader, healthy = get_cluster_state(backends)
-            healthy_count = len(healthy)
+            patroni_state = get_cluster_state(backends)
+            leader_name = get_leader_name(patroni_state, backends)
 
-            # Sync on leader change, healthy node count change, or every 30 seconds
-            should_sync = (
-                (leader and leader["name"] != last_leader) or
-                (healthy_count != last_healthy_count) or
-                (sync_interval >= 15)  # Every 30 seconds (15 * 2s poll interval)
-            )
+            # Only sync if state actually changed
+            if patroni_state != last_state:
+                if leader_name:
+                    logger.info(f"State change detected, leader: {leader_name}")
+                else:
+                    logger.warning("No leader found in Patroni")
+                sync_pgpool(backends, patroni_state)
+                last_state = patroni_state.copy()
 
-            if leader is None:
-                logger.warning("No leader found")
-            elif should_sync:
-                if leader["name"] != last_leader:
-                    logger.info(f"Leader change: {last_leader or 'none'} -> {leader['name']}")
-                elif healthy_count != last_healthy_count:
-                    logger.info(f"Healthy nodes changed: {last_healthy_count} -> {healthy_count}")
-                sync_pgpool(leader, backends)
-                last_leader = leader["name"]
-                last_healthy_count = healthy_count
-                sync_interval = 0
-
-            sync_interval += 1
             time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             break

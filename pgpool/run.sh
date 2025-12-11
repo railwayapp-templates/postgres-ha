@@ -44,8 +44,30 @@ done
 PGPOOL_CONF="${PGPOOL_CONF_DIR}/pgpool.conf"
 grep -v '^backend_' "$PGPOOL_CONF" > /tmp/pgpool.conf.tmp || true
 echo "$BACKEND_CONFIG" >> /tmp/pgpool.conf.tmp
+
+# Configure sr_check as fallback with relaxed timeouts
+# Primary detection handled by patroni-watcher, sr_check is safety net
+SR_USER="${PGPOOL_SR_CHECK_USER:-postgres}"
+HC_USER="${PGPOOL_HEALTH_CHECK_USER:-postgres}"
+cat >> /tmp/pgpool.conf.tmp <<PGPOOL_EXTRA_EOF
+
+# Streaming replication check - relaxed settings (patroni-watcher is primary)
+sr_check_period = 60
+sr_check_timeout = 30
+sr_check_user = '${SR_USER}'
+sr_check_database = 'postgres'
+
+# Health check - relaxed fallback
+health_check_period = 30
+health_check_timeout = 20
+health_check_max_retries = 3
+health_check_retry_delay = 5
+health_check_user = '${HC_USER}'
+health_check_database = 'postgres'
+PGPOOL_EXTRA_EOF
+
 mv /tmp/pgpool.conf.tmp "$PGPOOL_CONF"
-info "Backend configuration generated"
+info "Backend configuration generated (sr_check/health_check as fallback)"
 
 # Generate pcp.conf (pg_md5 is unreliable, use md5sum)
 USERNAME="${PGPOOL_ADMIN_USERNAME:-admin}"

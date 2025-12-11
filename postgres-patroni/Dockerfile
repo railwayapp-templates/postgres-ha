@@ -2,7 +2,7 @@
 #
 # Build variants:
 #   slim (default) - Matches postgres-ssl, ~400MB
-#   ha             - Adds Patroni + supervisord, ~550MB
+#   ha             - Adds Patroni for high availability, ~550MB
 #
 # Usage:
 #   docker build --build-arg POSTGRES_VERSION=17 --build-arg BUILD_VARIANT=slim -t postgres:17 .
@@ -41,7 +41,7 @@ ENTRYPOINT ["wrapper.sh"]
 CMD ["postgres", "-p", "5432", "-c", "listen_addresses=*"]
 
 # ============================================================
-# HA stage: Patroni + supervisord for high availability
+# HA stage: Patroni for high availability
 # ============================================================
 FROM base AS ha
 
@@ -52,7 +52,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     curl \
-    supervisor \
     && rm -rf /var/lib/apt/lists/*
 
 # Install setuptools first (needed for ydiff's legacy setup.py)
@@ -61,9 +60,11 @@ RUN pip3 install --no-cache-dir --break-system-packages setuptools
 # Install Patroni and dependencies (etcd3 for v3 API)
 # Note: python-etcd is required due to Patroni 4.0.5 import bug (GitHub #3337)
 # The etcd3 module imports from etcd module even when using v3 API
+# etcd3 is also installed separately for our stale-state cleanup script
 RUN pip3 install --no-cache-dir --break-system-packages \
     psycopg2-binary \
     python-etcd==0.4.5 \
+    etcd3 \
     patroni[etcd3]==${PATRONI_VERSION}
 
 # Create required directories
@@ -75,9 +76,6 @@ COPY --chmod=755 init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
 COPY --chmod=755 wrapper.sh /usr/local/bin/wrapper.sh
 COPY --chmod=755 post_bootstrap.sh /post_bootstrap.sh
 COPY --chmod=755 patroni-runner.sh /usr/local/bin/patroni-runner.sh
-COPY --chmod=755 patroni-watchdog.sh /usr/local/bin/patroni-watchdog.sh
-COPY --chmod=755 supervisor-exit-handler.sh /usr/local/bin/supervisor-exit-handler.sh
-COPY supervisord.conf /etc/supervisor/conf.d/patroni.conf
 
 EXPOSE 5432 8008
 

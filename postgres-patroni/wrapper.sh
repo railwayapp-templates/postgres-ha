@@ -31,7 +31,7 @@ POSTGRES_CONF_FILE="$PGDATA/postgresql.conf"
 
 # Route based on PATRONI_ENABLED
 if [ "${PATRONI_ENABLED:-false}" = "true" ]; then
-    echo "=== Patroni mode enabled (with supervisord watchdog) ==="
+    echo "=== Patroni mode enabled ==="
 
     # Ensure data directory exists and has correct permissions (Railway mounts as root)
     DATA_DIR="$EXPECTED_VOLUME_MOUNT_PATH"
@@ -68,12 +68,10 @@ if [ "${PATRONI_ENABLED:-false}" = "true" ]; then
         fi
     fi
 
-    # Phase 2 (RFC-007): Use supervisord to manage Patroni and watchdog
-    # This ensures:
-    # 1. Patroni restarts automatically if it crashes
-    # 2. PostgreSQL is stopped if Patroni is unrecoverable (preventing split-brain)
-    # 3. Container restarts on critical failures
-    exec /usr/bin/supervisord -c /etc/supervisor/conf.d/patroni.conf
+    # Run Patroni directly as PID 1
+    # Container death = PostgreSQL death (no orphan risk)
+    # Orchestrator handles restarts
+    exec /usr/local/bin/patroni-runner.sh
 else
     # === Standalone PostgreSQL mode (matches postgres-ssl behavior) ===
 

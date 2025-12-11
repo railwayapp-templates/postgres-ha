@@ -2,7 +2,7 @@
 #
 # Build variants:
 #   slim (default) - Matches postgres-ssl, ~400MB
-#   ha             - Adds Patroni + supervisord, ~550MB
+#   ha             - Adds Patroni for high availability, ~550MB
 #
 # Usage:
 #   docker build --target slim -t postgres:14 .
@@ -40,7 +40,7 @@ ENTRYPOINT ["wrapper.sh"]
 CMD ["postgres", "-p", "5432", "-c", "listen_addresses=*"]
 
 # ============================================================
-# HA stage: Patroni + supervisord for high availability
+# HA stage: Patroni for high availability
 # ============================================================
 FROM base AS ha
 
@@ -51,7 +51,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     curl \
-    supervisor \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Patroni and dependencies
@@ -69,9 +68,6 @@ COPY --chmod=755 init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
 COPY --chmod=755 wrapper.sh /usr/local/bin/wrapper.sh
 COPY --chmod=755 post_bootstrap.sh /post_bootstrap.sh
 COPY --chmod=755 patroni-runner.sh /usr/local/bin/patroni-runner.sh
-COPY --chmod=755 patroni-watchdog.sh /usr/local/bin/patroni-watchdog.sh
-COPY --chmod=755 supervisor-exit-handler.sh /usr/local/bin/supervisor-exit-handler.sh
-COPY supervisord.conf /etc/supervisor/conf.d/patroni.conf
 
 EXPOSE 5432 8008
 

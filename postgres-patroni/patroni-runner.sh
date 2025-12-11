@@ -1,8 +1,9 @@
 #!/bin/bash
 # patroni-runner.sh - Wrapper to run Patroni with proper setup
 #
-# This script is called by supervisord to start Patroni.
-# It generates the configuration and starts Patroni.
+# This script generates the Patroni configuration and starts Patroni.
+# Runs as PID 1 in container with built-in health monitoring.
+# If Patroni dies or becomes unresponsive, exits to trigger container restart.
 
 set -e
 
@@ -44,8 +45,6 @@ APP_PASS="${POSTGRES_PASSWORD}"
 APP_DB="${POSTGRES_DB:-${PGDATABASE:-railway}}"
 
 echo "Node: $NAME (address: $CONNECT_ADDRESS)"
-echo "DEBUG: SUPERUSER=$SUPERUSER, REPL_USER=$REPL_USER"
-echo "DEBUG: Full REPL_PASS from env: [${REPL_PASS}]"
 
 # Bootstrap completion marker (like etcd pattern)
 # pg_control can exist from a failed bootstrap - only trust data if marker exists
@@ -210,5 +209,76 @@ umask 0077
 # See: https://github.com/patroni/patroni/issues/1489
 unset PGPASSWORD PGUSER PGHOST PGPORT PGDATABASE
 
-# Start Patroni (exec to replace this shell process)
-exec patroni /tmp/patroni.yml
+# Health monitoring configuration
+HEALTH_CHECK_INTERVAL="${PATRONI_HEALTH_CHECK_INTERVAL:-5}"
+HEALTH_CHECK_TIMEOUT="${PATRONI_HEALTH_CHECK_TIMEOUT:-5}"
+MAX_FAILURES="${PATRONI_MAX_HEALTH_FAILURES:-3}"
+STARTUP_GRACE_PERIOD="${PATRONI_STARTUP_GRACE_PERIOD:-60}"
+
+# Start Patroni as child process (not exec, so we can monitor it)
+patroni /tmp/patroni.yml &
+PATRONI_PID=$!
+echo "Patroni started with PID $PATRONI_PID"
+
+# Forward termination signals to Patroni for graceful shutdown
+cleanup() {
+    echo "Received shutdown signal, stopping Patroni..."
+    kill -TERM "$PATRONI_PID" 2>/dev/null || true
+    wait "$PATRONI_PID" 2>/dev/null || true
+    exit 0
+}
+trap cleanup TERM INT
+
+# Wait for startup grace period before health checking
+echo "Waiting ${STARTUP_GRACE_PERIOD}s for Patroni to initialize..."
+startup_elapsed=0
+while [ $startup_elapsed -lt $STARTUP_GRACE_PERIOD ]; do
+    # Check if process died during startup
+    if ! kill -0 "$PATRONI_PID" 2>/dev/null; then
+        echo "Patroni process died during startup"
+        wait "$PATRONI_PID" 2>/dev/null || true
+        exit 1
+    fi
+    sleep 5
+    startup_elapsed=$((startup_elapsed + 5))
+
+    # Try health check - if it succeeds early, we can start monitoring
+    if curl -sf --max-time "$HEALTH_CHECK_TIMEOUT" http://localhost:8008/health > /dev/null 2>&1; then
+        echo "Patroni healthy after ${startup_elapsed}s, starting health monitoring"
+        break
+    fi
+done
+
+# Main health monitoring loop
+failures=0
+echo "Health monitoring active (interval=${HEALTH_CHECK_INTERVAL}s, max_failures=${MAX_FAILURES})"
+
+while true; do
+    sleep "$HEALTH_CHECK_INTERVAL"
+
+    # Check if Patroni process is alive
+    if ! kill -0 "$PATRONI_PID" 2>/dev/null; then
+        echo "Patroni process died unexpectedly"
+        wait "$PATRONI_PID" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Check Patroni health endpoint (detects hangs)
+    if curl -sf --max-time "$HEALTH_CHECK_TIMEOUT" http://localhost:8008/health > /dev/null 2>&1; then
+        if [ $failures -gt 0 ]; then
+            echo "Patroni recovered after $failures failed health checks"
+        fi
+        failures=0
+    else
+        failures=$((failures + 1))
+        echo "Health check failed ($failures/$MAX_FAILURES)"
+
+        if [ $failures -ge $MAX_FAILURES ]; then
+            echo "CRITICAL: Patroni unresponsive after $MAX_FAILURES checks - exiting to trigger restart"
+            kill -TERM "$PATRONI_PID" 2>/dev/null || true
+            sleep 2
+            kill -KILL "$PATRONI_PID" 2>/dev/null || true
+            exit 1
+        fi
+    fi
+done
