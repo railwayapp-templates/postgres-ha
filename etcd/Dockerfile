@@ -11,6 +11,11 @@ COPY --from=tools /bin/sleep /bin/sleep
 COPY --from=tools /bin/kill /bin/kill
 COPY --from=tools /bin/date /bin/date
 COPY --from=tools /usr/bin/seq /usr/bin/seq
+COPY --from=tools /usr/bin/nc /usr/bin/nc
+COPY --from=tools /bin/grep /bin/grep
+COPY --from=tools /bin/sed /bin/sed
+COPY --from=tools /usr/bin/cut /usr/bin/cut
+COPY --from=tools /usr/bin/tr /usr/bin/tr
 COPY --from=tools /lib/ld-musl-*.so.1 /lib/
 COPY --from=tools /lib/libc.musl-*.so.1 /lib/
 

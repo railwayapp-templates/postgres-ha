@@ -2,7 +2,7 @@ FROM haproxy:2.9-alpine
 
 USER root
 
-COPY haproxy/entrypoint.sh /entrypoint.sh
+COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && \
     chown -R haproxy:haproxy /usr/local/etc/haproxy
 

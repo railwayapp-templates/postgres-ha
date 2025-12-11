@@ -52,13 +52,15 @@ REPL_USER=$(grep -A2 'replication:' "$PATRONI_CONFIG" | grep 'username:' | head 
 REPL_PASS=$(grep -A2 'replication:' "$PATRONI_CONFIG" | grep 'password:' | head -1 | strip_yaml)
 SUPERUSER=$(grep -A2 'superuser:' "$PATRONI_CONFIG" | grep 'username:' | head -1 | strip_yaml)
 SUPERUSER_PASS=$(grep -A2 'superuser:' "$PATRONI_CONFIG" | grep 'password:' | head -1 | strip_yaml)
-APP_USER=$(grep -A2 'app_user:' "$PATRONI_CONFIG" | grep 'username:' | head -1 | strip_yaml)
-APP_PASS=$(grep -A2 'app_user:' "$PATRONI_CONFIG" | grep 'password:' | head -1 | strip_yaml)
+APP_USER=$(grep -A3 'app_user:' "$PATRONI_CONFIG" | grep 'username:' | head -1 | strip_yaml)
+APP_PASS=$(grep -A3 'app_user:' "$PATRONI_CONFIG" | grep 'password:' | head -1 | strip_yaml)
+APP_DB=$(grep -A3 'app_user:' "$PATRONI_CONFIG" | grep 'database:' | head -1 | strip_yaml)
 
 echo "DEBUG: REPL_USER=${REPL_USER}"
 echo "DEBUG: REPL_PASS length=${#REPL_PASS}"
 echo "DEBUG: REPL_PASS first4=${REPL_PASS:0:4} last4=${REPL_PASS: -4}"
 echo "DEBUG: SUPERUSER=${SUPERUSER}"
+echo "DEBUG: APP_DB=${APP_DB}"
 echo "DEBUG: Raw password line from YAML:"
 grep -A2 'replication:' "$PATRONI_CONFIG" | grep 'password:' | head -1 | cat -A
 
@@ -129,6 +131,30 @@ BEGIN
 END
 \$\$;
 
+-- Create app database if configured and doesn't exist
+DO \$\$
+BEGIN
+    IF '${APP_DB}' = '' OR '${APP_DB}' = 'postgres' THEN
+        RAISE NOTICE 'App database not configured or is postgres, skipping';
+    ELSIF NOT EXISTS (SELECT FROM pg_database WHERE datname = '${APP_DB}') THEN
+        EXECUTE format('CREATE DATABASE %I', '${APP_DB}');
+        RAISE NOTICE 'Created app database: ${APP_DB}';
+    ELSE
+        RAISE NOTICE 'App database already exists: ${APP_DB}';
+    END IF;
+END
+\$\$;
+
+-- Grant privileges on app database to app user
+DO \$\$
+BEGIN
+    IF '${APP_DB}' != '' AND '${APP_DB}' != 'postgres' AND '${APP_USER}' != '' AND '${APP_USER}' != '${SUPERUSER}' THEN
+        EXECUTE format('GRANT ALL PRIVILEGES ON DATABASE %I TO %I', '${APP_DB}', '${APP_USER}');
+        RAISE NOTICE 'Granted privileges on ${APP_DB} to ${APP_USER}';
+    END IF;
+END
+\$\$;
+
 -- Verify replication user exists and has correct attributes
 SELECT rolname, rolreplication, rolcanlogin FROM pg_roles WHERE rolname = '${REPL_USER}';
 
@@ -136,7 +162,7 @@ SELECT rolname, rolreplication, rolcanlogin FROM pg_roles WHERE rolname = '${REP
 SELECT rolname, left(rolpassword, 50) as hash_prefix FROM pg_authid WHERE rolname IN ('${SUPERUSER}', '${REPL_USER}');
 EOSQL
 
-echo "Post-bootstrap: users created (superuser: ${SUPERUSER}, replication: ${REPL_USER}, app: ${APP_USER})"
+echo "Post-bootstrap: users created (superuser: ${SUPERUSER}, replication: ${REPL_USER}, app: ${APP_USER}, database: ${APP_DB})"
 
 # TEST: Actually verify the password works via TCP connection
 echo "DEBUG: Testing replicator password via TCP connection..."

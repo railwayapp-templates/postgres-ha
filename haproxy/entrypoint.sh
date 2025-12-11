@@ -61,7 +61,7 @@ defaults
     timeout check 5s
 
 resolvers railway
-    nameserver dns1 127.0.0.11:53
+    parse-resolv-conf
     resolve_retries 3
     timeout resolve 1s
     timeout retry   1s
@@ -88,7 +88,7 @@ frontend postgresql_primary
 backend postgresql_primary_backend
     option httpchk GET /primary
     http-check expect status 200
-    default-server inter ${HAPROXY_CHECK_INTERVAL} fall 3 rise 2 on-marked-down shutdown-sessions resolvers railway init-addr none
+    default-server inter ${HAPROXY_CHECK_INTERVAL} fall 3 rise 2 on-marked-down shutdown-sessions resolvers railway init-addr last,libc,none
 ${PRIMARY_SERVERS}
 
 # Replica PostgreSQL (read-only)
@@ -100,7 +100,7 @@ backend postgresql_replicas_backend
     balance roundrobin
     option httpchk GET /replica
     http-check expect status 200
-    default-server inter ${HAPROXY_CHECK_INTERVAL} fall 3 rise 2 on-marked-down shutdown-sessions resolvers railway init-addr none
+    default-server inter ${HAPROXY_CHECK_INTERVAL} fall 3 rise 2 on-marked-down shutdown-sessions resolvers railway init-addr last,libc,none
 ${REPLICA_SERVERS}
 EOF
 

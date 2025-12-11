@@ -38,9 +38,10 @@ SUPERUSER="${PATRONI_SUPERUSER_USERNAME:-postgres}"
 SUPERUSER_PASS="${PATRONI_SUPERUSER_PASSWORD}"
 REPL_USER="${PATRONI_REPLICATION_USERNAME:-replicator}"
 REPL_PASS="${PATRONI_REPLICATION_PASSWORD}"
-# App user (standard postgres env vars)
+# App user and database (standard postgres env vars)
 APP_USER="${POSTGRES_USER:-postgres}"
 APP_PASS="${POSTGRES_PASSWORD}"
+APP_DB="${POSTGRES_DB:-${PGDATABASE:-railway}}"
 
 echo "Node: $NAME (address: $CONNECT_ADDRESS)"
 echo "DEBUG: SUPERUSER=$SUPERUSER, REPL_USER=$REPL_USER"
@@ -179,6 +180,7 @@ postgresql:
   app_user:
     username: "${APP_USER}"
     password: "${APP_PASS}"
+    database: "${APP_DB}"
   parameters:
     unix_socket_directories: /var/run/postgresql
 EOF
