@@ -1,4 +1,4 @@
-ARG ETCD_VERSION=3.5.16
+ARG ETCD_VERSION=3.6.6
 # Use alpine to get shell utilities
 FROM alpine:latest AS tools
 

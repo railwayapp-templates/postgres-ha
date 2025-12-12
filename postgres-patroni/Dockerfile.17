@@ -44,7 +44,7 @@ CMD ["postgres", "-p", "5432", "-c", "listen_addresses=*"]
 # ============================================================
 FROM base AS ha
 
-ARG PATRONI_VERSION=4.0.4
+ARG PATRONI_VERSION=4.1.0
 
 # Install HA dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -14,8 +14,6 @@ on:
       - 'postgres-patroni/**'
       - 'etcd/**'
       - 'haproxy/**'
-      - 'pgbouncer/**'
-      - 'pgpool/**'
       - '.github/workflows/build-and-push.yml'
 
 env:
@@ -24,9 +22,8 @@ env:
   # Which major version gets the "latest" tag
   LATEST_POSTGRES_MAJOR: 17
   # Component versions (update these to release new versions)
-  ETCD_VERSION: "3.5.16"
+  ETCD_VERSION: "3.6.6"
   HAPROXY_VERSION: "3.2"
-  PGPOOL_VERSION: "4"
   ALPINE_VERSION: "3.19"
 
 jobs:
@@ -87,7 +84,7 @@ jobs:
           cache-from: type=gha,scope=pg${{ matrix.postgres_major }}
           cache-to: type=gha,mode=max,scope=pg${{ matrix.postgres_major }}
 
-  # Build other components (etcd, haproxy, pgbouncer, pgpool)
+  # Build other components (etcd, haproxy)
   build-etcd:
     runs-on: ubuntu-latest
     permissions:
@@ -115,7 +112,7 @@ jobs:
         id: meta
         run: |
           echo "sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
-          # etcd: 3.5.16 -> major=3, minor=3.5, patch=3.5.16
+          # etcd: 3.6.6 -> major=3, minor=3.6, patch=3.6.6
           echo "major=$(echo ${{ env.ETCD_VERSION }} | cut -d. -f1)" >> $GITHUB_OUTPUT
           echo "minor=$(echo ${{ env.ETCD_VERSION }} | cut -d. -f1-2)" >> $GITHUB_OUTPUT
 
@@ -179,93 +176,3 @@ jobs:
             ${{ env.IMAGE_PREFIX }}/haproxy:${{ env.HAPROXY_VERSION }}-${{ steps.meta.outputs.sha }}
           cache-from: type=gha,scope=haproxy
           cache-to: type=gha,mode=max,scope=haproxy
-
-  build-pgbouncer:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Get short SHA and pgbouncer version
-        id: meta
-        run: |
-          echo "sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
-          # Get pgbouncer version from Alpine package (e.g., 1.22.1-r0 -> 1.22.1)
-          PGBOUNCER_VERSION=$(docker run --rm alpine:${{ env.ALPINE_VERSION }} sh -c "apk add --no-cache pgbouncer 2>/dev/null && pgbouncer --version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          echo "version=${PGBOUNCER_VERSION}" >> $GITHUB_OUTPUT
-          echo "minor=$(echo ${PGBOUNCER_VERSION} | cut -d. -f1-2)" >> $GITHUB_OUTPUT
-          echo "major=$(echo ${PGBOUNCER_VERSION} | cut -d. -f1)" >> $GITHUB_OUTPUT
-
-      - name: Build and push pgbouncer
-        uses: docker/build-push-action@v5
-        with:
-          context: ./pgbouncer
-          build-args: ALPINE_VERSION=${{ env.ALPINE_VERSION }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.IMAGE_PREFIX }}/pgbouncer:latest
-            ${{ env.IMAGE_PREFIX }}/pgbouncer:${{ steps.meta.outputs.version }}
-            ${{ env.IMAGE_PREFIX }}/pgbouncer:${{ steps.meta.outputs.minor }}
-            ${{ env.IMAGE_PREFIX }}/pgbouncer:${{ steps.meta.outputs.major }}
-            ${{ env.IMAGE_PREFIX }}/pgbouncer:${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.sha }}
-          cache-from: type=gha,scope=pgbouncer
-          cache-to: type=gha,mode=max,scope=pgbouncer
-
-  build-pgpool:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Get short SHA
-        id: meta
-        run: echo "sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
-
-      - name: Build and push pgpool
-        uses: docker/build-push-action@v5
-        with:
-          context: ./pgpool
-          build-args: PGPOOL_VERSION=${{ env.PGPOOL_VERSION }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.IMAGE_PREFIX }}/pgpool:latest
-            ${{ env.IMAGE_PREFIX }}/pgpool:${{ env.PGPOOL_VERSION }}
-            ${{ env.IMAGE_PREFIX }}/pgpool:${{ env.PGPOOL_VERSION }}-${{ steps.meta.outputs.sha }}
-          cache-from: type=gha,scope=pgpool
-          cache-to: type=gha,mode=max,scope=pgpool

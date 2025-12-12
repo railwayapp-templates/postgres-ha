@@ -1,5 +1,3 @@
-version: '3.9'
-
 networks:
   postgres-ha:
     driver: bridge
@@ -160,4 +158,3 @@ services:
       - postgres-1
       - postgres-2
       - postgres-3
-

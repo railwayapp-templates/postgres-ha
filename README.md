@@ -6,32 +6,35 @@ This template deploys a production-ready, highly-available PostgreSQL cluster on
 
 - **3-node PostgreSQL cluster** with streaming replication
 - **Automatic failover** in <10 seconds using Patroni
-- **2 standby replicas** for automatic failover
-- **Connection pooling** with Pgpool-II (3 replicas for HA)
+- **2 standby replicas** for automatic failover and read scaling
+- **HAProxy load balancer** with separate read-write and read-only endpoints
 - **Transparent routing** - single endpoint for all database connections
 - **Automatic recovery** - failed nodes rejoin as replicas
 - **Health monitoring** - Patroni REST API for cluster status
+- **Multi-version support** - PostgreSQL 13, 14, 15, 16, and 17
 
 ## Architecture
 
 ```
 Application
     ↓
-Pgpool-II (3 replicas) ← Load balanced endpoint
+HAProxy ← Load balanced endpoint
+    ├─ :5432 (read-write) → Primary only
+    └─ :5433 (read-only)  → Replicas (round-robin)
     ↓
 PostgreSQL Cluster
-    ├─ postgres-1 (Leader)  ← All queries
-    ├─ postgres-2 (Standby) ← Failover ready
-    └─ postgres-3 (Standby) ← Failover ready
+    ├─ postgres-1 (Leader)  ← Writes + Reads
+    ├─ postgres-2 (Standby) ← Reads + Failover ready
+    └─ postgres-3 (Standby) ← Reads + Failover ready
          ↓
     etcd (3 nodes) ← Distributed consensus
 ```
 
 ## Services Deployed
 
-1. **postgres-1, postgres-2, postgres-3** - PostgreSQL 17 with Patroni orchestration
+1. **postgres-1, postgres-2, postgres-3** - PostgreSQL with Patroni orchestration
 2. **etcd-1, etcd-2, etcd-3** - Distributed key-value store for leader election
-3. **pgpool** - Connection pooler and query router with built-in failover watcher
+3. **haproxy** - Load balancer with automatic primary detection
 
 **Total**: 7 services
 
@@ -47,19 +50,24 @@ PostgreSQL Cluster
 3. Wait for deployment (~2-3 minutes)
 4. Connect using the provided `DATABASE_URL`
 
-### Connection String
+### Connection Strings
 
-Once deployed, connect to your database via Pgpool-II:
+Once deployed, connect to your database via HAProxy:
 
 ```bash
-# From Railway private network (other services in same project)
-postgresql://railway:${POSTGRES_PASSWORD}@pgpool.railway.internal:5432/railway
+# Primary (read-write) - From Railway private network
+postgresql://railway:${POSTGRES_PASSWORD}@haproxy.railway.internal:5432/railway
+
+# Replicas (read-only) - For read scaling
+postgresql://railway:${POSTGRES_PASSWORD}@haproxy.railway.internal:5433/railway
 
 # From external (via TCP proxy)
-postgresql://railway:${POSTGRES_PASSWORD}@${PGPOOL_TCP_PROXY_DOMAIN}/railway
+postgresql://railway:${POSTGRES_PASSWORD}@${HAPROXY_TCP_PROXY_DOMAIN}/railway
 ```
 
-Pgpool-II automatically routes all queries to the current primary node. The `patroni-watcher` process monitors the Patroni cluster and updates Pgpool's backend configuration when leadership changes, ensuring transparent failover.
+HAProxy automatically routes connections:
+- **Port 5432**: Routes to current Patroni leader (read-write)
+- **Port 5433**: Load-balances across healthy replicas (read-only)
 
 ## Configuration
 
@@ -73,22 +81,19 @@ Pgpool-II automatically routes all queries to the current primary node. The `pat
 | `PATRONI_SCOPE` | `pg-ha-cluster` | Cluster identifier |
 | `PATRONI_TTL` | `30` | Leader lease TTL (seconds) |
 | `PATRONI_LOOP_WAIT` | `10` | Health check interval |
-| `PGPOOL_NUM_INIT_CHILDREN` | `32` | Connection pool workers per Pgpool instance |
-| `PGPOOL_MAX_POOL` | `4` | Cached connections per worker |
+| `POSTGRES_NODES` | (required for HAProxy) | Node list in format `host:pgport:patroniport,...` |
+| `HAPROXY_MAX_CONN` | `1000` | Maximum concurrent connections |
+| `HAPROXY_CHECK_INTERVAL` | `3s` | Backend health check interval |
 
-### Scaling Pgpool-II
+### Scaling HAProxy
 
-Pgpool-II is stateless and can be scaled horizontally:
+HAProxy is stateless and can be scaled horizontally via Railway replicas:
 
 ```toml
-# In pgpool/railway.toml
+# In haproxy/railway.toml
 [deploy]
-multiRegionConfig = { "us-east4-eqdc4a" = { numReplicas = 3 } }
+numReplicas = 3
 ```
-
-**Connection capacity**: `numReplicas × num_init_children × max_pool`
-- Default: `3 × 32 × 4 = 384 connections`
-- With 10 replicas: `10 × 32 × 4 = 1,280 connections`
 
 ## Monitoring
 
@@ -100,12 +105,14 @@ Each service exposes health endpoints:
 # PostgreSQL + Patroni
 curl http://postgres-1.railway.internal:8008/health
 curl http://postgres-1.railway.internal:8008/cluster  # Full cluster status
+curl http://postgres-1.railway.internal:8008/primary  # 200 if primary
+curl http://postgres-1.railway.internal:8008/replica  # 200 if replica
 
 # etcd
 curl http://etcd-1.railway.internal:2379/health
 
-# Pgpool-II
-pg_isready -h pgpool.railway.internal -p 5432
+# HAProxy stats dashboard
+curl http://haproxy.railway.internal:8404/stats
 ```
 
 ### Cluster Status
@@ -145,6 +152,10 @@ Response:
 }
 ```
 
+### HAProxy Stats
+
+Access the HAProxy stats dashboard at `http://haproxy.railway.internal:8404/stats` for real-time backend health and connection metrics.
+
 ## Failover Behavior
 
 ### Automatic Failover (Primary Crashes)
@@ -152,17 +163,17 @@ Response:
 **Timeline**:
 ```
 T+0s   postgres-1 (leader) crashes
-T+2s   Patroni detects failure via etcd
-T+4s   postgres-2 elected as new leader
-T+6s   Pgpool-II detects new primary
-T+10s  Failover complete
+T+3s   HAProxy health check fails (3s interval)
+T+6s   HAProxy marks backend DOWN (fall 3)
+T+8s   Patroni elects new leader via etcd
+T+10s  HAProxy routes to new primary
 ```
 
 **Impact**:
 - Existing write connections: Dropped (apps retry)
-- Existing read connections: Unaffected
+- Existing read connections: Unaffected (if using :5433)
 - New connections: Routed to new primary
-- **Total downtime**: ~5-10 seconds
+- **Total downtime**: ~10 seconds
 
 ### Automatic Recovery (Failed Node Returns)
 
@@ -174,6 +185,7 @@ T+3s   Patroni registers with etcd
 T+4s   Discovers postgres-2 is leader
 T+5s   Rejoins as replica
 T+10s  Begins streaming replication
+T+12s  HAProxy adds to replica pool
 ```
 
 **Result**: Original primary rejoins as **replica**, not leader.
@@ -194,15 +206,23 @@ patronictl -c /etc/patroni/patroni.yml switchover
 Test the cluster locally with Docker Compose:
 
 ```bash
-cd templates/postgres-ha
 docker-compose up -d
 ```
 
-This starts all services on your local machine.
+This starts all 7 services on your local machine.
 
 Connect to the cluster:
 ```bash
+# Read-write (primary)
 psql postgresql://railway:railway@localhost:5432/railway
+
+# Read-only (replicas)
+psql postgresql://railway:railway@localhost:5433/railway
+```
+
+View HAProxy stats:
+```bash
+open http://localhost:8404/stats
 ```
 
 ## Troubleshooting
@@ -238,26 +258,29 @@ curl http://postgres-2.railway.internal:8008/ | jq '.replication[0].lag'
 
 If lag is high (>1GB):
 - Check network connectivity between nodes
-- Increase `wal_keep_size` in patroni.yml
+- Increase `wal_keep_size` in patroni configuration
 - Consider increasing PostgreSQL resources
 
-### Pgpool connection errors
+### HAProxy connection errors
 
-1. Check backends status:
+1. Check HAProxy stats:
    ```bash
-   psql -h pgpool.railway.internal -U postgres -c "SHOW POOL_NODES;"
+   curl http://haproxy.railway.internal:8404/stats
    ```
 
-2. Verify passwords are correct (must match across all services)
+2. Verify backends are healthy:
+   ```bash
+   curl http://postgres-1.railway.internal:8008/health
+   ```
 
-3. Check Pgpool logs for authentication errors
+3. Check HAProxy logs for backend failures
 
 ## Cost Estimation
 
 **Resource allocation**:
 - 3 PostgreSQL: 2 vCPU, 2GB RAM each + 10GB volume
 - 3 etcd: 0.5 vCPU, 512MB RAM each
-- 1 Pgpool: 0.5 vCPU, 512MB RAM
+- 1 HAProxy: 0.5 vCPU, 512MB RAM
 
 **Estimated cost (Railway Pro)**:
 - Compute: ~$60-120/month
@@ -277,7 +300,7 @@ Railway Pro includes automatic volume snapshots:
 
 **Manual backup**:
 ```bash
-pg_dump -h pgpool.railway.internal -U railway railway > backup.sql
+pg_dump -h haproxy.railway.internal -U railway railway > backup.sql
 ```
 
 **Restore from snapshot**:
@@ -287,18 +310,18 @@ pg_dump -h pgpool.railway.internal -U railway railway > backup.sql
 
 ## Upgrading PostgreSQL
 
-To upgrade from PostgreSQL 17 to a newer version:
+This template supports PostgreSQL 13, 14, 15, 16, and 17. To upgrade:
 
 1. Create a logical backup:
    ```bash
-   pg_dumpall -h pgpool.railway.internal -U railway > cluster_backup.sql
+   pg_dumpall -h haproxy.railway.internal -U railway > cluster_backup.sql
    ```
 
 2. Deploy new template with updated PostgreSQL version
 
 3. Restore data:
    ```bash
-   psql -h new-pgpool.railway.internal -U railway < cluster_backup.sql
+   psql -h new-haproxy.railway.internal -U railway < cluster_backup.sql
    ```
 
 4. Update application `DATABASE_URL` to new cluster
@@ -309,14 +332,15 @@ To upgrade from PostgreSQL 17 to a newer version:
 
 - All passwords are auto-generated and encrypted at rest
 - Private networking isolates cluster from public internet
-- mTLS available for client connections (configure in Pgpool)
+- SSL enabled by default for PostgreSQL connections
 - Recommend enabling Railway's 2FA for project access
 
 ## Performance Tuning
 
 ### PostgreSQL
 
-Edit `patroni.yml` parameters:
+Patroni dynamically generates PostgreSQL configuration. Override via environment variables:
+
 ```yaml
 postgresql:
   parameters:
@@ -326,19 +350,38 @@ postgresql:
     work_mem: 4MB                # Per-query memory
 ```
 
-### Pgpool-II
+### HAProxy
 
-Edit `pgpool.conf`:
-```conf
-num_init_children = 64           # More connection workers
-max_pool = 8                     # More cached connections per worker
+Adjust via environment variables:
+
+```bash
+HAPROXY_MAX_CONN=2000           # More concurrent connections
+HAPROXY_CHECK_INTERVAL=1s       # Faster failover detection
+HAPROXY_TIMEOUT_CLIENT=60m      # Longer idle connections
 ```
 
-Redeploy services after configuration changes.
+## Docker Images
+
+Pre-built images are published to GitHub Container Registry:
+
+```bash
+# PostgreSQL + Patroni (multiple versions)
+ghcr.io/railwayapp/postgres-ha/postgres-patroni:17
+ghcr.io/railwayapp/postgres-ha/postgres-patroni:16
+ghcr.io/railwayapp/postgres-ha/postgres-patroni:15
+ghcr.io/railwayapp/postgres-ha/postgres-patroni:14
+ghcr.io/railwayapp/postgres-ha/postgres-patroni:13
+
+# etcd
+ghcr.io/railwayapp/postgres-ha/etcd:3.5.16
+
+# HAProxy
+ghcr.io/railwayapp/postgres-ha/haproxy:3.2
+```
 
 ## Support
 
-- **Issues**: https://github.com/railwayapp/examples/issues
+- **Issues**: https://github.com/railwayapp/postgres-ha/issues
 - **Documentation**: https://docs.railway.app/
 - **Community**: https://discord.gg/railway
 
@@ -352,5 +395,5 @@ Built with:
 - [PostgreSQL](https://www.postgresql.org/) - World's most advanced open source database
 - [Patroni](https://patroni.readthedocs.io/) - Template for PostgreSQL HA with Python
 - [etcd](https://etcd.io/) - Distributed reliable key-value store
-- [Pgpool-II](https://www.pgpool.net/) - Middleware for PostgreSQL clustering
+- [HAProxy](https://www.haproxy.org/) - Reliable, high-performance TCP/HTTP load balancer
 - [Railway](https://railway.app/) - Infrastructure, instantly
