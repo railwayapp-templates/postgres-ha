@@ -35,7 +35,17 @@ log() {
 }
 
 check_cluster_health() {
-  etcdctl endpoint health --endpoints=http://127.0.0.1:2379 >/dev/null 2>&1
+  # Try localhost first (works for voting members)
+  if etcdctl endpoint health --endpoints=http://127.0.0.1:2379 >/dev/null 2>&1; then
+    return 0
+  fi
+  # For learners, localhost fails - check via a voting member instead
+  voting_endpoint=$(get_voting_member_endpoint)
+  if [ -n "$voting_endpoint" ]; then
+    etcdctl endpoint health --endpoints="$voting_endpoint" >/dev/null 2>&1
+    return $?
+  fi
+  return 1
 }
 
 # Get bootstrap leader (alphabetically first node name)
