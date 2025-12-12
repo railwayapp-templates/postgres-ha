@@ -12,6 +12,11 @@
 # 3. Other nodes wait for leader, add themselves as LEARNERS (non-voting)
 # 4. Learners sync data, then auto-promote to voting members once healthy
 #
+# Recovery mode (leader volume loss):
+# - Before bootstrapping, leader checks if other peers have a healthy cluster
+# - If yes: leader removes its stale entry and joins as learner (not bootstrap)
+# - This prevents split-brain when leader loses volume but cluster still exists
+#
 # Benefits of learner mode:
 # - Learners don't affect quorum calculations
 # - Safe to remove if something goes wrong
@@ -60,6 +65,67 @@ get_leader_peer_host() {
 get_my_peer_url() {
   entry=$(echo "$ETCD_INITIAL_CLUSTER" | tr ',' '\n' | grep "^${ETCD_NAME}=")
   echo "$entry" | cut -d'=' -f2
+}
+
+# Check if any other peer has a healthy cluster (for recovery detection)
+# Returns 0 if a healthy peer is found, 1 otherwise
+# On success, outputs the healthy peer's client endpoint
+check_existing_cluster() {
+  log "Checking if other peers have an existing cluster..."
+
+  # Try each peer (except ourselves)
+  echo "$ETCD_INITIAL_CLUSTER" | tr ',' '\n' | while read -r entry; do
+    peer_name=$(echo "$entry" | cut -d'=' -f1)
+
+    # Skip ourselves
+    if [ "$peer_name" = "$ETCD_NAME" ]; then
+      continue
+    fi
+
+    peer_url=$(echo "$entry" | cut -d'=' -f2)
+    # Convert peer URL (2380) to client URL (2379)
+    client_endpoint=$(echo "$peer_url" | sed 's/:2380/:2379/')
+
+    log "Checking peer $peer_name at $client_endpoint..."
+
+    if etcdctl endpoint health --endpoints="$client_endpoint" >/dev/null 2>&1; then
+      log "Found healthy cluster at peer $peer_name"
+      echo "$client_endpoint"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Remove stale member entry for this node (used during recovery)
+remove_stale_self() {
+  endpoint=$1
+
+  log "Checking for stale member entry to remove..."
+
+  # Get member ID for our name (if exists)
+  member_id=$(etcdctl member list --endpoints="$endpoint" -w simple 2>/dev/null | while read -r line; do
+    name=$(echo "$line" | cut -d',' -f3 | tr -d ' ')
+    if [ "$name" = "$ETCD_NAME" ]; then
+      echo "$line" | cut -d',' -f1 | tr -d ' '
+      return
+    fi
+  done)
+
+  if [ -n "$member_id" ]; then
+    log "Found stale member entry (ID: $member_id), removing..."
+    if etcdctl member remove "$member_id" --endpoints="$endpoint" 2>&1; then
+      log "Successfully removed stale member entry"
+      return 0
+    else
+      log "Failed to remove stale member entry"
+      return 1
+    fi
+  else
+    log "No stale member entry found"
+    return 0
+  fi
 }
 
 # Wait for leader to be healthy and accepting connections
@@ -290,20 +356,81 @@ while [ $attempt -le $MAX_RETRIES ]; do
   if [ "$IS_LEADER" = "true" ]; then
     # Bootstrap leader: start single-node cluster if fresh, or normal start if already bootstrapped
     if [ ! -f "$BOOTSTRAP_COMPLETE_MARKER" ]; then
-      MY_PEER_URL=$(get_my_peer_url)
-      log "Bootstrapping as single-node cluster: ${ETCD_NAME}=${MY_PEER_URL}"
+      # RECOVERY CHECK: Before bootstrapping, check if other peers already have a cluster
+      # This prevents split-brain if the leader lost its volume but the cluster still exists
+      EXISTING_CLUSTER_ENDPOINT=$(check_existing_cluster)
+      if [ -n "$EXISTING_CLUSTER_ENDPOINT" ]; then
+        log "RECOVERY MODE: Found existing cluster, joining instead of bootstrapping"
 
-      # Override cluster config for single-node bootstrap
-      export ETCD_INITIAL_CLUSTER="${ETCD_NAME}=${MY_PEER_URL}"
-      export ETCD_INITIAL_CLUSTER_STATE="new"
+        # Remove our stale entry if it exists
+        remove_stale_self "$EXISTING_CLUSTER_ENDPOINT"
+
+        # Join as learner like a non-leader would
+        my_peer_url=$(get_my_peer_url)
+        log "Adding self as learner to existing cluster via $EXISTING_CLUSTER_ENDPOINT..."
+
+        output=$(etcdctl member add "$ETCD_NAME" --learner --peer-urls="$my_peer_url" --endpoints="$EXISTING_CLUSTER_ENDPOINT" 2>&1)
+        if [ $? -eq 0 ]; then
+          log "Successfully added as learner for recovery"
+          CURRENT_CLUSTER=$(echo "$output" | grep 'ETCD_INITIAL_CLUSTER=' | head -1 | sed 's/.*ETCD_INITIAL_CLUSTER="//' | sed 's/"$//')
+          if [ -z "$CURRENT_CLUSTER" ]; then
+            # Fallback: build from member list
+            CURRENT_CLUSTER=$(etcdctl member list --endpoints="$EXISTING_CLUSTER_ENDPOINT" -w simple 2>/dev/null | while read -r line; do
+              name=$(echo "$line" | cut -d',' -f3 | tr -d ' ')
+              peer_url=$(echo "$line" | cut -d',' -f4 | tr -d ' ')
+              if [ -n "$name" ] && [ -n "$peer_url" ]; then
+                echo "${name}=${peer_url}"
+              fi
+            done | tr '\n' ',' | sed 's/,$//')
+          fi
+
+          log "Joining existing cluster as learner (recovery): $CURRENT_CLUSTER"
+          JOINED_AS_LEARNER="learner"
+
+          export ETCD_INITIAL_CLUSTER="$CURRENT_CLUSTER"
+          export ETCD_INITIAL_CLUSTER_STATE="existing"
+
+          # Start health monitor for learner promotion
+          monitor_and_mark_bootstrap "learner" &
+          MONITOR_PID=$!
+
+          /usr/local/bin/etcd --auto-compaction-retention=1 --max-learners=2
+          EXIT_CODE=$?
+
+          # Skip to end of loop for retry handling
+          # (need to break out of the if-else chain)
+          RECOVERY_MODE=true
+        else
+          log "Failed to add as learner during recovery: $output"
+          log "Will retry..."
+          attempt=$((attempt + 1))
+          sleep $RETRY_DELAY
+          continue
+        fi
+      else
+        # Normal bootstrap: no existing cluster found
+        MY_PEER_URL=$(get_my_peer_url)
+        log "Bootstrapping as single-node cluster: ${ETCD_NAME}=${MY_PEER_URL}"
+
+        # Override cluster config for single-node bootstrap
+        export ETCD_INITIAL_CLUSTER="${ETCD_NAME}=${MY_PEER_URL}"
+        export ETCD_INITIAL_CLUSTER_STATE="new"
+
+        # Start health monitor in background (leader is not a learner)
+        monitor_and_mark_bootstrap "" &
+        MONITOR_PID=$!
+
+        /usr/local/bin/etcd --auto-compaction-retention=1 --max-learners=2
+        EXIT_CODE=$?
+      fi
+    else
+      # Already bootstrapped, just start normally
+      monitor_and_mark_bootstrap "" &
+      MONITOR_PID=$!
+
+      /usr/local/bin/etcd --auto-compaction-retention=1 --max-learners=2
+      EXIT_CODE=$?
     fi
-
-    # Start health monitor in background (leader is not a learner)
-    monitor_and_mark_bootstrap "" &
-    MONITOR_PID=$!
-
-    /usr/local/bin/etcd --auto-compaction-retention=1 --max-learners=2
-    EXIT_CODE=$?
   else
     # Non-leader: wait for leader, join existing cluster as learner
     if [ ! -f "$BOOTSTRAP_COMPLETE_MARKER" ]; then
