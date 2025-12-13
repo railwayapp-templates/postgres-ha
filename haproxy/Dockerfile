@@ -3,8 +3,9 @@ FROM haproxy:${HAPROXY_VERSION}-alpine
 
 USER root
 
-# Install postgresql-client for Railway's Database UI to work via SSH tunnel
-RUN apk add --no-cache postgresql-client
+# Install postgresql-client and bash for Railway's Database UI to work via SSH tunnel
+# (bash is required because the UI runs: bash +H -c 'psql ...')
+RUN apk add --no-cache postgresql-client bash
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && \
