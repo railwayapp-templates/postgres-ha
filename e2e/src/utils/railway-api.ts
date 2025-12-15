@@ -1,4 +1,4 @@
-import { BACKBOARD_URL } from "../constants";
+const BACKBOARD_URL = "https://backboard.railway.com";
 
 export class RailwayAPI {
   constructor(private token: string) {}
