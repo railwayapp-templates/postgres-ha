@@ -39,7 +39,8 @@ async function runFailoverTest(): Promise<void> {
     // Step 1: Deploy postgres-ha template
     // =========================================
     console.log("Step 1: Deploying postgres-ha template...");
-    const deployment = await api.deployTemplate("postgres-ha");
+    const projectName = `e2e-postgres-ha-${Date.now()}`;
+    const deployment = await api.deployTemplate("postgres-ha", projectName);
     projectId = deployment.projectId;
     console.log(`Template deployed, project ID: ${projectId}`);
 
