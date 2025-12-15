@@ -2,10 +2,10 @@ FROM node:20-slim
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY e2e/package*.json ./
 RUN npm ci
 
-COPY tsconfig.json ./
-COPY src ./src
+COPY e2e/tsconfig.json ./
+COPY e2e/src ./src
 
 CMD ["npm", "test"]
