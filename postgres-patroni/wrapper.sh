@@ -54,8 +54,13 @@ if [ "${PATRONI_ENABLED:-false}" = "true" ]; then
         fi
     fi
 
-    # Check/renew existing SSL certs (new certs generated in post_bootstrap)
-    if [ -f "$SSL_DIR/server.crt" ]; then
+    # Generate SSL certs if missing (replicas need this - they don't run post_bootstrap)
+    # pg_basebackup copies postgresql.conf with SSL=on but not the certs themselves
+    if [ ! -f "$SSL_DIR/server.crt" ]; then
+        echo "SSL certificates missing, generating..."
+        bash "$INIT_SSL_SCRIPT"
+    else
+        # Check/renew existing SSL certs
         # Regenerate if the certificate is not a x509v3 certificate
         if ! openssl x509 -noout -text -in "$SSL_DIR/server.crt" | grep -q "DNS:localhost"; then
             echo "Did not find a x509v3 certificate, regenerating certificates..."
