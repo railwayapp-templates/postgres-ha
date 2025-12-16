@@ -52,42 +52,37 @@ BOOTSTRAP_MARKER="$VOLUME_ROOT/.patroni_bootstrap_complete"
 
 HAS_VALID_DATA=false
 
+# When adopting existing data, always ensure pg_hba.conf has replication entries
+# This runs on every startup to handle cases where marker exists but pg_hba wasn't updated
+if [ "${PATRONI_ADOPT_EXISTING_DATA}" = "true" ] && [ -f "$DATA_DIR/pg_hba.conf" ]; then
+    PG_HBA="$DATA_DIR/pg_hba.conf"
+    echo "Checking pg_hba.conf for replication support..."
+
+    # Check if replication entries already exist
+    if ! grep -q "^host.*replication" "$PG_HBA" && ! grep -q "^hostssl.*replication" "$PG_HBA"; then
+        echo "Adding replication entries to pg_hba.conf..."
+        {
+            echo "# Replication entries added by Patroni migration"
+            echo "hostssl replication ${REPL_USER} 0.0.0.0/0 scram-sha-256"
+            echo "hostssl replication ${REPL_USER} ::/0 scram-sha-256"
+            echo "host replication ${REPL_USER} 0.0.0.0/0 scram-sha-256"
+            echo "host replication ${REPL_USER} ::/0 scram-sha-256"
+            echo ""
+            cat "$PG_HBA"
+        } > "$PG_HBA.new"
+        mv "$PG_HBA.new" "$PG_HBA"
+        chmod 600 "$PG_HBA"
+        echo "pg_hba.conf updated with replication entries"
+    else
+        echo "Replication entries already exist in pg_hba.conf"
+    fi
+fi
+
 # Check if we're migrating from vanilla postgres (set by Railway HA conversion)
 if [ "${PATRONI_ADOPT_EXISTING_DATA}" = "true" ] && [ -f "$DATA_DIR/global/pg_control" ] && [ ! -f "$BOOTSTRAP_MARKER" ]; then
     echo "PATRONI_ADOPT_EXISTING_DATA=true - migrating from vanilla PostgreSQL"
     echo "Preserving existing data and adopting into Patroni cluster"
     HAS_VALID_DATA=true
-
-    # CRITICAL: Update pg_hba.conf for replication BEFORE marking bootstrap complete
-    # Vanilla postgres doesn't have entries for replication from other hosts
-    # We need to add them so replicas can connect
-    # Do this before touching the marker so a crash doesn't leave us in a bad state
-    PG_HBA="$DATA_DIR/pg_hba.conf"
-    if [ -f "$PG_HBA" ]; then
-        echo "Updating pg_hba.conf for replication support..."
-
-        # Check if replication entries already exist
-        if ! grep -q "^host.*replication" "$PG_HBA" && ! grep -q "^hostssl.*replication" "$PG_HBA"; then
-            echo "Adding replication entries to pg_hba.conf..."
-            # Add replication entries at the beginning (after any comments)
-            {
-                echo "# Replication entries added by Patroni migration"
-                echo "hostssl replication ${REPL_USER} 0.0.0.0/0 scram-sha-256"
-                echo "hostssl replication ${REPL_USER} ::/0 scram-sha-256"
-                echo "host replication ${REPL_USER} 0.0.0.0/0 scram-sha-256"
-                echo "host replication ${REPL_USER} ::/0 scram-sha-256"
-                echo ""
-                cat "$PG_HBA"
-            } > "$PG_HBA.new"
-            mv "$PG_HBA.new" "$PG_HBA"
-            chmod 600 "$PG_HBA"
-            echo "pg_hba.conf updated with replication entries"
-        else
-            echo "Replication entries already exist in pg_hba.conf"
-        fi
-    fi
-
-    # Mark bootstrap complete only after all modifications are done
     touch "$BOOTSTRAP_MARKER"
 elif [ -f "$DATA_DIR/global/pg_control" ] && [ -f "$BOOTSTRAP_MARKER" ]; then
     HAS_VALID_DATA=true
