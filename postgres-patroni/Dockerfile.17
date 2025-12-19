@@ -68,6 +68,7 @@ COPY --chmod=755 init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
 COPY --chmod=755 wrapper.sh /usr/local/bin/wrapper.sh
 COPY --chmod=755 post_bootstrap.sh /post_bootstrap.sh
 COPY --chmod=755 patroni-runner.sh /usr/local/bin/patroni-runner.sh
+COPY --chmod=755 on_role_change.sh /on_role_change.sh
 
 EXPOSE 5432 8008
 
