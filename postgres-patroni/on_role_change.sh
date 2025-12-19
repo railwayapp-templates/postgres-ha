@@ -54,11 +54,9 @@ esac
 # Log locally for container logs
 echo "[${TIMESTAMP}] ${EVENT_TYPE}: ${MESSAGE} (node=${NODE_NAME}, scope=${SCOPE}, service=${SERVICE_ID})"
 
-# Build metadata for telemetry
 METADATA="node=${NODE_NAME}, role=${ROLE}, scope=${SCOPE}, address=${NODE_ADDRESS}, serviceId=${SERVICE_ID}, projectId=${PROJECT_ID}, environmentId=${ENVIRONMENT_ID}"
 
-# Send telemetry to Railway backboard (logs to Datadog)
-GRAPHQL_ENDPOINT="${RAILWAY_GRAPHQL_ENDPOINT:-https://backboard.railway.app/graphql/v2}"
+GRAPHQL_ENDPOINT="${RAILWAY_GRAPHQL_ENDPOINT:-https://backboard.railway.app/graphql/internal}"
 
 PAYLOAD=$(cat <<EOF
 {
@@ -77,7 +75,6 @@ PAYLOAD=$(cat <<EOF
 EOF
 )
 
-# Send to Railway backboard (fire and forget, don't block Patroni)
 if command -v curl &> /dev/null; then
     curl -s -X POST \
         -H "Content-Type: application/json" \
