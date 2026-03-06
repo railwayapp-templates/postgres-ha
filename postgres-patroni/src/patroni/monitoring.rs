@@ -1,8 +1,9 @@
 //! Patroni process monitoring
 //!
-//! Handles the monitoring loop, signal handling, and health check management.
+//! Handles the monitoring loop, signal handling, health check management,
+//! and timeline divergence auto-recovery.
 
-use super::{check_health, Config};
+use super::{check_health, is_start_failed, safe_reinitialize, Config};
 use common::{Telemetry, TelemetryEvent};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -36,6 +37,11 @@ pub async fn run_monitoring_loop(
     // We wait up to max_startup_timeout for Patroni to become healthy.
     // If it doesn't become healthy within that time, we exit(1) to trigger
     // container restart and recovery.
+    //
+    // Timeline divergence detection:
+    // If health check fails and node is in "start failed" state for 3 consecutive
+    // checks (15 seconds), we attempt safe reinitialize to recover from timeline
+    // divergence caused by multiple failovers.
     info!(
         grace_period = config.startup_grace_period,
         max_timeout = config.max_startup_timeout,
@@ -43,6 +49,9 @@ pub async fn run_monitoring_loop(
     );
 
     let mut startup_elapsed = 0u64;
+    let mut start_failed_count = 0u32;
+    const START_FAILED_THRESHOLD: u32 = 3; // 15 seconds of "start failed"
+
     loop {
         tokio::select! {
             _ = sigterm.recv() => {
@@ -70,7 +79,79 @@ pub async fn run_monitoring_loop(
                 startup_elapsed += 5;
                 if check_health(config.health_check_timeout).await {
                     info!(elapsed = startup_elapsed, "Patroni healthy, starting monitoring");
+                    start_failed_count = 0;
                     break;
+                }
+
+                // Check for "start failed" state (timeline divergence indicator)
+                // Only check after grace period to give Patroni time to start
+                if startup_elapsed >= config.startup_grace_period {
+                    if is_start_failed(&config.name, config.health_check_timeout).await {
+                        start_failed_count += 1;
+                        warn!(
+                            count = start_failed_count,
+                            threshold = START_FAILED_THRESHOLD,
+                            "Node in 'start failed' state - possible timeline divergence"
+                        );
+
+                        // After threshold consecutive failures, attempt safe reinitialize
+                        if start_failed_count >= START_FAILED_THRESHOLD {
+                            info!("Threshold reached, attempting safe reinitialize");
+
+                            match safe_reinitialize(&config.name, config.health_check_timeout).await {
+                                Ok((true, reason, local_tl, leader_tl)) => {
+                                    info!(
+                                        reason = %reason,
+                                        local_timeline = ?local_tl,
+                                        leader_timeline = ?leader_tl,
+                                        "Reinitialize triggered successfully"
+                                    );
+                                    telemetry.send(TelemetryEvent::TimelineDivergenceRecovery {
+                                        node: config.name.clone(),
+                                        action: "reinitialize".to_string(),
+                                        local_timeline: local_tl.unwrap_or(0),
+                                        leader_timeline: leader_tl,
+                                        reason,
+                                    });
+                                    // Reset counters and give time for reinit to complete
+                                    start_failed_count = 0;
+                                    startup_elapsed = 0; // Reset startup timer
+                                }
+                                Ok((false, reason, local_tl, leader_tl)) => {
+                                    warn!(
+                                        reason = %reason,
+                                        local_timeline = ?local_tl,
+                                        leader_timeline = ?leader_tl,
+                                        "Reinitialize blocked by safety check"
+                                    );
+                                    telemetry.send(TelemetryEvent::TimelineDivergenceRecovery {
+                                        node: config.name.clone(),
+                                        action: "blocked".to_string(),
+                                        local_timeline: local_tl.unwrap_or(0),
+                                        leader_timeline: leader_tl,
+                                        reason,
+                                    });
+                                    // Don't exit immediately - keep trying in case
+                                    // the situation changes (e.g., leader comes up)
+                                    start_failed_count = 0;
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Failed to trigger reinitialize");
+                                    telemetry.send(TelemetryEvent::TimelineDivergenceRecovery {
+                                        node: config.name.clone(),
+                                        action: "error".to_string(),
+                                        local_timeline: 0,
+                                        leader_timeline: None,
+                                        reason: e,
+                                    });
+                                    start_failed_count = 0;
+                                }
+                            }
+                        }
+                    } else {
+                        // Not in "start failed" state, reset counter
+                        start_failed_count = 0;
+                    }
                 }
 
                 // Check if we've exceeded max startup timeout

@@ -64,6 +64,18 @@ pub enum TelemetryEvent {
     /// This is a critical event: all nodes demoted, no writes possible
     DcsUnavailable { node: String, scope: String },
 
+    /// Timeline divergence detected - recovery attempted or blocked
+    /// Sent when a replica detects it's behind the leader's timeline after failovers
+    TimelineDivergenceRecovery {
+        node: String,
+        /// Action taken: "preflight_wipe", "reinitialize", "blocked"
+        action: String,
+        local_timeline: i64,
+        leader_timeline: Option<i64>,
+        /// Why action was taken or blocked
+        reason: String,
+    },
+
     // === etcd Events ===
     /// etcd cluster bootstrap initiated
     EtcdBootstrap {
@@ -135,6 +147,7 @@ impl TelemetryEvent {
             Self::HealthCheckFailed { .. } => "POSTGRES_HA_HEALTH_CHECK_FAILED",
             Self::ProcessDied { .. } => "POSTGRES_HA_PROCESS_DIED",
             Self::DcsUnavailable { .. } => "POSTGRES_HA_DCS_UNAVAILABLE",
+            Self::TimelineDivergenceRecovery { .. } => "POSTGRES_HA_TIMELINE_DIVERGENCE_RECOVERY",
             Self::EtcdBootstrap { .. } => "ETCD_CLUSTER_BOOTSTRAP",
             Self::EtcdNodeJoined { .. } => "ETCD_NODE_JOINED",
             Self::EtcdNodePromoted { .. } => "ETCD_NODE_PROMOTED",
@@ -195,6 +208,18 @@ impl TelemetryEvent {
                 format!(
                     "DCS unavailable - {} demoted, cluster {} has no leader (write outage)",
                     node, scope
+                )
+            }
+            Self::TimelineDivergenceRecovery {
+                node,
+                action,
+                local_timeline,
+                leader_timeline,
+                reason,
+            } => {
+                format!(
+                    "Timeline divergence on {} - action={}, local={}, leader={:?}: {}",
+                    node, action, local_timeline, leader_timeline, reason
                 )
             }
             Self::EtcdBootstrap {
