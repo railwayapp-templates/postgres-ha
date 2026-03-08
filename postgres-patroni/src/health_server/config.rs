@@ -17,6 +17,8 @@ pub struct HealthServerConfig {
     pub pg_password: String,
     /// PostgreSQL database (default: postgres)
     pub pg_database: String,
+    /// Patroni REST API port for fallback (default: 8008)
+    pub patroni_port: u16,
 }
 
 impl HealthServerConfig {
@@ -30,6 +32,7 @@ impl HealthServerConfig {
             pg_user: String::env_parse("PGUSER", "postgres".to_string()),
             pg_password: String::env_parse("PGPASSWORD", String::new()),
             pg_database: String::env_parse("PGDATABASE", "postgres".to_string()),
+            patroni_port: u16::env_parse("PATRONI_PORT", 8008),
         }
     }
 }

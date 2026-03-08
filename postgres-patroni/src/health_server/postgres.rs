@@ -35,3 +35,24 @@ pub async fn is_in_recovery(config: &HealthServerConfig) -> Result<bool> {
     let in_recovery: bool = row.get(0);
     Ok(in_recovery)
 }
+
+/// Fallback: check role via Patroni REST API
+///
+/// Returns Ok(true) if the endpoint returns 200, Ok(false) otherwise.
+/// Returns Err only on network/request failures.
+pub async fn check_patroni_role(config: &HealthServerConfig, role: &str) -> Result<bool> {
+    let url = format!("http://{}:{}/{}", config.pg_host, config.patroni_port, role);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("Failed to connect to Patroni")?;
+
+    Ok(response.status().is_success())
+}
