@@ -3,6 +3,7 @@
 use super::config::HealthServerConfig;
 use anyhow::{Context, Result};
 use tokio_postgres::NoTls;
+use tracing::debug;
 
 /// Check if PostgreSQL is in recovery mode (i.e., is a replica)
 ///
@@ -20,10 +21,11 @@ pub async fn is_in_recovery(config: &HealthServerConfig) -> Result<bool> {
         .await
         .context("Failed to connect to PostgreSQL")?;
 
-    // Spawn connection handler - it will terminate when client is dropped
+    // The connection future handles network I/O and must be running for
+    // the client to work. It completes when the client is dropped.
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::debug!(error = %e, "PostgreSQL connection closed");
+            debug!(error = %e, "PostgreSQL connection closed");
         }
     });
 
@@ -36,12 +38,12 @@ pub async fn is_in_recovery(config: &HealthServerConfig) -> Result<bool> {
     Ok(in_recovery)
 }
 
-/// Fallback: check role via Patroni REST API
+/// Fallback: check role via local Patroni REST API
 ///
+/// Patroni knows the cluster state from etcd, so we just ask it.
 /// Returns Ok(true) if the endpoint returns 200, Ok(false) otherwise.
-/// Returns Err only on network/request failures.
 pub async fn check_patroni_role(config: &HealthServerConfig, role: &str) -> Result<bool> {
-    let url = format!("http://{}:{}/{}", config.pg_host, config.patroni_port, role);
+    let url = format!("http://localhost:{}/{}", config.patroni_port, role);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))

@@ -9,7 +9,7 @@ use axum::{
     routing::get,
     Router,
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Create the router with all health check endpoints
 pub fn create_router(config: HealthServerConfig) -> Router {
@@ -36,18 +36,18 @@ async fn primary_handler(State(config): State<HealthServerConfig>) -> impl IntoR
             (StatusCode::SERVICE_UNAVAILABLE, "replica")
         }
         Err(e) => {
-            debug!(error = %e, "Primary check: PostgreSQL unreachable, falling back to Patroni");
+            info!(error = %e, "Primary check: PostgreSQL unreachable, falling back to Patroni");
             match check_patroni_role(&config, "primary").await {
                 Ok(true) => {
-                    debug!("Primary check: OK (via Patroni fallback)");
+                    info!("Primary check: OK (via Patroni fallback)");
                     (StatusCode::OK, "primary")
                 }
                 Ok(false) => {
-                    debug!("Primary check: FAIL (via Patroni fallback)");
+                    info!("Primary check: FAIL (via Patroni fallback)");
                     (StatusCode::SERVICE_UNAVAILABLE, "replica")
                 }
                 Err(e) => {
-                    debug!(error = %e, "Primary check: FAIL (Patroni also unreachable)");
+                    info!(error = %e, "Primary check: FAIL (Patroni also unreachable)");
                     (StatusCode::SERVICE_UNAVAILABLE, "error")
                 }
             }
@@ -71,18 +71,18 @@ async fn replica_handler(State(config): State<HealthServerConfig>) -> impl IntoR
             (StatusCode::SERVICE_UNAVAILABLE, "primary")
         }
         Err(e) => {
-            debug!(error = %e, "Replica check: PostgreSQL unreachable, falling back to Patroni");
+            info!(error = %e, "Replica check: PostgreSQL unreachable, falling back to Patroni");
             match check_patroni_role(&config, "replica").await {
                 Ok(true) => {
-                    debug!("Replica check: OK (via Patroni fallback)");
+                    info!("Replica check: OK (via Patroni fallback)");
                     (StatusCode::OK, "replica")
                 }
                 Ok(false) => {
-                    debug!("Replica check: FAIL (via Patroni fallback)");
+                    info!("Replica check: FAIL (via Patroni fallback)");
                     (StatusCode::SERVICE_UNAVAILABLE, "primary")
                 }
                 Err(e) => {
-                    debug!(error = %e, "Replica check: FAIL (Patroni also unreachable)");
+                    info!(error = %e, "Replica check: FAIL (Patroni also unreachable)");
                     (StatusCode::SERVICE_UNAVAILABLE, "error")
                 }
             }

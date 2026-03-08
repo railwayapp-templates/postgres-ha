@@ -21,12 +21,17 @@ use tracing::{error, info};
 /// of the main Patroni process.
 pub async fn start(config: HealthServerConfig) -> Result<tokio::task::JoinHandle<()>> {
     let port = config.port;
+    let patroni_port = config.patroni_port;
     let app = routes::create_router(config);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
 
-    info!(port, "Health server listening");
+    info!(
+        port,
+        patroni_fallback_port = patroni_port,
+        "Health server listening (endpoints: /primary, /replica, /health)"
+    );
 
     let handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
