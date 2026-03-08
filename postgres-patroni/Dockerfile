@@ -1,12 +1,12 @@
-# Multi-stage Dockerfile for PostgreSQL 17 with optional Patroni HA
+# Multi-stage Dockerfile for PostgreSQL with optional Patroni HA
 #
 # Build variants:
 #   slim (default) - Matches postgres-ssl, ~400MB
 #   ha             - Adds Patroni for high availability, ~550MB
 #
 # Usage:
-#   docker build --target slim -t postgres:17 .
-#   docker build --target ha -t postgres:17-ha .
+#   docker build --target slim --build-arg POSTGRES_VERSION=17 -t postgres:17 .
+#   docker build --target ha --build-arg POSTGRES_VERSION=17 -t postgres:17-ha .
 
 ARG POSTGRES_VERSION=17
 
@@ -26,6 +26,13 @@ COPY postgres-patroni ./postgres-patroni
 
 # Build release binaries
 RUN cargo build --release -p postgres-patroni
+
+# Minimal stage with just binaries (used as cache target in CI)
+FROM scratch AS rust-builder-local-output
+COPY --from=rust-builder /build/target/release/postgres-wrapper /postgres-wrapper
+COPY --from=rust-builder /build/target/release/post-bootstrap /post-bootstrap
+COPY --from=rust-builder /build/target/release/patroni-runner /patroni-runner
+COPY --from=rust-builder /build/target/release/on-role-change /on-role-change
 
 # ============================================================
 # Base stage: Common to both slim and HA
@@ -47,7 +54,7 @@ FROM base AS slim
 
 # Copy Rust binaries
 COPY --chmod=755 postgres-patroni/init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
-COPY --from=rust-builder --chmod=755 /build/target/release/postgres-wrapper /usr/local/bin/wrapper.sh
+COPY --from=rust-builder-local-output --chmod=755 /postgres-wrapper /usr/local/bin/wrapper.sh
 
 EXPOSE 5432
 
@@ -83,10 +90,10 @@ RUN mkdir -p /home/postgres /var/run/postgresql /etc/patroni \
 
 # Copy SSL init script and Rust binaries
 COPY --chmod=755 postgres-patroni/init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
-COPY --from=rust-builder --chmod=755 /build/target/release/postgres-wrapper /usr/local/bin/postgres-wrapper
-COPY --from=rust-builder --chmod=755 /build/target/release/post-bootstrap /usr/local/bin/post-bootstrap
-COPY --from=rust-builder --chmod=755 /build/target/release/patroni-runner /usr/local/bin/patroni-runner
-COPY --from=rust-builder --chmod=755 /build/target/release/on-role-change /usr/local/bin/on-role-change
+COPY --from=rust-builder-local-output --chmod=755 /postgres-wrapper /usr/local/bin/postgres-wrapper
+COPY --from=rust-builder-local-output --chmod=755 /post-bootstrap /usr/local/bin/post-bootstrap
+COPY --from=rust-builder-local-output --chmod=755 /patroni-runner /usr/local/bin/patroni-runner
+COPY --from=rust-builder-local-output --chmod=755 /on-role-change /usr/local/bin/on-role-change
 
 EXPOSE 5432 8008
 
