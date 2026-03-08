@@ -7,6 +7,7 @@
 //! - Common helper functions
 
 pub mod bootstrap;
+pub mod health_server;
 mod paths;
 pub mod patroni;
 mod ssl;

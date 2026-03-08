@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use common::init_logging;
 use nix::sys::stat::{umask, Mode};
+use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
     generate_patroni_config, run_monitoring_loop, update_pg_hba_for_replication, Config,
 };
@@ -132,6 +133,9 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 async fn main() -> Result<()> {
     let _guard = init_logging("patroni-runner");
 
+    // Capture health server config BEFORE clearing PG* env vars
+    let health_config = HealthServerConfig::from_env();
+
     let telemetry = Telemetry::from_env("postgres-ha");
     let config = Config::from_env()?;
 
@@ -199,6 +203,10 @@ async fn main() -> Result<()> {
     // Set umask so pg_basebackup creates files with correct permissions (0600/0700)
     // Without this, container environments may create files too permissive for PostgreSQL
     umask(Mode::from_bits_truncate(0o077));
+
+    // Start health server for HAProxy health checks
+    // This runs independently and queries PostgreSQL directly for primary/replica status
+    let _health_handle = health_server::start(health_config).await?;
 
     // Start Patroni and run monitoring loop
     let child = start_patroni().await?;
