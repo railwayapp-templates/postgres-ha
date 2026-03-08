@@ -42,7 +42,7 @@ fn generate_primary_backend(
             r#"backend postgresql_primary_backend
     option httpchk
     http-check connect linger
-    http-check send meth GET uri /primary ver HTTP/1.1 hdr Host localhost hdr Connection close
+    http-check send meth GET uri /primary ver HTTP/1.1 hdr Host localhost
     http-check expect status 200
     default-server inter {} fall 3 rise 2 fastinter {} downinter {} on-marked-down shutdown-sessions
 {}"#,
@@ -71,7 +71,7 @@ fn generate_replica_backend(
     balance leastconn
     option httpchk
     http-check connect linger
-    http-check send meth GET uri /replica ver HTTP/1.1 hdr Host localhost hdr Connection close
+    http-check send meth GET uri /replica ver HTTP/1.1 hdr Host localhost
     http-check expect status 200
     default-server inter {} fall 3 rise 2 fastinter {} downinter {} on-marked-down shutdown-sessions
 {}"#,
