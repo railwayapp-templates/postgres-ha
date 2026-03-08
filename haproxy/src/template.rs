@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::nodes::PostgresNode;
 
 /// Generate server entries for backend configuration
-fn generate_server_entries(nodes: &[PostgresNode], single_node_mode: bool, use_pgsql_check: bool) -> String {
+fn generate_server_entries(nodes: &[PostgresNode], single_node_mode: bool, health_port_override: Option<u16>) -> String {
     nodes
         .iter()
         .map(|node| {
@@ -14,17 +14,15 @@ fn generate_server_entries(nodes: &[PostgresNode], single_node_mode: bool, use_p
                     "    server {} {}:{} check resolvers railway resolve-prefer ipv4",
                     node.name, node.host, node.pg_port
                 )
-            } else if use_pgsql_check {
-                // Direct PostgreSQL check: external-check connects to pg_port
-                format!(
-                    "    server {} {}:{} check resolvers railway resolve-prefer ipv4",
-                    node.name, node.host, node.pg_port
-                )
             } else {
-                // Patroni REST API check: check port is the health_port
+                // Multi-node: HTTP health check on health port
+                let health_port = match health_port_override {
+                    Some(port) => port.to_string(),
+                    None => node.health_port.clone(),
+                };
                 format!(
                     "    server {} {}:{} check port {} resolvers railway resolve-prefer ipv4",
-                    node.name, node.host, node.pg_port, node.health_port
+                    node.name, node.host, node.pg_port, health_port
                 )
             }
         })
@@ -41,23 +39,12 @@ fn generate_primary_backend(config: &Config, server_entries: &str, single_node_m
 {}"#,
             config.check_interval, config.check_fastinter, config.check_downinter, server_entries
         )
-    } else if config.use_pgsql_check {
-        // Direct PostgreSQL check via pg_is_in_recovery()
-        format!(
-            r#"backend postgresql_primary_backend
-    option external-check
-    external-check command /usr/local/bin/check-primary.sh
-    default-server inter {} fall 3 rise 2 fastinter {} downinter {} on-marked-down shutdown-sessions
-{}"#,
-            config.check_interval, config.check_fastinter, config.check_downinter, server_entries
-        )
     } else {
-        // Patroni REST API check
+        // HTTP health check (works for both Patroni API and direct health server)
         format!(
             r#"backend postgresql_primary_backend
     option httpchk
-    http-check connect linger
-    http-check send meth GET uri /primary ver HTTP/1.1 hdr Host localhost
+    http-check send meth GET uri /primary
     http-check expect status 200
     default-server inter {} fall 3 rise 2 fastinter {} downinter {} on-marked-down shutdown-sessions
 {}"#,
@@ -76,25 +63,13 @@ fn generate_replica_backend(config: &Config, server_entries: &str, single_node_m
 {}"#,
             config.check_interval, config.check_fastinter, config.check_downinter, server_entries
         )
-    } else if config.use_pgsql_check {
-        // Direct PostgreSQL check via pg_is_in_recovery()
-        format!(
-            r#"backend postgresql_replicas_backend
-    balance leastconn
-    option external-check
-    external-check command /usr/local/bin/check-replica.sh
-    default-server inter {} fall 3 rise 2 fastinter {} downinter {} on-marked-down shutdown-sessions
-{}"#,
-            config.check_interval, config.check_fastinter, config.check_downinter, server_entries
-        )
     } else {
-        // Patroni REST API check
+        // HTTP health check (works for both Patroni API and direct health server)
         format!(
             r#"backend postgresql_replicas_backend
     balance leastconn
     option httpchk
-    http-check connect linger
-    http-check send meth GET uri /replica ver HTTP/1.1 hdr Host localhost
+    http-check send meth GET uri /replica
     http-check expect status 200
     default-server inter {} fall 3 rise 2 fastinter {} downinter {} on-marked-down shutdown-sessions
 {}"#,
@@ -106,22 +81,14 @@ fn generate_replica_backend(config: &Config, server_entries: &str, single_node_m
 /// Generate complete HAProxy configuration
 pub fn generate_config(config: &Config, nodes: &[PostgresNode]) -> String {
     let single_node_mode = nodes.len() == 1;
-    let server_entries = generate_server_entries(nodes, single_node_mode, config.use_pgsql_check);
+    let server_entries = generate_server_entries(nodes, single_node_mode, config.health_port_override);
     let primary_backend = generate_primary_backend(config, &server_entries, single_node_mode);
     let replica_backend = generate_replica_backend(config, &server_entries, single_node_mode);
-
-    // Enable external-check in global section when using pgsql checks
-    // insecure-fork-wanted is required for HAProxy 2.4+ to allow forking for external checks
-    let external_check_global = if !single_node_mode && config.use_pgsql_check {
-        "\n    external-check\n    insecure-fork-wanted"
-    } else {
-        ""
-    };
 
     format!(
         r#"global
     maxconn {}
-    log stdout format raw local0{}
+    log stdout format raw local0
 
 defaults
     log global
@@ -171,7 +138,6 @@ frontend postgresql_replicas
 {}
 "#,
         config.max_conn,
-        external_check_global,
         config.timeout_connect,
         config.timeout_client,
         config.timeout_server,

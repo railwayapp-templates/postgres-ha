@@ -36,5 +36,3 @@ tokio.workspace = true
 tracing.workspace = true
 axum.workspace = true
 tokio-postgres.workspace = true
-bb8.workspace = true
-bb8-postgres.workspace = true

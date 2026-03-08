@@ -20,13 +20,13 @@ use tracing::{error, info};
 /// The server runs in a background task and handles requests independently
 /// of the main Patroni process.
 pub async fn start(config: HealthServerConfig) -> Result<tokio::task::JoinHandle<()>> {
-    let pool = postgres::create_pool(&config).await?;
-    let app = routes::create_router(pool);
+    let port = config.port;
+    let app = routes::create_router(config);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
 
-    info!(port = config.port, "Health server listening");
+    info!(port, "Health server listening");
 
     let handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
