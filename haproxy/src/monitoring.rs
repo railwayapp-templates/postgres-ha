@@ -38,6 +38,7 @@ pub fn run_monitoring_loop(
         .build()?;
 
     let mut no_primary_alerted = false;
+    let mut no_replica_alerted = false;
 
     loop {
         // Check if HAProxy is still running
@@ -53,10 +54,11 @@ pub fn run_monitoring_loop(
             }
         }
 
-        // Check backend health
-        match check_primary_backend(&client) {
-            Ok(healthy_count) => {
-                if healthy_count == 0 {
+        // Check backend health (single request for both primary and replica)
+        match check_backend_health(&client) {
+            Ok(BackendHealth { primary, replica }) => {
+                // Handle primary backend
+                if primary == 0 {
                     if !no_primary_alerted {
                         warn!("No healthy primary backend - cluster has no leader");
                         telemetry.send(TelemetryEvent::DcsUnavailable {
@@ -67,9 +69,26 @@ pub fn run_monitoring_loop(
                     }
                 } else {
                     if no_primary_alerted {
-                        info!(healthy_count, "Primary backend recovered");
+                        info!(healthy_count = primary, "Primary backend recovered");
                     }
                     no_primary_alerted = false;
+                }
+
+                // Handle replica backend
+                if replica == 0 {
+                    if !no_replica_alerted {
+                        warn!("No healthy replica backend - no replicas available for reads");
+                        telemetry.send(TelemetryEvent::ReplicaUnavailable {
+                            node: "haproxy".to_string(),
+                            scope: "postgresql_replicas_backend".to_string(),
+                        });
+                        no_replica_alerted = true;
+                    }
+                } else {
+                    if no_replica_alerted {
+                        info!(healthy_count = replica, "Replica backend recovered");
+                    }
+                    no_replica_alerted = false;
                 }
             }
             Err(e) => {
@@ -81,24 +100,31 @@ pub fn run_monitoring_loop(
     }
 }
 
-/// Check how many healthy servers are in the primary backend
-fn check_primary_backend(client: &reqwest::blocking::Client) -> Result<usize> {
+struct BackendHealth {
+    primary: usize,
+    replica: usize,
+}
+
+/// Check how many healthy servers are in each backend (single HTTP request)
+fn check_backend_health(client: &reqwest::blocking::Client) -> Result<BackendHealth> {
     let resp = client.get(STATS_URL).send()?;
     let body = resp.text()?;
 
-    // HAProxy CSV format: pxname,svname,status,...
-    // We want rows where pxname=postgresql_primary_backend and status=UP
-    let healthy_count = body
-        .lines()
-        .filter(|line| {
-            let parts: Vec<&str> = line.split(',').collect();
-            // pxname is column 0, svname is column 1, status is column 17
-            parts.len() > 17
-                && parts[0] == "postgresql_primary_backend"
-                && parts[1] != "BACKEND" // Skip the backend summary row
-                && parts[17] == "UP"
-        })
-        .count();
+    let mut primary = 0;
+    let mut replica = 0;
 
-    Ok(healthy_count)
+    // HAProxy CSV format: pxname,svname,status,...
+    // pxname is column 0, svname is column 1, status is column 17
+    for line in body.lines() {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() > 17 && parts[1] != "BACKEND" && parts[17] == "UP" {
+            match parts[0] {
+                "postgresql_primary_backend" => primary += 1,
+                "postgresql_replicas_backend" => replica += 1,
+                _ => {}
+            }
+        }
+    }
+
+    Ok(BackendHealth { primary, replica })
 }

@@ -63,6 +63,9 @@ pub enum TelemetryEvent {
     /// This is a critical event: all nodes demoted, no writes possible
     DcsUnavailable { node: String, scope: String },
 
+    /// Replica backend unavailable - no healthy replicas for read traffic
+    ReplicaUnavailable { node: String, scope: String },
+
     // === etcd Events ===
     /// etcd cluster bootstrap initiated
     EtcdBootstrap {
@@ -134,6 +137,7 @@ impl TelemetryEvent {
             Self::HealthCheckFailed { .. } => "POSTGRES_HA_HEALTH_CHECK_FAILED",
             Self::ProcessDied { .. } => "POSTGRES_HA_PROCESS_DIED",
             Self::DcsUnavailable { .. } => "POSTGRES_HA_DCS_UNAVAILABLE",
+            Self::ReplicaUnavailable { .. } => "POSTGRES_HA_REPLICA_UNAVAILABLE",
             Self::EtcdBootstrap { .. } => "ETCD_CLUSTER_BOOTSTRAP",
             Self::EtcdNodeJoined { .. } => "ETCD_NODE_JOINED",
             Self::EtcdNodePromoted { .. } => "ETCD_NODE_PROMOTED",
@@ -193,6 +197,12 @@ impl TelemetryEvent {
             Self::DcsUnavailable { node, scope } => {
                 format!(
                     "DCS unavailable - {} demoted, cluster {} has no leader (write outage)",
+                    node, scope
+                )
+            }
+            Self::ReplicaUnavailable { node, scope } => {
+                format!(
+                    "Replica unavailable - {} reports no healthy replicas in {} (read-only traffic affected)",
                     node, scope
                 )
             }
