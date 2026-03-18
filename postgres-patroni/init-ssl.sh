@@ -62,6 +62,7 @@ ssl = on
 ssl_cert_file = '$SSL_SERVER_CRT'
 ssl_key_file = '$SSL_SERVER_KEY'
 ssl_ca_file = '$SSL_ROOT_CRT'
+shared_preload_libraries = 'pg_stat_statements'
 EOF
 else
     echo "Patroni mode: SSL certs generated, Patroni will configure PostgreSQL SSL settings"

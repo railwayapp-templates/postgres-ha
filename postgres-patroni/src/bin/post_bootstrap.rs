@@ -6,12 +6,12 @@
 
 use anyhow::{Context, Result};
 use common::{init_logging, Telemetry, TelemetryEvent};
-use postgres_patroni::bootstrap::{read_credentials, run_psql, run_psql_script, PATRONI_CONFIG};
+use postgres_patroni::bootstrap::{read_credentials, run_psql, run_psql_in_db, run_psql_script, PATRONI_CONFIG};
 use postgres_patroni::volume_root;
 use std::env;
 use std::path::Path;
 use std::time::Instant;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn main() -> Result<()> {
     let _guard = init_logging("post-bootstrap");
@@ -164,6 +164,24 @@ $$;
                 user = creds.app_user,
             );
             run_psql_script(&creds.superuser, &grant_sql)?;
+        }
+    }
+
+    // Enable pg_stat_statements extension in postgres database and app database
+    if let Err(e) = run_psql(
+        &creds.superuser,
+        "CREATE EXTENSION IF NOT EXISTS pg_stat_statements",
+    ) {
+        warn!(error = %e, "Failed to create pg_stat_statements in postgres database");
+    }
+
+    if !creds.app_db.is_empty() && creds.app_db != "postgres" {
+        if let Err(e) = run_psql_in_db(
+            &creds.superuser,
+            &creds.app_db,
+            "CREATE EXTENSION IF NOT EXISTS pg_stat_statements",
+        ) {
+            warn!(error = %e, database = %creds.app_db, "Failed to create pg_stat_statements in app database");
         }
     }
 
