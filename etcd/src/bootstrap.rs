@@ -204,6 +204,7 @@ pub async fn monitor_and_mark_bootstrap(
                     std::process::exit(1);
                 }
                 info!("Bootstrap marked complete");
+                break;
             }
         }
     }
@@ -397,7 +398,7 @@ async fn is_etcd_leader() -> bool {
     match etcdctl(&[
         "endpoint",
         "status",
-        "--endpoints=http://127.0.0.1:2379",
+        "--endpoints=127.0.0.1:2379",
         "--write-out=json",
     ])
     .await
@@ -424,13 +425,13 @@ pub async fn defrag_loop(config: Config, telemetry: Telemetry) {
     sleep(jitter).await;
 
     loop {
-        match etcdctl_probe(&["endpoint", "health", "--endpoints=http://127.0.0.1:2379"]).await {
+        match etcdctl_probe(&["endpoint", "health", "--endpoints=127.0.0.1:2379"]).await {
             Ok(true) => {
                 if is_etcd_leader().await {
                     info!("Skipping defrag: this node is the etcd leader");
                 } else {
                     info!("Starting defrag");
-                    match etcdctl(&["defrag", "--endpoints=http://127.0.0.1:2379"]).await {
+                    match etcdctl(&["defrag", "--endpoints=127.0.0.1:2379"]).await {
                         Ok(_) => info!("Defrag complete"),
                         Err(e) => {
                             warn!(error = %e, "Defrag failed");

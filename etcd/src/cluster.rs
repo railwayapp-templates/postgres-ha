@@ -57,7 +57,7 @@ pub async fn get_member_list(endpoint: &str) -> Result<Vec<MemberInfo>> {
 
 /// Check cluster health via localhost or voting member
 pub async fn check_cluster_health(initial_cluster: &str) -> Result<bool> {
-    if etcdctl_probe(&["endpoint", "health", "--endpoints=http://127.0.0.1:2379"]).await? {
+    if etcdctl_probe(&["endpoint", "health", "--endpoints=127.0.0.1:2379"]).await? {
         return Ok(true);
     }
 

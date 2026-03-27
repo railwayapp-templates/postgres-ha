@@ -47,6 +47,6 @@ ENV ETCD_STABILIZE_TIME=30
 EXPOSE 2379 2380
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
-  CMD etcdctl endpoint health --endpoints=http://127.0.0.1:2379 || exit 1
+  CMD etcdctl endpoint health --endpoints=127.0.0.1:2379 || exit 1
 
 ENTRYPOINT ["/entrypoint"]
