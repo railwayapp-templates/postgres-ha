@@ -105,8 +105,9 @@ async fn main() -> Result<()> {
         });
 
         let defrag_config = Config::from_env()?;
+        let defrag_telemetry = telemetry.clone();
         let defrag_handle = tokio::spawn(async move {
-            defrag_loop(defrag_config).await
+            defrag_loop(defrag_config, defrag_telemetry).await
         });
 
         let status = child.wait().await?;

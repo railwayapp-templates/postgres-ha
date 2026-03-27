@@ -374,6 +374,13 @@ pub async fn bootstrap_as_follower(
 // heartbeat timeouts. Each node defrags only itself (localhost:2379), so no
 // cross-node coordination is needed. Jitter from the node name staggers defrag
 // times so that the three nodes never defrag simultaneously.
+//
+// We skip defrag when this node is the etcd leader: defrag blocks the boltdb
+// file lock, which can delay Raft heartbeats and trigger a leader election.
+// During an election, writes to etcd are briefly unavailable; Patroni running
+// on the PostgreSQL primary holds a session lock that must be refreshed — if
+// the write outage outlasts Patroni's TTL it will self-demote, causing a
+// PostgreSQL failover. Followers defrag safely without any of these risks.
 
 const DEFRAG_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
 
@@ -385,8 +392,23 @@ fn jitter_from_name(name: &str, max: Duration) -> Duration {
     Duration::from_secs(hash % max.as_secs())
 }
 
+/// Returns true if the local etcd node is currently the Raft leader.
+async fn is_etcd_leader() -> bool {
+    match etcdctl(&[
+        "endpoint",
+        "status",
+        "--endpoints=http://127.0.0.1:2379",
+        "--write-out=json",
+    ])
+    .await
+    {
+        Ok(output) => output.contains("\"isLeader\":true"),
+        Err(_) => false,
+    }
+}
+
 /// Periodic defragmentation loop. Runs as a background task after bootstrap completes.
-pub async fn defrag_loop(config: Config) {
+pub async fn defrag_loop(config: Config, telemetry: Telemetry) {
     // Wait for bootstrap to complete before the first defrag
     let marker_path = config.bootstrap_marker();
     loop {
@@ -404,10 +426,20 @@ pub async fn defrag_loop(config: Config) {
     loop {
         match etcdctl_probe(&["endpoint", "health", "--endpoints=http://127.0.0.1:2379"]).await {
             Ok(true) => {
-                info!("Starting defrag");
-                match etcdctl(&["defrag", "--endpoints=http://127.0.0.1:2379"]).await {
-                    Ok(_) => info!("Defrag complete"),
-                    Err(e) => warn!(error = %e, "Defrag failed"),
+                if is_etcd_leader().await {
+                    info!("Skipping defrag: this node is the etcd leader");
+                } else {
+                    info!("Starting defrag");
+                    match etcdctl(&["defrag", "--endpoints=http://127.0.0.1:2379"]).await {
+                        Ok(_) => info!("Defrag complete"),
+                        Err(e) => {
+                            warn!(error = %e, "Defrag failed");
+                            telemetry.send(TelemetryEvent::EtcdDefragFailed {
+                                node: config.etcd_name.clone(),
+                                error: e.to_string(),
+                            });
+                        }
+                    }
                 }
             }
             Ok(false) => info!("Skipping defrag: local etcd unhealthy"),
