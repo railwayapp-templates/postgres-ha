@@ -19,7 +19,8 @@ use tokio::time::sleep;
 use tracing::{error, info};
 
 use bootstrap::{
-    bootstrap_as_follower, bootstrap_as_leader, clean_stale_data, monitor_and_mark_bootstrap,
+    bootstrap_as_follower, bootstrap_as_leader, clean_stale_data, defrag_loop,
+    monitor_and_mark_bootstrap,
 };
 use cluster::{clear_directory, has_local_data, start_etcd};
 use config::{get_bootstrap_leader, Config};
@@ -103,8 +104,14 @@ async fn main() -> Result<()> {
             monitor_and_mark_bootstrap(&monitor_config, joined_as_learner, monitor_telemetry).await
         });
 
+        let defrag_config = Config::from_env()?;
+        let defrag_handle = tokio::spawn(async move {
+            defrag_loop(defrag_config).await
+        });
+
         let status = child.wait().await?;
         monitor_handle.abort();
+        defrag_handle.abort();
 
         if status.success() {
             info!("etcd exited cleanly");

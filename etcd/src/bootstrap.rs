@@ -10,6 +10,7 @@ use crate::config::{get_leader_endpoint, parse_initial_cluster, peer_to_client_u
 use anyhow::{anyhow, Result};
 use common::{etcdctl, etcdctl_probe, Telemetry, TelemetryEvent};
 use std::path::Path;
+use std::time::Duration;
 use tokio::fs;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -363,5 +364,55 @@ pub async fn bootstrap_as_follower(
             warn!(error = %e, "Failed to add as learner");
             Ok(None) // Signal retry needed
         }
+    }
+}
+
+// ---- Periodic defragmentation ----
+// etcd compaction removes old revisions from the keyspace but does not reclaim
+// physical space in the underlying bolt DB file. Without periodic defrag the DB
+// grows continuously from fragmentation, causing slow fdatasync/reads and
+// heartbeat timeouts. Each node defrags only itself (localhost:2379), so no
+// cross-node coordination is needed. Jitter from the node name staggers defrag
+// times so that the three nodes never defrag simultaneously.
+
+const DEFRAG_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// Derive a deterministic per-node jitter from the node name (no rand dep needed).
+fn jitter_from_name(name: &str, max: Duration) -> Duration {
+    let hash = name
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    Duration::from_secs(hash % max.as_secs())
+}
+
+/// Periodic defragmentation loop. Runs as a background task after bootstrap completes.
+pub async fn defrag_loop(config: Config) {
+    // Wait for bootstrap to complete before the first defrag
+    let marker_path = config.bootstrap_marker();
+    loop {
+        if Path::new(&marker_path).exists() {
+            break;
+        }
+        sleep(Duration::from_secs(10)).await;
+    }
+
+    // Per-node jitter to prevent all three nodes defraging at the same time
+    let jitter = jitter_from_name(&config.etcd_name, DEFRAG_INTERVAL);
+    info!(jitter_secs = jitter.as_secs(), node = %config.etcd_name, "Defrag initial jitter");
+    sleep(jitter).await;
+
+    loop {
+        match etcdctl_probe(&["endpoint", "health", "--endpoints=http://127.0.0.1:2379"]).await {
+            Ok(true) => {
+                info!("Starting defrag");
+                match etcdctl(&["defrag", "--endpoints=http://127.0.0.1:2379"]).await {
+                    Ok(_) => info!("Defrag complete"),
+                    Err(e) => warn!(error = %e, "Defrag failed"),
+                }
+            }
+            Ok(false) => info!("Skipping defrag: local etcd unhealthy"),
+            Err(e) => warn!(error = %e, "Health check error, skipping defrag"),
+        }
+        sleep(DEFRAG_INTERVAL).await;
     }
 }
