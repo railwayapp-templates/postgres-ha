@@ -4,7 +4,7 @@
 
 use crate::cluster::{
     add_self_to_cluster, check_cluster_health, clear_directory, get_current_cluster,
-    has_local_data, promote_self, remove_stale_self,
+    get_member_list, has_local_data, promote_self, remove_stale_self,
 };
 use crate::config::{get_leader_endpoint, parse_initial_cluster, peer_to_client_url, Config};
 use anyhow::{anyhow, Result};
@@ -375,13 +375,6 @@ pub async fn bootstrap_as_follower(
 // heartbeat timeouts. Each node defrags only itself (localhost:2379), so no
 // cross-node coordination is needed. Jitter from the node name staggers defrag
 // times so that the three nodes never defrag simultaneously.
-//
-// We skip defrag when this node is the etcd leader: defrag blocks the boltdb
-// file lock, which can delay Raft heartbeats and trigger a leader election.
-// During an election, writes to etcd are briefly unavailable; Patroni running
-// on the PostgreSQL primary holds a session lock that must be refreshed — if
-// the write outage outlasts Patroni's TTL it will self-demote, causing a
-// PostgreSQL failover. Followers defrag safely without any of these risks.
 
 const DEFRAG_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
 
@@ -394,7 +387,7 @@ fn jitter_from_name(name: &str, max: Duration) -> Duration {
 }
 
 /// Returns true if the local etcd node is currently the Raft leader.
-async fn is_etcd_leader() -> bool {
+async fn is_this_node_leader() -> bool {
     match etcdctl(&[
         "endpoint",
         "status",
@@ -405,6 +398,23 @@ async fn is_etcd_leader() -> bool {
     {
         Ok(output) => output.contains("\"isLeader\":true"),
         Err(_) => false,
+    }
+}
+
+/// Transfer etcd leadership to a voting follower so this node can defrag safely.
+async fn move_leader_away(config: &Config) -> Result<()> {
+    let members = get_member_list("127.0.0.1:2379").await?;
+    let follower = members
+        .iter()
+        .find(|m| !m.is_learner && m.name != config.etcd_name);
+
+    match follower {
+        Some(m) => {
+            etcdctl(&["move-leader", &m.id, "--endpoints=127.0.0.1:2379"]).await?;
+            info!(target = %m.name, "Leadership transferred");
+            Ok(())
+        }
+        None => Err(anyhow!("No voting follower available to transfer leadership to")),
     }
 }
 
@@ -427,19 +437,26 @@ pub async fn defrag_loop(config: Config, telemetry: Telemetry) {
     loop {
         match etcdctl_probe(&["endpoint", "health", "--endpoints=127.0.0.1:2379"]).await {
             Ok(true) => {
-                if is_etcd_leader().await {
-                    info!("Skipping defrag: this node is the etcd leader");
-                } else {
-                    info!("Starting defrag");
-                    match etcdctl(&["defrag", "--endpoints=127.0.0.1:2379"]).await {
-                        Ok(_) => info!("Defrag complete"),
+                if is_this_node_leader().await {
+                    info!("This node is leader; transferring leadership before defrag");
+                    match move_leader_away(&config).await {
+                        Ok(_) => sleep(Duration::from_secs(2)).await,
                         Err(e) => {
-                            warn!(error = %e, "Defrag failed");
-                            telemetry.send(TelemetryEvent::EtcdDefragFailed {
-                                node: config.etcd_name.clone(),
-                                error: e.to_string(),
-                            });
+                            warn!(error = %e, "Failed to transfer leadership, skipping defrag");
+                            sleep(DEFRAG_INTERVAL).await;
+                            continue;
                         }
+                    }
+                }
+                info!("Starting defrag");
+                match etcdctl(&["defrag", "--endpoints=127.0.0.1:2379"]).await {
+                    Ok(_) => info!("Defrag complete"),
+                    Err(e) => {
+                        warn!(error = %e, "Defrag failed");
+                        telemetry.send(TelemetryEvent::EtcdDefragFailed {
+                            node: config.etcd_name.clone(),
+                            error: e.to_string(),
+                        });
                     }
                 }
             }
