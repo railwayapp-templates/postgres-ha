@@ -438,15 +438,15 @@ pub async fn defrag_loop(config: Config, telemetry: Telemetry) {
         match etcdctl_probe(&["endpoint", "health", "--endpoints=127.0.0.1:2379"]).await {
             Ok(true) => {
                 if is_this_node_leader().await {
-                    info!("This node is leader; transferring leadership before defrag");
+                    info!("This node is leader; transferring leadership and skipping defrag until next cycle");
                     match move_leader_away(&config).await {
-                        Ok(_) => sleep(Duration::from_secs(2)).await,
+                        Ok(_) => {}
                         Err(e) => {
                             warn!(error = %e, "Failed to transfer leadership, skipping defrag");
-                            sleep(DEFRAG_INTERVAL).await;
-                            continue;
                         }
                     }
+                    sleep(DEFRAG_INTERVAL).await;
+                    continue;
                 }
                 info!("Starting defrag");
                 match etcdctl(&["defrag", "--endpoints=127.0.0.1:2379"]).await {
