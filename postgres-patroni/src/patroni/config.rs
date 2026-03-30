@@ -65,10 +65,10 @@ impl Config {
             data_dir: pgdata(),
             certs_dir: ssl_dir(),
             // Constraint: loop_wait + 2*retry_timeout <= ttl
-            // Safety margin: 10 + 2*10 = 30 < 40 (10s buffer)
-            ttl: String::env_or("PATRONI_TTL", "40"),
+            // 10 + 2*17 = 44 <= 45 (1s buffer)
+            ttl: String::env_or("PATRONI_TTL", "45"),
             loop_wait: String::env_or("PATRONI_LOOP_WAIT", "10"),
-            retry_timeout: String::env_or("PATRONI_RETRY_TIMEOUT", "10"),
+            retry_timeout: String::env_or("PATRONI_RETRY_TIMEOUT", "17"),
             health_check_interval: u64::env_parse("PATRONI_HEALTH_CHECK_INTERVAL", 5),
             health_check_timeout: u64::env_parse("PATRONI_HEALTH_CHECK_TIMEOUT", 5),
             max_failures: u32::env_parse("PATRONI_MAX_HEALTH_FAILURES", 3),

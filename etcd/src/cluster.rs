@@ -372,6 +372,7 @@ pub async fn start_etcd(
 
     let child = Command::new("/usr/local/bin/etcd")
         .arg("--auto-compaction-retention=1")
+        .arg("--snapshot-count=1000")
         .arg("--max-learners=2")
         .env("ETCD_INITIAL_CLUSTER", initial_cluster)
         .env("ETCD_INITIAL_CLUSTER_STATE", initial_cluster_state)

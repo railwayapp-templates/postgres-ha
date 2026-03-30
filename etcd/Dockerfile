@@ -43,6 +43,11 @@ ENV ETCD_ENABLE_GRPC_GATEWAY=true
 ENV ETCD_MAX_RETRIES=60
 ENV ETCD_RETRY_DELAY=5
 ENV ETCD_STABILIZE_TIME=30
+# Tolerances for slower network-attached volumes (etcd defaults 100ms/1000ms are tuned for NVMe).
+# Slow fsyncs cause missed heartbeats → unnecessary leader elections → Patroni lock renewal failures.
+# Rule: ETCD_ELECTION_TIMEOUT must be 5-10x ETCD_HEARTBEAT_INTERVAL.
+ENV ETCD_HEARTBEAT_INTERVAL=500
+ENV ETCD_ELECTION_TIMEOUT=5000
 
 EXPOSE 2379 2380
 
