@@ -56,7 +56,7 @@ pub fn run_monitoring_loop(
 
         // Check backend health (single request for both primary and replica)
         match check_backend_health(&client) {
-            Ok(BackendHealth { primary, replica }) => {
+            Ok(BackendHealth { primary, replica, down_replicas }) => {
                 // Handle primary backend
                 if primary == 0 {
                     if !no_primary_alerted {
@@ -77,10 +77,11 @@ pub fn run_monitoring_loop(
                 // Handle replica backend
                 if replica == 0 {
                     if !no_replica_alerted {
-                        warn!("No healthy replica backend - no replicas available for reads");
+                        warn!(servers = ?down_replicas, "No healthy replica backend - no replicas available for reads");
                         telemetry.send(TelemetryEvent::ReplicaUnavailable {
                             node: "haproxy".to_string(),
                             scope: "postgresql_replicas_backend".to_string(),
+                            servers: down_replicas,
                         });
                         no_replica_alerted = true;
                     }
@@ -103,6 +104,7 @@ pub fn run_monitoring_loop(
 struct BackendHealth {
     primary: usize,
     replica: usize,
+    down_replicas: Vec<String>,
 }
 
 /// Check how many healthy servers are in each backend (single HTTP request)
@@ -112,19 +114,30 @@ fn check_backend_health(client: &reqwest::blocking::Client) -> Result<BackendHea
 
     let mut primary = 0;
     let mut replica = 0;
+    let mut down_replicas = Vec::new();
 
     // HAProxy CSV format: pxname,svname,status,...
     // pxname is column 0, svname is column 1, status is column 17
     for line in body.lines() {
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() > 17 && parts[1] != "BACKEND" && parts[17] == "UP" {
+        if parts.len() > 17 && parts[1] != "BACKEND" {
             match parts[0] {
-                "postgresql_primary_backend" => primary += 1,
-                "postgresql_replicas_backend" => replica += 1,
+                "postgresql_primary_backend" => {
+                    if parts[17] == "UP" {
+                        primary += 1;
+                    }
+                }
+                "postgresql_replicas_backend" => {
+                    if parts[17] == "UP" {
+                        replica += 1;
+                    } else {
+                        down_replicas.push(parts[1].to_string());
+                    }
+                }
                 _ => {}
             }
         }
     }
 
-    Ok(BackendHealth { primary, replica })
+    Ok(BackendHealth { primary, replica, down_replicas })
 }

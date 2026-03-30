@@ -64,7 +64,7 @@ pub enum TelemetryEvent {
     DcsUnavailable { node: String, scope: String },
 
     /// Replica backend unavailable - no healthy replicas for read traffic
-    ReplicaUnavailable { node: String, scope: String },
+    ReplicaUnavailable { node: String, scope: String, servers: Vec<String> },
 
     // === etcd Events ===
     /// etcd cluster bootstrap initiated
@@ -204,11 +204,18 @@ impl TelemetryEvent {
                     node, scope
                 )
             }
-            Self::ReplicaUnavailable { node, scope } => {
-                format!(
-                    "Replica unavailable - {} reports no healthy replicas in {} (read-only traffic affected)",
-                    node, scope
-                )
+            Self::ReplicaUnavailable { node, scope, servers } => {
+                if servers.is_empty() {
+                    format!(
+                        "Replica unavailable - {} reports no healthy replicas in {} (read-only traffic affected)",
+                        node, scope
+                    )
+                } else {
+                    format!(
+                        "Replica unavailable - {} reports no healthy replicas in {} (read-only traffic affected): {}",
+                        node, scope, servers.join(", ")
+                    )
+                }
             }
             Self::EtcdBootstrap {
                 node,
