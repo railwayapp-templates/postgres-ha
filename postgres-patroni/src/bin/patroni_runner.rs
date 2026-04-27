@@ -9,7 +9,8 @@ use common::init_logging;
 use nix::sys::stat::{umask, Mode};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
-    generate_patroni_config, run_monitoring_loop, update_pg_hba_for_replication, Config,
+    generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
+    update_pg_hba_for_replication, Config,
 };
 use postgres_patroni::{volume_root, Telemetry};
 use serde::{Deserialize, Serialize};
@@ -139,17 +140,16 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 /// pgBackRest drops WAL and reports success to Postgres rather than letting
 /// `pg_wal` fill the data volume.
 ///
-/// Idempotent: rewritten on every boot when the gate var is set; removed on
-/// every boot when unset (so disabling PITR cleans up).
-fn render_pgbackrest_conf(data_dir: &str, enabled: bool) -> Result<()> {
+/// Always rendered, regardless of whether archiving is currently enabled.
+/// Reasoning: during a disable transition, DCS may still hold
+/// `archive_mode=on` until the reconcile task patches it out and Postgres
+/// restarts. If the conf file were missing, `archive_command` would fail
+/// synchronously on every WAL switch and `pg_wal` would grow unbounded.
+/// With the conf present, pgbackrest enqueues to the spool, the async
+/// daemon fails the S3 push (no creds), and `archive-push-queue-max`
+/// trips at 5 GiB — DB stays up at the cost of a truncated PITR window.
+fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
     let conf_path = "/etc/pgbackrest/pgbackrest.conf";
-    if !enabled {
-        if Path::new(conf_path).exists() {
-            fs::remove_file(conf_path).context("Failed to remove pgbackrest.conf")?;
-            info!("pgbackrest disabled — removed {}", conf_path);
-        }
-        return Ok(());
-    }
 
     let conf = format!(
         "[global]\n\
@@ -296,10 +296,14 @@ async fn main() -> Result<()> {
     fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))
         .context("Failed to set data directory permissions")?;
 
-    // Render /etc/pgbackrest/pgbackrest.conf when archiving is enabled, or
-    // remove it when disabled. Must run before Patroni starts Postgres so the
-    // archive_command we emit into DCS can find the config on its first call.
-    render_pgbackrest_conf(&config.data_dir, config.pgbackrest_s3_bucket.is_some())?;
+    // Render /etc/pgbackrest/pgbackrest.conf unconditionally. The conf is
+    // operator policy (queue-max, async, spool-path, stanza definition) and
+    // is always safe to have in place: pgbackrest only does anything when
+    // Postgres invokes archive_command, and that is gated by archive_mode in
+    // DCS, not by the presence of this file. Keeping it always-present means
+    // archive_command can never fail synchronously due to a missing conf —
+    // worst case, queue-max trips and Postgres keeps running.
+    render_pgbackrest_conf(&config.data_dir)?;
 
     // Stage pgBackRest PITR replay if requested. No-op unless
     // POSTGRES_RECOVERY_TARGET_TIME is set. Must run before Patroni starts
@@ -325,5 +329,22 @@ async fn main() -> Result<()> {
 
     // Start Patroni and run monitoring loop
     let child = start_patroni().await?;
+
+    // Spawn a one-shot DCS reconcile task. This waits for Patroni's REST API
+    // to come up, then PATCHes /config so DCS archive params match env-var
+    // intent. Required because `bootstrap.dcs` only seeds DCS at first
+    // cluster init; without this, env-var changes on existing clusters are
+    // silently ignored by Patroni. Failure is logged but does not abort
+    // patroni-runner — the monitoring loop must still run.
+    {
+        let reconcile_config = Config::from_env()?;
+        tokio::spawn(async move {
+            match reconcile_pgbackrest_archive_config(&reconcile_config).await {
+                Ok(()) => {}
+                Err(e) => warn!(error = %e, "DCS pgbackrest reconcile failed"),
+            }
+        });
+    }
+
     run_monitoring_loop(&config, child, &telemetry).await
 }
