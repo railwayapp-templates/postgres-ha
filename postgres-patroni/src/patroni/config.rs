@@ -39,6 +39,20 @@ pub struct Config {
     /// If true, enable synchronous replication mode. Ensures at least one
     /// replica has received the data before a write is acknowledged.
     pub synchronous_mode: bool,
+    /// pgBackRest S3 bucket name (e.g. `my-pgbackrest-bucket`). When set,
+    /// Patroni config gets `archive_mode=on` + `archive_command='pgbackrest
+    /// archive-push'` + `archive_timeout=60` and patroni-runner renders
+    /// `/etc/pgbackrest/pgbackrest.conf`. Only the current Patroni leader
+    /// fires archive_command; standbys carry the same config + binary so
+    /// promotion instantly enables archiving. pgBackRest runs in async mode
+    /// with `archive-push-queue-max=5GiB` — when the queue trips, WAL is
+    /// dropped and Postgres keeps running rather than halting on a full
+    /// `pg_wal`. When unset, Patroni config is generated as it always was.
+    pub pgbackrest_s3_bucket: Option<String>,
+    /// Target timestamp for point-in-time recovery (ISO 8601). When set on a
+    /// restored volume, the runner stages `recovery.signal` + recovery
+    /// settings in postgresql.auto.conf before Patroni starts Postgres.
+    pub pitr_target_time: Option<String>,
 }
 
 impl Config {
@@ -77,6 +91,12 @@ impl Config {
             adopt_existing_data: bool::env_parse("PATRONI_ADOPT_EXISTING_DATA", false),
             wait_for_leader: bool::env_parse("PATRONI_WAIT_FOR_LEADER", false),
             synchronous_mode: bool::env_parse("PATRONI_SYNCHRONOUS_MODE", false),
+            pgbackrest_s3_bucket: env::var("PGBACKREST_REPO1_S3_BUCKET")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            pitr_target_time: env::var("POSTGRES_RECOVERY_TARGET_TIME")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
     }
 }

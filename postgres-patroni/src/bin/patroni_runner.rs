@@ -129,6 +129,109 @@ async fn start_patroni() -> Result<tokio::process::Child> {
     Ok(child)
 }
 
+/// Render `/etc/pgbackrest/pgbackrest.conf` with operator-policy defaults +
+/// stanza definition. User-supplied options (S3 bucket, region, key, secret,
+/// endpoint, repo path) are read by pgBackRest natively from `PGBACKREST_*`
+/// env vars, so they don't need to be in the conf file.
+///
+/// The `archive-async=y` + `archive-push-queue-max=5GiB` combination is what
+/// keeps Postgres alive under sustained S3 stalls — when the queue trips,
+/// pgBackRest drops WAL and reports success to Postgres rather than letting
+/// `pg_wal` fill the data volume.
+///
+/// Idempotent: rewritten on every boot when the gate var is set; removed on
+/// every boot when unset (so disabling PITR cleans up).
+fn render_pgbackrest_conf(data_dir: &str, enabled: bool) -> Result<()> {
+    let conf_path = "/etc/pgbackrest/pgbackrest.conf";
+    if !enabled {
+        if Path::new(conf_path).exists() {
+            fs::remove_file(conf_path).context("Failed to remove pgbackrest.conf")?;
+            info!("pgbackrest disabled — removed {}", conf_path);
+        }
+        return Ok(());
+    }
+
+    let conf = format!(
+        "[global]\n\
+         repo1-type=s3\n\
+         repo1-retention-full=2\n\
+         repo1-retention-diff=4\n\
+         repo1-retention-archive=14\n\
+         repo1-retention-archive-type=incr\n\
+         log-level-console=info\n\
+         log-level-file=off\n\
+         archive-async=y\n\
+         archive-push-queue-max=5GiB\n\
+         archive-get-queue-max=1GiB\n\
+         spool-path=/var/lib/postgresql/pgbackrest-spool\n\
+         process-max=4\n\
+         compress-type=zst\n\
+         compress-level=3\n\
+         start-fast=y\n\
+         \n\
+         [main]\n\
+         pg1-path={data_dir}\n\
+         pg1-port=5432\n",
+    );
+
+    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
+    fs::write(conf_path, conf).context("Failed to write pgbackrest.conf")?;
+    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
+        .context("Failed to set pgbackrest.conf permissions")?;
+    info!("pgbackrest: rendered {}", conf_path);
+    Ok(())
+}
+
+/// Stage PITR replay before Patroni starts Postgres.
+///
+/// When `POSTGRES_RECOVERY_TARGET_TIME` is set and we haven't already staged
+/// recovery on this volume (sentinel `$PGDATA/.pitr_configured`), this writes
+/// `recovery.signal` + recovery settings to postgresql.auto.conf so Postgres
+/// enters archive recovery on boot, replays WAL from the pgBackRest repo to
+/// the target timestamp, then promotes.
+///
+/// Postgres removes `recovery.signal` automatically on successful promote.
+/// The sentinel blocks re-trigger on subsequent restarts — repeat PITR is
+/// expected to run on a fresh volume, not rerun on already-recovered data.
+fn configure_pitr_recovery(data_dir: &str, target_time: &str) -> Result<()> {
+    use std::io::Write;
+
+    let marker_path = format!("{}/.pitr_configured", data_dir);
+    if Path::new(&marker_path).exists() {
+        info!(
+            target = %target_time,
+            "PITR recovery already staged on this volume — skipping",
+        );
+        return Ok(());
+    }
+
+    // Write the marker before mutating Postgres state so a crash mid-setup
+    // doesn't leave us in a loop re-triggering replay on the next boot.
+    fs::write(&marker_path, "").context("Failed to create PITR marker")?;
+
+    let signal_path = format!("{}/recovery.signal", data_dir);
+    fs::File::create(&signal_path).context("Failed to create recovery.signal")?;
+
+    let auto_conf_path = format!("{}/postgresql.auto.conf", data_dir);
+    let addition = format!(
+        "\n# managed by pgbackrest-recovery (patroni-runner)\n\
+         restore_command = 'pgbackrest --stanza=main archive-get %f %p'\n\
+         recovery_target_time = '{}'\n\
+         recovery_target_action = 'promote'\n",
+        target_time,
+    );
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&auto_conf_path)
+        .context("Failed to open postgresql.auto.conf")?;
+    f.write_all(addition.as_bytes())
+        .context("Failed to append recovery settings")?;
+
+    info!(target = %target_time, "pgbackrest PITR replay staged");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _guard = init_logging("patroni-runner");
@@ -192,6 +295,18 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&config.data_dir).context("Failed to create data directory")?;
     fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))
         .context("Failed to set data directory permissions")?;
+
+    // Render /etc/pgbackrest/pgbackrest.conf when archiving is enabled, or
+    // remove it when disabled. Must run before Patroni starts Postgres so the
+    // archive_command we emit into DCS can find the config on its first call.
+    render_pgbackrest_conf(&config.data_dir, config.pgbackrest_s3_bucket.is_some())?;
+
+    // Stage pgBackRest PITR replay if requested. No-op unless
+    // POSTGRES_RECOVERY_TARGET_TIME is set. Must run before Patroni starts
+    // Postgres so the signal file and recovery settings are in place.
+    if let Some(target_time) = &config.pitr_target_time {
+        configure_pitr_recovery(&config.data_dir, target_time)?;
+    }
 
     // Clear PostgreSQL environment variables to avoid conflicts
     env::remove_var("PGPASSWORD");

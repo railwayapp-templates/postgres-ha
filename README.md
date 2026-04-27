@@ -38,6 +38,65 @@ PostgreSQL Cluster
 
 **Total**: 7 services
 
+## Point-in-time recovery (opt-in)
+
+The `postgres-patroni` image ships with [pgBackRest](https://pgbackrest.org/)
+installed but dormant. When the env vars below are unset, the image behaves
+identically to a vanilla HA Postgres image — no archiving, no config
+mutation. When set, the current Patroni leader archives WAL continuously to
+S3-compatible storage in **async mode** (`archive_mode=on`); standbys carry
+the same config + binary so promotion instantly enables archiving with no
+config change.
+
+| Env var | Purpose |
+|---|---|
+| `PGBACKREST_REPO1_S3_BUCKET` | bucket name — gates archiving |
+| `PGBACKREST_REPO1_S3_ENDPOINT` | S3-compatible endpoint (e.g. `fly.storage.tigris.dev`) |
+| `PGBACKREST_REPO1_S3_REGION` | bucket region |
+| `PGBACKREST_REPO1_S3_KEY` / `PGBACKREST_REPO1_S3_KEY_SECRET` | bucket credentials |
+| `PGBACKREST_REPO1_PATH` | path prefix in bucket (e.g. `/pgbackrest`) |
+| `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
+
+When `PGBACKREST_REPO1_S3_BUCKET` is set, `patroni-runner` writes
+`archive_mode=on`, `archive_command='pgbackrest --stanza=main archive-push %p'`,
+and `archive_timeout=60` into the Patroni-generated cluster config, and
+renders `/etc/pgbackrest/pgbackrest.conf` with operator-policy defaults
+(`archive-async=y`, `archive-push-queue-max=5GiB`, `spool-path`,
+`compress-type=zst`). pgBackRest reads its S3 credentials natively from
+`PGBACKREST_*` env vars — no config-file rendering of secrets.
+
+Patroni propagates the same config to every node, but under
+`archive_mode=on` only the current leader fires `archive_command`. Standbys
+hold the pgBackRest binary and config so promotion instantly enables
+archiving with no config re-push. Residual failover RPO is `archive_timeout`
+(60s) plus failover-detection time; Patroni's promotion logic flushes any
+pending `archive_status/.ready` markers on the new leader to close most of
+that gap on planned switchover.
+
+**The never-halt guarantee**: pgBackRest runs in async mode with
+`archive-push-queue-max=5GiB`. When S3 stalls, WAL queues in the local
+spool without blocking Postgres. When the queue fills (sustained S3
+unavailability), pgBackRest drops WAL and tells Postgres the push
+succeeded. PITR window truncates; the database keeps running. This is the
+explicit reason this image uses pgBackRest instead of wal-g — synchronous
+`archive_command` shapes halt Postgres on full `pg_wal`, requiring manual
+intervention to recover.
+
+The first time archiving is enabled on a cluster, run `pgbackrest
+--stanza=main stanza-create` from the current Patroni leader to initialize
+the repo metadata. Subsequent restarts and failovers require no extra
+steps.
+
+When `POSTGRES_RECOVERY_TARGET_TIME` is set on a restored primary volume,
+`patroni-runner` creates `recovery.signal` and writes the matching
+`restore_command` / `recovery_target_time` / `recovery_target_action=promote`
+into `postgresql.auto.conf` before starting Patroni. Postgres enters
+archive recovery, replays WAL to the target, and promotes; Patroni then
+claims leadership. A sentinel file (`$PGDATA/.pitr_configured`) prevents
+re-triggering on later restarts — PITR is expected to run against a fresh
+primary volume restored from a base snapshot, with replica volumes wiped
+so they re-bootstrap from the restored primary via `pg_basebackup`.
+
 ## Quick Start
 
 ### Deploy to Railway
