@@ -87,6 +87,17 @@ The first time archiving is enabled on a cluster, run `pgbackrest
 the repo metadata. Subsequent restarts and failovers require no extra
 steps.
 
+**Env-var changes on existing clusters**: `patroni-runner` includes a
+one-shot DCS reconcile that runs after Patroni's REST API comes up. When
+the gate var is set but DCS lacks archive params (or vice versa), the
+reconcile patches DCS via `PATCH /config` so the env-var intent is
+authoritative. Because `archive_mode` is `PGC_POSTMASTER`, applying the
+patch flags `pending_restart` on the node — operators must run
+`patronictl restart <cluster> <node>` (or trigger one redeploy per node
+through Railway) for archiving to actually start or stop. The dashboard
+PITR enable/disable flow handles the rolling restart automatically; raw
+env-var users need one extra restart per node.
+
 When `POSTGRES_RECOVERY_TARGET_TIME` is set on a restored primary volume,
 `patroni-runner` creates `recovery.signal` and writes the matching
 `restore_command` / `recovery_target_time` / `recovery_target_action=promote`
