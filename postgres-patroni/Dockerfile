@@ -52,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     curl \
+    pgbackrest \
     postgresql-${POSTGRES_VERSION}-pgvector \
     && rm -rf /var/lib/apt/lists/*
 
@@ -64,9 +65,11 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     psycopg2-binary \
     patroni[etcd]==${PATRONI_VERSION}
 
-# Create required directories
-RUN mkdir -p /home/postgres /var/run/postgresql /etc/patroni \
-    && chown -R postgres:postgres /home/postgres /var/run/postgresql /etc/patroni
+# Create required directories. pgBackRest spool dir is dormant unless
+# PGBACKREST_REPO1_S3_BUCKET is set at runtime; see patroni-runner.
+RUN mkdir -p /home/postgres /var/run/postgresql /etc/patroni /etc/pgbackrest /var/lib/postgresql/pgbackrest-spool \
+    && chown -R postgres:postgres /home/postgres /var/run/postgresql /etc/patroni /etc/pgbackrest /var/lib/postgresql/pgbackrest-spool \
+    && chmod 0750 /var/lib/postgresql/pgbackrest-spool
 
 # Copy SSL init script and Rust binaries
 COPY --chmod=755 postgres-patroni/init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh

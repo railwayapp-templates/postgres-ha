@@ -9,6 +9,29 @@ use tracing::info;
 
 /// Generate Patroni YAML configuration
 pub fn generate_patroni_config(config: &Config) -> String {
+    // Opt-in pgBackRest archiving: adds archive_mode/archive_command/
+    // archive_timeout to the cluster's postgresql.parameters when
+    // PGBACKREST_REPO1_S3_BUCKET is set.
+    //
+    // archive_mode=on (industry-mainstream Patroni + WAL archiving setting):
+    // every node carries the same config, but only the current Patroni
+    // leader actually fires archive_command. Standbys hold the pgBackRest
+    // binary and config so promotion instantly enables archiving with no
+    // config change. Residual failover RPO under `on` is archive_timeout
+    // (60s) plus failover-detection time.
+    //
+    // pgBackRest runs in async mode (configured in /etc/pgbackrest/pgbackrest.conf
+    // by patroni-runner) with archive-push-queue-max=5GiB — when the queue
+    // trips, pgBackRest drops WAL and tells Postgres the push succeeded,
+    // keeping the database running rather than letting pg_wal fill the data
+    // volume. PITR window truncates; DB stays up. This is the explicit
+    // architectural reason we picked pgBackRest over wal-g.
+    let pgbackrest_archive_params = if config.pgbackrest_s3_bucket.is_some() {
+        "        archive_mode: \"on\"\n        archive_command: \"pgbackrest --stanza=main archive-push %p\"\n        archive_timeout: 60\n"
+    } else {
+        ""
+    };
+
     format!(
         r#"scope: {scope}
 name: {name}
@@ -41,7 +64,7 @@ bootstrap:
         max_connections: 200
         password_encryption: scram-sha-256
         shared_preload_libraries: pg_stat_statements
-
+{pgbackrest_archive_params}
   initdb:
     - encoding: UTF8
     - data-checksums
@@ -105,6 +128,7 @@ postgresql:
         data_dir = config.data_dir,
         certs_dir = config.certs_dir,
         synchronous_mode = config.synchronous_mode,
+        pgbackrest_archive_params = pgbackrest_archive_params,
     )
 }
 
