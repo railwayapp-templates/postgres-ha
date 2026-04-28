@@ -53,6 +53,19 @@ pub struct Config {
     /// restored volume, the runner stages `recovery.signal` + recovery
     /// settings in postgresql.auto.conf before Patroni starts Postgres.
     pub pitr_target_time: Option<String>,
+    /// `archive_timeout` written into Patroni's bootstrap.dcs and asserted by
+    /// the DCS reconciler when archiving is enabled. Default 60s. Operators
+    /// raise it on idle DBs to cut S3 cost or lower it for tighter RPO.
+    pub archive_timeout_secs: i64,
+    /// Bucket prefix where archive-push lands. Read from `PGBACKREST_REPO1_PATH`
+    /// at config-load time so the sentinel-based divergence check can compare
+    /// against the recorded source path on a restored volume.
+    pub pgbackrest_repo1_path: Option<String>,
+    /// Bucket prefix where archive-get reads WAL during PITR replay. Set to
+    /// the source cluster's `PGBACKREST_REPO1_PATH` so the recovered cluster
+    /// can pull source WAL while writing post-promote WAL into a different
+    /// prefix. Baked into `restore_command` via `--repo1-path=...`.
+    pub pgbackrest_recovery_repo1_path: Option<String>,
 }
 
 impl Config {
@@ -95,6 +108,17 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             pitr_target_time: env::var("POSTGRES_RECOVERY_TARGET_TIME")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            archive_timeout_secs: env::var("POSTGRES_ARCHIVE_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(60),
+            pgbackrest_repo1_path: env::var("PGBACKREST_REPO1_PATH")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            pgbackrest_recovery_repo1_path: env::var("PGBACKREST_RECOVERY_REPO1_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),
         })

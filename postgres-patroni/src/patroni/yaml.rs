@@ -27,9 +27,12 @@ pub fn generate_patroni_config(config: &Config) -> String {
     // volume. PITR window truncates; DB stays up. This is the explicit
     // architectural reason we picked pgBackRest over wal-g.
     let pgbackrest_archive_params = if config.pgbackrest_s3_bucket.is_some() {
-        "        archive_mode: \"on\"\n        archive_command: \"pgbackrest --stanza=main archive-push %p\"\n        archive_timeout: 60\n"
+        format!(
+            "        archive_mode: \"on\"\n        archive_command: \"pgbackrest --stanza=main archive-push %p\"\n        archive_timeout: {}\n",
+            config.archive_timeout_secs,
+        )
     } else {
-        ""
+        String::new()
     };
 
     format!(

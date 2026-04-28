@@ -54,12 +54,16 @@ config change.
 | `PGBACKREST_REPO1_S3_ENDPOINT` | S3-compatible endpoint (e.g. `fly.storage.tigris.dev`) |
 | `PGBACKREST_REPO1_S3_REGION` | bucket region |
 | `PGBACKREST_REPO1_S3_KEY` / `PGBACKREST_REPO1_S3_KEY_SECRET` | bucket credentials |
-| `PGBACKREST_REPO1_PATH` | path prefix in bucket (e.g. `/pgbackrest`) |
+| `PGBACKREST_REPO1_PATH` | path prefix where archive-push writes (e.g. `/pgbackrest`) |
+| `PGBACKREST_RECOVERY_REPO1_PATH` | path prefix archive-get reads from during PITR replay; baked into `restore_command`. Set to the source's `PGBACKREST_REPO1_PATH` so the recovered cluster can read source WAL while writing to a new prefix |
+| `PGBACKREST_PROCESS_MAX` | parallel S3 workers for archive-push/get (default `2`) |
+| `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 
 When `PGBACKREST_REPO1_S3_BUCKET` is set, `patroni-runner` writes
 `archive_mode=on`, `archive_command='pgbackrest --stanza=main archive-push %p'`,
-and `archive_timeout=60` into the Patroni-generated cluster config, and
+and `archive_timeout` (default `60`, override via `POSTGRES_ARCHIVE_TIMEOUT`)
+into the Patroni-generated cluster config, and
 renders `/etc/pgbackrest/pgbackrest.conf` with operator-policy defaults
 (`archive-async=y`, `archive-push-queue-max=5GiB`, `spool-path`,
 `compress-type=zst`). pgBackRest reads its S3 credentials natively from
@@ -107,6 +111,23 @@ claims leadership. A sentinel file (`$PGDATA/.pitr_configured`) prevents
 re-triggering on later restarts — PITR is expected to run against a fresh
 primary volume restored from a base snapshot, with replica volumes wiped
 so they re-bootstrap from the restored primary via `pg_basebackup`.
+
+**Repo-path divergence (mandatory on PITR restore)**: a restored volume
+carries the source's `$PGDATA` contents, including a
+`.pgbackrest_source_path` sentinel recording the bucket prefix the source
+has been pushing WAL to. On restore, the operator MUST set two distinct
+repo paths:
+
+- `PGBACKREST_REPO1_PATH` → a **new** prefix for the recovered cluster's
+  post-promote `archive_command`. If left equal to the source's path,
+  the recovered timeline overwrites the source's ongoing WAL chain.
+- `PGBACKREST_RECOVERY_REPO1_PATH` → the **source's** path, baked into
+  `restore_command` via `--repo1-path=...` so `archive-get` reads source
+  WAL during replay.
+
+`patroni-runner` refuses to start (exits non-zero) when
+`PGBACKREST_REPO1_PATH` matches the stamped source path — surfacing the
+misconfig before Patroni boots.
 
 ## Quick Start
 

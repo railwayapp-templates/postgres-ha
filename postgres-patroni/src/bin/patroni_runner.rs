@@ -151,20 +151,24 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
     let conf_path = "/etc/pgbackrest/pgbackrest.conf";
 
+    // repo1-retention-* is intentionally omitted: this image never runs
+    // `pgbackrest backup`/`expire`, so those knobs would be no-ops anyway.
+    // WAL retention is enforced server-side by the bucket's lifecycle policy.
+    let process_max = env::var("PGBACKREST_PROCESS_MAX")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "2".to_string());
+
     let conf = format!(
         "[global]\n\
          repo1-type=s3\n\
-         repo1-retention-full=2\n\
-         repo1-retention-diff=4\n\
-         repo1-retention-archive=14\n\
-         repo1-retention-archive-type=incr\n\
          log-level-console=info\n\
          log-level-file=off\n\
          archive-async=y\n\
          archive-push-queue-max=5GiB\n\
          archive-get-queue-max=1GiB\n\
          spool-path=/var/lib/postgresql/pgbackrest-spool\n\
-         process-max=4\n\
+         process-max={process_max}\n\
          compress-type=zst\n\
          compress-level=3\n\
          start-fast=y\n\
@@ -182,6 +186,30 @@ fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Path of the sentinel that records which `repo1-path` this volume's WAL has
+/// been pushed to. Recovery refuses to stage if the current
+/// `PGBACKREST_REPO1_PATH` still equals this — the operator must change it so
+/// post-promote `archive-push` lands in a different prefix and can't corrupt
+/// the source's ongoing WAL chain.
+fn source_path_sentinel(data_dir: &str) -> String {
+    format!("{}/.pgbackrest_source_path", data_dir)
+}
+
+/// Refresh the sentinel to track the currently-configured `repo1-path`. Runs
+/// on every boot when archiving is enabled so the recorded value matches the
+/// path Postgres is actually pushing to right now.
+fn stamp_source_repo_path(data_dir: &str, current_path: &str) -> Result<()> {
+    let sentinel = source_path_sentinel(data_dir);
+    if let Ok(existing) = fs::read_to_string(&sentinel) {
+        if existing == current_path {
+            return Ok(());
+        }
+    }
+    fs::write(&sentinel, current_path).context("Failed to write source-path sentinel")?;
+    info!(path = %current_path, "pgbackrest: stamped source repo path");
+    Ok(())
+}
+
 /// Stage PITR replay before Patroni starts Postgres.
 ///
 /// When `POSTGRES_RECOVERY_TARGET_TIME` is set and we haven't already staged
@@ -193,9 +221,19 @@ fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
 /// Postgres removes `recovery.signal` automatically on successful promote.
 /// The sentinel blocks re-trigger on subsequent restarts — repeat PITR is
 /// expected to run on a fresh volume, not rerun on already-recovered data.
-fn configure_pitr_recovery(data_dir: &str, target_time: &str) -> Result<()> {
+///
+/// Repo-path divergence is enforced two ways:
+///   1. Read path: `PGBACKREST_RECOVERY_REPO1_PATH` names where `archive-get`
+///      pulls WAL from during replay (the source's path). Baked into
+///      `restore_command` via `--repo1-path=...`.
+///   2. Write path: `PGBACKREST_REPO1_PATH` must NOT equal the stamped source
+///      path. After promote, `archive_command` pushes to that path; if it's
+///      still the source's, the new timeline corrupts the source's ongoing
+///      WAL chain. Refusing here surfaces the misconfig before Patroni starts.
+fn configure_pitr_recovery(config: &Config, target_time: &str) -> Result<()> {
     use std::io::Write;
 
+    let data_dir = &config.data_dir;
     let marker_path = format!("{}/.pitr_configured", data_dir);
     if Path::new(&marker_path).exists() {
         info!(
@@ -204,6 +242,38 @@ fn configure_pitr_recovery(data_dir: &str, target_time: &str) -> Result<()> {
         );
         return Ok(());
     }
+
+    // Refuse to stage when the post-promote write path still matches the
+    // source's stamped path — recovered timeline would otherwise overwrite
+    // the source's WAL prefix.
+    let sentinel = source_path_sentinel(data_dir);
+    if let Ok(stamped) = fs::read_to_string(&sentinel) {
+        let current_write = config.pgbackrest_repo1_path.as_deref().unwrap_or("");
+        if stamped == current_write {
+            anyhow::bail!(
+                "pgbackrest: REFUSING to stage PITR — PGBACKREST_REPO1_PATH ('{}') matches the source's stamped repo path. \
+After promote, archive_command would push the recovered timeline back into the source's repo and corrupt its WAL chain. \
+Set PGBACKREST_REPO1_PATH to a NEW prefix for the recovered cluster's writes, and PGBACKREST_RECOVERY_REPO1_PATH='{}' so archive-get can still read source WAL during replay.",
+                current_write,
+                stamped,
+            );
+        }
+    }
+
+    let restore_cmd = match config.pgbackrest_recovery_repo1_path.as_deref() {
+        Some(p) => format!(
+            "pgbackrest --stanza=main --repo1-path={} archive-get %f %p",
+            p,
+        ),
+        None => {
+            warn!(
+                "PGBACKREST_RECOVERY_REPO1_PATH unset; archive-get will use \
+                 PGBACKREST_REPO1_PATH. Set the recovery-read path explicitly \
+                 to avoid coupling read and write paths."
+            );
+            "pgbackrest --stanza=main archive-get %f %p".to_string()
+        }
+    };
 
     // Write the marker before mutating Postgres state so a crash mid-setup
     // doesn't leave us in a loop re-triggering replay on the next boot.
@@ -215,10 +285,10 @@ fn configure_pitr_recovery(data_dir: &str, target_time: &str) -> Result<()> {
     let auto_conf_path = format!("{}/postgresql.auto.conf", data_dir);
     let addition = format!(
         "\n# managed by pgbackrest-recovery (patroni-runner)\n\
-         restore_command = 'pgbackrest --stanza=main archive-get %f %p'\n\
+         restore_command = '{}'\n\
          recovery_target_time = '{}'\n\
          recovery_target_action = 'promote'\n",
-        target_time,
+        restore_cmd, target_time,
     );
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -307,9 +377,19 @@ async fn main() -> Result<()> {
 
     // Stage pgBackRest PITR replay if requested. No-op unless
     // POSTGRES_RECOVERY_TARGET_TIME is set. Must run before Patroni starts
-    // Postgres so the signal file and recovery settings are in place.
+    // Postgres so the signal file and recovery settings are in place. Reads
+    // the source-path sentinel before stamp_source_repo_path overwrites it,
+    // so the path-divergence check sees the original source value.
     if let Some(target_time) = &config.pitr_target_time {
-        configure_pitr_recovery(&config.data_dir, target_time)?;
+        configure_pitr_recovery(&config, target_time)?;
+    }
+
+    // Track the post-recovery (or steady-state) write path on disk so a
+    // future PITR-restored snapshot of this volume can detect whether the
+    // operator pivoted PGBACKREST_REPO1_PATH before staging recovery.
+    if config.pgbackrest_s3_bucket.is_some() {
+        let current_write = config.pgbackrest_repo1_path.as_deref().unwrap_or("");
+        stamp_source_repo_path(&config.data_dir, current_write)?;
     }
 
     // Clear PostgreSQL environment variables to avoid conflicts
