@@ -39,33 +39,35 @@ pub struct Config {
     /// If true, enable synchronous replication mode. Ensures at least one
     /// replica has received the data before a write is acknowledged.
     pub synchronous_mode: bool,
-    /// pgBackRest S3 bucket name (e.g. `my-pgbackrest-bucket`). When set,
-    /// Patroni config gets `archive_mode=on` + `archive_command='pgbackrest
-    /// archive-push'` + `archive_timeout=60` and patroni-runner renders
+    /// This cluster's own archive bucket. Tool-agnostic name read from
+    /// `WAL_ARCHIVE_BUCKET`; patroni-runner translates it (and the matching
+    /// `WAL_ARCHIVE_KEY` / `_SECRET` / `_REGION` / `_ENDPOINT` / `_PATH`)
+    /// into pgBackRest's native `PGBACKREST_REPO1_S3_*` (or `_REPO2_*` in
+    /// dual-repo mode) so pgBackRest reads them natively. When set, Patroni
+    /// DCS gets `archive_mode=on` + the archive-push wrapper as
+    /// `archive_command` + `archive_timeout`, and patroni-runner renders
     /// `/etc/pgbackrest/pgbackrest.conf`. Only the current Patroni leader
     /// fires archive_command; standbys carry the same config + binary so
     /// promotion instantly enables archiving. pgBackRest runs in async mode
     /// with `archive-push-queue-max=5GiB` — when the queue trips, WAL is
     /// dropped and Postgres keeps running rather than halting on a full
     /// `pg_wal`. When unset, Patroni config is generated as it always was.
-    pub pgbackrest_s3_bucket: Option<String>,
+    pub wal_archive_bucket: Option<String>,
+    /// Source cluster's bucket on a PITR-restored volume, read by
+    /// `archive-get` during recovery only. Translated by patroni-runner from
+    /// `WAL_RECOVER_FROM_*` to pgBackRest's `PGBACKREST_REPO1_S3_*`. Under
+    /// the new-service restore design (per RFC) HA restore creates a fresh
+    /// single-node service rather than restoring in place, so this is rare
+    /// in HA but kept for symmetry with postgres-ssl.
+    pub wal_recover_from_bucket: Option<String>,
     /// Target timestamp for point-in-time recovery (ISO 8601). When set on a
     /// restored volume, the runner stages `recovery.signal` + recovery
-    /// settings in postgresql.auto.conf before Patroni starts Postgres.
+    /// settings before Patroni starts Postgres.
     pub pitr_target_time: Option<String>,
     /// `archive_timeout` written into Patroni's bootstrap.dcs and asserted by
     /// the DCS reconciler when archiving is enabled. Default 60s. Operators
     /// raise it on idle DBs to cut S3 cost or lower it for tighter RPO.
     pub archive_timeout_secs: i64,
-    /// Bucket prefix where archive-push lands. Read from `PGBACKREST_REPO1_PATH`
-    /// at config-load time so the sentinel-based divergence check can compare
-    /// against the recorded source path on a restored volume.
-    pub pgbackrest_repo1_path: Option<String>,
-    /// Bucket prefix where archive-get reads WAL during PITR replay. Set to
-    /// the source cluster's `PGBACKREST_REPO1_PATH` so the recovered cluster
-    /// can pull source WAL while writing post-promote WAL into a different
-    /// prefix. Baked into `restore_command` via `--repo1-path=...`.
-    pub pgbackrest_recovery_repo1_path: Option<String>,
 }
 
 impl Config {
@@ -104,7 +106,10 @@ impl Config {
             adopt_existing_data: bool::env_parse("PATRONI_ADOPT_EXISTING_DATA", false),
             wait_for_leader: bool::env_parse("PATRONI_WAIT_FOR_LEADER", false),
             synchronous_mode: bool::env_parse("PATRONI_SYNCHRONOUS_MODE", false),
-            pgbackrest_s3_bucket: env::var("PGBACKREST_REPO1_S3_BUCKET")
+            wal_archive_bucket: env::var("WAL_ARCHIVE_BUCKET")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            wal_recover_from_bucket: env::var("WAL_RECOVER_FROM_BUCKET")
                 .ok()
                 .filter(|s| !s.is_empty()),
             pitr_target_time: env::var("POSTGRES_RECOVERY_TARGET_TIME")
@@ -115,12 +120,6 @@ impl Config {
                 .and_then(|s| s.parse::<i64>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(60),
-            pgbackrest_repo1_path: env::var("PGBACKREST_REPO1_PATH")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            pgbackrest_recovery_repo1_path: env::var("PGBACKREST_RECOVERY_REPO1_PATH")
-                .ok()
-                .filter(|s| !s.is_empty()),
         })
     }
 }
