@@ -23,6 +23,111 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
 
+/// Translate the tool-agnostic `WAL_ARCHIVE_*` / `WAL_RECOVER_FROM_*` env
+/// contract into pgBackRest's native `PGBACKREST_REPO{1,2}_S3_*` so
+/// pgBackRest reads them natively and the rest of this binary (and the
+/// `archive_command` wrapper Postgres invokes) can stay pgBackRest-shaped.
+///
+/// Backboard / frontend / template speak the WAL_ contract; the image
+/// translates locally so swapping pgBackRest for another archiver is a
+/// wrapper change rather than a cross-repo rewrite.
+///
+/// Three modes:
+///   - `WAL_ARCHIVE_*` only → standalone archiving cluster. REPO1 = archive.
+///   - `WAL_RECOVER_FROM_*` only → restored cluster, no ongoing archiving.
+///     REPO1 = source bucket (read for archive-get during recovery).
+///   - `WAL_ARCHIVE_*` + `WAL_RECOVER_FROM_*` → restored cluster with PITR
+///     re-enabled. REPO1 = recover-from, REPO2 = archive; the archive-push
+///     wrapper picks `--repo=2` so post-promote WAL never sprays into the
+///     source bucket.
+fn translate_wal_env_to_pgbackrest() {
+    let archive = env::var("WAL_ARCHIVE_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let recover = env::var("WAL_RECOVER_FROM_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    if recover.is_some() {
+        export_repo("PGBACKREST_REPO1", "WAL_RECOVER_FROM");
+    } else if archive.is_some() {
+        export_repo("PGBACKREST_REPO1", "WAL_ARCHIVE");
+    }
+
+    if recover.is_some() && archive.is_some() {
+        export_repo("PGBACKREST_REPO2", "WAL_ARCHIVE");
+    }
+}
+
+/// Copy a `WAL_<role>_*` quintuple onto a `PGBACKREST_<repo>_S3_*` quintuple
+/// (plus the non-S3-prefixed `_PATH` knob). Path defaults to `/pgbackrest`
+/// when unset, matching the wrapper.sh behavior in postgres-ssl.
+fn export_repo(repo_prefix: &str, source_prefix: &str) {
+    for (dst_suffix, src_suffix, default) in [
+        ("S3_BUCKET", "BUCKET", None),
+        ("S3_KEY", "KEY", None),
+        ("S3_KEY_SECRET", "SECRET", None),
+        ("S3_REGION", "REGION", None),
+        ("S3_ENDPOINT", "ENDPOINT", None),
+        ("PATH", "PATH", Some("/pgbackrest")),
+    ] {
+        let src = format!("{source_prefix}_{src_suffix}");
+        let dst = format!("{repo_prefix}_{dst_suffix}");
+        let value = env::var(&src)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| default.map(String::from));
+        if let Some(v) = value {
+            env::set_var(&dst, v);
+        }
+    }
+}
+
+/// Detect the container's effective CPU allocation. Reads cgroup v2 cpu.max
+/// first, then falls back to cgroup v1 cpu.cfs_quota_us, then to nproc.
+/// Returns the integer ceiling of fractional quotas (0.5 vCPU → 1) so
+/// process-max sizing is sane on the smallest tier.
+fn detect_cpus() -> u32 {
+    if let Ok(s) = fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let mut it = s.split_whitespace();
+        if let (Some(q), Some(p)) = (it.next(), it.next()) {
+            if q != "max" {
+                if let (Ok(quota), Ok(period)) = (q.parse::<i64>(), p.parse::<i64>()) {
+                    if quota > 0 && period > 0 {
+                        return ((quota + period - 1) / period) as u32;
+                    }
+                }
+            }
+        }
+    }
+    let q = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let p = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    if let (Some(quota), Some(period)) = (q, p) {
+        if quota > 0 && period > 0 {
+            return ((quota + period - 1) / period) as u32;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
+fn clamp(v: i64, lo: i64, hi: i64) -> u32 {
+    v.clamp(lo, hi) as u32
+}
+
+fn env_or_clamp(var: &str, default: u32) -> u32 {
+    env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(default)
+}
+
 /// Request body for etcd v3 range API
 #[derive(Serialize)]
 struct EtcdRangeRequest {
@@ -133,45 +238,96 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 /// Render `/etc/pgbackrest/pgbackrest.conf` with operator-policy defaults +
 /// stanza definition. User-supplied options (S3 bucket, region, key, secret,
 /// endpoint, repo path) are read by pgBackRest natively from `PGBACKREST_*`
-/// env vars, so they don't need to be in the conf file.
+/// env vars (which `translate_wal_env_to_pgbackrest` populated from the
+/// `WAL_ARCHIVE_*` / `WAL_RECOVER_FROM_*` contract), so they don't need to
+/// be in the conf file.
 ///
-/// The `archive-async=y` + `archive-push-queue-max=5GiB` combination is what
-/// keeps Postgres alive under sustained S3 stalls — when the queue trips,
-/// pgBackRest drops WAL and reports success to Postgres rather than letting
-/// `pg_wal` fill the data volume.
+/// The `archive-async=y` + `archive-push-queue-max=5GiB` combination is one
+/// of the two thresholds that keep Postgres alive under archiving failure;
+/// the other is `pgbackrest-archive-push-wrapper.sh`'s
+/// `PGBACKREST_DROP_THRESHOLD_MB` on `pg_wal/`. Either tripping drops WAL
+/// and keeps the DB up at the cost of a truncated PITR window.
 ///
-/// Always rendered, regardless of whether archiving is currently enabled.
-/// Reasoning: during a disable transition, DCS may still hold
-/// `archive_mode=on` until the reconcile task patches it out and Postgres
-/// restarts. If the conf file were missing, `archive_command` would fail
-/// synchronously on every WAL switch and `pg_wal` would grow unbounded.
-/// With the conf present, pgbackrest enqueues to the spool, the async
-/// daemon fails the S3 push (no creds), and `archive-push-queue-max`
-/// trips at 5 GiB — DB stays up at the cost of a truncated PITR window.
+/// Spool lives under `$PGDATA/pgbackrest-spool` so segments staged but not
+/// yet pushed to S3 survive container restarts on the Railway volume.
+///
+/// Per-command `process-max` is sized off cgroup-detected vCPU. Each
+/// command has a different bottleneck shape: archive-push is gated by
+/// serial WAL arrival + S3 PUT overhead; archive-get by serial replay
+/// inside Postgres; backup leaves CPU for live DB; restore is unbounded
+/// (DB is down) up to pgBackRest's plateau around 32 workers.
+///
+/// No-op when neither archive nor recover-from is configured. Otherwise
+/// idempotent — rewritten on every boot.
 fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
+    if env::var("PGBACKREST_REPO1_S3_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return Ok(());
+    }
+
     let conf_path = "/etc/pgbackrest/pgbackrest.conf";
+    let spool_dir = format!("{data_dir}/pgbackrest-spool");
+
+    let cpus = detect_cpus().max(1) as i64;
+    let push_max = env_or_clamp("PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX", clamp(cpus / 8, 2, 8));
+    let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", 1);
+    let backup_max = env_or_clamp("PGBACKREST_BACKUP_PROCESS_MAX", clamp(cpus / 4, 1, 16));
+    let restore_max = env_or_clamp("PGBACKREST_RESTORE_PROCESS_MAX", clamp(cpus, 1, 32));
+
+    info!(
+        cpus = cpus,
+        push = push_max,
+        get = get_max,
+        backup = backup_max,
+        restore = restore_max,
+        "pgbackrest: detected vCPU and sized process-max"
+    );
+
+    // Two-repo mode: REPO1 reads source's WAL during recovery, REPO2
+    // receives the restored cluster's post-promote pushes. The archive-push
+    // wrapper picks the right repo at command time via --repo; here we
+    // declare repo2-type so pgBackRest reads the corresponding env vars.
+    let repo2_block = if env::var("PGBACKREST_REPO2_S3_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        "repo2-type=s3\n"
+    } else {
+        ""
+    };
 
     // repo1-retention-* is intentionally omitted: this image never runs
     // `pgbackrest backup`/`expire`, so those knobs would be no-ops anyway.
     // WAL retention is enforced server-side by the bucket's lifecycle policy.
-    let process_max = env::var("PGBACKREST_PROCESS_MAX")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "2".to_string());
-
     let conf = format!(
         "[global]\n\
          repo1-type=s3\n\
+         {repo2_block}\
          log-level-console=info\n\
          log-level-file=off\n\
          archive-async=y\n\
          archive-push-queue-max=5GiB\n\
          archive-get-queue-max=1GiB\n\
-         spool-path=/var/lib/postgresql/pgbackrest-spool\n\
-         process-max={process_max}\n\
+         spool-path={spool_dir}\n\
          compress-type=zst\n\
          compress-level=3\n\
          start-fast=y\n\
+         \n\
+         [global:archive-push]\n\
+         process-max={push_max}\n\
+         \n\
+         [global:archive-get]\n\
+         process-max={get_max}\n\
+         \n\
+         [global:backup]\n\
+         process-max={backup_max}\n\
+         \n\
+         [global:restore]\n\
+         process-max={restore_max}\n\
          \n\
          [main]\n\
          pg1-path={data_dir}\n\
@@ -182,113 +338,80 @@ fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
     fs::write(conf_path, conf).context("Failed to write pgbackrest.conf")?;
     fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
         .context("Failed to set pgbackrest.conf permissions")?;
-    info!("pgbackrest: rendered {}", conf_path);
-    Ok(())
-}
 
-/// Path of the sentinel that records which `repo1-path` this volume's WAL has
-/// been pushed to. Recovery refuses to stage if the current
-/// `PGBACKREST_REPO1_PATH` still equals this — the operator must change it so
-/// post-promote `archive-push` lands in a different prefix and can't corrupt
-/// the source's ongoing WAL chain.
-fn source_path_sentinel(data_dir: &str) -> String {
-    format!("{}/.pgbackrest_source_path", data_dir)
-}
-
-/// Refresh the sentinel to track the currently-configured `repo1-path`. Runs
-/// on every boot when archiving is enabled so the recorded value matches the
-/// path Postgres is actually pushing to right now.
-fn stamp_source_repo_path(data_dir: &str, current_path: &str) -> Result<()> {
-    let sentinel = source_path_sentinel(data_dir);
-    if let Ok(existing) = fs::read_to_string(&sentinel) {
-        if existing == current_path {
-            return Ok(());
-        }
+    // Spool only gets created once the data dir exists; before initdb,
+    // Postgres won't run if PGDATA is non-empty. Patroni creates PGDATA on
+    // init, so by the time we render here on an existing volume we're safe;
+    // on first init we render before Patroni starts and PGDATA may not
+    // exist yet — best-effort, will retry on next boot.
+    if Path::new(data_dir).exists() {
+        fs::create_dir_all(&spool_dir).context("Failed to create pgbackrest-spool dir")?;
+        fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o750))
+            .context("Failed to set pgbackrest-spool permissions")?;
     }
-    fs::write(&sentinel, current_path).context("Failed to write source-path sentinel")?;
-    info!(path = %current_path, "pgbackrest: stamped source repo path");
+
+    info!("pgbackrest: rendered {}", conf_path);
     Ok(())
 }
 
 /// Stage PITR replay before Patroni starts Postgres.
 ///
-/// When `POSTGRES_RECOVERY_TARGET_TIME` is set and we haven't already staged
-/// recovery on this volume (sentinel `$PGDATA/.pitr_configured`), this writes
-/// `recovery.signal` + recovery settings to postgresql.auto.conf so Postgres
-/// enters archive recovery on boot, replays WAL from the pgBackRest repo to
-/// the target timestamp, then promotes.
+/// When `POSTGRES_RECOVERY_TARGET_TIME` is set, writes `recovery.signal` +
+/// recovery settings to postgresql.auto.conf so Postgres enters archive
+/// recovery on boot, replays WAL from `repo1` (the source bucket via the
+/// `WAL_RECOVER_FROM_*` translation) to the target timestamp, then promotes.
 ///
-/// Postgres removes `recovery.signal` automatically on successful promote.
-/// The sentinel blocks re-trigger on subsequent restarts — repeat PITR is
-/// expected to run on a fresh volume, not rerun on already-recovered data.
+/// Two filesystem stamps coordinate "exactly once per successful promote":
+///   - `.pitr_staging`: written when we hand recovery off to Postgres. Means
+///     a replay attempt is in flight or last attempt didn't promote yet.
+///   - `.pitr_configured`: written on the boot AFTER Postgres consumes
+///     `recovery.signal` (which Postgres removes only on successful
+///     promote). Means PITR is done and must not run again on this volume.
+///     Once set, subsequent boots skip recovery even if
+///     `POSTGRES_RECOVERY_TARGET_TIME` is changed. To re-run PITR with a
+///     different target the operator must restore from a fresh snapshot
+///     (or, advanced: rm the marker).
 ///
-/// Repo-path divergence is enforced two ways:
-///   1. Read path: `PGBACKREST_RECOVERY_REPO1_PATH` names where `archive-get`
-///      pulls WAL from during replay (the source's path). Baked into
-///      `restore_command` via `--repo1-path=...`.
-///   2. Write path: `PGBACKREST_REPO1_PATH` must NOT equal the stamped source
-///      path. After promote, `archive_command` pushes to that path; if it's
-///      still the source's, the new timeline corrupts the source's ongoing
-///      WAL chain. Refusing here surfaces the misconfig before Patroni starts.
+/// A failed replay (bad target time, missing WAL, bad creds) leaves
+/// `.pitr_staging` behind WITHOUT `.pitr_configured` — the operator can fix
+/// env vars and restart, and the next boot will re-stage cleanly.
+///
+/// Source-path divergence detection is gone: under the new-service restore
+/// design, the restored cluster has its own bucket (`WAL_ARCHIVE_*`) and
+/// reads from the source's bucket via the distinct `WAL_RECOVER_FROM_*`
+/// repo, so no shared write path exists to corrupt.
 fn configure_pitr_recovery(config: &Config, target_time: &str) -> Result<()> {
     use std::io::Write;
 
     let data_dir = &config.data_dir;
-    let marker_path = format!("{}/.pitr_configured", data_dir);
-    if Path::new(&marker_path).exists() {
-        info!(
-            target = %target_time,
-            "PITR recovery already staged on this volume — skipping",
-        );
+    let staging = format!("{data_dir}/.pitr_staging");
+    let done = format!("{data_dir}/.pitr_configured");
+    let signal = format!("{data_dir}/recovery.signal");
+
+    if Path::new(&done).exists() {
         return Ok(());
     }
 
-    // Refuse to stage when the post-promote write path still matches the
-    // source's stamped path — recovered timeline would otherwise overwrite
-    // the source's WAL prefix.
-    let sentinel = source_path_sentinel(data_dir);
-    if let Ok(stamped) = fs::read_to_string(&sentinel) {
-        let current_write = config.pgbackrest_repo1_path.as_deref().unwrap_or("");
-        if stamped == current_write {
-            anyhow::bail!(
-                "pgbackrest: REFUSING to stage PITR — PGBACKREST_REPO1_PATH ('{}') matches the source's stamped repo path. \
-After promote, archive_command would push the recovered timeline back into the source's repo and corrupt its WAL chain. \
-Set PGBACKREST_REPO1_PATH to a NEW prefix for the recovered cluster's writes, and PGBACKREST_RECOVERY_REPO1_PATH='{}' so archive-get can still read source WAL during replay.",
-                current_write,
-                stamped,
-            );
-        }
+    // Postgres removes recovery.signal on successful promote. If staging is
+    // present and the signal is gone, replay completed on a prior boot and
+    // we just need to stamp the done marker.
+    if Path::new(&staging).exists() && !Path::new(&signal).exists() {
+        let _ = fs::remove_file(&staging);
+        fs::write(&done, "").context("Failed to write PITR done marker")?;
+        info!("pgbackrest: previous PITR replay completed; marker written");
+        return Ok(());
     }
 
-    let restore_cmd = match config.pgbackrest_recovery_repo1_path.as_deref() {
-        Some(p) => format!(
-            "pgbackrest --stanza=main --repo1-path={} archive-get %f %p",
-            p,
-        ),
-        None => {
-            warn!(
-                "PGBACKREST_RECOVERY_REPO1_PATH unset; archive-get will use \
-                 PGBACKREST_REPO1_PATH. Set the recovery-read path explicitly \
-                 to avoid coupling read and write paths."
-            );
-            "pgbackrest --stanza=main archive-get %f %p".to_string()
-        }
-    };
+    let restore_cmd = "pgbackrest --stanza=main --repo=1 archive-get %f %p";
+    let escaped_target = target_time.replace('\'', "''");
+    let escaped_restore = restore_cmd.replace('\'', "''");
 
-    // Write the marker before mutating Postgres state so a crash mid-setup
-    // doesn't leave us in a loop re-triggering replay on the next boot.
-    fs::write(&marker_path, "").context("Failed to create PITR marker")?;
-
-    let signal_path = format!("{}/recovery.signal", data_dir);
-    fs::File::create(&signal_path).context("Failed to create recovery.signal")?;
-
-    let auto_conf_path = format!("{}/postgresql.auto.conf", data_dir);
+    let auto_conf_path = format!("{data_dir}/postgresql.auto.conf");
     let addition = format!(
         "\n# managed by pgbackrest-recovery (patroni-runner)\n\
-         restore_command = '{}'\n\
-         recovery_target_time = '{}'\n\
+         restore_command = '{escaped_restore}'\n\
+         recovery_target_time = '{escaped_target}'\n\
          recovery_target_action = 'promote'\n",
-        restore_cmd, target_time,
     );
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -298,13 +421,78 @@ Set PGBACKREST_REPO1_PATH to a NEW prefix for the recovered cluster's writes, an
     f.write_all(addition.as_bytes())
         .context("Failed to append recovery settings")?;
 
+    fs::File::create(&signal).context("Failed to create recovery.signal")?;
+    fs::write(&staging, "").context("Failed to write PITR staging marker")?;
+
     info!(target = %target_time, "pgbackrest PITR replay staged");
     Ok(())
+}
+
+/// Run `pgbackrest stanza-create` once Postgres is reachable. Forks a
+/// background poller so patroni-runner can stay on its existing exec
+/// path. stanza-create is idempotent: a matching stanza in the repo is a
+/// no-op; a mismatch errors loudly. Skipped in dual-repo mode (restored
+/// cluster with PITR re-enabled) — pgBackRest's stanza-create operates
+/// against all configured repos and we don't want to touch the source's.
+fn spawn_bootstrap_stanza_create() {
+    if env::var("WAL_ARCHIVE_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return;
+    }
+    if env::var("WAL_RECOVER_FROM_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        warn!(
+            "pgbackrest: skipping stanza-create — both WAL_RECOVER_FROM_* and \
+             WAL_ARCHIVE_* are set; clear the recover-from vars then restart"
+        );
+        return;
+    }
+
+    tokio::spawn(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                warn!("pgbackrest: timed out waiting for Postgres before stanza-create");
+                return;
+            }
+            let probe = tokio::process::Command::new("pg_isready")
+                .args(["-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-q"])
+                .status()
+                .await;
+            if matches!(probe, Ok(s) if s.success()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let out = tokio::process::Command::new("gosu")
+            .args(["postgres", "pgbackrest", "--stanza=main", "stanza-create"])
+            .status()
+            .await;
+        match out {
+            Ok(s) if s.success() => info!("pgbackrest: stanza-create completed"),
+            Ok(s) => {
+                warn!(status = ?s, "pgbackrest: stanza-create failed (will retry on next boot)")
+            }
+            Err(e) => warn!(error = %e, "pgbackrest: stanza-create invocation failed"),
+        }
+    });
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let _guard = init_logging("patroni-runner");
+
+    // Translate the WAL_* env contract into pgBackRest-native PGBACKREST_*
+    // before anything reads either set. Done first so Config::from_env() and
+    // every downstream invocation (patroni archive_command, the wrapper
+    // script, stanza-create) see the same translated env.
+    translate_wal_env_to_pgbackrest();
 
     // Capture health server config BEFORE clearing PG* env vars
     let health_config = HealthServerConfig::from_env();
@@ -353,7 +541,8 @@ async fn main() -> Result<()> {
     // Generate and write Patroni config
     let patroni_config = generate_patroni_config(&config);
     fs::create_dir_all("/etc/patroni").context("Failed to create /etc/patroni directory")?;
-    fs::write("/etc/patroni/patroni.yml", &patroni_config).context("Failed to write patroni.yml")?;
+    fs::write("/etc/patroni/patroni.yml", &patroni_config)
+        .context("Failed to write patroni.yml")?;
 
     info!(
         scope = %config.scope,
@@ -366,30 +555,17 @@ async fn main() -> Result<()> {
     fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))
         .context("Failed to set data directory permissions")?;
 
-    // Render /etc/pgbackrest/pgbackrest.conf unconditionally. The conf is
-    // operator policy (queue-max, async, spool-path, stanza definition) and
-    // is always safe to have in place: pgbackrest only does anything when
-    // Postgres invokes archive_command, and that is gated by archive_mode in
-    // DCS, not by the presence of this file. Keeping it always-present means
-    // archive_command can never fail synchronously due to a missing conf —
-    // worst case, queue-max trips and Postgres keeps running.
+    // Render /etc/pgbackrest/pgbackrest.conf when pgBackRest is in use at
+    // all (either archiving outgoing WAL or recovering from a source
+    // bucket). No-op when both are unset — vanilla cluster, no need for
+    // the conf and nothing reads it.
     render_pgbackrest_conf(&config.data_dir)?;
 
     // Stage pgBackRest PITR replay if requested. No-op unless
     // POSTGRES_RECOVERY_TARGET_TIME is set. Must run before Patroni starts
-    // Postgres so the signal file and recovery settings are in place. Reads
-    // the source-path sentinel before stamp_source_repo_path overwrites it,
-    // so the path-divergence check sees the original source value.
+    // Postgres so the signal file and recovery settings are in place.
     if let Some(target_time) = &config.pitr_target_time {
         configure_pitr_recovery(&config, target_time)?;
-    }
-
-    // Track the post-recovery (or steady-state) write path on disk so a
-    // future PITR-restored snapshot of this volume can detect whether the
-    // operator pivoted PGBACKREST_REPO1_PATH before staging recovery.
-    if config.pgbackrest_s3_bucket.is_some() {
-        let current_write = config.pgbackrest_repo1_path.as_deref().unwrap_or("");
-        stamp_source_repo_path(&config.data_dir, current_write)?;
     }
 
     // Clear PostgreSQL environment variables to avoid conflicts
@@ -425,6 +601,13 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    // Auto-run pgbackrest stanza-create once Postgres is reachable. Without
+    // this, the first WAL switch after enable would fail until a human
+    // exec'd in and ran the command. Idempotent and safe to run from every
+    // node — pgBackRest's stanza metadata is keyed on system_identifier,
+    // which is identical across HA peers.
+    spawn_bootstrap_stanza_create();
 
     run_monitoring_loop(&config, child, &telemetry).await
 }

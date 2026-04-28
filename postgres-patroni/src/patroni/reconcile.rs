@@ -7,15 +7,16 @@
 //! Without this reconcile, the env-var enable/disable contract would be
 //! broken on existing clusters:
 //!
-//! - Set `PGBACKREST_REPO1_S3_BUCKET` on an existing cluster, redeploy →
-//!   DCS stays unarchived → cluster runs without archiving despite the env
-//!   vars being present, looking enabled but archiving nothing.
-//! - Unset `PGBACKREST_REPO1_S3_BUCKET` on a previously-enabled cluster,
-//!   redeploy → DCS still has `archive_mode=on` and `archive_command=...` →
-//!   pgbackrest tries to push but the S3 creds are gone → queue-max
+//! - Set `WAL_ARCHIVE_BUCKET` on an existing cluster, redeploy → DCS stays
+//!   unarchived → cluster runs without archiving despite the env vars
+//!   being present, looking enabled but archiving nothing.
+//! - Unset `WAL_ARCHIVE_BUCKET` on a previously-enabled cluster, redeploy
+//!   → DCS still has `archive_mode=on` and `archive_command=...` →
+//!   archive-push wrapper fires but the S3 creds are gone → queue-max
 //!   eventually trips and WAL is silently dropped; PITR coverage degrades
-//!   invisibly. Or if pgbackrest.conf were absent, archive_command would
-//!   fail synchronously and `pg_wal` would fill the volume.
+//!   invisibly. Or if pgbackrest.conf were absent, archive-push would
+//!   fail synchronously and the wrapper's pg_wal-threshold drop would
+//!   kick in (still keeps DB up, but louder than necessary).
 //!
 //! This runs once per node startup, after Patroni reports healthy, and uses
 //! Patroni's REST API (`PATCH /config`) so it goes through the same
@@ -40,7 +41,7 @@ use tracing::{info, warn};
 
 const PATRONI_REST: &str = "http://localhost:8008";
 const EXPECTED_ARCHIVE_MODE: &str = "on";
-const EXPECTED_ARCHIVE_COMMAND: &str = "pgbackrest --stanza=main archive-push %p";
+const EXPECTED_ARCHIVE_COMMAND: &str = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
 
 /// Wait for Patroni's REST API to respond before reconciling. Patroni starts
 /// shortly after `patroni-runner` spawns it, but there's a startup window
@@ -74,15 +75,15 @@ async fn wait_for_patroni_rest(client: &reqwest::Client) -> Result<()> {
 
 /// Reconcile DCS archive params with env-driven intent.
 ///
-/// - `PGBACKREST_REPO1_S3_BUCKET` set: assert
-///   `archive_mode=on` / `archive_command='pgbackrest --stanza=main archive-push %p'` /
+/// - `WAL_ARCHIVE_BUCKET` set: assert `archive_mode=on` /
+///   `archive_command='/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'` /
 ///   `archive_timeout=60` are present in DCS. Patches them in if missing.
-/// - `PGBACKREST_REPO1_S3_BUCKET` unset: remove those keys from DCS so
-///   leftover archive_mode from a previous enable doesn't keep firing
+/// - `WAL_ARCHIVE_BUCKET` unset: remove those keys from DCS so leftover
+///   archive_mode from a previous enable doesn't keep firing
 ///   archive_command after disable.
 /// - Idempotent: no patch issued when DCS already matches intent.
 pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> {
-    let enabled = config.pgbackrest_s3_bucket.is_some();
+    let enabled = config.wal_archive_bucket.is_some();
     let expected_archive_timeout = config.archive_timeout_secs;
 
     let client = reqwest::Client::builder()
@@ -155,7 +156,7 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
         warn!(
             current_mode = ?archive_mode,
             current_command = ?archive_command,
-            "DCS still has archive params but PGBACKREST_REPO1_S3_BUCKET is unset — clearing"
+            "DCS still has archive params but WAL_ARCHIVE_BUCKET is unset — clearing"
         );
 
         // null in PATCH /config removes the key from the merged DCS config.

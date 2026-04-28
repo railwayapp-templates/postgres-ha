@@ -65,14 +65,16 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     psycopg2-binary \
     patroni[etcd]==${PATRONI_VERSION}
 
-# Create required directories. pgBackRest spool dir is dormant unless
-# PGBACKREST_REPO1_S3_BUCKET is set at runtime; see patroni-runner.
-RUN mkdir -p /home/postgres /var/run/postgresql /etc/patroni /etc/pgbackrest /var/lib/postgresql/pgbackrest-spool \
-    && chown -R postgres:postgres /home/postgres /var/run/postgresql /etc/patroni /etc/pgbackrest /var/lib/postgresql/pgbackrest-spool \
-    && chmod 0750 /var/lib/postgresql/pgbackrest-spool
+# Create required directories. The pgBackRest spool lives on the data
+# volume ($PGDATA/pgbackrest-spool) so segments staged but not yet pushed
+# survive container restarts; patroni-runner creates it at runtime when
+# WAL_ARCHIVE_BUCKET is set, so nothing to pre-create here.
+RUN mkdir -p /home/postgres /var/run/postgresql /etc/patroni /etc/pgbackrest \
+    && chown -R postgres:postgres /home/postgres /var/run/postgresql /etc/patroni /etc/pgbackrest
 
-# Copy SSL init script and Rust binaries
+# Copy SSL init script, archive-push wrapper, and Rust binaries
 COPY --chmod=755 postgres-patroni/init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
+COPY --chmod=755 postgres-patroni/pgbackrest-archive-push-wrapper.sh /usr/local/bin/pgbackrest-archive-push-wrapper.sh
 COPY --from=rust-binaries --chmod=755 /postgres-wrapper /usr/local/bin/postgres-wrapper
 COPY --from=rust-binaries --chmod=755 /post-bootstrap /usr/local/bin/post-bootstrap
 COPY --from=rust-binaries --chmod=755 /patroni-runner /usr/local/bin/patroni-runner

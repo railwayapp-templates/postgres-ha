@@ -11,7 +11,7 @@ use tracing::info;
 pub fn generate_patroni_config(config: &Config) -> String {
     // Opt-in pgBackRest archiving: adds archive_mode/archive_command/
     // archive_timeout to the cluster's postgresql.parameters when
-    // PGBACKREST_REPO1_S3_BUCKET is set.
+    // WAL_ARCHIVE_BUCKET is set.
     //
     // archive_mode=on (industry-mainstream Patroni + WAL archiving setting):
     // every node carries the same config, but only the current Patroni
@@ -20,15 +20,18 @@ pub fn generate_patroni_config(config: &Config) -> String {
     // config change. Residual failover RPO under `on` is archive_timeout
     // (60s) plus failover-detection time.
     //
-    // pgBackRest runs in async mode (configured in /etc/pgbackrest/pgbackrest.conf
-    // by patroni-runner) with archive-push-queue-max=5GiB — when the queue
-    // trips, pgBackRest drops WAL and tells Postgres the push succeeded,
-    // keeping the database running rather than letting pg_wal fill the data
-    // volume. PITR window truncates; DB stays up. This is the explicit
-    // architectural reason we picked pgBackRest over wal-g.
-    let pgbackrest_archive_params = if config.pgbackrest_s3_bucket.is_some() {
+    // archive_command points at the never-halt wrapper rather than calling
+    // pgbackrest directly. The wrapper measures pg_wal/ on hard failures
+    // (bad creds, deleted bucket, expired keys) and drops segments past
+    // PGBACKREST_DROP_THRESHOLD_MB (default 500 MiB) to keep Postgres
+    // running. pgBackRest itself is configured async with
+    // archive-push-queue-max=5GiB (in /etc/pgbackrest/pgbackrest.conf,
+    // rendered by patroni-runner) so transient S3 stalls absorb in the
+    // spool. PITR window truncates on either path; DB stays up. This is
+    // the explicit architectural reason we picked pgBackRest over wal-g.
+    let pgbackrest_archive_params = if config.wal_archive_bucket.is_some() {
         format!(
-            "        archive_mode: \"on\"\n        archive_command: \"pgbackrest --stanza=main archive-push %p\"\n        archive_timeout: {}\n",
+            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n",
             config.archive_timeout_secs,
         )
     } else {
@@ -164,11 +167,7 @@ host replication {} 0.0.0.0/0 scram-sha-256
 host replication {} ::/0 scram-sha-256
 
 "#,
-        config.repl_user,
-        config.repl_user,
-        config.repl_user,
-        config.repl_user,
-        config.repl_user
+        config.repl_user, config.repl_user, config.repl_user, config.repl_user, config.repl_user
     );
 
     let new_content = format!("{}{}", new_entries, content);
