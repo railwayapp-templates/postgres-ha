@@ -41,7 +41,6 @@ use tracing::{info, warn};
 const PATRONI_REST: &str = "http://localhost:8008";
 const EXPECTED_ARCHIVE_MODE: &str = "on";
 const EXPECTED_ARCHIVE_COMMAND: &str = "pgbackrest --stanza=main archive-push %p";
-const EXPECTED_ARCHIVE_TIMEOUT: i64 = 60;
 
 /// Wait for Patroni's REST API to respond before reconciling. Patroni starts
 /// shortly after `patroni-runner` spawns it, but there's a startup window
@@ -84,6 +83,7 @@ async fn wait_for_patroni_rest(client: &reqwest::Client) -> Result<()> {
 /// - Idempotent: no patch issued when DCS already matches intent.
 pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> {
     let enabled = config.pgbackrest_s3_bucket.is_some();
+    let expected_archive_timeout = config.archive_timeout_secs;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -121,7 +121,7 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
     if enabled {
         if archive_mode == Some(EXPECTED_ARCHIVE_MODE)
             && archive_command == Some(EXPECTED_ARCHIVE_COMMAND)
-            && archive_timeout == Some(EXPECTED_ARCHIVE_TIMEOUT)
+            && archive_timeout == Some(expected_archive_timeout)
         {
             info!("DCS archive config matches env-driven intent (PITR enabled)");
             return Ok(());
@@ -139,7 +139,7 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
                 "parameters": {
                     "archive_mode": EXPECTED_ARCHIVE_MODE,
                     "archive_command": EXPECTED_ARCHIVE_COMMAND,
-                    "archive_timeout": EXPECTED_ARCHIVE_TIMEOUT,
+                    "archive_timeout": expected_archive_timeout,
                 }
             }
         });
@@ -173,7 +173,6 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
         info!("DCS archive params cleared (PITR disabled)");
     }
 
-    let _ = config; // silence unused if we don't expand intent later
     Ok(())
 }
 
