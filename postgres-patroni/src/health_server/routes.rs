@@ -2,13 +2,7 @@
 
 use super::config::HealthServerConfig;
 use super::postgres::{check_patroni_role, is_in_recovery};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Router,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use tracing::{debug, info};
 
 /// Create the router with all health check endpoints
