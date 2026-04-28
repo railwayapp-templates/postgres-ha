@@ -41,11 +41,13 @@ fn main() {
             new_role: role.unwrap().to_string(),
             scope: scope.to_string(),
         },
-        (Some("replica" | "standby"), Some(scope), Some(node)) => TelemetryEvent::PostgresRejoined {
-            node,
-            role: role.unwrap().to_string(),
-            scope: scope.to_string(),
-        },
+        (Some("replica" | "standby"), Some(scope), Some(node)) => {
+            TelemetryEvent::PostgresRejoined {
+                node,
+                role: role.unwrap().to_string(),
+                scope: scope.to_string(),
+            }
+        }
         _ => TelemetryEvent::ComponentError {
             component: "patroni".to_string(),
             error: format!(

@@ -6,7 +6,9 @@
 
 use anyhow::{Context, Result};
 use common::{init_logging, Telemetry, TelemetryEvent};
-use postgres_patroni::bootstrap::{read_credentials, run_psql, run_psql_in_db, run_psql_script, PATRONI_CONFIG};
+use postgres_patroni::bootstrap::{
+    read_credentials, run_psql, run_psql_in_db, run_psql_script, PATRONI_CONFIG,
+};
 use postgres_patroni::volume_root;
 use std::env;
 use std::path::Path;
