@@ -319,18 +319,27 @@ setup_patroni_cluster() {
     esac
   done
   if [ "$needs_archive_restart" = "1" ]; then
-    wait_for_leader "$scope" 240 >/dev/null 2>&1 || { echo "$n1 $n2 $n3"; return; }
-    # Each node calls its OWN local Patroni REST API to schedule its
-    # restart. Calling from a third party works only until the third
-    # party itself restarts — when the source node is the leader, it
-    # races itself out of the loop. Self-restart sidesteps that.
-    # Sequential w/ wait so the cluster keeps a leader at all times.
+    local leader; leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
+    # Force the DCS postgresql.parameters to include archive_mode et al.
+    # The runner spawns a reconcile task that should do this, but in the
+    # phase-1→phase-2 reuse flow (vanilla cluster bootstraps DCS without
+    # archive params, then we restart with archive env) the reconcile
+    # races Patroni's REST coming up and may silently no-op. Doing it
+    # from the harness mirrors what `dashboard enable PITR` does in prod.
+    docker exec "$leader" curl -sf -X PATCH -H "Content-Type: application/json" \
+      -d '{"postgresql":{"parameters":{"archive_mode":"on","archive_command":"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p","archive_timeout":60,"track_commit_timestamp":"on"}}}' \
+      "http://localhost:8008/config" >/dev/null 2>&1 || true
+    # Use `docker restart` rather than Patroni REST /restart. The runner
+    # has a tight 3-failure health monitor on Patroni REST and self-exits
+    # when REST goes down mid-restart — Patroni's own /restart bounces
+    # postgres but blips its own REST too, which trips the monitor.
+    # Full container restart sidesteps that: patroni-runner comes up
+    # fresh, reads DCS (already PATCHed above), applies archive_mode at
+    # first start, no health-monitor race. Sequential so a leader stays.
     for n in "$n1" "$n2" "$n3"; do
-      docker exec "$n" curl -sf -X POST -H "Content-Type: application/json" \
-        -d "{\"role\":\"any\"}" \
-        "http://localhost:8008/restart" >/dev/null 2>&1 || true
-      # Wait for the node to come back ready before moving to the next.
-      local ready_deadline=$(($(date +%s) + 60))
+      docker restart "$n" >/dev/null 2>&1 || true
+      # Wait for Patroni REST to be back before next node.
+      local ready_deadline=$(($(date +%s) + 90))
       while [ "$(date +%s)" -lt "$ready_deadline" ]; do
         if docker exec "$n" curl -sf "http://localhost:8008/health" >/dev/null 2>&1; then
           break
@@ -339,7 +348,7 @@ setup_patroni_cluster() {
       done
     done
     # Re-elect leader if needed.
-    local leader; leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
+    leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
 
     # The runner's spawn_bootstrap_stanza_create task fires ONCE on
     # patroni-runner start. On the second-boot path that task hits
