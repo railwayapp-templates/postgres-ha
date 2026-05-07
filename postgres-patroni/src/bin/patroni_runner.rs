@@ -470,8 +470,17 @@ fn spawn_bootstrap_stanza_create() {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+        // PGHOST/PGPORT must not leak into pgbackrest's libpq calls — a
+        // customer-supplied PGHOST=${{ Postgres.RAILWAY_PRIVATE_DOMAIN }}
+        // would point libpq at the privnet domain and time out
+        // (`unable to find primary cluster`). The parent already cleared
+        // these before forking this task, but a Command-level remove is
+        // belt-and-suspenders so future refactors can't reintroduce the
+        // leak. Mirrors postgres-ssl PR #51.
         let out = tokio::process::Command::new("gosu")
             .args(["postgres", "pgbackrest", "--stanza=main", "stanza-create"])
+            .env_remove("PGHOST")
+            .env_remove("PGPORT")
             .status()
             .await;
         match out {
