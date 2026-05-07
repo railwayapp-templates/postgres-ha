@@ -319,18 +319,27 @@ setup_patroni_cluster() {
     esac
   done
   if [ "$needs_archive_restart" = "1" ]; then
-    local leader; leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
-    # Use Patroni REST API to trigger restart on each node — this is
-    # what `patronictl restart` does under the hood. Single-node
-    # rolling restart so the cluster keeps a leader at all times.
+    wait_for_leader "$scope" 240 >/dev/null 2>&1 || { echo "$n1 $n2 $n3"; return; }
+    # Each node calls its OWN local Patroni REST API to schedule its
+    # restart. Calling from a third party works only until the third
+    # party itself restarts — when the source node is the leader, it
+    # races itself out of the loop. Self-restart sidesteps that.
+    # Sequential w/ wait so the cluster keeps a leader at all times.
     for n in "$n1" "$n2" "$n3"; do
-      docker exec "$leader" curl -sf -X POST -H "Content-Type: application/json" \
+      docker exec "$n" curl -sf -X POST -H "Content-Type: application/json" \
         -d "{\"role\":\"any\"}" \
-        "http://${n}:8008/restart" >/dev/null 2>&1 || true
-      sleep 8
+        "http://localhost:8008/restart" >/dev/null 2>&1 || true
+      # Wait for the node to come back ready before moving to the next.
+      local ready_deadline=$(($(date +%s) + 60))
+      while [ "$(date +%s)" -lt "$ready_deadline" ]; do
+        if docker exec "$n" curl -sf "http://localhost:8008/health" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 1
+      done
     done
     # Re-elect leader if needed.
-    leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
+    local leader; leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
 
     # The runner's spawn_bootstrap_stanza_create task fires ONCE on
     # patroni-runner start. On the second-boot path that task hits
