@@ -387,6 +387,21 @@ fn configure_pitr_recovery(config: &Config, target_time: &str) -> Result<()> {
     let staging = format!("{data_dir}/.pitr_staging");
     let done = format!("{data_dir}/.pitr_configured");
     let signal = format!("{data_dir}/recovery.signal");
+    let pg_version = format!("{data_dir}/PG_VERSION");
+    let restored_marker = format!("{data_dir}/.pgbackrest_restored");
+
+    // Log restore-gate state up front so post-mortems on "why did/didn't
+    // PITR run" don't require guessing. Mirrors postgres-ssl PR #57.
+    info!(
+        wal_recover_from_bucket = config.wal_recover_from_bucket.is_some(),
+        postgres_recovery_target_time = %target_time,
+        pg_version_present = Path::new(&pg_version).exists(),
+        restored_marker_present = Path::new(&restored_marker).exists(),
+        pitr_staging_present = Path::new(&staging).exists(),
+        pitr_configured_present = Path::new(&done).exists(),
+        pgdata_path = %data_dir,
+        "pgbackrest: restore-gate state"
+    );
 
     if Path::new(&done).exists() {
         return Ok(());
