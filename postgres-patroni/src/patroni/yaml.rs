@@ -9,6 +9,42 @@ use tracing::info;
 
 /// Generate Patroni YAML configuration
 pub fn generate_patroni_config(config: &Config) -> String {
+    // Opt-in pgBackRest archiving: adds archive_mode/archive_command/
+    // archive_timeout to the cluster's postgresql.parameters when
+    // WAL_ARCHIVE_BUCKET is set.
+    //
+    // archive_mode=on (industry-mainstream Patroni + WAL archiving setting):
+    // every node carries the same config, but only the current Patroni
+    // leader actually fires archive_command. Standbys hold the pgBackRest
+    // binary and config so promotion instantly enables archiving with no
+    // config change. Residual failover RPO under `on` is archive_timeout
+    // (60s) plus failover-detection time.
+    //
+    // archive_command points at the never-halt wrapper rather than calling
+    // pgbackrest directly. The wrapper measures pg_wal/ on hard failures
+    // (bad creds, deleted bucket, expired keys) and drops segments past
+    // PGBACKREST_DROP_THRESHOLD_MB (default 500 MiB) to keep Postgres
+    // running. pgBackRest itself is configured async with
+    // archive-push-queue-max=5GiB (in /etc/pgbackrest/pgbackrest.conf,
+    // rendered by patroni-runner) so transient S3 stalls absorb in the
+    // spool. PITR window truncates on either path; DB stays up. This is
+    // the explicit architectural reason we picked pgBackRest over wal-g.
+    // track_commit_timestamp lets pg_last_committed_xact() return the
+    // wall-clock time of the last commit. The PITR picker uses that as its
+    // upper bound: `recovery_target_time` only matches commit record
+    // timestamps, so on an idle DB the archive head keeps ticking with empty
+    // WAL while the latest reachable target stays pinned at the last commit.
+    // Without this GUC the picker falls back to lastArchivedAt and the user
+    // can pick an unreachable target. Mirrors postgres-ssl PRs #52 + #58.
+    let pgbackrest_archive_params = if config.wal_archive_bucket.is_some() {
+        format!(
+            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n",
+            config.archive_timeout_secs,
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"scope: {scope}
 name: {name}
@@ -41,7 +77,7 @@ bootstrap:
         max_connections: 200
         password_encryption: scram-sha-256
         shared_preload_libraries: pg_stat_statements
-
+{pgbackrest_archive_params}
   initdb:
     - encoding: UTF8
     - data-checksums
@@ -105,6 +141,7 @@ postgresql:
         data_dir = config.data_dir,
         certs_dir = config.certs_dir,
         synchronous_mode = config.synchronous_mode,
+        pgbackrest_archive_params = pgbackrest_archive_params,
     )
 }
 
@@ -137,11 +174,7 @@ host replication {} 0.0.0.0/0 scram-sha-256
 host replication {} ::/0 scram-sha-256
 
 "#,
-        config.repl_user,
-        config.repl_user,
-        config.repl_user,
-        config.repl_user,
-        config.repl_user
+        config.repl_user, config.repl_user, config.repl_user, config.repl_user, config.repl_user
     );
 
     let new_content = format!("{}{}", new_entries, content);

@@ -31,15 +31,14 @@ pub fn is_valid_x509v3_cert(cert_path: &str) -> Result<bool> {
     }
 
     // Parse server certificate
-    let server_crt_pem =
-        fs::read(&server_crt_path).context("Failed to read server certificate")?;
+    let server_crt_pem = fs::read(&server_crt_path).context("Failed to read server certificate")?;
     let server_cert =
         X509::from_pem(&server_crt_pem).context("Failed to parse server certificate as PEM")?;
 
     // Parse server private key
     let server_key_pem = fs::read(&server_key_path).context("Failed to read server private key")?;
-    let server_key =
-        PKey::private_key_from_pem(&server_key_pem).context("Failed to parse server private key")?;
+    let server_key = PKey::private_key_from_pem(&server_key_pem)
+        .context("Failed to parse server private key")?;
 
     // Parse root CA certificate
     let root_crt_pem = fs::read(&root_crt_path).context("Failed to read root CA certificate")?;
@@ -62,8 +61,7 @@ pub fn is_valid_x509v3_cert(cert_path: &str) -> Result<bool> {
         .context("Failed to add root CA to store")?;
     let store = store_builder.build();
 
-    let mut store_ctx =
-        X509StoreContext::new().context("Failed to create X509 store context")?;
+    let mut store_ctx = X509StoreContext::new().context("Failed to create X509 store context")?;
 
     let chain = openssl::stack::Stack::new().context("Failed to create certificate chain")?;
 
@@ -89,7 +87,9 @@ pub fn cert_expires_within(cert_path: &str, seconds: u64) -> Result<bool> {
     // Asn1TimeRef::diff(other) computes: other - self
     // We want: not_after - now = time remaining until expiry
     let now = openssl::asn1::Asn1Time::days_from_now(0).context("Failed to get current time")?;
-    let diff = now.diff(&not_after).context("Failed to compute time difference")?;
+    let diff = now
+        .diff(&not_after)
+        .context("Failed to compute time difference")?;
 
     // Convert diff to total seconds (time remaining until expiry)
     let total_seconds = (diff.days as i64 * 86400) + diff.secs as i64;
