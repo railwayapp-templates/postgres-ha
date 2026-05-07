@@ -6,12 +6,14 @@
 //! - Health checking
 //! - Process monitoring
 
+mod backup_watcher;
 mod config;
 mod health;
 mod monitoring;
 mod reconcile;
 mod yaml;
 
+pub use backup_watcher::spawn as spawn_backup_watcher;
 pub use config::Config;
 pub use health::check_health;
 pub use monitoring::run_monitoring_loop;

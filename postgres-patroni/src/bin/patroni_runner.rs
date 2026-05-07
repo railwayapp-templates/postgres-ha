@@ -10,7 +10,7 @@ use nix::sys::stat::{umask, Mode};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
-    update_pg_hba_for_replication, Config,
+    spawn_backup_watcher, update_pg_hba_for_replication, Config,
 };
 use postgres_patroni::{volume_root, Telemetry};
 use serde::{Deserialize, Serialize};
@@ -813,6 +813,13 @@ async fn main() -> Result<()> {
     // node — pgBackRest's stanza metadata is keyed on system_identifier,
     // which is identical across HA peers.
     spawn_bootstrap_stanza_create();
+
+    // Spawn the leader-only backup watcher. Mirrors postgres-ssl
+    // pgbackrest-backup-watcher.sh. Each iteration re-checks Patroni's
+    // /leader API so replicas stay idle and a new leader takes over
+    // within one poll cycle after failover. No-op when
+    // WAL_ARCHIVE_BUCKET is unset.
+    spawn_backup_watcher(config.data_dir.clone());
 
     run_monitoring_loop(&config, child, &telemetry).await
 }
