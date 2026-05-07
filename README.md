@@ -49,18 +49,27 @@ continuously to S3-compatible storage in **async mode**
 instantly enables archiving with no config change.
 
 The image reads a tool-agnostic `WAL_ARCHIVE_*` / `WAL_RECOVER_FROM_*`
-env contract; `patroni-runner` translates internally to pgBackRest's
-native `PGBACKREST_REPO{1,2}_S3_*` so swapping pgBackRest for another
-archiver in the future is a wrapper change rather than a cross-repo
-rewrite. Three modes:
+env contract. `patroni-runner` translates `WAL_ARCHIVE_*` to pgBackRest's
+native `PGBACKREST_REPO1_S3_*` so the main `pgbackrest.conf`'s repo1
+always = the cluster's own archive bucket. `WAL_RECOVER_FROM_*` is
+materialised in a separate `/etc/pgbackrest/pgbackrest-recovery-source.conf`
+(only that file references the source bucket) and is NEVER exported as
+env vars — pgBackRest's option resolution is command-line > env > config
+> default, so a global env export would silently override the
+`--config` we pass during recovery and could leak archive-push to the
+source bucket. With this isolation:
 
-- `WAL_ARCHIVE_*` only → standalone archiving cluster. `repo1` = archive bucket.
-- `WAL_RECOVER_FROM_*` only → restored cluster, no ongoing archiving.
-  `repo1` = source's bucket (read-only during recovery).
+- `WAL_ARCHIVE_*` only → standalone archiving cluster. Main conf's
+  repo1 = archive bucket.
+- `WAL_RECOVER_FROM_*` only → cluster restoring from a source bucket;
+  recovery-source conf has the source. After promote the cluster runs
+  as plain non-archiving Postgres.
 - `WAL_ARCHIVE_*` + `WAL_RECOVER_FROM_*` → restored cluster with PITR
-  re-enabled. `repo1` = source (read), `repo2` = own archive bucket
-  (write). The archive-push wrapper passes `--repo=2` so post-promote
-  WAL never sprays into the source bucket.
+  re-enabled. Main conf's repo1 = own archive bucket (post-promote
+  archive-push); recovery-source conf has source bucket (archive-get
+  during replay only). Source and own bucket never appear in the same
+  config file, so archive-push from the fork can never spray into the
+  source bucket.
 
 Operator-facing env contract:
 
@@ -74,12 +83,17 @@ Operator-facing env contract:
 | `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored cluster; `archive-get` reads source WAL from here during replay. Set by backboard on restore; not normally a manual knob. |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 | `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
+| `WAL_BACKUP_FULL_INTERVAL_HOURS` | image-owned full base-backup cadence (default `168` = weekly; `0` disables periodic fulls). Initial / gap-recovery fulls fire regardless. |
+| `WAL_BACKUP_DIFF_INTERVAL_HOURS` | image-owned differential base-backup cadence (default `24`; `0` disables) |
+| `WAL_BACKUP_RETENTION_FULL` | full backups kept by `pgbackrest expire` (default `4`) |
+| `WAL_BACKUP_RETENTION_DIFF` | differentials kept by `pgbackrest expire` (default `14`) |
+| `WAL_HEARTBEAT_DISABLED` | set to `1` to disable the idle-DB WAL heartbeat (advanced; reduces archive cost on quiet DBs at the price of stale PITR ceiling) |
 
 Image-level tuning knobs (pgBackRest-native, internal):
 
 | Env var | Purpose |
 |---|---|
-| `PGBACKREST_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `500`) |
+| `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `500`). Outside the `PGBACKREST_*` namespace because pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
 | `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
 | `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default `1` (WAL replay is serial). |
 | `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 16)`. |
@@ -108,7 +122,7 @@ that gap on planned switchover.
 - `archive-push-queue-max=5GiB` (image-baked) governs the **spool**.
   Trips on transient S3 stalls — async worker keeps retrying and most
   segments eventually land. Generous buffer to absorb multi-hour outages.
-- `PGBACKREST_DROP_THRESHOLD_MB=500` (default) governs **`pg_wal/`**
+- `WAL_DROP_THRESHOLD_MB=500` (default) governs **`pg_wal/`**
   when pgbackrest's foreground returns non-zero. Trips on hard failures
   (bad creds, deleted bucket) where retrying without operator
   intervention has zero chance of success. The `archive_command` is the
@@ -156,13 +170,109 @@ WAL chain. The previous "mandatory repo-path divergence" guard and the
 For backwards compatibility, when `POSTGRES_RECOVERY_TARGET_TIME` is set
 on an HA primary volume directly, `patroni-runner` still creates
 `recovery.signal` and writes the matching recovery settings into
-`postgresql.auto.conf` before starting Patroni. Two filesystem stamps
-coordinate "exactly once per successful promote": `.pitr_staging` is
-written when replay is handed to Postgres, `.pitr_configured` is written
-on the boot AFTER Postgres consumes `recovery.signal` (which it only
-removes on successful promote). A failed replay leaves `.pitr_staging`
-behind WITHOUT `.pitr_configured` — fix env vars and restart, the next
-boot re-stages cleanly.
+`postgresql.auto.conf` before starting Patroni. The `restore_command`
+references `--config=/etc/pgbackrest/pgbackrest-recovery-source.conf`
+so archive-get during replay reads only the source bucket. Two
+filesystem stamps coordinate "exactly once per successful promote":
+`.pitr_staging` is written when replay is handed to Postgres,
+`.pitr_configured` is written on the boot AFTER Postgres consumes
+`recovery.signal` (which it only removes on successful promote). A
+failed replay leaves `.pitr_staging` behind WITHOUT `.pitr_configured` —
+fix env vars and restart, the next boot re-stages cleanly.
+
+### Image-owned base backups
+
+When `WAL_ARCHIVE_BUCKET` is set, `patroni-runner` spawns a leader-only
+backup-watcher task that polls every 60s. Every iteration the watcher
+asks the local Patroni REST API (`GET /leader`, 200 = leader, 503 =
+replica) — replicas no-op the iteration, so only the current leader
+runs backups. After failover the new leader's watcher takes over within
+one poll cycle. pgBackRest's stanza locks are the second-line guarantee
+against concurrent backups across cluster nodes.
+
+The watcher runs `pgbackrest backup` against the archive bucket when
+one of these conditions holds:
+
+1. **Initial backup** — no full has been recorded on this volume.
+   Triggers a `--type=full` immediately; pgBackRest brackets the base
+   in `pg_backup_start`/`pg_backup_stop` and waits for the closing WAL
+   to archive before declaring success, so a broken `archive_command`
+   fails the backup loudly instead of producing an unrestorable base.
+2. **Gap recovery** — either the archive-push wrapper dropped a segment
+   (touches `$PGDATA/.pgbackrest_gap_pending`) or
+   `pg_stat_archiver.failed_count` grew since the last full. Once
+   archive failures have been quiescent for
+   `WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS` (default 300s), runs a fresh
+   full so the PITR window resumes from the new base. The dropped
+   segment itself remains unrestorable; everything from the new base
+   forward is.
+3. **Periodic** — `WAL_BACKUP_FULL_INTERVAL_HOURS` (default 168 h /
+   weekly) for fulls, `WAL_BACKUP_DIFF_INTERVAL_HOURS` (default 24 h)
+   for differentials. Set either to `0` to disable that schedule.
+
+Every iteration also emits a tiny non-transactional WAL record
+(`pg_logical_emit_message`) so `archive_timeout=60` flushes a segment
+on idle DBs — without it the picker's "latest restorable" lags
+wall-clock by the checkpoint interval (default 5 min) on quiet
+services. Disable via `WAL_HEARTBEAT_DISABLED=1`.
+
+State persists at `$PGDATA/.pgbackrest_backup_state` (key=value lines:
+`last_full_at`, `last_diff_at`, `last_full_failed_count`). The
+bucket-side `pgbackrest --stanza=main info --output=json` is the
+canonical source of truth; the local file is a cache that survives
+restarts.
+
+**Known gap**: pgBackRest's `archive-push-queue-max` trip drops segments
+without going through the archive-push wrapper *and* without
+incrementing `failed_count`, so neither gap signal fires. Until log
+parsing or LSN-lag detection lands, queue-max-trip gaps are sealed by
+the next periodic full rather than promptly.
+
+### Per-cluster archive paths
+
+Each cluster archives under a sub-prefix derived from its
+`system_identifier`:
+`${WAL_ARCHIVE_PATH}/cluster-<system_identifier>`. The path is
+persisted in `$PGDATA/.pgbackrest_repo_path` so the archive-push
+wrapper, the backup watcher, `pgbackrest stanza-create`, and out-of-
+band invocations (e.g. mono's PITR coverage probe over SSH) all
+converge on the same value. `patroni-runner` rewrites the rendered
+`/etc/pgbackrest/pgbackrest.conf`'s `repo1-path=` line once
+`pg_control` is on disk, so an SSH-driven `pgbackrest info` (which
+inherits no shell env from the container) reads the per-cluster path
+correctly.
+
+Why per-cluster: a wipe-and-reuse-bucket cycle (operator drops the
+data volume, redeploys against the same `WAL_ARCHIVE_BUCKET`) produces
+a brand-new `system_identifier` from `initdb`. Without discrimination,
+pgBackRest's stanza-create would refuse the new cluster on system-id
+mismatch and the new cluster's WAL would never land — silent data loss
+for any operator who didn't notice. With per-cluster paths, the new
+cluster lands at `cluster-<new_sysid>`, the previous cluster's archive
+stays at `cluster-<old_sysid>`, and both histories coexist.
+
+`WAL_RECOVER_FROM_PATH` on a restored cluster must point at the
+specific source-side `cluster-<sysid>` sub-prefix the user wants to
+restore from — `pgbackrest restore` reads from one path. Backboard
+discovers per-cluster sub-prefixes by listing the bucket and surfaces
+them as separate "histories" in the restore UI.
+
+### Retention
+
+For PITR-enabled clusters, **`pgbackrest expire` is the sole WAL
+retention authority** — no Postgres GUCs, no bucket-side lifecycle
+policy. Backup manifests pin the WAL needed to make each backup
+restorable; expire releases both together when a backup ages out.
+Earlier iterations proposed a bucket-side TTL as a safety net but it's
+superfluous: any TTL shorter than expire's horizon would yank WAL out
+from under live manifests, and any TTL ≥ that horizon is redundant.
+
+`pgbackrest expire` runs automatically after each `pgbackrest backup`
+the watcher invokes, removing fulls/diffs beyond
+`WAL_BACKUP_RETENTION_FULL` / `WAL_BACKUP_RETENTION_DIFF`, plus the WAL
+their manifests no longer pin. The default retention (full=4, diff=14,
+weekly fulls + daily diffs) covers approximately a four-week PITR
+window before the oldest full ages out.
 
 ## Quick Start
 
