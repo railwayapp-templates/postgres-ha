@@ -431,12 +431,49 @@ wait_for_stanza_create() {
 # Wait for the watcher to log a successful backup of the given type on
 # the leader. Format from the Rust runner: `backup_type="full"
 # pgbackrest-watcher: backup completed`.
+_strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'; }
+
+# Heredoc-friendly preamble that re-derives PGBACKREST_REPO1_*
+# from the WAL_ARCHIVE_* env contract. Patroni-runner only exports
+# these to its own forks, so ad-hoc `docker exec` shells need to
+# rebuild them. Reads the per-cluster repo-path marker (PR #47/#50).
+# Use as: docker exec ... bash -c "$(_pgbackrest_env_preamble); cmd"
+_pgbackrest_env_preamble() {
+  cat <<'PRE'
+export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
+export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
+export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
+export PGBACKREST_REPO1_S3_REGION="${WAL_ARCHIVE_REGION:-us-east-1}"
+export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
+export PGBACKREST_REPO1_S3_URI_STYLE="${WAL_ARCHIVE_S3_URI_STYLE:-path}"
+if [ -f /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path ]; then
+  export PGBACKREST_REPO1_PATH="$(cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path)"
+else
+  export PGBACKREST_REPO1_PATH="${WAL_ARCHIVE_PATH:-/pgbackrest}"
+fi
+unset PGHOST PGPORT
+PRE
+}
+
+# Count "pgbackrest-watcher: backup completed" lines of a given type.
+# tracing emits the message first then the structured field
+# (backup_type=...) and styles the field with ANSI escapes by default,
+# so naive `grep "field=value.*message"` loses the line. Strip ANSI
+# first, then match the two substrings independently.
+count_watcher_backup_logs() {
+  local container="$1" want_type="$2"
+  docker logs "$container" 2>&1 \
+    | _strip_ansi \
+    | grep "pgbackrest-watcher: backup completed" \
+    | grep -cE "backup_type=\"?${want_type}\"?" \
+    || true
+}
+
 wait_for_watcher_backup() {
   local container="$1" want_type="$2" deadline_secs="${3:-90}"
   local deadline=$(($(date +%s) + deadline_secs))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$container" 2>&1 \
-       | grep -E "backup_type=\"?${want_type}\"?.*pgbackrest-watcher: backup completed" -q; then
+    if [ "$(count_watcher_backup_logs "$container" "$want_type")" -gt 0 ]; then
       return 0
     fi
     sleep 3
@@ -449,12 +486,7 @@ wait_for_watcher_backup() {
 # sub-prefix.
 count_backups_of_type() {
   local container="$1" want_type="$2"
-  docker exec -u postgres "$container" bash -c "
-    if [ -f /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path ]; then
-      export PGBACKREST_REPO1_PATH=\"\$(cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path)\"
-    else
-      export PGBACKREST_REPO1_PATH=\"\${WAL_ARCHIVE_PATH:-/pgbackrest}\"
-    fi
+  docker exec -u postgres "$container" bash -c "$(_pgbackrest_env_preamble)
     pgbackrest --stanza=main info 2>/dev/null | grep -cE '^[[:space:]]+${want_type} backup: ' || true
   " 2>/dev/null | tail -1
 }
@@ -463,12 +495,7 @@ count_backups_of_type() {
 # avoid waiting for periodic cadence.
 take_pgbackrest_backup() {
   local container="$1" backup_type="${2:-full}"
-  docker exec -u postgres "$container" bash -c "
-    if [ -f /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path ]; then
-      export PGBACKREST_REPO1_PATH=\"\$(cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path)\"
-    else
-      export PGBACKREST_REPO1_PATH=\"\${WAL_ARCHIVE_PATH:-/pgbackrest}\"
-    fi
+  docker exec -u postgres "$container" bash -c "$(_pgbackrest_env_preamble)
     pgbackrest --stanza=main backup --type=$backup_type
   " >/dev/null 2>&1
 }
@@ -802,12 +829,12 @@ t_watcher_periodic_full() {
   '
 
   local before_count
-  before_count=$(docker logs "$leader" 2>&1 | grep -cE 'backup_type="?full"?.*pgbackrest-watcher: backup completed' || true)
+  before_count=$(count_watcher_backup_logs "$leader" full)
 
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local now_count
-    now_count=$(docker logs "$leader" 2>&1 | grep -cE 'backup_type="?full"?.*pgbackrest-watcher: backup completed' || true)
+    now_count=$(count_watcher_backup_logs "$leader" full)
     if [ "$now_count" -gt "$before_count" ]; then hit=1; break; fi
     sleep 3
   done
@@ -894,14 +921,14 @@ t_watcher_gap_recovery_full() {
   wait_for_watcher_backup "$leader" full 120 || { ko t_watcher_gap_recovery_full "no initial full"; teardown_scope "$scope"; return; }
 
   local before_count
-  before_count=$(docker logs "$leader" 2>&1 | grep -cE 'backup_type="?full"?.*pgbackrest-watcher: backup completed' || true)
+  before_count=$(count_watcher_backup_logs "$leader" full)
 
   docker exec -u postgres "$leader" touch /var/lib/postgresql/data/pgdata/.pgbackrest_gap_pending
 
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local now_count
-    now_count=$(docker logs "$leader" 2>&1 | grep -cE 'backup_type="?full"?.*pgbackrest-watcher: backup completed' || true)
+    now_count=$(count_watcher_backup_logs "$leader" full)
     if [ "$now_count" -gt "$before_count" ]; then hit=1; break; fi
     sleep 3
   done
