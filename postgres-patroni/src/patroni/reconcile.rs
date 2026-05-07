@@ -118,11 +118,15 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
     let archive_timeout = params
         .and_then(|m| m.get("archive_timeout"))
         .and_then(|v| v.as_i64());
+    let track_commit_timestamp = params
+        .and_then(|m| m.get("track_commit_timestamp"))
+        .and_then(|v| v.as_str());
 
     if enabled {
         if archive_mode == Some(EXPECTED_ARCHIVE_MODE)
             && archive_command == Some(EXPECTED_ARCHIVE_COMMAND)
             && archive_timeout == Some(expected_archive_timeout)
+            && track_commit_timestamp == Some("on")
         {
             info!("DCS archive config matches env-driven intent (PITR enabled)");
             return Ok(());
@@ -132,6 +136,7 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
             current_mode = ?archive_mode,
             current_command = ?archive_command,
             current_timeout = ?archive_timeout,
+            current_track_commit_timestamp = ?track_commit_timestamp,
             "DCS archive config drifted from env-driven intent — re-asserting"
         );
 
@@ -141,6 +146,7 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
                     "archive_mode": EXPECTED_ARCHIVE_MODE,
                     "archive_command": EXPECTED_ARCHIVE_COMMAND,
                     "archive_timeout": expected_archive_timeout,
+                    "track_commit_timestamp": "on",
                 }
             }
         });
@@ -160,6 +166,8 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
         );
 
         // null in PATCH /config removes the key from the merged DCS config.
+        // track_commit_timestamp is left in place: it's harmless when set
+        // without archiving, and a no-op cost on inactive clusters.
         let patch = json!({
             "postgresql": {
                 "parameters": {

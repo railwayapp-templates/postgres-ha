@@ -29,9 +29,16 @@ pub fn generate_patroni_config(config: &Config) -> String {
     // rendered by patroni-runner) so transient S3 stalls absorb in the
     // spool. PITR window truncates on either path; DB stays up. This is
     // the explicit architectural reason we picked pgBackRest over wal-g.
+    // track_commit_timestamp lets pg_last_committed_xact() return the
+    // wall-clock time of the last commit. The PITR picker uses that as its
+    // upper bound: `recovery_target_time` only matches commit record
+    // timestamps, so on an idle DB the archive head keeps ticking with empty
+    // WAL while the latest reachable target stays pinned at the last commit.
+    // Without this GUC the picker falls back to lastArchivedAt and the user
+    // can pick an unreachable target. Mirrors postgres-ssl PRs #52 + #58.
     let pgbackrest_archive_params = if config.wal_archive_bucket.is_some() {
         format!(
-            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n",
+            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n",
             config.archive_timeout_secs,
         )
     } else {
