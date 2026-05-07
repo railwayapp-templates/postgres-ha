@@ -248,8 +248,12 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 /// `PGBACKREST_DROP_THRESHOLD_MB` on `pg_wal/`. Either tripping drops WAL
 /// and keeps the DB up at the cost of a truncated PITR window.
 ///
-/// Spool lives under `$PGDATA/pgbackrest-spool` so segments staged but not
-/// yet pushed to S3 survive container restarts on the Railway volume.
+/// Spool lives at the volume root (sibling to pgdata) so segments staged
+/// but not yet pushed to S3 survive container restarts on the Railway
+/// volume. Same filesystem as pgdata (pgBackRest needs that for atomic
+/// rename of WAL into the archive queue), but kept out of pgdata itself —
+/// any subdir there would dirty pgdata before Patroni's first bootstrap
+/// and make replicas refuse to clone.
 ///
 /// Per-command `process-max` is sized off cgroup-detected vCPU. Each
 /// command has a different bottleneck shape: archive-push is gated by
@@ -269,7 +273,13 @@ fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
     }
 
     let conf_path = "/etc/pgbackrest/pgbackrest.conf";
-    let spool_dir = format!("{data_dir}/pgbackrest-spool");
+    // Spool lives at the volume root, sibling to pgdata — same filesystem
+    // (pgBackRest needs that for atomic rename of WAL into the archive
+    // queue), but NOT inside pgdata. If we put it under pgdata, every fresh
+    // PITR-enabled replica boot creates an empty subdir before Patroni
+    // bootstraps, and Patroni then refuses to clone with "data dir is not
+    // empty, but system ID is invalid".
+    let spool_dir = format!("{}/pgbackrest-spool", volume_root());
 
     let cpus = detect_cpus().max(1) as i64;
     let push_max = env_or_clamp("PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX", clamp(cpus / 8, 2, 8));
@@ -339,16 +349,9 @@ fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
     fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
         .context("Failed to set pgbackrest.conf permissions")?;
 
-    // Spool only gets created once the data dir exists; before initdb,
-    // Postgres won't run if PGDATA is non-empty. Patroni creates PGDATA on
-    // init, so by the time we render here on an existing volume we're safe;
-    // on first init we render before Patroni starts and PGDATA may not
-    // exist yet — best-effort, will retry on next boot.
-    if Path::new(data_dir).exists() {
-        fs::create_dir_all(&spool_dir).context("Failed to create pgbackrest-spool dir")?;
-        fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o750))
-            .context("Failed to set pgbackrest-spool permissions")?;
-    }
+    fs::create_dir_all(&spool_dir).context("Failed to create pgbackrest-spool dir")?;
+    fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o750))
+        .context("Failed to set pgbackrest-spool permissions")?;
 
     info!("pgbackrest: rendered {}", conf_path);
     Ok(())
