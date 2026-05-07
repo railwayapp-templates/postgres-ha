@@ -339,6 +339,29 @@ fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
     fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
         .context("Failed to set pgbackrest.conf permissions")?;
 
+    // One-shot migration from the pre-fix layout (spool inside pgdata).
+    // archive-async returns success to Postgres as soon as WAL hits spool,
+    // so segments staged but not yet pushed to S3 would be orphaned by
+    // simply switching paths. Atomic rename keeps any pending segments
+    // visible to pgBackRest at the new location. Same-FS guaranteed —
+    // both paths sit on the Railway volume.
+    let old_spool = format!("{data_dir}/pgbackrest-spool");
+    if Path::new(&old_spool).is_dir() && !Path::new(&spool_dir).exists() {
+        match fs::rename(&old_spool, &spool_dir) {
+            Ok(()) => info!(
+                from = %old_spool,
+                to = %spool_dir,
+                "pgbackrest: migrated spool out of pgdata"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                from = %old_spool,
+                to = %spool_dir,
+                "pgbackrest: spool migration failed; pending WAL in old spool may be orphaned"
+            ),
+        }
+    }
+
     fs::create_dir_all(&spool_dir).context("Failed to create pgbackrest-spool dir")?;
     fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o750))
         .context("Failed to set pgbackrest-spool permissions")?;
