@@ -443,6 +443,108 @@ fn configure_pitr_recovery(config: &Config, target_time: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read Postgres' `system_identifier` from pg_control via the
+/// `pg_controldata` binary. Returns None when pg_control isn't on disk yet
+/// (fresh volume, pre-initdb) or when parsing fails.
+fn read_postgres_sysid(data_dir: &str) -> Option<String> {
+    let pg_control = format!("{data_dir}/global/pg_control");
+    if !Path::new(&pg_control).exists() {
+        return None;
+    }
+    let out = std::process::Command::new("pg_controldata")
+        .arg(data_dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("Database system identifier:") {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the effective repo1-path for archiving. Uses the per-cluster
+/// `<base>/cluster-<sysid>` form so a wipe-and-reuse-bucket cycle (volume
+/// wiped, container redeployed against the same WAL_ARCHIVE_BUCKET) lets
+/// the new cluster's history coexist with the old at distinct sub-prefixes.
+///
+/// 1. Marker file present → trust it. Idempotent across boots; survives
+///    container restarts; wiped with the volume.
+/// 2. pg_control exists, marker absent → derive
+///    `<base>/cluster-<sysid>`, write marker.
+/// 3. Pre-initdb (no pg_control) → return base path as a placeholder; the
+///    marker gets written by the bootstrap subshell once Postgres is up.
+///
+/// Mirrors postgres-ssl PRs #47 + #50.
+fn derive_pgbackrest_repo_path(data_dir: &str) -> String {
+    let user_path = env::var("WAL_ARCHIVE_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/pgbackrest".to_string());
+    let marker = format!("{data_dir}/.pgbackrest_repo_path");
+
+    if let Ok(existing) = fs::read_to_string(&marker) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let Some(sysid) = read_postgres_sysid(data_dir) else {
+        return user_path;
+    };
+
+    let trimmed_base = user_path.trim_end_matches('/');
+    let cluster_path = format!("{trimmed_base}/cluster-{sysid}");
+    write_pgbackrest_repo_path_marker(&marker, &cluster_path);
+    cluster_path
+}
+
+fn write_pgbackrest_repo_path_marker(marker: &str, path: &str) {
+    if let Err(e) = fs::write(marker, format!("{path}\n")) {
+        warn!(error = %e, marker = %marker, "pgbackrest: failed to write repo-path marker");
+        return;
+    }
+    if let Err(e) = fs::set_permissions(marker, std::fs::Permissions::from_mode(0o640)) {
+        warn!(error = %e, marker = %marker, "pgbackrest: failed to set marker permissions");
+    }
+}
+
+/// Rewrite the repo1-path line in /etc/pgbackrest/pgbackrest.conf so that
+/// out-of-band pgbackrest invocations (mono's PITR coverage probe over
+/// SSH, which inherits no shell env) see the per-cluster path. Without
+/// this rewrite the probe would read the conf's bootstrap path
+/// (=$WAL_ARCHIVE_PATH) and find no backups. Mirrors postgres-ssl PR #50.
+fn update_pgbackrest_conf_repo_path(conf_path: &str, new_path: &str) -> Result<()> {
+    if !Path::new(conf_path).exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(conf_path).context("Failed to read pgbackrest.conf")?;
+    let mut updated = String::with_capacity(content.len());
+    let mut found = false;
+    for line in content.lines() {
+        if line.starts_with("repo1-path=") {
+            updated.push_str(&format!("repo1-path={new_path}\n"));
+            found = true;
+        } else {
+            updated.push_str(line);
+            updated.push('\n');
+        }
+    }
+    if !found {
+        return Ok(());
+    }
+    fs::write(conf_path, updated).context("Failed to rewrite pgbackrest.conf")?;
+    Ok(())
+}
+
 /// Run `pgbackrest stanza-create` once Postgres is reachable. Forks a
 /// background poller so patroni-runner can stay on its existing exec
 /// path. stanza-create is idempotent: a matching stanza in the repo is a
@@ -469,7 +571,8 @@ fn spawn_bootstrap_stanza_create() {
         return;
     }
 
-    tokio::spawn(async {
+    let data_dir = env::var("PGDATA").unwrap_or_else(|_| "/var/lib/postgresql/data".to_string());
+    tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
         loop {
             if tokio::time::Instant::now() >= deadline {
@@ -485,6 +588,24 @@ fn spawn_bootstrap_stanza_create() {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+
+        // Re-derive the repo path now that pg_control is on disk. This is
+        // the canonical first chance to do it on a fresh-cluster path.
+        // Mirrors postgres-ssl PR #47/#50.
+        let repo_path = derive_pgbackrest_repo_path(&data_dir);
+        env::set_var("PGBACKREST_REPO1_PATH", &repo_path);
+
+        // Update the rendered pgbackrest.conf so SSH-driven pgbackrest
+        // invocations (mono's probePgbackrestInfo runs `gosu postgres
+        // pgbackrest info` over SSH and inherits no shell env from this
+        // task) see the per-cluster path.
+        if let Err(e) =
+            update_pgbackrest_conf_repo_path("/etc/pgbackrest/pgbackrest.conf", &repo_path)
+        {
+            warn!(error = %e, "pgbackrest: failed to update repo1-path in conf");
+        }
+        info!(repo_path = %repo_path, "pgbackrest: using per-cluster repo1-path");
+
         // PGHOST/PGPORT must not leak into pgbackrest's libpq calls — a
         // customer-supplied PGHOST=${{ Postgres.RAILWAY_PRIVATE_DOMAIN }}
         // would point libpq at the privnet domain and time out
