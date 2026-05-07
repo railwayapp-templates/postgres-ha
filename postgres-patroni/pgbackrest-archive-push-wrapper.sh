@@ -36,19 +36,26 @@ if [ -z "$WAL_FILE" ]; then
 fi
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
-PGWAL_THRESHOLD_MB="${PGBACKREST_DROP_THRESHOLD_MB:-500}"
+PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-${PGBACKREST_DROP_THRESHOLD_MB:-500}}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 
-# When two repos are configured (restored cluster: repo1=recover-from,
-# repo2=archive), pin archive-push to repo2 so post-promote WAL doesn't
-# spray into the source bucket. Standalone clusters have only repo1 set
-# and skip the flag entirely.
-REPO_FLAG=""
-if [ -n "${PGBACKREST_REPO2_S3_BUCKET:-}" ]; then
-  REPO_FLAG="--repo=2"
+# Per-cluster repo-path: read the marker written by patroni-runner's
+# bootstrap subshell. Without this, every archive-push would go to the
+# ${WAL_ARCHIVE_PATH} root and a wipe-and-reuse-bucket scenario would
+# collide on stanza identity. With it, archive-push targets
+# ${WAL_ARCHIVE_PATH}/cluster-<sysid>.
+if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
+  PGBACKREST_REPO1_PATH=$(cat "$PGDATA/.pgbackrest_repo_path")
+  export PGBACKREST_REPO1_PATH
 fi
 
-pgbackrest --stanza=main $REPO_FLAG archive-push "$WAL_FILE"
+# pgBackRest 2.58 rejects --repo on archive-push (it pushes to whatever
+# repos are configured). The default /etc/pgbackrest/pgbackrest.conf has
+# only repo1 (the service's own bucket); the recovery-source conf is
+# isolated under a separate file referenced via --config exclusively for
+# archive-get during recovery. So archive-push naturally only touches
+# the service's own bucket.
+pgbackrest --stanza=main archive-push "$WAL_FILE"
 PGB_RC=$?
 if [ "$PGB_RC" -eq 0 ]; then
   exit 0

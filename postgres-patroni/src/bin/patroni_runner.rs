@@ -23,39 +23,33 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-/// Translate the tool-agnostic `WAL_ARCHIVE_*` / `WAL_RECOVER_FROM_*` env
-/// contract into pgBackRest's native `PGBACKREST_REPO{1,2}_S3_*` so
-/// pgBackRest reads them natively and the rest of this binary (and the
-/// `archive_command` wrapper Postgres invokes) can stay pgBackRest-shaped.
+/// Translate the tool-agnostic `WAL_ARCHIVE_*` env contract into
+/// pgBackRest's native `PGBACKREST_REPO1_S3_*` so pgBackRest reads them
+/// natively and the rest of this binary (and the `archive_command`
+/// wrapper Postgres invokes) can stay pgBackRest-shaped.
 ///
 /// Backboard / frontend / template speak the WAL_ contract; the image
 /// translates locally so swapping pgBackRest for another archiver is a
 /// wrapper change rather than a cross-repo rewrite.
 ///
-/// Three modes:
-///   - `WAL_ARCHIVE_*` only → standalone archiving cluster. REPO1 = archive.
-///   - `WAL_RECOVER_FROM_*` only → restored cluster, no ongoing archiving.
-///     REPO1 = source bucket (read for archive-get during recovery).
-///   - `WAL_ARCHIVE_*` + `WAL_RECOVER_FROM_*` → restored cluster with PITR
-///     re-enabled. REPO1 = recover-from, REPO2 = archive; the archive-push
-///     wrapper picks `--repo=2` so post-promote WAL never sprays into the
-///     source bucket.
+/// `WAL_RECOVER_FROM_*` is intentionally NOT translated to env vars.
+/// pgBackRest's option resolution is command-line > env vars > config
+/// file > defaults, so a global `PGBACKREST_REPO*_*` export silently
+/// overrides any --config we pass during recovery. Instead the
+/// recover-from credentials live ONLY in
+/// `/etc/pgbackrest/pgbackrest-recovery-source.conf`, which is referenced
+/// via --config exclusively for restore + archive-get during recovery.
+/// This keeps archive-push, stanza-create, and backup against the
+/// service's own bucket — they read the default pgbackrest.conf which
+/// has only repo1 (the service's archive bucket). Mirrors postgres-ssl
+/// PR #49.
 fn translate_wal_env_to_pgbackrest() {
     let archive = env::var("WAL_ARCHIVE_BUCKET")
         .ok()
         .filter(|s| !s.is_empty());
-    let recover = env::var("WAL_RECOVER_FROM_BUCKET")
-        .ok()
-        .filter(|s| !s.is_empty());
 
-    if recover.is_some() {
-        export_repo("PGBACKREST_REPO1", "WAL_RECOVER_FROM");
-    } else if archive.is_some() {
+    if archive.is_some() {
         export_repo("PGBACKREST_REPO1", "WAL_ARCHIVE");
-    }
-
-    if recover.is_some() && archive.is_some() {
-        export_repo("PGBACKREST_REPO2", "WAL_ARCHIVE");
     }
 }
 
@@ -286,27 +280,28 @@ fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
         "pgbackrest: detected vCPU and sized process-max"
     );
 
-    // Two-repo mode: REPO1 reads source's WAL during recovery, REPO2
-    // receives the restored cluster's post-promote pushes. The archive-push
-    // wrapper picks the right repo at command time via --repo; here we
-    // declare repo2-type so pgBackRest reads the corresponding env vars.
-    let repo2_block = if env::var("PGBACKREST_REPO2_S3_BUCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .is_some()
-    {
-        "repo2-type=s3\n"
-    } else {
-        ""
-    };
+    // The default pgbackrest.conf only ever has repo1 (the service's own
+    // archive bucket). Recovery (which needs read access to source's
+    // bucket on a fork) uses a separate
+    // /etc/pgbackrest/pgbackrest-recovery-source.conf, referenced via
+    // --config in restore + restore_command. Mirrors postgres-ssl PR #49.
 
-    // repo1-retention-* is intentionally omitted: this image never runs
-    // `pgbackrest backup`/`expire`, so those knobs would be no-ops anyway.
-    // WAL retention is enforced server-side by the bucket's lifecycle policy.
+    let retention_full = env::var("WAL_BACKUP_RETENTION_FULL")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(4);
+    let retention_diff = env::var("WAL_BACKUP_RETENTION_DIFF")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(14);
+
     let conf = format!(
         "[global]\n\
          repo1-type=s3\n\
-         {repo2_block}\
+         repo1-retention-full={retention_full}\n\
+         repo1-retention-diff={retention_diff}\n\
          log-level-console=info\n\
          log-level-file=off\n\
          archive-async=y\n\
@@ -350,6 +345,60 @@ fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
             .context("Failed to set pgbackrest-spool permissions")?;
     }
 
+    info!("pgbackrest: rendered {}", conf_path);
+    Ok(())
+}
+
+/// Render `/etc/pgbackrest/pgbackrest-recovery-source.conf` when
+/// `WAL_RECOVER_FROM_*` is set. This conf is used exclusively during
+/// recovery: explicit `pgbackrest restore` (empty-volume restore in
+/// future) and `restore_command` for archive-get. Has only the source
+/// bucket as repo1 (numbering is per-config) so post-promote
+/// archive-push from the fork's main pgbackrest.conf can never fan out
+/// to source's read-only bucket and 403. Mirrors postgres-ssl PR #49.
+fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
+    let bucket = match env::var("WAL_RECOVER_FROM_BUCKET") {
+        Ok(b) if !b.is_empty() => b,
+        _ => return Ok(()),
+    };
+    let key = env::var("WAL_RECOVER_FROM_KEY").unwrap_or_default();
+    let secret = env::var("WAL_RECOVER_FROM_SECRET").unwrap_or_default();
+    let region = env::var("WAL_RECOVER_FROM_REGION").unwrap_or_default();
+    let endpoint = env::var("WAL_RECOVER_FROM_ENDPOINT").unwrap_or_default();
+    let uri_style = env::var("WAL_RECOVER_FROM_S3_URI_STYLE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "path".to_string());
+    let path = env::var("WAL_RECOVER_FROM_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/pgbackrest".to_string());
+
+    let spool_dir = format!("{data_dir}/pgbackrest-spool");
+    let conf = format!(
+        "[global]\n\
+         log-level-console=info\n\
+         log-level-file=off\n\
+         spool-path={spool_dir}\n\
+         repo1-type=s3\n\
+         repo1-s3-bucket={bucket}\n\
+         repo1-s3-key={key}\n\
+         repo1-s3-key-secret={secret}\n\
+         repo1-s3-region={region}\n\
+         repo1-s3-endpoint={endpoint}\n\
+         repo1-s3-uri-style={uri_style}\n\
+         repo1-path={path}\n\
+         \n\
+         [main]\n\
+         pg1-path={data_dir}\n\
+         pg1-port=5432\n",
+    );
+
+    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
+    let conf_path = "/etc/pgbackrest/pgbackrest-recovery-source.conf";
+    fs::write(conf_path, conf).context("Failed to write pgbackrest-recovery-source.conf")?;
+    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
+        .context("Failed to set pgbackrest-recovery-source.conf permissions")?;
     info!("pgbackrest: rendered {}", conf_path);
     Ok(())
 }
@@ -417,7 +466,12 @@ fn configure_pitr_recovery(config: &Config, target_time: &str) -> Result<()> {
         return Ok(());
     }
 
-    let restore_cmd = "pgbackrest --stanza=main --repo=1 archive-get %f %p";
+    // Recovery uses the dedicated recovery-source conf (only contains the
+    // source bucket as its repo1) so archive-get during replay can never
+    // touch the service's own bucket. Post-promote archive_command reads
+    // /etc/pgbackrest/pgbackrest.conf which has only the service's repo1.
+    // Mirrors postgres-ssl PR #49.
+    let restore_cmd = "pgbackrest --config=/etc/pgbackrest/pgbackrest-recovery-source.conf --stanza=main archive-get %f %p";
     let escaped_target = target_time.replace('\'', "''");
     let escaped_restore = restore_cmd.replace('\'', "''");
 
@@ -700,11 +754,17 @@ async fn main() -> Result<()> {
     fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))
         .context("Failed to set data directory permissions")?;
 
-    // Render /etc/pgbackrest/pgbackrest.conf when pgBackRest is in use at
-    // all (either archiving outgoing WAL or recovering from a source
-    // bucket). No-op when both are unset — vanilla cluster, no need for
-    // the conf and nothing reads it.
+    // Render /etc/pgbackrest/pgbackrest.conf when archiving is enabled
+    // (WAL_ARCHIVE_BUCKET set). Has only repo1 = the service's own bucket.
     render_pgbackrest_conf(&config.data_dir)?;
+
+    // Render /etc/pgbackrest/pgbackrest-recovery-source.conf when
+    // WAL_RECOVER_FROM_BUCKET is set. Has only the source bucket as
+    // repo1 (per-config numbering). Used by restore_command (archive-get
+    // during PITR replay) and by future explicit `pgbackrest restore`.
+    // Isolated from the main conf so archive-push, stanza-create, and
+    // backup never fan out to source's read-only bucket.
+    render_pgbackrest_recovery_source_conf(&config.data_dir)?;
 
     // Stage pgBackRest PITR replay if requested. No-op unless
     // POSTGRES_RECOVERY_TARGET_TIME is set. Must run before Patroni starts
