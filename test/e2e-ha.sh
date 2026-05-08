@@ -1746,7 +1746,15 @@ for t in "${TESTS[@]}"; do
     ko "$t" "no such test"
     continue
   fi
+  before_pass=$PASS
+  before_fail=$FAIL
   "$t"
+  # Every test must end via ok() or ko(); a return without recording
+  # either is a phantom-pass landmine (e.g. silent skip on a missing
+  # state-file dependency). Convert to a hard failure so it can't hide.
+  if [ "$PASS" -eq "$before_pass" ] && [ "$FAIL" -eq "$before_fail" ]; then
+    ko "$t" "test exited without recording PASS or FAIL — likely a silent skip"
+  fi
 done
 
 echo
