@@ -141,13 +141,8 @@ async fn run(data_dir: String) -> Result<()> {
         .timeout(Duration::from_secs(5))
         .build()?;
 
-    // Once-per-boot commit_ts warmup state. Set to true after the first
-    // successful warmup commit on the current leader; takeover after
-    // failover gets a fresh attempt because each tokio task owns its own.
-    let mut commit_ts_warmed_up = false;
-
     loop {
-        watcher_iteration(&data_dir, &config, &client, &mut commit_ts_warmed_up).await;
+        watcher_iteration(&data_dir, &config, &client).await;
         let state_path = format!("{data_dir}/{STATE_FILENAME}");
         let interval = if read_state_field(&state_path, "last_full_at").is_none() {
             config.initial_poll_interval
@@ -158,12 +153,7 @@ async fn run(data_dir: String) -> Result<()> {
     }
 }
 
-async fn watcher_iteration(
-    data_dir: &str,
-    config: &WatcherConfig,
-    client: &reqwest::Client,
-    commit_ts_warmed_up: &mut bool,
-) {
+async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqwest::Client) {
     // Sync per-cluster repo path on every iteration. The marker may not
     // exist on the very first iteration if patroni-runner's bootstrap
     // subshell hasn't run yet; later iterations pick it up.
@@ -203,23 +193,6 @@ async fn watcher_iteration(
             warn!(error = %e, "pgbackrest-watcher: iteration skipped (in_recovery probe failed)");
             return;
         }
-    }
-
-    // Issue a tiny transactional commit once per boot so
-    // pg_last_committed_xact() returns a real value to the PITR picker.
-    // track_commit_timestamp persists commit-ts to disk in pg_commit_ts/,
-    // but the in-memory `newestCommitTsXid` cursor (ShmemVariableCache) is
-    // reset to InvalidTransactionId on every postmaster start.
-    // pg_last_committed_xact() reads that cursor first, so it returns NULL
-    // until the cluster does its first new commit since boot — even when
-    // pg_commit_ts/ has years of history. That NULL forces the picker's
-    // backup-stop fallback path, which is coarser than the real ceiling.
-    // One transactional WAL message commits, gets its xid recorded, and
-    // seeds the cursor. Leader-only (we're past the leader check) so the
-    // commit is legal; on failover the new leader's task starts with
-    // commit_ts_warmed_up=false and warms its own cursor.
-    if !*commit_ts_warmed_up && warmup_commit_ts_if_needed().await {
-        *commit_ts_warmed_up = true;
     }
 
     if !config.heartbeat_disabled {
@@ -337,76 +310,6 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
         failed_count: parts[1].parse().unwrap_or(0),
         last_failed_epoch: parts[3].parse().unwrap_or(0),
     })
-}
-
-/// One-shot commit-ts warmup. Returns true on success so the caller can
-/// flip its "already warmed" flag and skip subsequent iterations. Returns
-/// false on transient failure (psql error, GUC off, postmaster wedged) so
-/// the next iteration retries.
-///
-/// Skips when `track_commit_timestamp` is off — there's nothing for the
-/// cursor to track, the picker's commit-ts ceiling will already be null
-/// for legitimate reasons, and writing a no-op WAL message would just
-/// burn a segment switch.
-async fn warmup_commit_ts_if_needed() -> bool {
-    let guc = match Command::new("psql")
-        .args([
-            "-U",
-            "postgres",
-            "-h",
-            "/var/run/postgresql",
-            "-tAXq",
-            "-c",
-            "SHOW track_commit_timestamp",
-        ])
-        .env_remove("PGHOST")
-        .env_remove("PGPORT")
-        .output()
-        .await
-    {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
-        _ => return false,
-    };
-
-    if guc != "on" {
-        // Treat as warmed-up: nothing to do this boot, don't retry.
-        return true;
-    }
-
-    let res = Command::new("psql")
-        .args([
-            "-U",
-            "postgres",
-            "-h",
-            "/var/run/postgresql",
-            "-tAXq",
-            "-c",
-            "BEGIN; SELECT pg_logical_emit_message(true, 'rwy_commit_ts_warmup', ''); COMMIT;",
-        ])
-        .env_remove("PGHOST")
-        .env_remove("PGPORT")
-        .output()
-        .await;
-
-    match res {
-        Ok(out) if out.status.success() => {
-            info!("pgbackrest-watcher: commit-ts warmup committed");
-            true
-        }
-        Ok(out) => {
-            warn!(
-                stderr = %String::from_utf8_lossy(&out.stderr),
-                "pgbackrest-watcher: commit-ts warmup psql failed (non-fatal)"
-            );
-            false
-        }
-        Err(e) => {
-            warn!(error = %e, "pgbackrest-watcher: commit-ts warmup invocation failed (non-fatal)");
-            false
-        }
-    }
 }
 
 /// Emit a tiny non-transactional WAL record so archive_timeout=60 has
