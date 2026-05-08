@@ -531,6 +531,16 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
         "pgbackrest: restore-gate state"
     );
 
+    // Without WAL_RECOVER_FROM_BUCKET the recovery-source conf never gets
+    // rendered (render_pgbackrest_recovery_source_conf early-returns when
+    // the bucket env is unset), so the staged restore_command would
+    // archive-get FATAL at boot. Mirrors postgres-ssl wrapper.sh's
+    // `[ -z "$WAL_RECOVER_FROM_BUCKET" ] && return 0` guard.
+    if config.wal_recover_from_bucket.is_none() {
+        info!("pgbackrest: WAL_RECOVER_FROM_BUCKET unset — skipping recovery staging");
+        return Ok(());
+    }
+
     if Path::new(&done).exists() {
         return Ok(());
     }
@@ -885,16 +895,13 @@ async fn main() -> Result<()> {
     render_pgbackrest_recovery_source_conf(&config.data_dir)?;
 
     // Stage pgBackRest PITR replay if requested. No-op unless
-    // POSTGRES_RECOVERY_TARGET_TIME or POSTGRES_RECOVERY_TARGET_XID is set
-    // alongside WAL_RECOVER_FROM_BUCKET. Without the source bucket, the
-    // staged restore_command would point at the recovery-source conf which
-    // never got rendered (render_pgbackrest_recovery_source_conf early-
-    // returns when the bucket env is unset), so archive-get would FATAL.
-    // Mirrors postgres-ssl wrapper.sh's `[ -z "$WAL_RECOVER_FROM_BUCKET" ]
-    // && return 0` guard.
-    if (config.pitr_target_time.is_some() || config.pitr_target_xid.is_some())
-        && config.wal_recover_from_bucket.is_some()
-    {
+    // POSTGRES_RECOVERY_TARGET_TIME or POSTGRES_RECOVERY_TARGET_XID is set.
+    // Must run before Patroni starts Postgres so the signal file and
+    // recovery settings are in place. The function logs restore-gate state
+    // unconditionally and gates the actual staging on
+    // WAL_RECOVER_FROM_BUCKET internally — operators see why staging was
+    // skipped via the log even when no bucket is configured.
+    if config.pitr_target_time.is_some() || config.pitr_target_xid.is_some() {
         configure_pitr_recovery(&config)?;
     }
 
