@@ -398,12 +398,65 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Granular cleanup driven by the `WAL_*` env contract. Each role has its
+/// own gate, mirroring postgres-ssl wrapper.sh:
+///   - `WAL_ARCHIVE_BUCKET` unset → drop watcher state markers
+///     (`.pgbackrest_backup_state`, `.pgbackrest_gap_pending`). Without
+///     this, a disable→re-enable leaves a `last_full_at` from a year ago
+///     in state, which suppresses NEEDS_INITIAL_BACKUP for up to one
+///     full-backup interval while the bucket actually has zero backups.
+///   - `WAL_RECOVER_FROM_BUCKET` unset → drop PITR replay markers
+///     (`.pitr_staging`, `.pitr_configured`) so a future restore-from-this-
+///     service starts cleanly.
+///
+/// HA puts archive-related Postgres config (archive_mode / archive_command
+/// / archive_timeout) in DCS rather than a conf file, so there is no
+/// archive-conf file to remove here — DCS reconcile handles that side.
+/// Idempotent and safe to call on every boot.
+fn clear_pgbackrest_state_if_disabled(config: &Config) {
+    let data_dir = &config.data_dir;
+    let mut removed = false;
+
+    if config.wal_archive_bucket.is_none() {
+        for marker in [".pgbackrest_backup_state", ".pgbackrest_gap_pending"] {
+            let path = format!("{data_dir}/{marker}");
+            if Path::new(&path).exists() && fs::remove_file(&path).is_ok() {
+                removed = true;
+            }
+        }
+    }
+
+    if config.wal_recover_from_bucket.is_none() {
+        for marker in [".pitr_staging", ".pitr_configured"] {
+            let path = format!("{data_dir}/{marker}");
+            if Path::new(&path).exists() && fs::remove_file(&path).is_ok() {
+                removed = true;
+            }
+        }
+    }
+
+    if removed {
+        info!("pgbackrest: cleared stale archive/recovery state for the disabled role(s)");
+    }
+}
+
 /// Stage PITR replay before Patroni starts Postgres.
 ///
-/// When `POSTGRES_RECOVERY_TARGET_TIME` is set, writes `recovery.signal` +
-/// recovery settings to postgresql.auto.conf so Postgres enters archive
-/// recovery on boot, replays WAL from `repo1` (the source bucket via the
-/// `WAL_RECOVER_FROM_*` translation) to the target timestamp, then promotes.
+/// When `POSTGRES_RECOVERY_TARGET_XID` or `POSTGRES_RECOVERY_TARGET_TIME` is
+/// set (xid wins when both are present), writes `recovery.signal` + recovery
+/// settings to postgresql.auto.conf so Postgres enters archive recovery on
+/// boot, replays WAL from `repo1` (the source bucket via the
+/// `WAL_RECOVER_FROM_*` translation) to the target, then promotes.
+///
+/// Target type selection: xid > time. recovery_target_time requires postgres
+/// to observe a WAL record with timestamp > target before declaring "target
+/// reached" and firing recovery_target_action=promote; on an idle DB no
+/// such record exists, so recovery FATALs with "recovery ended before
+/// configured recovery target was reached." recovery_target_xid matches an
+/// exact transaction ID — applying the target xid's commit is unambiguously
+/// "target reached." The picker (mono's createServiceFromPITR mutation)
+/// sets _XID when it clamped target down to lastCommittedTxnAt and leaves
+/// it unset for arbitrary historical times. Mirrors postgres-ssl PR #63.
 ///
 /// Two filesystem stamps coordinate "exactly once per successful promote":
 ///   - `.pitr_staging`: written when we hand recovery off to Postgres. Means
@@ -411,12 +464,12 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
 ///   - `.pitr_configured`: written on the boot AFTER Postgres consumes
 ///     `recovery.signal` (which Postgres removes only on successful
 ///     promote). Means PITR is done and must not run again on this volume.
-///     Once set, subsequent boots skip recovery even if
-///     `POSTGRES_RECOVERY_TARGET_TIME` is changed. To re-run PITR with a
-///     different target the operator must restore from a fresh snapshot
-///     (or, advanced: rm the marker).
+///     Once set, subsequent boots skip recovery even if the target env
+///     vars are changed. To re-run PITR with a different target the
+///     operator must restore from a fresh snapshot (or, advanced: rm the
+///     marker).
 ///
-/// A failed replay (bad target time, missing WAL, bad creds) leaves
+/// A failed replay (bad target, missing WAL, bad creds) leaves
 /// `.pitr_staging` behind WITHOUT `.pitr_configured` — the operator can fix
 /// env vars and restart, and the next boot will re-stage cleanly.
 ///
@@ -424,7 +477,7 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
 /// design, the restored cluster has its own bucket (`WAL_ARCHIVE_*`) and
 /// reads from the source's bucket via the distinct `WAL_RECOVER_FROM_*`
 /// repo, so no shared write path exists to corrupt.
-fn configure_pitr_recovery(config: &Config, target_time: &str) -> Result<()> {
+fn configure_pitr_recovery(config: &Config) -> Result<()> {
     use std::io::Write;
 
     let data_dir = &config.data_dir;
@@ -432,15 +485,14 @@ fn configure_pitr_recovery(config: &Config, target_time: &str) -> Result<()> {
     let done = format!("{data_dir}/.pitr_configured");
     let signal = format!("{data_dir}/recovery.signal");
     let pg_version = format!("{data_dir}/PG_VERSION");
-    let restored_marker = format!("{data_dir}/.pgbackrest_restored");
 
     // Log restore-gate state up front so post-mortems on "why did/didn't
     // PITR run" don't require guessing. Mirrors postgres-ssl PR #57.
     info!(
         wal_recover_from_bucket = config.wal_recover_from_bucket.is_some(),
-        postgres_recovery_target_time = %target_time,
+        postgres_recovery_target_time = config.pitr_target_time.as_deref().unwrap_or(""),
+        postgres_recovery_target_xid = config.pitr_target_xid.as_deref().unwrap_or(""),
         pg_version_present = Path::new(&pg_version).exists(),
-        restored_marker_present = Path::new(&restored_marker).exists(),
         pitr_staging_present = Path::new(&staging).exists(),
         pitr_configured_present = Path::new(&done).exists(),
         pgdata_path = %data_dir,
@@ -467,14 +519,32 @@ fn configure_pitr_recovery(config: &Config, target_time: &str) -> Result<()> {
     // /etc/pgbackrest/pgbackrest.conf which has only the service's repo1.
     // Mirrors postgres-ssl PR #49.
     let restore_cmd = "pgbackrest --config=/etc/pgbackrest/pgbackrest-recovery-source.conf --stanza=main archive-get %f %p";
-    let escaped_target = target_time.replace('\'', "''");
     let escaped_restore = restore_cmd.replace('\'', "''");
+
+    let (recovery_param_line, target_label) = match (&config.pitr_target_xid, &config.pitr_target_time) {
+        (Some(xid), _) => {
+            let escaped = xid.replace('\'', "''");
+            (
+                format!("recovery_target_xid = '{escaped}'"),
+                format!("xid={xid}"),
+            )
+        }
+        (None, Some(time)) => {
+            let escaped = time.replace('\'', "''");
+            (
+                format!("recovery_target_time = '{escaped}'"),
+                format!("time={time}"),
+            )
+        }
+        // Caller gates on at-least-one being set; this branch is unreachable.
+        (None, None) => return Ok(()),
+    };
 
     let auto_conf_path = format!("{data_dir}/postgresql.auto.conf");
     let addition = format!(
         "\n# managed by pgbackrest-recovery (patroni-runner)\n\
          restore_command = '{escaped_restore}'\n\
-         recovery_target_time = '{escaped_target}'\n\
+         {recovery_param_line}\n\
          recovery_target_action = 'promote'\n",
     );
     let mut f = fs::OpenOptions::new()
@@ -488,7 +558,7 @@ fn configure_pitr_recovery(config: &Config, target_time: &str) -> Result<()> {
     fs::File::create(&signal).context("Failed to create recovery.signal")?;
     fs::write(&staging, "").context("Failed to write PITR staging marker")?;
 
-    info!(target = %target_time, "pgbackrest PITR replay staged");
+    info!(target = %target_label, "pgbackrest PITR replay staged");
     Ok(())
 }
 
@@ -781,6 +851,13 @@ async fn main() -> Result<()> {
     fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))
         .context("Failed to set data directory permissions")?;
 
+    // Drop stale per-volume pgbackrest state when its role is disabled.
+    // Without this, disable→re-enable leaves last_full_at from the previous
+    // archiving epoch behind. Re-enable then suppresses NEEDS_INITIAL_BACKUP
+    // for up to a full backup interval while the bucket has zero backups.
+    // Mirrors postgres-ssl clear_pgbackrest_state_if_disabled.
+    clear_pgbackrest_state_if_disabled(&config);
+
     // Render /etc/pgbackrest/pgbackrest.conf when archiving is enabled
     // (WAL_ARCHIVE_BUCKET set). Has only repo1 = the service's own bucket.
     render_pgbackrest_conf(&config.data_dir)?;
@@ -794,10 +871,18 @@ async fn main() -> Result<()> {
     render_pgbackrest_recovery_source_conf(&config.data_dir)?;
 
     // Stage pgBackRest PITR replay if requested. No-op unless
-    // POSTGRES_RECOVERY_TARGET_TIME is set. Must run before Patroni starts
-    // Postgres so the signal file and recovery settings are in place.
-    if let Some(target_time) = &config.pitr_target_time {
-        configure_pitr_recovery(&config, target_time)?;
+    // WAL_RECOVER_FROM_BUCKET is set and at least one of
+    // POSTGRES_RECOVERY_TARGET_XID / POSTGRES_RECOVERY_TARGET_TIME is set.
+    // Without the recover-source bucket the resulting recovery.signal
+    // would point restore_command at a missing/empty source — postgres
+    // FATALs (or replays from its own archive bucket, which on a fresh
+    // restored volume has nothing to replay). Mirrors postgres-ssl wrapper.sh.
+    // Must run before Patroni starts Postgres so the signal file and
+    // recovery settings are in place.
+    if config.wal_recover_from_bucket.is_some()
+        && (config.pitr_target_xid.is_some() || config.pitr_target_time.is_some())
+    {
+        configure_pitr_recovery(&config)?;
     }
 
     // Clear PostgreSQL environment variables to avoid conflicts
