@@ -64,6 +64,21 @@ pub struct Config {
     /// restored volume, the runner stages `recovery.signal` + recovery
     /// settings before Patroni starts Postgres.
     pub pitr_target_time: Option<String>,
+    /// Target transaction ID for point-in-time recovery. When set, takes
+    /// precedence over `pitr_target_time` because it's the only target type
+    /// postgres can match exactly on an idle source. `recovery_target_time`
+    /// requires postgres to observe a WAL record with timestamp > target
+    /// before declaring "target reached" and firing
+    /// `recovery_target_action=promote`; on an idle DB no such record exists,
+    /// so recovery FATALs with "recovery ended before configured recovery
+    /// target was reached" and the cluster either crash-loops the FATAL or
+    /// hangs in hot_standby read-only mode. `recovery_target_xid` matches an
+    /// exact transaction ID — applying the target xid's commit is
+    /// unambiguously "target reached." The picker (mono's
+    /// createServiceFromPITR mutation) sets `_XID` when it clamped target
+    /// down to `lastCommittedTxnAt`; leaves it unset for arbitrary historical
+    /// times. Mirrors postgres-ssl PR #63.
+    pub pitr_target_xid: Option<String>,
     /// `archive_timeout` written into Patroni's bootstrap.dcs and asserted by
     /// the DCS reconciler when archiving is enabled. Default 60s. Operators
     /// raise it on idle DBs to cut S3 cost or lower it for tighter RPO.
@@ -113,6 +128,9 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             pitr_target_time: env::var("POSTGRES_RECOVERY_TARGET_TIME")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            pitr_target_xid: env::var("POSTGRES_RECOVERY_TARGET_XID")
                 .ok()
                 .filter(|s| !s.is_empty()),
             archive_timeout_secs: env::var("POSTGRES_ARCHIVE_TIMEOUT")
