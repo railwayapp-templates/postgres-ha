@@ -1420,19 +1420,26 @@ gosu postgres pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/data/pgdat
     return
   fi
 
-  # Source bucket count should not have grown post-fork-boot. Count
-  # before vs after a small pause; fork should have written nothing
-  # there.
+  # Source bucket count should not grow due to fork's archive-push.
+  # Stop the source cluster first — otherwise its own watcher and
+  # archive_command keep adding WAL during the observation window
+  # and produce false positives. After the source is stopped, any
+  # new objects in source's bucket can only have come from the fork.
+  for n in "$n1" "$n2" "$n3"; do
+    docker stop "$n" >/dev/null 2>&1 || true
+  done
+  # Give in-flight async archive-push from the source a moment to
+  # drain the spool dir to S3 before we measure (anything spool→S3
+  # after `before` would be a real isolation breach since the source
+  # processes are now dead).
+  sleep 5
   local source_count_before
   source_count_before=$(mc "mc ls --recursive local/${BUCKET} | wc -l" | tail -1 | tr -d ' ')
-
-  # Trigger a write attempt on the fork: wait for it to come up enough
-  # to log archive activity, then check the source bucket again.
   sleep 30
   local source_count_after
   source_count_after=$(mc "mc ls --recursive local/${BUCKET} | wc -l" | tail -1 | tr -d ' ')
   if [ "$source_count_after" -ne "$source_count_before" ]; then
-    ko t_ha_recovery_source_conf_isolation "source bucket grew during fork startup; before=$source_count_before after=$source_count_after"
+    ko t_ha_recovery_source_conf_isolation "source bucket grew during fork-only window; before=$source_count_before after=$source_count_after"
     teardown_scope "$fork_scope"
     teardown_scope "$scope"
     return
