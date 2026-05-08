@@ -1,0 +1,84 @@
+name: E2E
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [17]
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build postgres-patroni image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./postgres-patroni/Dockerfile
+          build-args: |
+            POSTGRES_VERSION=${{ matrix.pg_version }}
+          platforms: linux/amd64
+          tags: postgres-ha-pitr:${{ matrix.pg_version }}
+          load: true
+          cache-from: type=gha,scope=patroni-pg${{ matrix.pg_version }}
+          cache-to: type=gha,scope=patroni-pg${{ matrix.pg_version }},mode=max
+
+      - name: Build etcd image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./etcd/Dockerfile
+          platforms: linux/amd64
+          tags: postgres-ha-etcd-test:latest
+          load: true
+          cache-from: type=gha,scope=etcd
+          cache-to: type=gha,scope=etcd,mode=max
+
+      - name: Run e2e harness
+        shell: bash
+        env:
+          PG_VERSION: ${{ matrix.pg_version }}
+        run: |
+          ./test/e2e-ha.sh 2>&1 | tee "e2e-ha-pg${PG_VERSION}.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Collect failure diagnostics
+        if: failure()
+        env:
+          PG_VERSION: ${{ matrix.pg_version }}
+        run: |
+          mkdir -p failure-artifacts
+          mv "e2e-ha-pg${PG_VERSION}.log" failure-artifacts/ 2>/dev/null || true
+          docker ps -a > failure-artifacts/docker-ps.txt 2>&1 || true
+          docker volume ls > failure-artifacts/docker-volumes.txt 2>&1 || true
+          for c in $(docker ps -aq --filter "label=postgres-ha-e2e=1"); do
+            name=$(docker inspect -f '{{.Name}}' "$c" | sed 's|^/||')
+            docker logs --tail 200 "$c" > "failure-artifacts/container-${name}.log" 2>&1 || true
+          done
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-ha-logs-pg${{ matrix.pg_version }}
+          path: failure-artifacts
+          retention-days: 14
