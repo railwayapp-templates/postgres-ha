@@ -178,23 +178,6 @@ async fn main() -> Result<()> {
 
         check_and_generate_ssl(&telemetry).await?;
 
-        // Defensive cert regen scaffold for post-restore. pgbackrest only
-        // restores PGDATA (`.../data/pgdata`); certs live one directory up
-        // at `.../data/certs` so they survive most restores. But a fresh-
-        // volume restore where init-ssl never ran leaves postgresql.conf
-        // (from the restored backup) without matching certs — Postgres
-        // FATALs on missing server.crt at boot. The check above already
-        // covers "server.crt missing → regenerate", so this is just a
-        // re-check after any future in-Rust pgbackrest restore step
-        // would run between init-ssl and Patroni start. Mirrors
-        // postgres-ssl PR #60.
-        let post_restore_marker = format!("{}/.pgbackrest_restored", data_dir);
-        let server_crt = format!("{}/server.crt", ssl_dir());
-        if Path::new(&post_restore_marker).exists() && !Path::new(&server_crt).exists() {
-            info!("post-restore: cert files missing under restored volume, regenerating");
-            run_init_ssl().await?;
-        }
-
         info!("Starting Patroni runner...");
         let err = Command::new("gosu")
             .args(["postgres", "/usr/local/bin/patroni-runner"])

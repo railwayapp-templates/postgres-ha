@@ -153,7 +153,11 @@ async fn run(data_dir: String) -> Result<()> {
     }
 }
 
-async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqwest::Client) {
+async fn watcher_iteration(
+    data_dir: &str,
+    config: &WatcherConfig,
+    client: &reqwest::Client,
+) {
     // Sync per-cluster repo path on every iteration. The marker may not
     // exist on the very first iteration if patroni-runner's bootstrap
     // subshell hasn't run yet; later iterations pick it up.
