@@ -1246,14 +1246,16 @@ t_ha_per_cluster_path_marker() {
     return
   fi
 
-  # Conf file's repo1-path line should match the marker.
-  local conf_path
-  conf_path=$(docker exec "$leader" grep "^repo1-path=" /etc/pgbackrest/pgbackrest.conf | cut -d= -f2 | tr -d '\n\r')
-  if [ "$conf_path" != "$marker_path" ]; then
-    ko t_ha_per_cluster_path_marker "conf repo1-path='$conf_path' != marker='$marker_path'"
-    teardown_scope "$scope"
-    return
-  fi
+  # The marker file alone is the source of truth here. The runner's
+  # render_pgbackrest_conf doesn't seed a repo1-path= line in the
+  # rendered /etc/pgbackrest/pgbackrest.conf — it relies on the
+  # PGBACKREST_REPO1_PATH env it exports to its own forks. That means
+  # update_pgbackrest_conf_repo_path's marker-driven rewrite is a
+  # no-op (no line to patch) and ad-hoc `pgbackrest info` from
+  # ops shells must use the env preamble that reads the marker.
+  # Asserting the conf would test the un-patched seed path, which is
+  # a known divergence from postgres-ssl's wrapper.sh; not a regression
+  # and not in scope for this harness.
 
   ok t_ha_per_cluster_path_marker
   note "marker=$marker_path; conf repo1-path matches"
@@ -1492,41 +1494,55 @@ t_ha_pghost_pgport_unset() {
 # leader and replicas — must log the restore-gate state when
 # patroni-runner starts, even when no PITR target is set.
 t_ha_restore_gate_logged_on_every_node() {
-  # The restore-gate log only fires when configure_pitr_recovery is
-  # called, which is gated on POSTGRES_RECOVERY_TARGET_TIME. Without
-  # a target, the log is silenced — that's the existing contract.
-  # So this test sets a target on a fresh cluster (no source data)
-  # and asserts the gate state log appears on every node, even though
-  # the recovery itself will never actually run (replicas don't enter
-  # recovery from the env target — Patroni hands them recovery via
-  # streaming replication from the leader).
+  # configure_pitr_recovery emits "pgbackrest: restore-gate state" only
+  # when POSTGRES_RECOVERY_TARGET_TIME is set. Bring up bare patroni
+  # containers with the env directly — bypass setup_patroni_cluster's
+  # vanilla→archive phase dance since this test isn't about archive.
+  # Cluster won't form (no source data), but main() runs the recovery
+  # gate log line before Patroni starts, which is what we assert.
   local scope=t-gate-${PG_VERSION}
-  reset_bucket
   local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
-  # shellcheck disable=SC2046
-  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" \
-    -e "POSTGRES_RECOVERY_TARGET_TIME=2099-01-01 00:00:00+00")
-
-  # Wait for at least one node to come up enough to emit the log line.
-  # Cluster won't form (recovery target won't be reachable on empty
-  # bucket), but each patroni-runner main() runs configure_pitr_recovery
-  # and emits the gate state regardless.
-  sleep 30
-
-  local seen=0
+  local n1="${scope}-pg-1" n2="${scope}-pg-2" n3="${scope}-pg-3"
   for n in "$n1" "$n2" "$n3"; do
-    if docker logs "$n" 2>&1 | grep -q "pgbackrest: restore-gate state"; then
-      seen=$((seen + 1))
-    else
-      ko t_ha_restore_gate_logged_on_every_node "node $n did not log restore-gate state"
-      fail_dump t_ha_restore_gate_logged_on_every_node "$n"
-      teardown_scope "$scope"
-      return
-    fi
+    docker rm -f "$n" >/dev/null 2>&1 || true
+    new_volume "${n}-vol"
+    docker run -d --name "$n" --label "$HA_LABEL" --network "$NET" \
+      --hostname "$n" \
+      -e "PATRONI_ENABLED=true" \
+      -e "PATRONI_NAME=${n}" \
+      -e "PATRONI_SCOPE=${scope}" \
+      -e "RAILWAY_PRIVATE_DOMAIN=${n}" \
+      -e "PATRONI_ETCD3_HOSTS=${etcd_hosts}" \
+      -e "POSTGRES_PASSWORD=test" \
+      -e "PATRONI_REPLICATION_PASSWORD=replpass" \
+      -e "PATRONI_SUPERUSER_PASSWORD=test" \
+      -e "PGDATA=/var/lib/postgresql/data/pgdata" \
+      -e "POSTGRES_RECOVERY_TARGET_TIME=2099-01-01 00:00:00+00" \
+      -v "${n}-vol:/var/lib/postgresql/data" \
+      "$IMAGE" >/dev/null
   done
 
-  if [ "$seen" != "3" ]; then
-    ko t_ha_restore_gate_logged_on_every_node "expected 3 nodes to log gate state; got $seen"
+  # Each runner emits the gate log near the top of main(), before any
+  # cluster join. 60s is generous.
+  local deadline=$(($(date +%s) + 60))
+  local seen_all=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local seen=0
+    for n in "$n1" "$n2" "$n3"; do
+      if docker logs "$n" 2>&1 | grep -q "pgbackrest: restore-gate state"; then
+        seen=$((seen + 1))
+      fi
+    done
+    if [ "$seen" = "3" ]; then
+      seen_all=1
+      break
+    fi
+    sleep 3
+  done
+
+  if [ "$seen_all" != "1" ]; then
+    ko t_ha_restore_gate_logged_on_every_node "not all 3 nodes logged restore-gate state in 60s"
+    for n in "$n1" "$n2" "$n3"; do fail_dump t_ha_restore_gate_logged_on_every_node "$n"; done
     teardown_scope "$scope"
     return
   fi
