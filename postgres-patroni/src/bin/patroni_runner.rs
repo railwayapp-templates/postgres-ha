@@ -244,6 +244,12 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 ///
 /// Spool lives under `$PGDATA/pgbackrest-spool` so segments staged but not
 /// yet pushed to S3 survive container restarts on the Railway volume.
+/// Note: the spool directory is NOT created here — pre-creating it would
+/// dirty pgdata before Patroni's first bootstrap and make fresh replicas
+/// refuse to clone with "data dir is not empty, but system ID is invalid".
+/// `spawn_bootstrap_stanza_create` mkdirs it after `pg_isready` confirms
+/// Postgres is up (i.e., pgdata has been initialized by Patroni's clone or
+/// initdb), mirroring postgres-ssl's `/docker-entrypoint-initdb.d` ordering.
 ///
 /// Per-command `process-max` is sized off cgroup-detected vCPU. Each
 /// command has a different bottleneck shape: archive-push is gated by
@@ -333,17 +339,6 @@ fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
     fs::write(conf_path, conf).context("Failed to write pgbackrest.conf")?;
     fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
         .context("Failed to set pgbackrest.conf permissions")?;
-
-    // Spool only gets created once the data dir exists; before initdb,
-    // Postgres won't run if PGDATA is non-empty. Patroni creates PGDATA on
-    // init, so by the time we render here on an existing volume we're safe;
-    // on first init we render before Patroni starts and PGDATA may not
-    // exist yet — best-effort, will retry on next boot.
-    if Path::new(data_dir).exists() {
-        fs::create_dir_all(&spool_dir).context("Failed to create pgbackrest-spool dir")?;
-        fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o750))
-            .context("Failed to set pgbackrest-spool permissions")?;
-    }
 
     info!("pgbackrest: rendered {}", conf_path);
     Ok(())
@@ -599,12 +594,27 @@ fn update_pgbackrest_conf_repo_path(conf_path: &str, new_path: &str) -> Result<(
     Ok(())
 }
 
-/// Run `pgbackrest stanza-create` once Postgres is reachable. Forks a
-/// background poller so patroni-runner can stay on its existing exec
-/// path. stanza-create is idempotent: a matching stanza in the repo is a
-/// no-op; a mismatch errors loudly. Skipped in dual-repo mode (restored
-/// cluster with PITR re-enabled) — pgBackRest's stanza-create operates
-/// against all configured repos and we don't want to touch the source's.
+/// Post-Postgres-ready pgBackRest setup: mkdir the spool dir, then run
+/// stanza-create. Forks a background poller so patroni-runner can stay on
+/// its existing exec path.
+///
+/// Spool creation is deferred to here (rather than inside
+/// `render_pgbackrest_conf` at boot) because pre-creating
+/// `$PGDATA/pgbackrest-spool` would dirty pgdata before Patroni's first
+/// bootstrap and trip its "data dir is not empty, but system ID is
+/// invalid" gate on fresh replicas. Mirrors postgres-ssl, where the spool
+/// is mkdir'd by an init script under `/docker-entrypoint-initdb.d` —
+/// upstream's docker-entrypoint runs those only after `initdb` populates
+/// pgdata. By the time `pg_isready` succeeds, Patroni has clone+started
+/// Postgres, so adding a sibling subdir is harmless. Idempotent on
+/// subsequent boots.
+///
+/// stanza-create is idempotent: a matching stanza in the repo is a no-op;
+/// a mismatch errors loudly. Skipped in dual-repo mode (restored cluster
+/// with PITR re-enabled) — pgBackRest's stanza-create operates against
+/// all configured repos and we don't want to touch the source's. Spool
+/// creation still happens in dual-repo mode because the restored cluster
+/// will start archiving its own WAL once promoted.
 fn spawn_bootstrap_stanza_create() {
     if env::var("WAL_ARCHIVE_BUCKET")
         .ok()
@@ -613,19 +623,13 @@ fn spawn_bootstrap_stanza_create() {
     {
         return;
     }
-    if env::var("WAL_RECOVER_FROM_BUCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .is_some()
-    {
-        warn!(
-            "pgbackrest: skipping stanza-create — both WAL_RECOVER_FROM_* and \
-             WAL_ARCHIVE_* are set; clear the recover-from vars then restart"
-        );
-        return;
-    }
 
     let data_dir = env::var("PGDATA").unwrap_or_else(|_| "/var/lib/postgresql/data".to_string());
+    let dual_repo_mode = env::var("WAL_RECOVER_FROM_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some();
+
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
         loop {
@@ -641,6 +645,29 @@ fn spawn_bootstrap_stanza_create() {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        // pgdata is now populated; safe to add the spool subdir.
+        let spool_dir = format!("{data_dir}/pgbackrest-spool");
+        match fs::create_dir_all(&spool_dir) {
+            Ok(()) => {
+                if let Err(e) =
+                    fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o750))
+                {
+                    warn!(error = %e, "pgbackrest: failed to set spool permissions");
+                } else {
+                    info!(spool_dir = %spool_dir, "pgbackrest: spool dir ready");
+                }
+            }
+            Err(e) => warn!(error = %e, "pgbackrest: failed to create spool dir"),
+        }
+
+        if dual_repo_mode {
+            warn!(
+                "pgbackrest: skipping stanza-create — both WAL_RECOVER_FROM_* and \
+                 WAL_ARCHIVE_* are set; clear the recover-from vars then restart"
+            );
+            return;
         }
 
         // Re-derive the repo path now that pg_control is on disk. This is
