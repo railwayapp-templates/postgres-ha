@@ -141,14 +141,8 @@ async fn run(data_dir: String) -> Result<()> {
         .timeout(Duration::from_secs(5))
         .build()?;
 
-    // Per-leader-lifetime flag: once we've emitted a successful warmup
-    // commit on this primary, we don't need another one. Failover spawns
-    // a new watcher process, so the flag resets — the new leader does
-    // its own warmup on first iteration.
-    let mut warmup_emitted = false;
-
     loop {
-        watcher_iteration(&data_dir, &config, &client, &mut warmup_emitted).await;
+        watcher_iteration(&data_dir, &config, &client).await;
         let state_path = format!("{data_dir}/{STATE_FILENAME}");
         let interval = if read_state_field(&state_path, "last_full_at").is_none() {
             config.initial_poll_interval
@@ -163,7 +157,6 @@ async fn watcher_iteration(
     data_dir: &str,
     config: &WatcherConfig,
     client: &reqwest::Client,
-    warmup_emitted: &mut bool,
 ) {
     // Sync per-cluster repo path on every iteration. The marker may not
     // exist on the very first iteration if patroni-runner's bootstrap
@@ -206,19 +199,33 @@ async fn watcher_iteration(
         }
     }
 
-    // PITR warmup commit — once per leader lifetime, the first iteration
-    // where we're confirmed leader and out of recovery. Emits a single
-    // XACT_COMMIT so pg_last_committed_xact() is non-null even on a primary
-    // that hasn't seen a user write since (re)boot or post-failover. The
-    // PITR picker uses pg_last_committed_xact() as its commit-time ceiling
-    // and refuses to fall back to archive-head times (those advance with
-    // empty heartbeat segments and aren't reachable by recovery_target_time),
-    // so without this warmup a freshly-promoted leader on an idle workload
-    // would show no upper bound at all even though WAL is being archived
-    // continuously and is fully restorable.
-    if !*warmup_emitted && emit_pitr_warmup().await {
-        info!("pgbackrest-watcher: PITR warmup commit emitted (pg_last_committed_xact populated)");
-        *warmup_emitted = true;
+    // PITR warmup commit — fired whenever pg_last_committed_xact() is NULL
+    // on this primary. The picker uses that function as its commit-time
+    // ceiling and refuses to fall back to archive-head times (those advance
+    // with empty heartbeat segments and aren't reachable by
+    // recovery_target_time), so a NULL reading means "no upper bound" in
+    // the UI even though WAL is being archived and fully restorable.
+    //
+    // Why poll the value instead of warming up once per leader lifetime:
+    // pg_last_committed_xact() reads from `commitTsShared->commitTsNewest`,
+    // a runtime tracker that ActivateCommitTs resets to InvalidTransactionId
+    // on every postmaster start. An in-place Postgres restart (e.g.
+    // `patronictl restart` after a parameter change) leaves this watcher
+    // process running but resets the tracker to NULL, so a once-per-lifetime
+    // flag would falsely think the warmup was done. Re-checking each
+    // iteration self-heals across any restart cause without bookkeeping.
+    // Cost is one tiny query per minute when the value is non-null, plus
+    // one tiny commit when it's null; negligible.
+    match query_last_committed_xact_is_null().await {
+        Ok(true) => {
+            if emit_pitr_warmup().await {
+                info!("pgbackrest-watcher: PITR warmup commit emitted (pg_last_committed_xact populated)");
+            } else {
+                warn!("pgbackrest-watcher: PITR warmup commit failed (will retry next iteration)");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => warn!(error = %e, "pgbackrest-watcher: pg_last_committed_xact probe failed"),
     }
 
     if !config.heartbeat_disabled {
@@ -362,12 +369,43 @@ async fn emit_wal_heartbeat() {
         .await;
 }
 
+/// Probe `pg_last_committed_xact()` and report whether the timestamp
+/// component is NULL. Postgres' track_commit_timestamp tracker is runtime
+/// state (commitTsShared->commitTsNewest), reset on every postmaster
+/// startup; this query is the only reliable way to know the picker's
+/// ceiling source is unpopulated and we need to emit a warmup. Returns
+/// Err on transient psql failures so the caller can log and skip rather
+/// than warmup-spam on probe glitches.
+async fn query_last_committed_xact_is_null() -> Result<bool> {
+    let out = Command::new("psql")
+        .args([
+            "-U",
+            "postgres",
+            "-h",
+            "/var/run/postgresql",
+            "-tAXq",
+            "-c",
+            "SELECT (pg_last_committed_xact()).timestamp IS NULL",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "pg_last_committed_xact probe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim() == "t")
+}
+
 /// Emit one transactional WAL message so the surrounding autocommit txn
 /// produces an XACT_COMMIT record — track_commit_timestamp records its
-/// wall-clock as pg_last_committed_xact() from this point on. Differs from
-/// emit_wal_heartbeat in two ways: transactional=true (so it's wrapped in
-/// a real txn that emits an XACT_COMMIT) and called once per leader
-/// lifetime, not every poll. Returns true on success.
+/// wall-clock and pg_last_committed_xact() reflects it from this point
+/// on. Differs from emit_wal_heartbeat in being transactional=true (so
+/// it's wrapped in a real txn that emits an XACT_COMMIT). Returns true
+/// on success.
 async fn emit_pitr_warmup() -> bool {
     let res = Command::new("psql")
         .args([
