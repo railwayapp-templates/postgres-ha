@@ -69,6 +69,11 @@ fi
 if [ "$PGWAL_BYTES" -ge "$PGWAL_THRESHOLD_BYTES" ]; then
   PGWAL_MB=$(( PGWAL_BYTES / 1024 / 1024 ))
   echo "pgbackrest-wrapper: pg_wal at ${PGWAL_MB} MiB (threshold ${PGWAL_THRESHOLD_MB} MiB) and archive-push failing; dropping ${WAL_FILE} to keep Postgres up" >&2
+  # Mark the gap so the backup watcher takes a fresh full once archiving
+  # recovers. Without this, gap detection collapses to single-signal
+  # (failed_count growth from foreground archive_command failures), but the
+  # wrapper-drop path returns 0 to Postgres so failed_count never grows.
+  touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
   exit 0
 fi
 

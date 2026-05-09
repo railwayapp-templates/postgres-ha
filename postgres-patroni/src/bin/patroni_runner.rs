@@ -259,6 +259,66 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 ///
 /// No-op when neither archive nor recover-from is configured. Otherwise
 /// idempotent — rewritten on every boot.
+///
+/// Wipe pgBackRest filesystem state for any role that is no longer
+/// configured. Runs before the conf renderers so disabled-then-re-enabled
+/// clusters don't carry forward stale watcher state, gap markers, or
+/// recovery-staging markers from a previous configuration.
+///
+/// State scoping mirrors postgres-ssl wrapper.sh's clear_pgbackrest_state_
+/// if_disabled:
+///   - WAL_ARCHIVE_*  unset → drop watcher state, gap marker, repo-path
+///                            marker (the per-cluster archive prefix)
+///   - WAL_RECOVER_FROM_* unset → drop PITR staging/done/restored markers
+///   - both unset → also drop the pgbackrest.conf files (they carry S3
+///                  credentials from the previous role; clearing them
+///                  removes a stale-cred footgun for any manual pgbackrest
+///                  invocation post-disable)
+///
+/// The async spool dir is left alone: per design it's a coordination
+/// cache, not durable data, and bootstrap_pgbackrest_stanza recreates it
+/// when archiving comes back.
+fn clear_pgbackrest_state_if_disabled(data_dir: &str) {
+    let archive_enabled = env::var("WAL_ARCHIVE_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let recover_enabled = env::var("WAL_RECOVER_FROM_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some();
+
+    if archive_enabled && recover_enabled {
+        return;
+    }
+
+    let rm = |path: String| {
+        if Path::new(&path).exists() {
+            match fs::remove_file(&path) {
+                Ok(_) => info!(path = %path, "pgbackrest: cleared stale state file"),
+                Err(e) => warn!(error = %e, path = %path, "pgbackrest: failed to clear state file"),
+            }
+        }
+    };
+
+    if !archive_enabled {
+        rm(format!("{data_dir}/.pgbackrest_backup_state"));
+        rm(format!("{data_dir}/.pgbackrest_gap_pending"));
+        rm(format!("{data_dir}/.pgbackrest_repo_path"));
+    }
+
+    if !recover_enabled {
+        rm(format!("{data_dir}/.pitr_staging"));
+        rm(format!("{data_dir}/.pitr_configured"));
+        rm(format!("{data_dir}/.pgbackrest_restored"));
+    }
+
+    if !archive_enabled && !recover_enabled {
+        rm("/etc/pgbackrest/pgbackrest.conf".to_string());
+        rm("/etc/pgbackrest/pgbackrest-recovery-source.conf".to_string());
+    }
+}
+
 fn render_pgbackrest_conf(data_dir: &str) -> Result<()> {
     if env::var("PGBACKREST_REPO1_S3_BUCKET")
         .ok()
@@ -470,6 +530,16 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
         pgdata_path = %data_dir,
         "pgbackrest: restore-gate state"
     );
+
+    // Without WAL_RECOVER_FROM_BUCKET the recovery-source conf never gets
+    // rendered (render_pgbackrest_recovery_source_conf early-returns when
+    // the bucket env is unset), so the staged restore_command would
+    // archive-get FATAL at boot. Mirrors postgres-ssl wrapper.sh's
+    // `[ -z "$WAL_RECOVER_FROM_BUCKET" ] && return 0` guard.
+    if config.wal_recover_from_bucket.is_none() {
+        info!("pgbackrest: WAL_RECOVER_FROM_BUCKET unset — skipping recovery staging");
+        return Ok(());
+    }
 
     if Path::new(&done).exists() {
         return Ok(());
@@ -805,6 +875,13 @@ async fn main() -> Result<()> {
     fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))
         .context("Failed to set data directory permissions")?;
 
+    // Wipe stale pgBackRest filesystem state for any role no longer
+    // configured. Must run before the conf renderers so a disable→re-enable
+    // with the same volume doesn't carry forward yesterday's last_full_at
+    // (suppressing NEEDS_INITIAL_BACKUP) or recovery markers from a prior
+    // restore.
+    clear_pgbackrest_state_if_disabled(&config.data_dir);
+
     // Render /etc/pgbackrest/pgbackrest.conf when archiving is enabled
     // (WAL_ARCHIVE_BUCKET set). Has only repo1 = the service's own bucket.
     render_pgbackrest_conf(&config.data_dir)?;
@@ -820,7 +897,10 @@ async fn main() -> Result<()> {
     // Stage pgBackRest PITR replay if requested. No-op unless
     // POSTGRES_RECOVERY_TARGET_TIME or POSTGRES_RECOVERY_TARGET_XID is set.
     // Must run before Patroni starts Postgres so the signal file and
-    // recovery settings are in place.
+    // recovery settings are in place. The function logs restore-gate state
+    // unconditionally and gates the actual staging on
+    // WAL_RECOVER_FROM_BUCKET internally — operators see why staging was
+    // skipped via the log even when no bucket is configured.
     if config.pitr_target_time.is_some() || config.pitr_target_xid.is_some() {
         configure_pitr_recovery(&config)?;
     }
