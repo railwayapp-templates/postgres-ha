@@ -1249,13 +1249,9 @@ t_ha_per_cluster_path_marker() {
   # The marker file alone is the source of truth here. The runner's
   # render_pgbackrest_conf doesn't seed a repo1-path= line in the
   # rendered /etc/pgbackrest/pgbackrest.conf — it relies on the
-  # PGBACKREST_REPO1_PATH env it exports to its own forks. That means
-  # update_pgbackrest_conf_repo_path's marker-driven rewrite is a
-  # no-op (no line to patch) and ad-hoc `pgbackrest info` from
-  # ops shells must use the env preamble that reads the marker.
-  # Asserting the conf would test the un-patched seed path, which is
-  # a known divergence from postgres-ssl's wrapper.sh; not a regression
-  # and not in scope for this harness.
+  # PGBACKREST_REPO1_PATH env it exports to its own forks. Ad-hoc
+  # `pgbackrest info` from ops shells must use the env preamble that
+  # reads the marker.
 
   ok t_ha_per_cluster_path_marker
   note "marker=$marker_path; conf repo1-path matches"
