@@ -455,11 +455,56 @@ async fn run_backup(data_dir: &str, action: Action, _stats_pre: &ArchiverStats) 
                 _ => {}
             }
             info!(backup_type = %backup_type, "pgbackrest-watcher: backup completed");
+            emit_pitr_anchor().await;
         }
         Ok(s) => {
             warn!(status = ?s, backup_type = %backup_type, "pgbackrest-watcher: backup failed (will retry next poll)")
         }
         Err(e) => warn!(error = %e, "pgbackrest-watcher: backup invocation failed"),
+    }
+}
+
+/// Emits one transactional commit right after a successful backup so the
+/// PITR picker has a commit-timestamp anchor to clamp `recovery_target_time`
+/// against. Without this, a brand-new cluster with a base backup but zero
+/// user commits leaves `pg_last_committed_xact()` and
+/// `pg_xact_commit_timestamp(newest_commit_ts_xid from pg_control_checkpoint())`
+/// both NULL — the picker has no safe ceiling and any restore target FATALs
+/// recovery with "recovery ended before configured recovery target was
+/// reached" (it only stops at XLOG_XACT_COMMIT records).
+///
+/// `transactional=true` produces a real XLOG_XACT_COMMIT record with a
+/// commit timestamp, populates `pg_commit_ts/`, and the next checkpoint
+/// persists `newest_commit_ts_xid` into pg_control. The picker's
+/// GREATEST-of-two-sources query picks it up on the next 30s probe refresh.
+///
+/// Idempotent: every subsequent backup re-fires the emit. If the cluster
+/// already has user commits, the extra anchor is invisible noise (one
+/// trivial transaction, no table side effect). Failure is non-fatal — the
+/// next iteration's backup retries.
+async fn emit_pitr_anchor() {
+    let res = Command::new("psql")
+        .args([
+            "-U",
+            "postgres",
+            "-h",
+            "/var/run/postgresql",
+            "-tAXq",
+            "-c",
+            "SELECT pg_logical_emit_message(true, 'rwy_pitr_anchor', '')",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output()
+        .await;
+    match res {
+        Ok(o) if o.status.success() => info!("pgbackrest-watcher: pitr anchor emitted"),
+        Ok(o) => warn!(
+            status = ?o.status,
+            stderr = %String::from_utf8_lossy(&o.stderr),
+            "pgbackrest-watcher: pitr anchor emit failed (non-fatal)"
+        ),
+        Err(e) => warn!(error = %e, "pgbackrest-watcher: pitr anchor invocation failed (non-fatal)"),
     }
 }
 
