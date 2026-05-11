@@ -79,6 +79,13 @@ pub struct Config {
     /// down to `lastCommittedTxnAt`; leaves it unset for arbitrary historical
     /// times. Mirrors postgres-ssl PR #63.
     pub pitr_target_xid: Option<String>,
+    /// `recovery_target=immediate` toggle. When `POSTGRES_RECOVERY_TARGET_TYPE`
+    /// is `immediate`, restore stops at the end of the base backup with no WAL
+    /// replay past `pg_backup_stop`. Takes precedence over both `_TIME` and
+    /// `_XID`. Used when the source has zero tracked commits (brand-new
+    /// cluster) and there's no timestamp/xid to anchor recovery against —
+    /// `recovery_target_time` would FATAL because no commit record exists.
+    pub pitr_target_immediate: bool,
     /// `archive_timeout` written into Patroni's bootstrap.dcs and asserted by
     /// the DCS reconciler when archiving is enabled. Default 60s. Operators
     /// raise it on idle DBs to cut S3 cost or lower it for tighter RPO.
@@ -133,6 +140,10 @@ impl Config {
             pitr_target_xid: env::var("POSTGRES_RECOVERY_TARGET_XID")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            pitr_target_immediate: env::var("POSTGRES_RECOVERY_TARGET_TYPE")
+                .ok()
+                .map(|s| s.eq_ignore_ascii_case("immediate"))
+                .unwrap_or(false),
             archive_timeout_secs: env::var("POSTGRES_ARCHIVE_TIMEOUT")
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())

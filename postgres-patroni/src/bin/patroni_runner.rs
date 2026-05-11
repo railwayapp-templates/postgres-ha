@@ -507,12 +507,27 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
     let pg_version = format!("{data_dir}/PG_VERSION");
     let restored_marker = format!("{data_dir}/.pgbackrest_restored");
 
-    // Pick the recovery target type. xid wins over time when both are set —
-    // see fn-doc above. Caller already gated on at least one being Some.
-    let (target_param, target_value) = if let Some(xid) = config.pitr_target_xid.as_deref() {
-        ("recovery_target_xid", xid)
+    // Pick the recovery target type. `immediate` wins outright — postgres
+    // stops at end-of-base-backup consistency, no target value needed.
+    // `_XID` wins over `_TIME` when both are set, see fn-doc above for
+    // idle-source-safe rationale. Caller already gated on at least one of
+    // the three being set.
+    enum RecoveryTarget<'a> {
+        Immediate,
+        WithValue { param: &'a str, value: &'a str },
+    }
+    let target = if config.pitr_target_immediate {
+        RecoveryTarget::Immediate
+    } else if let Some(xid) = config.pitr_target_xid.as_deref() {
+        RecoveryTarget::WithValue {
+            param: "recovery_target_xid",
+            value: xid,
+        }
     } else if let Some(time) = config.pitr_target_time.as_deref() {
-        ("recovery_target_time", time)
+        RecoveryTarget::WithValue {
+            param: "recovery_target_time",
+            value: time,
+        }
     } else {
         return Ok(());
     };
@@ -523,6 +538,7 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
         wal_recover_from_bucket = config.wal_recover_from_bucket.is_some(),
         postgres_recovery_target_time = ?config.pitr_target_time,
         postgres_recovery_target_xid = ?config.pitr_target_xid,
+        postgres_recovery_target_immediate = config.pitr_target_immediate,
         pg_version_present = Path::new(&pg_version).exists(),
         restored_marker_present = Path::new(&restored_marker).exists(),
         pitr_staging_present = Path::new(&staging).exists(),
@@ -561,14 +577,20 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
     // /etc/pgbackrest/pgbackrest.conf which has only the service's repo1.
     // Mirrors postgres-ssl PR #49.
     let restore_cmd = "pgbackrest --config=/etc/pgbackrest/pgbackrest-recovery-source.conf --stanza=main archive-get %f %p";
-    let escaped_target = target_value.replace('\'', "''");
     let escaped_restore = restore_cmd.replace('\'', "''");
 
+    let target_line = match target {
+        RecoveryTarget::Immediate => "recovery_target = 'immediate'".to_string(),
+        RecoveryTarget::WithValue { param, value } => {
+            let escaped = value.replace('\'', "''");
+            format!("{param} = '{escaped}'")
+        }
+    };
     let auto_conf_path = format!("{data_dir}/postgresql.auto.conf");
     let addition = format!(
         "\n# managed by pgbackrest-recovery (patroni-runner)\n\
          restore_command = '{escaped_restore}'\n\
-         {target_param} = '{escaped_target}'\n\
+         {target_line}\n\
          recovery_target_action = 'promote'\n",
     );
     let mut f = fs::OpenOptions::new()
@@ -582,7 +604,14 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
     fs::File::create(&signal).context("Failed to create recovery.signal")?;
     fs::write(&staging, "").context("Failed to write PITR staging marker")?;
 
-    info!(target_param = %target_param, target = %target_value, "pgbackrest PITR replay staged");
+    match target {
+        RecoveryTarget::Immediate => {
+            info!("pgbackrest PITR replay staged (recovery_target=immediate)")
+        }
+        RecoveryTarget::WithValue { param, value } => {
+            info!(target_param = %param, target = %value, "pgbackrest PITR replay staged")
+        }
+    }
     Ok(())
 }
 
@@ -895,13 +924,17 @@ async fn main() -> Result<()> {
     render_pgbackrest_recovery_source_conf(&config.data_dir)?;
 
     // Stage pgBackRest PITR replay if requested. No-op unless
-    // POSTGRES_RECOVERY_TARGET_TIME or POSTGRES_RECOVERY_TARGET_XID is set.
-    // Must run before Patroni starts Postgres so the signal file and
-    // recovery settings are in place. The function logs restore-gate state
-    // unconditionally and gates the actual staging on
-    // WAL_RECOVER_FROM_BUCKET internally — operators see why staging was
-    // skipped via the log even when no bucket is configured.
-    if config.pitr_target_time.is_some() || config.pitr_target_xid.is_some() {
+    // POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID, or
+    // POSTGRES_RECOVERY_TARGET_TYPE=immediate is set. Must run before
+    // Patroni starts Postgres so the signal file and recovery settings
+    // are in place. The function logs restore-gate state unconditionally
+    // and gates the actual staging on WAL_RECOVER_FROM_BUCKET internally
+    // — operators see why staging was skipped via the log even when no
+    // bucket is configured.
+    if config.pitr_target_time.is_some()
+        || config.pitr_target_xid.is_some()
+        || config.pitr_target_immediate
+    {
         configure_pitr_recovery(&config)?;
     }
 
