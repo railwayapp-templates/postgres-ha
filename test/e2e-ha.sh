@@ -333,6 +333,19 @@ setup_patroni_cluster() {
       -d '{"postgresql":{"parameters":{"archive_mode":"on","archive_command":"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p","archive_timeout":60,"track_commit_timestamp":"on"}}}' \
       "http://localhost:8008/config" >/dev/null 2>&1 || true
 
+    # archive_command is not PGC_POSTMASTER — Patroni propagates it to
+    # postgresql.conf via reload after the DCS PATCH. Wait until SHOW
+    # archive_command reflects pgbackrest before proceeding; otherwise
+    # the watcher's initial full fires before the reload lands and
+    # pgBackRest rejects it with "archive_command '' must contain pgbackrest".
+    local ac_deadline=$(($(date +%s) + 60))
+    while [ "$(date +%s)" -lt "$ac_deadline" ]; do
+      local ac
+      ac=$(docker exec -u postgres "$leader" psql -h /var/run/postgresql -At -c "SHOW archive_command" 2>/dev/null || echo "")
+      if echo "$ac" | grep -q "pgbackrest"; then break; fi
+      sleep 2
+    done
+
     # Ensure the pgBackRest stanza exists. spawn_bootstrap_stanza_create
     # runs once per patroni-runner start and may race Patroni's REST
     # coming up. Drive it explicitly so subsequent watcher iterations
