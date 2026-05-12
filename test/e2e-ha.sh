@@ -307,18 +307,21 @@ setup_patroni_cluster() {
       "$IMAGE" >/dev/null
   done
 
-  # Phase 3 (only when archiving env was added): trigger a Patroni
-  # restart on every node so archive_mode (PGC_POSTMASTER) flips from
-  # off to on. The runner's DCS reconciler patches DCS but explicitly
-  # does NOT auto-restart — the dashboard PITR-enable flow handles the
-  # rolling restart in production. We mirror that here.
-  local needs_archive_restart=0
+  # Phase 3 (only when archiving env was added): ensure DCS has the
+  # archive params and that a pgBackRest stanza exists. No rolling
+  # restart needed: archive_mode=on is already applied during Phase 2
+  # because patroni.yml local postgresql.parameters now carries it, so
+  # the full docker rm+run in Phase 2 activates it without a separate
+  # per-node restart. A rolling restart here would cause temporary
+  # leaders to take successful backups mid-restart and produce extra
+  # fulls in the bucket that the test counts don't expect.
+  local has_archive_env=0
   for arg in "${extra_args[@]}"; do
     case "$arg" in
-      WAL_ARCHIVE_BUCKET=*) needs_archive_restart=1 ;;
+      WAL_ARCHIVE_BUCKET=*) has_archive_env=1 ;;
     esac
   done
-  if [ "$needs_archive_restart" = "1" ]; then
+  if [ "$has_archive_env" = "1" ]; then
     local leader; leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
     # Force the DCS postgresql.parameters to include archive_mode et al.
     # The runner spawns a reconcile task that should do this, but in the
@@ -329,34 +332,11 @@ setup_patroni_cluster() {
     docker exec "$leader" curl -sf -X PATCH -H "Content-Type: application/json" \
       -d '{"postgresql":{"parameters":{"archive_mode":"on","archive_command":"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p","archive_timeout":60,"track_commit_timestamp":"on"}}}' \
       "http://localhost:8008/config" >/dev/null 2>&1 || true
-    # Use `docker restart` rather than Patroni REST /restart. The runner
-    # has a tight 3-failure health monitor on Patroni REST and self-exits
-    # when REST goes down mid-restart — Patroni's own /restart bounces
-    # postgres but blips its own REST too, which trips the monitor.
-    # Full container restart sidesteps that: patroni-runner comes up
-    # fresh, reads DCS (already PATCHed above), applies archive_mode at
-    # first start, no health-monitor race. Sequential so a leader stays.
-    for n in "$n1" "$n2" "$n3"; do
-      docker restart "$n" >/dev/null 2>&1 || true
-      # Wait for Patroni REST to be back before next node.
-      local ready_deadline=$(($(date +%s) + 90))
-      while [ "$(date +%s)" -lt "$ready_deadline" ]; do
-        if docker exec "$n" curl -sf "http://localhost:8008/health" >/dev/null 2>&1; then
-          break
-        fi
-        sleep 1
-      done
-    done
-    # Re-elect leader if needed.
-    leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
 
-    # The runner's spawn_bootstrap_stanza_create task fires ONCE on
-    # patroni-runner start. On the second-boot path that task hits
-    # PG before archive_mode flipped to on (post-phase-3 restart only
-    # bounces Postgres, not patroni-runner) and fails silently. We
-    # manually drive stanza-create here so subsequent watcher
-    # iterations have a stanza to back up against. Mirrors
-    # spawn_bootstrap_stanza_create's exact env shape.
+    # Ensure the pgBackRest stanza exists. spawn_bootstrap_stanza_create
+    # runs once per patroni-runner start and may race Patroni's REST
+    # coming up. Drive it explicitly so subsequent watcher iterations
+    # have a stanza to back up against.
     docker exec -u postgres "$leader" bash -c '
       export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
       export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
