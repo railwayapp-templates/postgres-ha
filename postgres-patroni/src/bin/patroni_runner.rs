@@ -737,6 +737,46 @@ fn spawn_bootstrap_stanza_create() {
             return;
         }
 
+        // Wait for this node to become primary before running stanza-create.
+        // pg_isready above only confirms Postgres accepts connections — a
+        // replica in hot_standby mode passes that check while still being
+        // in recovery. pgBackRest stanza-create connects to the local
+        // Postgres instance and fails with error 056 ("unable to find
+        // primary cluster") if it finds a standby. We must wait here for
+        // pg_is_in_recovery() to return false (i.e., Patroni has promoted
+        // this node) before proceeding. On permanent replicas this loop
+        // never exits and the task exits at the deadline — replicas don't
+        // own the stanza.
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                warn!("pgbackrest: timed out waiting for primary promotion before stanza-create");
+                return;
+            }
+            let out = tokio::process::Command::new("psql")
+                .args([
+                    "-U",
+                    "postgres",
+                    "-h",
+                    "/var/run/postgresql",
+                    "-tAXq",
+                    "-c",
+                    "SELECT pg_is_in_recovery()",
+                ])
+                .env_remove("PGHOST")
+                .env_remove("PGPORT")
+                .output()
+                .await;
+            match out {
+                Ok(o) if o.status.success() => {
+                    if String::from_utf8_lossy(&o.stdout).trim() == "f" {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
         // Re-derive the repo path now that pg_control is on disk. This is
         // the canonical first chance to do it on a fresh-cluster path.
         let repo_path = derive_pgbackrest_repo_path(&data_dir);
