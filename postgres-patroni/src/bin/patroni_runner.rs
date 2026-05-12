@@ -750,8 +750,15 @@ fn spawn_bootstrap_stanza_create() {
         // these before forking this task, but a Command-level remove is
         // belt-and-suspenders so future refactors can't reintroduce the
         // leak. Mirrors postgres-ssl PR #51.
-        let out = tokio::process::Command::new("gosu")
-            .args(["postgres", "pgbackrest", "--stanza=main", "stanza-create"])
+        //
+        // Call pgbackrest directly (no `gosu postgres` wrapper). In ssl,
+        // wrapper.sh runs as root and gosu drops to postgres; in HA,
+        // postgres-wrapper already dropped to postgres before exec'ing
+        // patroni-runner, so we're non-root here — gosu's setgroups(0)
+        // fails with EPERM ("error: failed switching to 'postgres'") and
+        // stanza-create never completes, breaking archive-push.
+        let out = tokio::process::Command::new("pgbackrest")
+            .args(["--stanza=main", "stanza-create"])
             .env_remove("PGHOST")
             .env_remove("PGPORT")
             .status()
