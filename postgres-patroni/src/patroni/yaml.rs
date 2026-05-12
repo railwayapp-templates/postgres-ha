@@ -45,6 +45,21 @@ pub fn generate_patroni_config(config: &Config) -> String {
         String::new()
     };
 
+    // archive_mode and track_commit_timestamp are PGC_POSTMASTER — they can
+    // only be applied by restarting PostgreSQL, not via reload. Bootstrap.dcs
+    // only seeds DCS on the very first cluster init; on existing clusters,
+    // DCS might start empty (etcd reset, timing race with the DCS reconciler,
+    // or first-time PITR enable on a running cluster). To guarantee Postgres
+    // always starts with these params active — regardless of DCS state — also
+    // place them in Patroni's local postgresql.parameters section. DCS takes
+    // priority when both are present and agree; if DCS is empty at startup
+    // the local value fills the gap and avoids the reload→pending_restart trap.
+    let pgbackrest_local_params = if config.wal_archive_bucket.is_some() {
+        "    archive_mode: \"on\"\n    track_commit_timestamp: \"on\"\n".to_string()
+    } else {
+        String::new()
+    };
+
     format!(
         r#"scope: {scope}
 name: {name}
@@ -123,7 +138,7 @@ postgresql:
     ssl_cert_file: "{certs_dir}/server.crt"
     ssl_key_file: "{certs_dir}/server.key"
     ssl_ca_file: "{certs_dir}/root.crt"
-"#,
+{pgbackrest_local_params}"#,
         scope = config.scope,
         name = config.name,
         connect_address = config.connect_address,
@@ -142,6 +157,7 @@ postgresql:
         certs_dir = config.certs_dir,
         synchronous_mode = config.synchronous_mode,
         pgbackrest_archive_params = pgbackrest_archive_params,
+        pgbackrest_local_params = pgbackrest_local_params,
     )
 }
 
