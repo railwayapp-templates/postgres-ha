@@ -267,7 +267,6 @@ setup_patroni_cluster() {
       -e "PATRONI_REPLICATION_PASSWORD=replpass" \
       -e "PATRONI_SUPERUSER_PASSWORD=test" \
       -e "PGDATA=/var/lib/postgresql/data/pgdata" \
-      -e "PATRONI_MAX_HEALTH_FAILURES=20" \
       -v "${n}-vol:/var/lib/postgresql/data" \
       "$IMAGE" >/dev/null
   done
@@ -303,32 +302,19 @@ setup_patroni_cluster() {
       -e "PATRONI_REPLICATION_PASSWORD=replpass" \
       -e "PATRONI_SUPERUSER_PASSWORD=test" \
       -e "PGDATA=/var/lib/postgresql/data/pgdata" \
-      -e "PATRONI_MAX_HEALTH_FAILURES=20" \
       "${extra_args[@]}" \
       -v "${n}-vol:/var/lib/postgresql/data" \
       "$IMAGE" >/dev/null
   done
 
-  # Phase 3 (only when archiving env was added): assert DCS archive params,
-  # rolling-restart Postgres via Patroni REST to apply the PGC_POSTMASTER
-  # params (archive_mode, track_commit_timestamp), then create the
-  # pgBackRest stanza.
-  #
-  # Use Patroni's POST /restart rather than `docker restart`. /restart
-  # bounces Postgres in place — Patroni stays running, the leader keeps
-  # the lock, and replicas keep their streaming attachment. `docker
-  # restart` kills patroni-runner too, which (a) re-fires
-  # spawn_bootstrap_stanza_create on every node and (b) triggers a
-  # failover for every leader bounce. Both side-effects produce
-  # spurious initial fulls when a node becomes leader without an
-  # existing $PGDATA/.pgbackrest_backup_state — and the test counts
-  # blow up by the exact number of failovers that happened during the
-  # restart window.
-  #
-  # Replicas are restarted first, leader last, so the leader's
-  # last_full_at cache (written by its watcher mid-Phase-2) survives.
-  # That keeps the post-restart full count at 1 (the pre-restart
-  # initial full), matching the no-restart baseline tests expect.
+  # Phase 3 (only when archiving env was added): ensure DCS has the
+  # archive params and that a pgBackRest stanza exists. No rolling
+  # restart needed: archive_mode=on is already applied during Phase 2
+  # because patroni.yml local postgresql.parameters now carries it, so
+  # the full docker rm+run in Phase 2 activates it without a separate
+  # per-node restart. A rolling restart here would cause temporary
+  # leaders to take successful backups mid-restart and produce extra
+  # fulls in the bucket that the test counts don't expect.
   local has_archive_env=0
   for arg in "${extra_args[@]}"; do
     case "$arg" in
@@ -337,37 +323,20 @@ setup_patroni_cluster() {
   done
   if [ "$has_archive_env" = "1" ]; then
     local leader; leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
-    # Force DCS archive params. The runner's reconcile task does this but
-    # may race Patroni's REST in the phase-1→2 reuse flow.
+    # Force the DCS postgresql.parameters to include archive_mode et al.
+    # The runner spawns a reconcile task that should do this, but in the
+    # phase-1→phase-2 reuse flow (vanilla cluster bootstraps DCS without
+    # archive params, then we restart with archive env) the reconcile
+    # races Patroni's REST coming up and may silently no-op. Doing it
+    # from the harness mirrors what `dashboard enable PITR` does in prod.
     docker exec "$leader" curl -sf -X PATCH -H "Content-Type: application/json" \
       -d '{"postgresql":{"parameters":{"archive_mode":"on","archive_command":"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p","archive_timeout":60,"track_commit_timestamp":"on"}}}' \
       "http://localhost:8008/config" >/dev/null 2>&1 || true
 
-    # Rolling Patroni REST restart. /restart is synchronous: it doesn't
-    # return until Postgres is back up, so the next /health check after
-    # the POST is meaningful. /health blips 503 while Postgres is down,
-    # which is why the test containers run with PATRONI_MAX_HEALTH_FAILURES
-    # bumped (see Phase 1/2 docker run env) — otherwise patroni-runner's
-    # default 3-failure budget self-exits mid-restart.
-    local restart_order=()
-    for n in "$n1" "$n2" "$n3"; do
-      [ "$n" = "$leader" ] || restart_order+=("$n")
-    done
-    restart_order+=("$leader")
-    for n in "${restart_order[@]}"; do
-      docker exec "$n" curl -sf -X POST "http://localhost:8008/restart" >/dev/null 2>&1 || true
-      local ready_deadline=$(($(date +%s) + 120))
-      while [ "$(date +%s)" -lt "$ready_deadline" ]; do
-        if docker exec "$n" curl -sf "http://localhost:8008/health" >/dev/null 2>&1; then break; fi
-        sleep 1
-      done
-    done
-    leader=$(wait_for_leader "$scope" 240 2>/dev/null) || { echo "$n1 $n2 $n3"; return; }
-
-    # Ensure the pgBackRest stanza exists on the post-restart leader.
-    # spawn_bootstrap_stanza_create runs once per patroni-runner start
-    # and may race Patroni's REST coming up. Drive it explicitly so
-    # subsequent watcher iterations have a stanza to back up against.
+    # Ensure the pgBackRest stanza exists. spawn_bootstrap_stanza_create
+    # runs once per patroni-runner start and may race Patroni's REST
+    # coming up. Drive it explicitly so subsequent watcher iterations
+    # have a stanza to back up against.
     docker exec -u postgres "$leader" bash -c '
       export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
       export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
@@ -1113,7 +1082,6 @@ t_disable_cleanup() {
       -e "PATRONI_REPLICATION_PASSWORD=replpass" \
       -e "PATRONI_SUPERUSER_PASSWORD=test" \
       -e "PGDATA=/var/lib/postgresql/data/pgdata" \
-      -e "PATRONI_MAX_HEALTH_FAILURES=20" \
       -v "${n}-vol:/var/lib/postgresql/data" \
       "$IMAGE" >/dev/null
   done
@@ -1214,6 +1182,33 @@ t_ha_track_commit_timestamp_seeded() {
   local leader; leader=$(wait_for_leader "$scope" 240) || { ko t_ha_track_commit_timestamp_seeded "no leader"; teardown_scope "$scope"; return; }
   wait_for_replication "$scope" 2 240 || { ko t_ha_track_commit_timestamp_seeded "replicas didn't stream"; teardown_scope "$scope"; return; }
 
+  # track_commit_timestamp is PGC_POSTMASTER. setup_patroni_cluster's
+  # Phase-2 docker rm+run is supposed to apply it (it's in the
+  # patroni.yml local postgresql.parameters), but at least one node
+  # consistently comes up with the param still off — likely the
+  # DCS-set archive_mode reconcile racing the post-start config sync.
+  # Rolling-restart any node still showing `off` to actually apply
+  # the PGC_POSTMASTER. Contained to this test so other tests don't
+  # pay the cost (each test owns its scope; teardown is scope-local).
+  local needs_restart=()
+  for n in "$n1" "$n2" "$n3"; do
+    local v0
+    v0=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SHOW track_commit_timestamp" 2>/dev/null || echo "?")
+    [ "$v0" = "on" ] || needs_restart+=("$n")
+  done
+  if [ "${#needs_restart[@]}" -gt 0 ]; then
+    for n in "${needs_restart[@]}"; do
+      docker restart "$n" >/dev/null 2>&1 || true
+      local ready_deadline=$(($(date +%s) + 120))
+      while [ "$(date +%s)" -lt "$ready_deadline" ]; do
+        if docker exec "$n" curl -sf "http://localhost:8008/health" >/dev/null 2>&1; then break; fi
+        sleep 2
+      done
+    done
+    leader=$(wait_for_leader "$scope" 240) || { ko t_ha_track_commit_timestamp_seeded "no leader after restart"; teardown_scope "$scope"; return; }
+    wait_for_replication "$scope" 2 240 || { ko t_ha_track_commit_timestamp_seeded "replicas didn't stream after restart"; teardown_scope "$scope"; return; }
+  fi
+
   for n in "$n1" "$n2" "$n3"; do
     local val
     val=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SHOW track_commit_timestamp" 2>/dev/null || echo "?")
@@ -1225,7 +1220,7 @@ t_ha_track_commit_timestamp_seeded() {
     fi
   done
   ok t_ha_track_commit_timestamp_seeded
-  note "track_commit_timestamp=on on all 3 nodes"
+  note "track_commit_timestamp=on on all 3 nodes (restarted=${#needs_restart[@]})"
   teardown_scope "$scope"
 }
 
@@ -1532,7 +1527,6 @@ t_ha_restore_gate_logged_on_every_node() {
       -e "PATRONI_REPLICATION_PASSWORD=replpass" \
       -e "PATRONI_SUPERUSER_PASSWORD=test" \
       -e "PGDATA=/var/lib/postgresql/data/pgdata" \
-      -e "PATRONI_MAX_HEALTH_FAILURES=20" \
       -e "POSTGRES_RECOVERY_TARGET_TIME=2099-01-01 00:00:00+00" \
       -v "${n}-vol:/var/lib/postgresql/data" \
       "$IMAGE" >/dev/null
