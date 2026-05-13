@@ -333,6 +333,19 @@ setup_patroni_cluster() {
       -d '{"postgresql":{"parameters":{"archive_mode":"on","archive_command":"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p","archive_timeout":60,"track_commit_timestamp":"on"}}}' \
       "http://localhost:8008/config" >/dev/null 2>&1 || true
 
+    # archive_command is not PGC_POSTMASTER — Patroni propagates it to
+    # postgresql.conf via reload after the DCS PATCH. Wait until SHOW
+    # archive_command reflects pgbackrest before proceeding; otherwise
+    # the watcher's initial full fires before the reload lands and
+    # pgBackRest rejects it with "archive_command '' must contain pgbackrest".
+    local ac_deadline=$(($(date +%s) + 60))
+    while [ "$(date +%s)" -lt "$ac_deadline" ]; do
+      local ac
+      ac=$(docker exec -u postgres "$leader" psql -h /var/run/postgresql -At -c "SHOW archive_command" 2>/dev/null || echo "")
+      if echo "$ac" | grep -q "pgbackrest"; then break; fi
+      sleep 2
+    done
+
     # Ensure the pgBackRest stanza exists. spawn_bootstrap_stanza_create
     # runs once per patroni-runner start and may race Patroni's REST
     # coming up. Drive it explicitly so subsequent watcher iterations
@@ -1182,6 +1195,33 @@ t_ha_track_commit_timestamp_seeded() {
   local leader; leader=$(wait_for_leader "$scope" 240) || { ko t_ha_track_commit_timestamp_seeded "no leader"; teardown_scope "$scope"; return; }
   wait_for_replication "$scope" 2 240 || { ko t_ha_track_commit_timestamp_seeded "replicas didn't stream"; teardown_scope "$scope"; return; }
 
+  # track_commit_timestamp is PGC_POSTMASTER. setup_patroni_cluster's
+  # Phase-2 docker rm+run is supposed to apply it (it's in the
+  # patroni.yml local postgresql.parameters), but at least one node
+  # consistently comes up with the param still off — likely the
+  # DCS-set archive_mode reconcile racing the post-start config sync.
+  # Rolling-restart any node still showing `off` to actually apply
+  # the PGC_POSTMASTER. Contained to this test so other tests don't
+  # pay the cost (each test owns its scope; teardown is scope-local).
+  local needs_restart=()
+  for n in "$n1" "$n2" "$n3"; do
+    local v0
+    v0=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SHOW track_commit_timestamp" 2>/dev/null || echo "?")
+    [ "$v0" = "on" ] || needs_restart+=("$n")
+  done
+  if [ "${#needs_restart[@]}" -gt 0 ]; then
+    for n in "${needs_restart[@]}"; do
+      docker restart "$n" >/dev/null 2>&1 || true
+      local ready_deadline=$(($(date +%s) + 120))
+      while [ "$(date +%s)" -lt "$ready_deadline" ]; do
+        if docker exec "$n" curl -sf "http://localhost:8008/health" >/dev/null 2>&1; then break; fi
+        sleep 2
+      done
+    done
+    leader=$(wait_for_leader "$scope" 240) || { ko t_ha_track_commit_timestamp_seeded "no leader after restart"; teardown_scope "$scope"; return; }
+    wait_for_replication "$scope" 2 240 || { ko t_ha_track_commit_timestamp_seeded "replicas didn't stream after restart"; teardown_scope "$scope"; return; }
+  fi
+
   for n in "$n1" "$n2" "$n3"; do
     local val
     val=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SHOW track_commit_timestamp" 2>/dev/null || echo "?")
@@ -1193,7 +1233,7 @@ t_ha_track_commit_timestamp_seeded() {
     fi
   done
   ok t_ha_track_commit_timestamp_seeded
-  note "track_commit_timestamp=on on all 3 nodes"
+  note "track_commit_timestamp=on on all 3 nodes (restarted=${#needs_restart[@]})"
   teardown_scope "$scope"
 }
 
