@@ -13,6 +13,11 @@
 # archiving config" so the underlying issue (bad creds, deleted bucket,
 # expired keys, …) gets fixed.
 #
+# Special case: if the bucket actively does not exist (S3 NoSuchBucket error),
+# there is no recovery without operator action — retrying is pointless and
+# letting WAL accumulate up to the threshold wastes disk. In that case the
+# wrapper drops immediately (returns 0) regardless of pg_wal size.
+#
 # Why ≤500 MiB here, vs pgBackRest's archive-push-queue-max ≤5GiB:
 # the two thresholds gate orthogonal failure regimes. archive-push-queue-max
 # governs the SPOOL — graceful absorption of transient S3 stalls, where the
@@ -60,9 +65,19 @@ fi
 # isolated under a separate file referenced via --config exclusively for
 # archive-get during recovery. So archive-push naturally only touches
 # the service's own bucket.
-pgbackrest --stanza=main archive-push "$WAL_FILE"
+pgb_out=$(pgbackrest --stanza=main archive-push "$WAL_FILE" 2>&1)
 PGB_RC=$?
+[ -n "$pgb_out" ] && printf '%s\n' "$pgb_out" >&2
 if [ "$PGB_RC" -eq 0 ]; then
+  exit 0
+fi
+
+# Bucket deleted: NoSuchBucket is the S3 error for a bucket that no longer
+# exists. No retry will ever succeed without operator action, so drop the
+# segment immediately rather than accumulating WAL up to the threshold.
+if printf '%s\n' "$pgb_out" | grep -q 'NoSuchBucket'; then
+  echo "pgbackrest-wrapper: bucket does not exist (NoSuchBucket); dropping ${WAL_FILE} immediately" >&2
+  touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
   exit 0
 fi
 
