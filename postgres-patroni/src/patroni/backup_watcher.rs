@@ -216,6 +216,10 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
             run_backup(data_dir, action, &stats).await;
         }
     }
+
+    verify_catalog(data_dir).await;
+    // If last_full_at was cleared by verify_catalog, NEEDS_INITIAL_BACKUP
+    // fires on the next iteration.
 }
 
 fn sync_repo_path_from_marker(data_dir: &str) {
@@ -505,6 +509,74 @@ async fn emit_pitr_anchor() {
             "pgbackrest-watcher: pitr anchor emit failed (non-fatal)"
         ),
         Err(e) => warn!(error = %e, "pgbackrest-watcher: pitr anchor invocation failed (non-fatal)"),
+    }
+}
+
+/// Runs `pgbackrest --stanza=main info --output=json` and returns the number
+/// of full backups found in the "main" stanza. Returns `None` on any error
+/// (S3 unreachable, parse failure, stanza absent) so callers can distinguish
+/// "definitely zero" from "unknown".
+async fn pgbackrest_full_count() -> Option<u64> {
+    let out = Command::new("pgbackrest")
+        .args(["--stanza=main", "info", "--output=json"])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output()
+        .await
+        .ok()?;
+
+    if !out.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(out.stdout).ok()?;
+    let stanzas: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let arr = stanzas.as_array()?;
+
+    let stanza = arr
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("main"))?;
+
+    let backups = stanza.get("backup")?.as_array()?;
+    let count = backups
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("full"))
+        .count() as u64;
+
+    Some(count)
+}
+
+/// Verifies that the pgBackRest catalog agrees with the local state file.
+/// Returns `true` if a re-trigger is needed (state was reset).
+///
+/// Rate-limited to once per hour via `last_catalog_verified_at`. If the probe
+/// returns `None` (S3 unreachable, parse error, etc.) the timestamp is still
+/// updated so we don't hammer the catalog on every poll during an outage, but
+/// state is never cleared — only a confirmed `Some(0)` triggers the reset.
+async fn verify_catalog(data_dir: &str) -> bool {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+
+    let last_verified = read_state_field(&state_path, "last_catalog_verified_at")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    let now = now_epoch();
+    if now - last_verified < 3600 {
+        return false;
+    }
+
+    let count = pgbackrest_full_count().await;
+
+    // Always stamp the verification time, even when the probe returned None.
+    let _ = write_state_field(&state_path, "last_catalog_verified_at", &now.to_string());
+
+    match count {
+        Some(0) => {
+            warn!("pgbackrest-watcher: catalog shows 0 fulls despite state; resetting last_full_at");
+            let _ = write_state_field(&state_path, "last_full_at", "");
+            true
+        }
+        _ => false,
     }
 }
 
