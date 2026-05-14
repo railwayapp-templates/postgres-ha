@@ -60,6 +60,7 @@ struct WatcherConfig {
     full_interval: u64,
     diff_interval: u64,
     heartbeat_disabled: bool,
+    catalog_verify_interval: u64,
 }
 
 impl WatcherConfig {
@@ -83,6 +84,12 @@ impl WatcherConfig {
                 .ok()
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            // How often to verify S3 catalog actually has a full backup.
+            // 0 disables. Default 3600 (1 hour). Mirrors postgres-ssl.
+            catalog_verify_interval: env_u64(
+                "WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS",
+                3600,
+            ),
         }
     }
 }
@@ -206,6 +213,10 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
             return;
         }
     };
+
+    // Periodically verify S3 catalog actually has a full backup. Clears local
+    // state if catalog is empty so decide_action fires a new full.
+    maybe_verify_catalog(data_dir, config).await;
 
     let action = decide_action(data_dir, config, &stats);
     match action {
@@ -334,6 +345,94 @@ async fn emit_wal_heartbeat() {
         .env_remove("PGPORT")
         .output()
         .await;
+}
+
+/// Check whether the S3 catalog for repo1 contains at least one full backup.
+/// Returns `Some(true)` = backup exists, `Some(false)` = catalog readable but
+/// empty, `None` = couldn't determine (S3 unreachable, stanza not yet created,
+/// spawn error, timeout). Only `Some(false)` triggers a state reset; `None` is
+/// treated as inconclusive so transient S3 failures don't burn an extra full.
+async fn catalog_has_backup() -> Option<bool> {
+    let inner = Command::new("pgbackrest")
+        .args([
+            "--stanza=main",
+            "--repo=1",
+            "info",
+            "--output=json",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output();
+
+    let out = match tokio::time::timeout(Duration::from_secs(60), inner).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            warn!(error = %e, "pgbackrest-watcher: catalog check spawn failed");
+            return None;
+        }
+        Err(_) => {
+            warn!("pgbackrest-watcher: catalog check timed out");
+            return None;
+        }
+    };
+
+    if !out.status.success() {
+        // Non-zero exit: stanza doesn't exist yet, S3 unreachable, auth error,
+        // etc. Treat as inconclusive — don't clear state.
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Some(stdout.contains("\"type\":\"full\""))
+}
+
+/// Periodically verify S3 catalog actually has a full backup. If local state
+/// claims a full was taken but the catalog disagrees (catalog readable + empty),
+/// clears `last_full_at` so `decide_action` fires `NEEDS_INITIAL_BACKUP` on
+/// the next iteration. Catches divergence caused by: backup command returning
+/// exit 0 without committing catalog metadata (S3 partial write, stanza-create
+/// race), or a volume surviving a redeployment with stale state pointing at a
+/// different sysid/stanza path.
+async fn maybe_verify_catalog(data_dir: &str, config: &WatcherConfig) {
+    if config.catalog_verify_interval == 0 {
+        return;
+    }
+
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+
+    // Only verify if local state claims a full backup exists; otherwise
+    // NEEDS_INITIAL_BACKUP handles the fresh case already.
+    if read_state_field(&state_path, "last_full_at")
+        .and_then(|s| s.parse::<i64>().ok())
+        .is_none()
+    {
+        return;
+    }
+
+    let last_verify = read_state_field(&state_path, "last_catalog_verify_at")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    let now = now_epoch();
+    if (now - last_verify) < config.catalog_verify_interval as i64 {
+        return;
+    }
+
+    info!("pgbackrest-watcher: verifying S3 catalog has full backup");
+    let _ = write_state_field(&state_path, "last_catalog_verify_at", &now.to_string());
+
+    match catalog_has_backup().await {
+        None => {
+            info!("pgbackrest-watcher: catalog check inconclusive (S3 unreachable or stanza missing) — skipping");
+        }
+        Some(false) => {
+            warn!("pgbackrest-watcher: catalog shows no full backup despite local state; clearing last_full_at to trigger new full");
+            let _ = write_state_field(&state_path, "last_full_at", "");
+        }
+        Some(true) => {
+            info!("pgbackrest-watcher: catalog verified — full backup present in S3");
+        }
+    }
 }
 
 #[derive(Debug)]
