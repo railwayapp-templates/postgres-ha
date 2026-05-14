@@ -28,10 +28,11 @@
 //!      flushes a segment on idle DBs. Cost ~16MB/min raw, zstd-3
 //!      compresses to a handful of KB. Skip if WAL_HEARTBEAT_DISABLED=1.
 //!
-//! HA: this is a leader-only task. Each iteration re-checks the Patroni
-//! local API (`http://localhost:8008/leader`) — replicas get HTTP 503
-//! and the iteration becomes a no-op. After failover the new leader's
-//! watcher takes over within one poll cycle.
+//! HA: this is a leader-only task. Each iteration gates on
+//! `pg_is_in_recovery()` (primary gate, no etcd dependency) plus
+//! Patroni's `/leader` endpoint as an advisory confirmation. A confirmed
+//! non-leader from Patroni skips immediately; Patroni unreachable falls
+//! through to pg_is_in_recovery() so backups continue during etcd outages.
 //!
 //! State persists at `$PGDATA/.pgbackrest_backup_state` (key=value lines,
 //! no JSON dep). The bucket-side `pgbackrest --stanza=main info` is the
@@ -164,25 +165,24 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
         return;
     }
 
-    // Leader check — every iteration. Replica skips backups; new leader
-    // takes over within one poll cycle after failover.
+    // Leader check: trust pg_is_in_recovery() as the primary gate —
+    // it goes straight to Postgres and doesn't depend on etcd/Patroni.
+    // Patroni's /leader endpoint is advisory: a confirmed Ok(false)
+    // means etcd explicitly designated this node as a replica, so we
+    // skip immediately. Any other Patroni result (leader confirmed, or
+    // unreachable) falls through to pg_is_in_recovery() so backups
+    // continue normally during etcd/Patroni outages.
     match is_patroni_leader(client).await {
-        Ok(true) => {}
         Ok(false) => {
             info!("pgbackrest-watcher: iteration skipped (not patroni leader)");
             return;
         }
+        Ok(true) => {}
         Err(e) => {
-            warn!(error = %e, "pgbackrest-watcher: iteration skipped (patroni /leader unreachable)");
-            return;
+            warn!(error = %e, "pgbackrest-watcher: patroni /leader unreachable; relying on pg_is_in_recovery()");
         }
     }
 
-    // Standby check via pg_is_in_recovery() — second-line guarantee
-    // beyond the Patroni leader API. A node could be in standby mode
-    // briefly after promotion before pg_is_in_recovery() flips, or
-    // could be Patroni-leader but Postgres-recovery during a contended
-    // failover. Skip in either case.
     match pg_is_in_recovery().await {
         Ok(true) => {
             info!("pgbackrest-watcher: iteration skipped (pg_is_in_recovery)");
