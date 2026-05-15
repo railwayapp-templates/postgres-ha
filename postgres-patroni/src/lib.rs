@@ -10,6 +10,7 @@ pub mod bootstrap;
 pub mod health_server;
 mod paths;
 pub mod patroni;
+pub mod pgbackrest;
 mod ssl;
 
 // Re-export path utilities
