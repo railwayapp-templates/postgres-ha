@@ -7,8 +7,11 @@
 //! for security reasons, so we read the node name from the config file instead.
 
 use common::{Telemetry, TelemetryEvent};
+use postgres_patroni::pgbackrest::derive_pgbackrest_repo_path;
+use postgres_patroni::pgdata;
 use std::env;
 use std::fs;
+use tracing::info;
 
 /// Read the node name from Patroni's YAML config file.
 /// Patroni strips PATRONI_* env vars from callback subprocesses,
@@ -36,11 +39,29 @@ fn main() {
     let telemetry = Telemetry::from_env("postgres-ha");
 
     let event = match (role.map(|s| s.as_str()), scope, node_name) {
-        (Some("master" | "primary"), Some(scope), Some(node)) => TelemetryEvent::PostgresFailover {
-            node,
-            new_role: role.unwrap().to_string(),
-            scope: scope.to_string(),
-        },
+        (Some("master" | "primary"), Some(scope), Some(node)) => {
+            // Write .pgbackrest_repo_path immediately on master promotion so the
+            // marker is present before the first archive_command fires. Without
+            // this, a node that was previously a replica (and whose volume never
+            // had the marker written) would probe as ARCHIVE_CATALOG_EMPTY until
+            // the first WAL archive wrote it — or until the monitor's
+            // pg_control_system() fallback kicked in.
+            if env::var("WAL_ARCHIVE_BUCKET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                let data_dir = pgdata();
+                let repo_path = derive_pgbackrest_repo_path(&data_dir);
+                info!(repo_path = %repo_path, "pgbackrest: repo-path marker refreshed on master promotion");
+            }
+
+            TelemetryEvent::PostgresFailover {
+                node,
+                new_role: role.unwrap().to_string(),
+                scope: scope.to_string(),
+            }
+        }
         (Some("replica" | "standby"), Some(scope), Some(node)) => {
             TelemetryEvent::PostgresRejoined {
                 node,
