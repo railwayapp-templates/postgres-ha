@@ -417,12 +417,37 @@ async fn run_backup(data_dir: &str, action: Action, _stats_pre: &ArchiverStats) 
     };
     info!(backup_type = %backup_type, "pgbackrest-watcher: running backup");
 
-    let res = Command::new("pgbackrest")
+    let mut res = Command::new("pgbackrest")
         .args(["--stanza=main", "backup", &format!("--type={backup_type}")])
         .env_remove("PGHOST")
         .env_remove("PGPORT")
         .status()
         .await;
+
+    // Exit 55 = FileMissingError: backup.info absent — stanza was never
+    // initialized (bootstrap stanza-create failed or timed out on first
+    // boot). Run stanza-create now and retry once; the watcher loop handles
+    // subsequent retries.
+    if res.as_ref().ok().and_then(|s| s.code()) == Some(55) {
+        info!("pgbackrest-watcher: stanza not initialized (exit 55), running stanza-create then retrying");
+        let sc = Command::new("pgbackrest")
+            .args(["--stanza=main", "stanza-create"])
+            .env_remove("PGHOST")
+            .env_remove("PGPORT")
+            .status()
+            .await;
+        match sc {
+            Ok(s) if s.success() => info!("pgbackrest-watcher: stanza-create completed"),
+            Ok(s) => warn!(status = ?s, "pgbackrest-watcher: stanza-create failed"),
+            Err(e) => warn!(error = %e, "pgbackrest-watcher: stanza-create invocation failed"),
+        }
+        res = Command::new("pgbackrest")
+            .args(["--stanza=main", "backup", &format!("--type={backup_type}")])
+            .env_remove("PGHOST")
+            .env_remove("PGPORT")
+            .status()
+            .await;
+    }
 
     match res {
         Ok(s) if s.success() => {
