@@ -768,10 +768,7 @@ fn spawn_bootstrap_stanza_create() {
         // patroni-runner, so we're non-root here — gosu's setgroups(0)
         // fails with EPERM ("error: failed switching to 'postgres'") and
         // stanza-create never completes, breaking archive-push.
-        const MAX_SC_ATTEMPTS: u32 = 5;
-        let mut sc_attempt = 0u32;
         loop {
-            sc_attempt += 1;
             let out = tokio::process::Command::new("pgbackrest")
                 .args(["--stanza=main", "stanza-create"])
                 .env_remove("PGHOST")
@@ -783,20 +780,14 @@ fn spawn_bootstrap_stanza_create() {
                     info!("pgbackrest: stanza-create completed");
                     break;
                 }
-                Ok(s) if sc_attempt < MAX_SC_ATTEMPTS => {
-                    warn!(status = ?s, attempt = sc_attempt, max = MAX_SC_ATTEMPTS,
-                        "pgbackrest: stanza-create failed, retrying in 30s");
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
                 Ok(s) => {
-                    warn!(status = ?s, "pgbackrest: stanza-create failed after {MAX_SC_ATTEMPTS} attempts (will retry on next boot)");
-                    break;
+                    warn!(status = ?s, "pgbackrest: stanza-create failed, retrying in 30s");
                 }
                 Err(e) => {
-                    warn!(error = %e, "pgbackrest: stanza-create invocation failed");
-                    break;
+                    warn!(error = %e, "pgbackrest: stanza-create invocation failed, retrying in 30s");
                 }
             }
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
 }
