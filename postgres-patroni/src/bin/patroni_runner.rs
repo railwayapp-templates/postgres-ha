@@ -768,18 +768,57 @@ fn spawn_bootstrap_stanza_create() {
         // patroni-runner, so we're non-root here — gosu's setgroups(0)
         // fails with EPERM ("error: failed switching to 'postgres'") and
         // stanza-create never completes, breaking archive-push.
-        let out = tokio::process::Command::new("pgbackrest")
-            .args(["--stanza=main", "stanza-create"])
-            .env_remove("PGHOST")
-            .env_remove("PGPORT")
-            .status()
-            .await;
-        match out {
-            Ok(s) if s.success() => info!("pgbackrest: stanza-create completed"),
-            Ok(s) => {
-                warn!(status = ?s, "pgbackrest: stanza-create failed (will retry on next boot)")
+        loop {
+            let out = tokio::process::Command::new("pgbackrest")
+                .args(["--stanza=main", "stanza-create"])
+                .env_remove("PGHOST")
+                .env_remove("PGPORT")
+                .status()
+                .await;
+            match out {
+                Ok(s) if s.success() => {
+                    info!("pgbackrest: stanza-create completed");
+                    break;
+                }
+                Ok(s) => {
+                    warn!(status = ?s, "pgbackrest: stanza-create failed, retrying in 30s");
+                }
+                Err(e) => {
+                    warn!(error = %e, "pgbackrest: stanza-create invocation failed, retrying in 30s");
+                }
             }
-            Err(e) => warn!(error = %e, "pgbackrest: stanza-create invocation failed"),
+            tokio::time::sleep(Duration::from_secs(30)).await;
+
+            // Re-check leadership before the next attempt. If this node was
+            // demoted after passing the promotion gate above, exit cleanly —
+            // the backup watcher (already leader-gated) will run stanza-create
+            // via exit-55 recovery once this node is promoted again.
+            let recovery_check = tokio::process::Command::new("psql")
+                .args([
+                    "-U",
+                    "postgres",
+                    "-h",
+                    "/var/run/postgresql",
+                    "-tAXq",
+                    "-c",
+                    "SELECT pg_is_in_recovery()",
+                ])
+                .env_remove("PGHOST")
+                .env_remove("PGPORT")
+                .output()
+                .await;
+            let still_primary = matches!(
+                recovery_check,
+                Ok(ref o) if o.status.success()
+                    && String::from_utf8_lossy(&o.stdout).trim() == "f"
+            );
+            if !still_primary {
+                info!(
+                    "pgbackrest: node is no longer primary, stopping stanza-create bootstrap \
+                     (watcher will recover on next promotion)"
+                );
+                return;
+            }
         }
     });
 }
