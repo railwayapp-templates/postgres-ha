@@ -64,8 +64,8 @@ async fn wait_for_patroni_rest(client: &reqwest::Client) -> Result<()> {
             Ok(resp) => {
                 warn!(status = %resp.status(), "Patroni REST not yet ready");
             }
-            Err(_) => {
-                // Connection refused / timeout while Patroni is still booting
+            Err(e) => {
+                warn!(error = %e, "Patroni REST unreachable");
             }
         }
 

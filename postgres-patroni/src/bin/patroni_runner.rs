@@ -956,18 +956,33 @@ async fn main() -> Result<()> {
     // Start Patroni and run monitoring loop
     let child = start_patroni().await?;
 
-    // Spawn a one-shot DCS reconcile task. This waits for Patroni's REST API
-    // to come up, then PATCHes /config so DCS archive params match env-var
-    // intent. Required because `bootstrap.dcs` only seeds DCS at first
-    // cluster init; without this, env-var changes on existing clusters are
-    // silently ignored by Patroni. Failure is logged but does not abort
-    // patroni-runner — the monitoring loop must still run.
+    // Spawn a DCS reconcile task that retries indefinitely with exponential
+    // backoff until it succeeds. This waits for Patroni's REST API to come up,
+    // then PATCHes /config so DCS archive params match env-var intent.
+    // Required because `bootstrap.dcs` only seeds DCS at first cluster init;
+    // without this, env-var changes on existing clusters are silently ignored
+    // by Patroni.
+    //
+    // Retries indefinitely (like stanza-create) so a transient etcd CAS
+    // failure or Patroni startup race during bulk deployments cannot
+    // permanently leave archive_mode unset. Does not abort patroni-runner.
     {
         let reconcile_config = Config::from_env()?;
         tokio::spawn(async move {
-            match reconcile_pgbackrest_archive_config(&reconcile_config).await {
-                Ok(()) => {}
-                Err(e) => warn!(error = %e, "DCS pgbackrest reconcile failed"),
+            let mut delay = Duration::from_secs(10);
+            loop {
+                match reconcile_pgbackrest_archive_config(&reconcile_config).await {
+                    Ok(()) => return,
+                    Err(e) => {
+                        warn!(
+                            delay_secs = delay.as_secs(),
+                            error = %e,
+                            "DCS pgbackrest reconcile failed, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(120));
+                    }
+                }
             }
         });
     }
