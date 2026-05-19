@@ -207,8 +207,6 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
         }
     };
 
-    force_initial_wal_archive(&stats).await;
-
     let action = decide_action(data_dir, config, &stats);
     match action {
         Action::None { reason } => {
@@ -336,42 +334,6 @@ async fn emit_wal_heartbeat() {
         .env_remove("PGPORT")
         .output()
         .await;
-}
-
-/// If PITR is enabled but this cluster has never archived a WAL segment, force
-/// an immediate segment boundary from inside the image. Correctly-wired
-/// archive_command setups archive the switched segment; broken setups fail
-/// loudly through pg_stat_archiver / Postgres logs and the watcher retries.
-async fn force_initial_wal_archive(stats: &ArchiverStats) {
-    if stats.archived_count != 0 {
-        return;
-    }
-
-    let res = Command::new("psql")
-        .args([
-            "-U",
-            "postgres",
-            "-h",
-            "/var/run/postgresql",
-            "-tAXq",
-            "-c",
-            "SELECT pg_switch_wal()",
-        ])
-        .env_remove("PGHOST")
-        .env_remove("PGPORT")
-        .output()
-        .await;
-
-    match res {
-        Ok(o) if o.status.success() => {
-            info!("pgbackrest-watcher: forced initial WAL switch (archived_count=0)")
-        }
-        Ok(o) => warn!(
-            status = ?o.status,
-            "pgbackrest-watcher: initial WAL switch failed (non-fatal)"
-        ),
-        Err(e) => warn!(error = %e, "pgbackrest-watcher: initial WAL switch invocation failed"),
-    }
 }
 
 #[derive(Debug)]
