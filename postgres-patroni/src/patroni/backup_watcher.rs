@@ -12,15 +12,29 @@
 //!      for the closing WAL to archive before declaring success, so a
 //!      broken archive_command fails the backup loudly instead of
 //!      producing an unrestorable base.
-//!   2. Gap recovery — any of: pgbackrest-archive-push-wrapper.sh dropped
-//!      a segment and touched `.pgbackrest_gap_pending`,
-//!      `pg_stat_archiver.failed_count` grew since the last full's
-//!      checkpoint, or the LSN-lag probe found
-//!      pg_stat_archiver.last_archived_wal more than
-//!      `WAL_LAG_GAP_THRESHOLD_SEGMENTS` ahead of the S3 catalog's
-//!      high-water. Once failures are decisively over (grace period
-//!      elapsed since last_failed_time / last_lag_detected_at), a fresh
-//!      full re-anchors the PITR window.
+//!   2. Gap recovery — a state machine that fires whenever WAL coverage is
+//!      diverging from the S3 catalog, regardless of cause. Entry conditions
+//!      (any of):
+//!        - pgbackrest-archive-push-wrapper.sh dropped a segment and touched
+//!          `.pgbackrest_gap_pending` (bucket gone, hard archive-push failure)
+//!        - LSN-lag probe found `pg_stat_archiver.last_archived_wal` more
+//!          than `WAL_LAG_GAP_THRESHOLD_SEGMENTS` ahead of the catalog max
+//!          (async worker silently wedged — queue-max-trip or hung
+//!          connection)
+//!      Recovery flow once in the state:
+//!        - Wait `GAP_RECOVERY_BACKOFF_SECONDS` (default 10 min) for natural
+//!          async recovery. Most short Tigris/S3 hiccups self-heal here.
+//!        - Still no catalog progress → pkill the async daemon. Foreground
+//!          archive-push respawns it on the next WAL switch. Cycle repeats
+//!          every `GAP_RECOVERY_BACKOFF_SECONDS` until catalog advances or
+//!          the postgres process exits.
+//!        - Catalog max > catalog max at detection (proof async pushed to
+//!          S3 successfully) → take a diff backup to re-anchor
+//!          `latestRestorableAt`, then clear the gap marker.
+//!      Diff (not full) is enough because the customer-visible state is
+//!      "latestRestorableAt is fresh", which a diff produces in seconds.
+//!      Historical missing segments stay missing in the old chain;
+//!      retention eventually rolls them off.
 //!   3. Periodic full every `WAL_BACKUP_FULL_INTERVAL_HOURS` (default
 //!      168 = 7 days). `WAL_BACKUP_FULL_INTERVAL_SECONDS` overrides the
 //!      hours setting for the e2e harness (bash arithmetic precludes
@@ -39,15 +53,15 @@
 //! accepting WAL (foreground returns 0) while the S3 catalog stays
 //! frozen. archive-push-queue-max eventually drops segments and ALSO
 //! returns 0 to Postgres — so failed_count never increments and the
-//! archive-push wrapper never sees a non-zero exit. Both other gap
-//! signals miss this entirely. The LSN-lag probe compares
-//! pg_stat_archiver.last_archived_wal against `pgbackrest info`'s
-//! archive max segment (per timeline); when the watcher sees the
-//! handoff WAL more than `WAL_LAG_GAP_THRESHOLD_SEGMENTS` ahead of the
-//! repo catalog, it writes the gap marker. Threshold matches the
-//! backboard-side admin monitor's `WAL_ARCHIVE_LAG_CRIT_SEGMENTS` (64
-//! segments ≈ 1 GiB) so in-image self-heal fires at the same point the
-//! dashboard surfaces the warning.
+//! archive-push wrapper never sees a non-zero exit.
+//!
+//! Detection: every iteration, compare pg_stat_archiver.last_archived_wal
+//! against the catalog max from `pgbackrest info --output=json` (parsed
+//! with serde_json — earlier substring-match extraction had a silent
+//! catch-all that collapsed unparseable output into "lag=0", missing real
+//! wedges). When lag ≥ `WAL_LAG_GAP_THRESHOLD_SEGMENTS` (default 32 ≈
+//! 512 MiB) the watcher enters the gap-recovery state machine described
+//! under "Gap recovery" above.
 //!
 //! HA: this is a leader-only task. Each iteration re-checks the Patroni
 //! local API (`http://localhost:8008/leader`) — replicas get HTTP 503
@@ -77,16 +91,21 @@ const PATRONI_LEADER_URL: &str = "http://localhost:8008/leader";
 struct WatcherConfig {
     poll_interval: u64,
     initial_poll_interval: u64,
-    gap_grace: u64,
+    /// Cooldown between gap-recovery actions. After initial detection, the
+    /// state machine waits this long for natural async recovery before
+    /// kicking the async daemon. Each subsequent pkill cycle also waits
+    /// this long before the next pkill. Catalog advance breaks out of the
+    /// wait immediately.
+    gap_recovery_backoff: u64,
     full_interval: u64,
     diff_interval: u64,
     heartbeat_disabled: bool,
-    /// LSN-lag detection — see file header. Threshold matches the admin
-    /// monitor's `WAL_ARCHIVE_LAG_CRIT_SEGMENTS`. Probe cadence is the
-    /// dominant cost (one `pgbackrest info` S3 round-trip per probe), so
-    /// it's throttled separately from the main poll cadence.
+    /// LSN-lag detection — see file header. 32 segments ≈ 512 MiB: far
+    /// enough above the steady-state hand-off-vs-upload skew to avoid
+    /// false positives, far enough below archive-push-queue-max (default
+    /// 5 GiB / 320 segments) to leave headroom for the recovery state
+    /// machine to act before the queue actually trips.
     lag_threshold_segments: u64,
-    lag_probe_interval: u64,
 }
 
 impl WatcherConfig {
@@ -96,7 +115,7 @@ impl WatcherConfig {
         Self {
             poll_interval: env_u64("WAL_BACKUP_POLL_INTERVAL_SECONDS", 60),
             initial_poll_interval: env_u64("WAL_BACKUP_INITIAL_POLL_SECONDS", 5),
-            gap_grace: env_u64("WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS", 300),
+            gap_recovery_backoff: env_u64("WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS", 600),
             // WAL_BACKUP_FULL_INTERVAL_SECONDS overrides hours for the e2e
             // harness (bash arithmetic in postgres-ssl precludes fractional
             // hours; we mirror the override here for parity). 0 means "no
@@ -110,8 +129,7 @@ impl WatcherConfig {
                 .ok()
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            lag_threshold_segments: env_u64("WAL_LAG_GAP_THRESHOLD_SEGMENTS", 64),
-            lag_probe_interval: env_u64("WAL_LAG_PROBE_INTERVAL_SECONDS", 300),
+            lag_threshold_segments: env_u64("WAL_LAG_GAP_THRESHOLD_SEGMENTS", 32),
         }
     }
 }
@@ -129,23 +147,11 @@ fn env_u64_optional(key: &str) -> Option<u64> {
 struct ArchiverStats {
     archived_count: i64,
     failed_count: i64,
-    last_failed_epoch: i64,
     /// 24-char hex WAL filename of the most-recent segment Postgres handed
     /// off to the archive process. Empty when `pg_stat_archiver` reports
     /// NULL (cluster just started, never archived). Used by the LSN-lag
     /// probe to compare against `pgbackrest info`'s repo high-water.
     last_archived_wal: String,
-}
-
-/// In-process throttle + most-recent-observation cache for the LSN-lag
-/// probe. Lives on the watcher loop's stack across iterations so the
-/// `pgbackrest info` S3 round-trip happens at most once per
-/// `lag_probe_interval`.
-#[derive(Default)]
-struct LagProbeState {
-    last_probe_epoch: i64,
-    last_observed_segments: u64,
-    last_repo_max: String,
 }
 
 /// Spawn the watcher as a tokio task. Returns immediately. Bails (logs
@@ -173,9 +179,8 @@ async fn run(data_dir: String) -> Result<()> {
         initial_poll = config.initial_poll_interval,
         full = config.full_interval,
         diff = config.diff_interval,
-        gap_grace = config.gap_grace,
+        gap_recovery_backoff = config.gap_recovery_backoff,
         heartbeat_disabled = config.heartbeat_disabled,
-        lag_probe = config.lag_probe_interval,
         lag_threshold_segments = config.lag_threshold_segments,
         "pgbackrest-watcher: starting"
     );
@@ -188,10 +193,8 @@ async fn run(data_dir: String) -> Result<()> {
         .timeout(Duration::from_secs(5))
         .build()?;
 
-    let mut lag_state = LagProbeState::default();
-
     loop {
-        watcher_iteration(&data_dir, &config, &client, &mut lag_state).await;
+        watcher_iteration(&data_dir, &config, &client).await;
         let state_path = format!("{data_dir}/{STATE_FILENAME}");
         let interval = if read_state_field(&state_path, "last_full_at").is_none() {
             config.initial_poll_interval
@@ -206,7 +209,6 @@ async fn watcher_iteration(
     data_dir: &str,
     config: &WatcherConfig,
     client: &reqwest::Client,
-    lag_state: &mut LagProbeState,
 ) {
     // Sync per-cluster repo path on every iteration. The marker may not
     // exist on the very first iteration if patroni-runner's bootstrap
@@ -261,12 +263,11 @@ async fn watcher_iteration(
         }
     };
 
-    // Detect silent async failure modes (queue-max-trip with no
-    // failed_count bump, stuck async worker holding the lock) by
-    // comparing the WAL segment Postgres handed off against the S3
-    // catalog high-water. Throttled internally to lag_probe_interval so
-    // we don't S3-round-trip every iteration.
-    check_lsn_lag_and_mark_gap(data_dir, config, &stats, lag_state).await;
+    // Gap-recovery state machine — detects WAL/catalog divergence and
+    // drives the kick-and-diff sequence. Runs every iteration;
+    // pgbackrest info is cheap enough that throttling isn't worth the
+    // false-negative window the earlier throttled version introduced.
+    gap_recovery_step(data_dir, config, &stats).await;
 
     let action = decide_action(data_dir, config, &stats);
     match action {
@@ -379,7 +380,6 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
     Ok(ArchiverStats {
         archived_count: parts[0].parse().unwrap_or(0),
         failed_count: parts[1].parse().unwrap_or(0),
-        last_failed_epoch: parts[3].parse().unwrap_or(0),
         last_archived_wal,
     })
 }
@@ -422,49 +422,59 @@ fn segment_to_number(wal: &str) -> Option<u64> {
     Some(log * 256 + seg)
 }
 
-/// Extract the highest archived WAL segment on the timeline matching
-/// `tl_hex` (first 8 hex chars) from `pgbackrest info --output=json`'s
-/// stdout. Text-parsed because the JSON dep would pull serde_json into a
-/// place where we currently have none and the schema is stable: each
-/// archive entry has a `"max":"<24-hex>"` per timeline.
-fn parse_repo_max_for_timeline(info_json: &str, tl_hex: &str) -> Option<String> {
-    let needle = format!("\"max\":\"{tl_hex}");
+/// Probe state passed to `gap_recovery_step` and returned for tests.
+/// `catalog_max` is None when the catalog has no archive entries for the
+/// current timeline yet (fresh stanza); `Err` from `probe_catalog_max`
+/// is "pgbackrest info failed" — leave state alone.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CatalogProbe {
+    catalog_max: Option<String>,
+    lag: u64,
+}
+
+/// Parse `pgbackrest info --output=json` and extract the lex-max archive
+/// segment whose first 8 hex chars match `tl_hex`. Returns None when the
+/// timeline isn't in the catalog (legitimate "fresh stanza" case).
+/// Bubbles up serde_json errors so the caller distinguishes "no entries"
+/// from "couldn't parse" — the previous substring-based extractor
+/// collapsed both into "lag=0" and silently masked real wedges.
+fn parse_catalog_max(info_json: &str, tl_hex: &str) -> Result<Option<String>> {
+    let v: serde_json::Value = serde_json::from_str(info_json)?;
+    let stanzas = v.as_array().ok_or_else(|| {
+        anyhow::anyhow!("pgbackrest info JSON top-level not an array")
+    })?;
     let mut best: Option<String> = None;
-    for hit in info_json.match_indices(&needle) {
-        let start = hit.0 + needle.len();
-        // We just matched `"max":"<tl>` — the next 16 chars should be
-        // the log+segment suffix, then a closing quote.
-        let suffix: String = info_json[start..]
-            .chars()
-            .take(16)
-            .collect::<String>();
-        if suffix.len() != 16 || !suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+    for stanza in stanzas {
+        let Some(archives) = stanza.get("archive").and_then(|a| a.as_array()) else {
             continue;
-        }
-        let candidate = format!("{tl_hex}{suffix}");
-        match &best {
-            None => best = Some(candidate),
-            Some(prev) => {
-                if candidate.as_str() > prev.as_str() {
-                    best = Some(candidate);
-                }
+        };
+        for archive in archives {
+            let Some(max) = archive.get("max").and_then(|m| m.as_str()) else {
+                continue;
+            };
+            if max.len() != 24 || !max.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            if &max[..8] != tl_hex {
+                continue;
+            }
+            match &best {
+                None => best = Some(max.to_string()),
+                Some(prev) if max > prev.as_str() => best = Some(max.to_string()),
+                _ => {}
             }
         }
     }
-    best
+    Ok(best)
 }
 
-/// Run `pgbackrest info` and compute the lag (in segments) between the
-/// WAL Postgres handed off (`stats.last_archived_wal`) and the highest
-/// segment in the S3 catalog on the same timeline. Updates `state` with
-/// the observation and returns Ok(()) on a successful probe (even when
-/// lag is 0); returns Err on transient failure so callers leave prior
-/// state in place rather than acting on noise.
-async fn probe_archive_lag(stats: &ArchiverStats, state: &mut LagProbeState) -> Result<()> {
+/// Run `pgbackrest info` and extract the catalog max for the current
+/// timeline plus computed lag. Returns Err on transient probe failure
+/// (`pgbackrest info` errored or stdout didn't parse) so the caller
+/// leaves any in-flight state alone.
+async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
     if stats.last_archived_wal.is_empty() {
-        state.last_observed_segments = 0;
-        state.last_repo_max.clear();
-        return Ok(());
+        return Ok(CatalogProbe::default());
     }
     let handed_off = segment_to_number(&stats.last_archived_wal)
         .ok_or_else(|| anyhow::anyhow!("malformed last_archived_wal: {}", stats.last_archived_wal))?;
@@ -487,71 +497,195 @@ async fn probe_archive_lag(stats: &ArchiverStats, state: &mut LagProbeState) -> 
     }
     let info_json = String::from_utf8_lossy(&out.stdout);
     let tl_hex = &stats.last_archived_wal[..8];
-    let repo_max = match parse_repo_max_for_timeline(&info_json, tl_hex) {
-        Some(s) => s,
-        None => {
-            // Same timeline not in catalog yet (fresh stanza, no archived
-            // WAL). NEEDS_INITIAL_BACKUP / stanza-create paths cover the
-            // empty-catalog cases.
-            state.last_observed_segments = 0;
-            state.last_repo_max.clear();
-            return Ok(());
-        }
+    let catalog_max = parse_catalog_max(&info_json, tl_hex)?;
+    let lag = match catalog_max.as_deref().and_then(segment_to_number) {
+        Some(n) => handed_off.saturating_sub(n),
+        None => 0,
     };
-    let repo_max_n = segment_to_number(&repo_max)
-        .ok_or_else(|| anyhow::anyhow!("malformed repo max: {repo_max}"))?;
-    state.last_observed_segments = handed_off.saturating_sub(repo_max_n);
-    state.last_repo_max = repo_max;
-    Ok(())
+    Ok(CatalogProbe { catalog_max, lag })
 }
 
-/// Throttled wrapper around `probe_archive_lag` that writes the gap
-/// marker + `last_lag_detected_at` state field when observed lag crosses
-/// the threshold. Idempotent: re-detecting an already-marked gap only
-/// refreshes the log breadcrumb; the state-file epoch is only stamped on
-/// the FIRST detection so `gap_recovered`'s grace check actually clears.
-async fn check_lsn_lag_and_mark_gap(
+/// Clears all gap-recovery state (marker file + state fields). Called
+/// after a successful diff (recovery confirmed) or full (re-anchors the
+/// baseline).
+fn clear_gap_recovery_state(data_dir: &str, reason: &str) {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
+    let _ = write_state_field(&state_path, "last_lag_detected_at", "0");
+    let _ = write_state_field(&state_path, "catalog_max_at_detection", "");
+    let _ = write_state_field(&state_path, "last_force_recovery_at", "0");
+    let _ = write_state_field(&state_path, "force_attempts", "0");
+    if Path::new(&gap_marker).exists() {
+        let _ = fs::remove_file(&gap_marker);
+        info!(reason = %reason, "pgbackrest-watcher: gap-recovery state cleared");
+    }
+}
+
+/// Kicks the async daemon. Foreground archive-push respawns it on the
+/// next WAL switch (heartbeat + archive_timeout=60 guarantees one within
+/// ~60s). Crashed-daemon case: pkill is a no-op, respawn happens
+/// regardless. Hung-daemon case: pkill removes the stuck process so the
+/// next archive-push can spawn a fresh one. Spool is safe to disrupt —
+/// pgBackRest re-uploads from pg_wal on respawn.
+async fn kick_async_daemon() {
+    // pkill -f matches on the FULL cmdline; the foreground archive-push
+    // invocation lives ~300ms before exiting, so the race risk of
+    // pkilling a transient foreground call is minute. Even if pkill
+    // catches the foreground, postgres re-invokes archive_command on the
+    // next WAL switch and the cycle continues cleanly.
+    let _ = Command::new("pkill")
+        .args(["-f", "pgbackrest .* archive-push .* --archive-async"])
+        .status()
+        .await;
+}
+
+/// Recovery state machine. Replaces the old "wait for grace then take a
+/// full" path with: detect → wait 10 min → pkill → wait 10 min → pkill →
+/// … → (catalog advances) → take diff → clear. Repeats pkill every
+/// backoff window during an extended upstream outage; the diff fires the
+/// instant the catalog actually advances past the detection point, which
+/// is the only conclusive proof async has resumed pushing to S3.
+///
+/// Called every iteration. Idempotent — re-entering the function while
+/// already in recovery just advances the timers / inspects current
+/// catalog max.
+async fn gap_recovery_step(
     data_dir: &str,
     config: &WatcherConfig,
     stats: &ArchiverStats,
-    state: &mut LagProbeState,
 ) {
     let now = now_epoch();
-    if now - state.last_probe_epoch < config.lag_probe_interval as i64 {
-        return;
-    }
-    state.last_probe_epoch = now;
-
-    if let Err(e) = probe_archive_lag(stats, state).await {
-        warn!(error = %e, "pgbackrest-watcher: lag probe inconclusive; leaving prior state");
-        return;
-    }
-
-    if state.last_observed_segments < config.lag_threshold_segments {
-        return;
-    }
-
-    let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
-    if !Path::new(&gap_marker).exists() {
+    let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
+
+    let probe = match probe_catalog_max(stats).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "pgbackrest-watcher: pgbackrest info probe failed; leaving gap-recovery state unchanged");
+            return;
+        }
+    };
+
+    let catalog_max = probe.catalog_max.unwrap_or_default();
+    let lag = probe.lag;
+
+    // In recovery? The marker is the truth — either we set it on a
+    // previous lag detection or the archive-push wrapper touched it on a
+    // hard failure.
+    if Path::new(&gap_marker).exists() {
+        let mut detected_at = read_state_field(&state_path, "last_lag_detected_at")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut catalog_at_detection =
+            read_state_field(&state_path, "catalog_max_at_detection").unwrap_or_default();
+        let last_force = read_state_field(&state_path, "last_force_recovery_at")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut force_attempts = read_state_field(&state_path, "force_attempts")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        // Back-fill state when the wrapper touched the marker but the
+        // watcher hasn't entered the state machine yet.
+        if detected_at == 0 {
+            detected_at = now;
+            let _ = write_state_field(&state_path, "last_lag_detected_at", &now.to_string());
+        }
+        if catalog_at_detection.is_empty() {
+            catalog_at_detection = catalog_max.clone();
+            let _ = write_state_field(
+                &state_path,
+                "catalog_max_at_detection",
+                &catalog_at_detection,
+            );
+        }
+
+        // Recovery proof: catalog has advanced past the detection point.
+        // That's the only conclusive proof the async daemon successfully
+        // pushed at least one segment to S3 — async is working again.
+        let advanced = !catalog_max.is_empty()
+            && !catalog_at_detection.is_empty()
+            && catalog_max != catalog_at_detection
+            && matches!(
+                (segment_to_number(&catalog_max), segment_to_number(&catalog_at_detection)),
+                (Some(curr), Some(det)) if curr > det
+            );
+
+        if advanced {
+            info!(
+                catalog_at_detection = %catalog_at_detection,
+                catalog_max = %catalog_max,
+                force_attempts,
+                "pgbackrest-watcher: gap-recovery — catalog advanced, taking diff to anchor restore point"
+            );
+            run_backup(data_dir, Action::Diff, stats).await;
+            // run_backup writes last_diff_at on success but doesn't
+            // touch gap state for diffs; clear it explicitly here. On
+            // failure, the marker stays and we retry next iteration.
+            // We re-check the marker post-run_backup: run_backup's
+            // success path doesn't unconditionally clear, but a diff
+            // failure path leaves it for retry.
+            let last_diff_str = read_state_field(&state_path, "last_diff_at");
+            let recent_diff = last_diff_str
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|t| (now_epoch() - t).abs() < 120)
+                .unwrap_or(false);
+            if recent_diff {
+                clear_gap_recovery_state(data_dir, "cleared by gap-recovery diff");
+            } else {
+                warn!("pgbackrest-watcher: gap-recovery diff did not complete; will retry next iteration");
+            }
+            return;
+        }
+
+        // No advance yet. Check if it's time to kick (or kick again).
+        let last_action_at = detected_at.max(last_force);
+        let since_action = now.saturating_sub(last_action_at);
+
+        if since_action >= config.gap_recovery_backoff as i64 {
+            force_attempts += 1;
+            let stuck_min = (now - detected_at) / 60;
+            info!(
+                catalog_at_detection = %catalog_at_detection,
+                handoff = %stats.last_archived_wal,
+                lag,
+                attempt = force_attempts,
+                stuck_min,
+                "pgbackrest-watcher: gap-recovery — catalog still frozen, pkill async daemon"
+            );
+            kick_async_daemon().await;
+            let _ = write_state_field(&state_path, "last_force_recovery_at", &now.to_string());
+            let _ = write_state_field(&state_path, "force_attempts", &force_attempts.to_string());
+        } else {
+            let wait_remaining = config.gap_recovery_backoff as i64 - since_action;
+            info!(
+                catalog_at_detection = %catalog_at_detection,
+                lag,
+                force_attempts,
+                wait_remaining_seconds = wait_remaining,
+                "pgbackrest-watcher: gap-recovery — waiting for natural recovery / next pkill"
+            );
+        }
+        return;
+    }
+
+    // Not in recovery. New detection?
+    if lag >= config.lag_threshold_segments {
         if let Err(e) = fs::write(&gap_marker, "") {
             warn!(error = %e, "pgbackrest-watcher: failed to write gap marker");
             return;
         }
         let _ = write_state_field(&state_path, "last_lag_detected_at", &now.to_string());
+        let _ = write_state_field(&state_path, "catalog_max_at_detection", &catalog_max);
+        let _ = write_state_field(&state_path, "last_force_recovery_at", "0");
+        let _ = write_state_field(&state_path, "force_attempts", "0");
         info!(
             handoff = %stats.last_archived_wal,
-            repo_max = %state.last_repo_max,
-            lag = state.last_observed_segments,
+            catalog_max = %catalog_max,
+            lag,
             threshold = config.lag_threshold_segments,
-            "pgbackrest-watcher: LSN-lag gap detected — marking gap_pending"
-        );
-    } else {
-        info!(
-            handoff = %stats.last_archived_wal,
-            repo_max = %state.last_repo_max,
-            lag = state.last_observed_segments,
-            "pgbackrest-watcher: LSN-lag persists"
+            backoff_seconds = config.gap_recovery_backoff,
+            "pgbackrest-watcher: lag ≥ threshold — entering gap-recovery, first pkill after backoff if catalog hasn't advanced"
         );
     }
 }
@@ -587,30 +721,15 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     }
     let last_full = last_full.unwrap();
 
-    // Gap recovery — drop marker (touched by archive-push wrapper on
-    // hard failure OR by check_lsn_lag_and_mark_gap when async-side
-    // queue-max-trip is inferred from LSN lag) OR failed_count grew
-    // since last full. Any of the three indicates archive-push had
-    // problems since the last LSN-coordinated baseline; a fresh full
-    // re-anchors the PITR window.
-    let has_marker = Path::new(&gap_marker).exists();
-    let failed_grew = stats.failed_count > last_full_failed;
-    if has_marker || failed_grew {
-        let last_failed = stats.last_failed_epoch;
-        let last_lag = read_state_field(&state_path, "last_lag_detected_at")
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
-        let failed_resolved =
-            last_failed == 0 || (now - last_failed) >= config.gap_grace as i64;
-        let lag_resolved = last_lag == 0 || (now - last_lag) >= config.gap_grace as i64;
-        if failed_resolved && lag_resolved {
-            return Action::Full;
-        }
+    // Gap-recovery state machine owns the .pgbackrest_gap_pending marker.
+    // While the marker is present, decide_action stays silent —
+    // gap_recovery_step already ran this iteration and either took a
+    // diff, kicked the async daemon, or is waiting on the backoff.
+    // Racing a periodic full on top of an in-flight recovery would burn
+    // a full at the worst time (mid-outage).
+    if Path::new(&gap_marker).exists() {
         return Action::None {
-            reason: format!(
-                "gap open (marker={has_marker}, failed_grew={failed_grew}, last_failed={last_failed}, last_lag={last_lag}, grace={}s)",
-                config.gap_grace
-            ),
+            reason: "gap-recovery in progress (state machine owns the marker)".to_string(),
         };
     }
 
@@ -680,7 +799,6 @@ async fn run_backup(data_dir: &str, action: Action, _stats_pre: &ArchiverStats) 
         Ok(s) if s.success() => {
             let now = now_epoch();
             let state_path = format!("{data_dir}/{STATE_FILENAME}");
-            let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
             match backup_type {
                 "full" => {
                     let _ = write_state_field(&state_path, "last_full_at", &now.to_string());
@@ -696,14 +814,7 @@ async fn run_backup(data_dir: &str, action: Action, _stats_pre: &ArchiverStats) 
                             &post_stats.failed_count.to_string(),
                         );
                     }
-                    // last_lag_detected_at is gap-recovery state same as
-                    // last_full_failed_count; clearing alongside the gap
-                    // marker keeps the next-round grace window honest.
-                    let _ = write_state_field(&state_path, "last_lag_detected_at", "0");
-                    if Path::new(&gap_marker).exists() {
-                        let _ = fs::remove_file(&gap_marker);
-                        info!("pgbackrest-watcher: cleared gap marker");
-                    }
+                    clear_gap_recovery_state(data_dir, "cleared by full backup");
                 }
                 "diff" => {
                     let _ = write_state_field(&state_path, "last_diff_at", &now.to_string());
@@ -800,7 +911,7 @@ fn now_epoch() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_repo_max_for_timeline, segment_to_number};
+    use super::{parse_catalog_max, segment_to_number};
 
     #[test]
     fn segment_to_number_real_values() {
@@ -825,37 +936,58 @@ mod tests {
     }
 
     #[test]
-    fn parse_repo_max_picks_matching_timeline() {
+    fn parse_catalog_max_picks_matching_timeline() {
         // Single-timeline case (the AlgoEd-shape input).
         let info = r#"[{"archive":[{"id":"18-1","min":"000000010000000000000001","max":"000000010000001B00000024"}],"backup":[]}]"#;
         assert_eq!(
-            parse_repo_max_for_timeline(info, "00000001"),
+            parse_catalog_max(info, "00000001").unwrap(),
             Some("000000010000001B00000024".to_string())
         );
         // Wrong timeline → None.
-        assert_eq!(parse_repo_max_for_timeline(info, "00000002"), None);
+        assert_eq!(parse_catalog_max(info, "00000002").unwrap(), None);
     }
 
     #[test]
-    fn parse_repo_max_handles_multi_timeline() {
+    fn parse_catalog_max_handles_multi_timeline() {
         // Multi-timeline post-failover catalog. Match the requested one.
         let info = r#"[{"archive":[
             {"id":"18-1","min":"000000010000000000000001","max":"000000010000001A00000010"},
             {"id":"18-2","min":"000000020000000000000005","max":"000000020000000200000050"}
         ],"backup":[]}]"#;
         assert_eq!(
-            parse_repo_max_for_timeline(info, "00000002"),
+            parse_catalog_max(info, "00000002").unwrap(),
             Some("000000020000000200000050".to_string())
         );
         assert_eq!(
-            parse_repo_max_for_timeline(info, "00000001"),
+            parse_catalog_max(info, "00000001").unwrap(),
             Some("000000010000001A00000010".to_string())
         );
     }
 
     #[test]
-    fn parse_repo_max_returns_none_when_timeline_absent() {
+    fn parse_catalog_max_returns_none_when_timeline_absent() {
         let info = r#"[{"archive":[],"backup":[]}]"#;
-        assert_eq!(parse_repo_max_for_timeline(info, "00000001"), None);
+        assert_eq!(parse_catalog_max(info, "00000001").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_catalog_max_errors_on_malformed_json() {
+        // The bug this whole change fixes: previous text-match extractor
+        // silently returned None ("treat as no entries") for unparseable
+        // output, which the caller collapsed to lag=0 — masking real
+        // wedges. parse_catalog_max now bubbles a serde_json error so the
+        // caller logs "probe failed" and leaves state alone instead of
+        // pretending everything's fine.
+        assert!(parse_catalog_max("not json at all", "00000001").is_err());
+        assert!(parse_catalog_max("{\"not\": \"an array\"}", "00000001").is_err());
+    }
+
+    #[test]
+    fn parse_catalog_max_skips_null_max() {
+        // pgBackRest can emit `"max": null` when a stanza exists but the
+        // archive section has been wiped. Treat as "no entry for this
+        // timeline" rather than a parse error.
+        let info = r#"[{"archive":[{"id":"18-1","min":null,"max":null}],"backup":[]}]"#;
+        assert_eq!(parse_catalog_max(info, "00000001").unwrap(), None);
     }
 }
