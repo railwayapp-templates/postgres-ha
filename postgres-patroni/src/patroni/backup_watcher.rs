@@ -705,16 +705,11 @@ async fn gap_recovery_step(
             kick_async_daemon().await;
             let _ = write_state_field(&state_path, "last_force_recovery_at", &now.to_string());
             let _ = write_state_field(&state_path, "force_attempts", &force_attempts.to_string());
-        } else {
-            let wait_remaining = config.gap_recovery_backoff as i64 - since_action;
-            info!(
-                catalog_at_detection = %catalog_at_detection,
-                lag,
-                force_attempts,
-                wait_remaining_seconds = wait_remaining,
-                "pgbackrest-watcher: gap-recovery — waiting for natural recovery / next pkill"
-            );
         }
+        // No log line during the wait — per-iteration tracing in the
+        // surrounding watcher_iteration loop already surfaces enough
+        // state; printing the same "still waiting" message every minute
+        // for 10 minutes per backoff cycle is just diagnostic spam.
         return;
     }
 
