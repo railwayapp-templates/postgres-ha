@@ -137,9 +137,16 @@ fn validate_wal_archive_bucket(volume_root: &str) {
     }
     // postgres_wrapper has already chowned volume_root to postgres:postgres
     // before exec'ing patroni-runner, so writes here succeed as the
-    // postgres user.
-    let _ = fs::write(&marker, format!("{reason}\n"));
-    let _ = fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o640));
+    // postgres user. Log errors loudly — silent failures here mean the
+    // dashboard wouldn't show the misconfiguration and operators would
+    // think PITR was never enabled (rather than wired to junk).
+    match fs::write(&marker, format!("{reason}\n")) {
+        Ok(()) => info!(marker = %marker, "pgbackrest: invalid-bucket sentinel written"),
+        Err(e) => warn!(marker = %marker, error = %e, "pgbackrest: failed to write invalid-bucket sentinel"),
+    }
+    if let Err(e) = fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o640)) {
+        warn!(marker = %marker, error = %e, "pgbackrest: failed to set sentinel permissions");
+    }
     for key in [
         "WAL_ARCHIVE_BUCKET",
         "WAL_ARCHIVE_KEY",

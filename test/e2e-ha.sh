@@ -53,8 +53,8 @@ fail_dump() {
   echo "${R}--- failure detail (${label}) ---${N}" >&2
   for c in "$@"; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${c}$"; then
-      echo "${R}--- docker logs ${c} (last 60) ---${N}" >&2
-      docker logs --tail 60 "$c" 2>&1 | sed 's/^/    /' >&2
+      echo "${R}--- docker logs ${c} (last 200) ---${N}" >&2
+      docker logs --tail 200 "$c" 2>&1 | sed 's/^/    /' >&2
     fi
   done
 }
