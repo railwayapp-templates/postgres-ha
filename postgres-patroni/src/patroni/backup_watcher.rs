@@ -564,14 +564,19 @@ async fn clear_gap_recovery_state(data_dir: &str, reason: &str) {
 /// regardless. Hung-daemon case: pkill removes the stuck process so the
 /// next archive-push can spawn a fresh one. Spool is safe to disrupt —
 /// pgBackRest re-uploads from pg_wal on respawn.
+///
+/// Target: the literal substring "archive-push:async" in the cmdline.
+/// pgBackRest spawns the async daemon via
+/// cfgExecParam(cfgCmdArchivePush, cfgCmdRoleAsync, ...) and
+/// cfgParseCommandRoleName (src/config/parse.c) encodes the role with a
+/// colon — argv[1] of the spawned process becomes "archive-push:async".
+/// The foreground caller (runs as archive_command, exits in ~300ms) has
+/// "archive-push" *without* a colon, so the colon disambiguates: pkill
+/// matches the long-lived async daemon but never the foreground call.
+/// Verify in a running container with `pgrep -af archive-push:async`.
 async fn kick_async_daemon() {
-    // pkill -f matches on the FULL cmdline; the foreground archive-push
-    // invocation lives ~300ms before exiting, so the race risk of
-    // pkilling a transient foreground call is minute. Even if pkill
-    // catches the foreground, postgres re-invokes archive_command on the
-    // next WAL switch and the cycle continues cleanly.
     let _ = Command::new("pkill")
-        .args(["-f", "pgbackrest .* archive-push .* --archive-async"])
+        .args(["-f", "archive-push:async"])
         .status()
         .await;
 }
@@ -628,7 +633,14 @@ async fn gap_recovery_step(
             detected_at = now;
             let _ = write_state_field(&state_path, "last_lag_detected_at", &now.to_string());
         }
-        if catalog_at_detection.is_empty() {
+        // Only write a real value; an empty catalog (fresh stanza, no
+        // archive entries on this timeline yet) leaves the field unset
+        // and the back-fill re-fires next iteration. Writing "" would
+        // set catalog_at_detection equal to the first non-empty
+        // catalog_max captured in a later iteration's back-fill, and
+        // we'd then never see a difference vs. current catalog_max —
+        // recovery couldn't fire.
+        if catalog_at_detection.is_empty() && !catalog_max.is_empty() {
             catalog_at_detection = catalog_max.clone();
             let _ = write_state_field(
                 &state_path,
