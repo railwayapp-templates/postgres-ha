@@ -156,6 +156,15 @@ struct ArchiverStats {
 
 /// Spawn the watcher as a tokio task. Returns immediately. Bails (logs
 /// and exits the task) if WAL_ARCHIVE_BUCKET is unset.
+///
+/// Supervisor: `run()` is wrapped in a respawn loop. If the inner task
+/// errors out or panics, the supervisor logs the cause and restarts it
+/// after a 5s backoff. The marker file + state file live on disk, so a
+/// re-spawned watcher picks the in-flight recovery state up exactly
+/// where the old one left off. The dedicated `tokio::task::spawn` per
+/// iteration is what gives us panic isolation — a panic inside `run`
+/// shows up as a `JoinError::is_panic()` on the supervisor side rather
+/// than aborting the whole patroni-runner process.
 pub fn spawn(data_dir: String) {
     if env::var("WAL_ARCHIVE_BUCKET")
         .ok()
@@ -166,8 +175,24 @@ pub fn spawn(data_dir: String) {
     }
 
     tokio::spawn(async move {
-        if let Err(e) = run(data_dir).await {
-            warn!(error = %e, "pgbackrest-watcher: terminated");
+        loop {
+            let dd = data_dir.clone();
+            let h = tokio::task::spawn(async move { run(dd).await });
+            match h.await {
+                Ok(Ok(())) => {
+                    warn!("pgbackrest-watcher: run loop returned cleanly — respawning in 5s")
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "pgbackrest-watcher: run loop errored — respawning in 5s")
+                }
+                Err(e) if e.is_panic() => {
+                    warn!(panic = ?e, "pgbackrest-watcher: run loop panicked — respawning in 5s")
+                }
+                Err(e) => {
+                    warn!(error = %e, "pgbackrest-watcher: join error — respawning in 5s")
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 }
