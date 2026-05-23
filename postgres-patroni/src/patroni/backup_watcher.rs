@@ -151,7 +151,19 @@ struct ArchiverStats {
     /// NULL (cluster just started, never archived). Used by the LSN-lag
     /// probe to compare against `pgbackrest info`'s repo high-water.
     last_archived_wal: String,
+    /// `0x100000000 / wal_segment_size` — how many WAL segments fit per
+    /// XLogId. Default 256 for the standard 16 MiB segsize. Postgres
+    /// allows any power-of-2 between 1 MiB and 1 GiB at initdb (via
+    /// `initdb --wal-segsize=N`), so hardcoding 256 would mis-scale lag
+    /// by `(default / actual)` on non-default clusters. Carried alongside
+    /// `failed_count` so every consumer sees a single coherent snapshot.
+    segments_per_log_file: u64,
 }
+
+/// Default segments-per-XLogId for a 16 MiB wal_segment_size — used as a
+/// safe pre-query placeholder before `refresh_archiver_stats` fills the
+/// real value. 0x100000000 / 16777216 = 256.
+const DEFAULT_SEGMENTS_PER_LOG_FILE: u64 = 256;
 
 /// Spawn the watcher as a tokio task. Returns immediately. Bails (logs
 /// and exits the task) if WAL_ARCHIVE_BUCKET is unset.
@@ -361,6 +373,10 @@ async fn pg_is_in_recovery() -> Result<bool> {
 }
 
 async fn refresh_archiver_stats() -> Result<ArchiverStats> {
+    // Combined query: pg_stat_archiver columns + wal_segment_size in 8 KiB
+    // pages (pg_settings's PGC_INTERNAL unit for this GUC). Folding both
+    // into a single round-trip keeps watcher iteration cheap.
+    //
     // COALESCE last_archived_wal to '-' so split_whitespace() doesn't
     // collapse an empty trailing column into the preceding one and corrupt
     // the bind. The sentinel is stripped below.
@@ -377,7 +393,8 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
             "SELECT failed_count, \
              COALESCE(EXTRACT(EPOCH FROM last_archived_time)::bigint, 0), \
              COALESCE(EXTRACT(EPOCH FROM last_failed_time)::bigint, 0), \
-             COALESCE(last_archived_wal, '-') \
+             COALESCE(last_archived_wal, '-'), \
+             (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') \
              FROM pg_stat_archiver",
         ])
         .env_remove("PGHOST")
@@ -396,7 +413,7 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
         anyhow::bail!("pg_stat_archiver returned empty result");
     }
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 4 {
+    if parts.len() < 5 {
         anyhow::bail!("pg_stat_archiver malformed: {line}");
     }
     let wal = parts[3];
@@ -405,9 +422,28 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
     } else {
         wal.to_string()
     };
+    // wal_segment_size is reported as the number of 8 KiB pages per
+    // segment. Convert to bytes, then to segments-per-XLogId. Fall back
+    // to the default (256 = 16 MiB segsize) on any parse failure; that's
+    // strictly better than panicking, and a wrong-by-power-of-2 scaling
+    // gets the watcher firing on a slightly different threshold rather
+    // than not at all.
+    let segments_per_log_file = parts[4]
+        .parse::<u64>()
+        .ok()
+        .filter(|&p| p > 0)
+        .and_then(|pages_per_segment| {
+            let bytes = pages_per_segment.checked_mul(8 * 1024)?;
+            if bytes == 0 || 0x1_0000_0000u64 % bytes != 0 {
+                return None;
+            }
+            Some(0x1_0000_0000u64 / bytes)
+        })
+        .unwrap_or(DEFAULT_SEGMENTS_PER_LOG_FILE);
     Ok(ArchiverStats {
         failed_count: parts[0].parse().unwrap_or(0),
         last_archived_wal,
+        segments_per_log_file,
     })
 }
 
@@ -435,18 +471,22 @@ async fn emit_wal_heartbeat() {
         .await;
 }
 
-/// 24-char hex WAL filename → absolute segment count (256 segments per
-/// log file at the default 16 MiB wal_segment_size). Returns None on
-/// malformed input so callers short-circuit. Strict shape + hex check
-/// avoids letting a stray non-hex character feed `u64::from_str_radix`
-/// and surface a parse error to the watcher loop.
-fn segment_to_number(wal: &str) -> Option<u64> {
+/// 24-char hex WAL filename → absolute segment count.
+/// `segments_per_log_file` = `0x100000000 / wal_segment_size`; the caller
+/// (always sourced from `ArchiverStats.segments_per_log_file`) carries
+/// the cluster's actual GUC value rather than the 256 hardcode, so a
+/// cluster initdb'd with `--wal-segsize=N` (legal between 1 MiB and 1
+/// GiB, powers of 2) computes lag correctly. Returns None on malformed
+/// input so callers short-circuit. Strict shape + hex check avoids
+/// letting a stray non-hex character feed `u64::from_str_radix` and
+/// surface a parse error to the watcher loop.
+fn segment_to_number(wal: &str, segments_per_log_file: u64) -> Option<u64> {
     if wal.len() != 24 || !wal.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let log = u64::from_str_radix(&wal[8..16], 16).ok()?;
     let seg = u64::from_str_radix(&wal[16..24], 16).ok()?;
-    Some(log * 256 + seg)
+    Some(log * segments_per_log_file + seg)
 }
 
 /// Probe state passed to `gap_recovery_step` and returned for tests.
@@ -503,7 +543,7 @@ async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
     if stats.last_archived_wal.is_empty() {
         return Ok(CatalogProbe::default());
     }
-    let handed_off = segment_to_number(&stats.last_archived_wal)
+    let handed_off = segment_to_number(&stats.last_archived_wal, stats.segments_per_log_file)
         .ok_or_else(|| anyhow::anyhow!("malformed last_archived_wal: {}", stats.last_archived_wal))?;
 
     let out = tokio::time::timeout(
@@ -525,7 +565,10 @@ async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
     let info_json = String::from_utf8_lossy(&out.stdout);
     let tl_hex = &stats.last_archived_wal[..8];
     let catalog_max = parse_catalog_max(&info_json, tl_hex)?;
-    let lag = match catalog_max.as_deref().and_then(segment_to_number) {
+    let lag = match catalog_max
+        .as_deref()
+        .and_then(|w| segment_to_number(w, stats.segments_per_log_file))
+    {
         Some(n) => handed_off.saturating_sub(n),
         None => 0,
     };
@@ -626,6 +669,10 @@ struct GapRecoveryInputs {
     last_full_failed: i64,
     threshold_segments: u64,
     backoff_seconds: u64,
+    /// `0x100000000 / wal_segment_size` — carried from `ArchiverStats`
+    /// so the segment-arithmetic side-channel sees the cluster's actual
+    /// segsize instead of the 256 hardcode. See `segment_to_number`.
+    segments_per_log_file: u64,
 }
 
 /// What the orchestrator should do in this iteration. Exactly one variant
@@ -700,8 +747,8 @@ fn decide_gap_recovery(inp: &GapRecoveryInputs) -> GapRecoveryAction {
     }
 
     // Advance check: catalog moved past the detection baseline → diff.
-    let curr = segment_to_number(&inp.catalog_max);
-    let det = segment_to_number(&inp.catalog_at_detection);
+    let curr = segment_to_number(&inp.catalog_max, inp.segments_per_log_file);
+    let det = segment_to_number(&inp.catalog_at_detection, inp.segments_per_log_file);
     let advanced = matches!((curr, det), (Some(c), Some(d)) if c > d);
     if advanced {
         return GapRecoveryAction::TakeRecoveryDiff;
@@ -759,6 +806,7 @@ async fn gap_recovery_step(
             .unwrap_or(0),
         threshold_segments: config.lag_threshold_segments,
         backoff_seconds: config.gap_recovery_backoff,
+        segments_per_log_file: stats.segments_per_log_file,
     };
 
     match decide_gap_recovery(&inp) {
@@ -1098,6 +1146,7 @@ mod tests {
             last_full_failed: 0,
             threshold_segments: 32,
             backoff_seconds: 600,
+            segments_per_log_file: 256,
         }
     }
 
@@ -1105,22 +1154,53 @@ mod tests {
     fn segment_to_number_real_values() {
         // Real cache values (admin monitor warning detail). Lag must match
         // the segment math the monitor uses (713 segments for both).
-        assert_eq!(segment_to_number("000000010000001D000000ED"), Some(7661));
-        assert_eq!(segment_to_number("000000010000001B00000024"), Some(6948));
         assert_eq!(
-            segment_to_number("000000010000001D000000ED").unwrap()
-                - segment_to_number("000000010000001B00000024").unwrap(),
+            segment_to_number("000000010000001D000000ED", 256),
+            Some(7661)
+        );
+        assert_eq!(
+            segment_to_number("000000010000001B00000024", 256),
+            Some(6948)
+        );
+        assert_eq!(
+            segment_to_number("000000010000001D000000ED", 256).unwrap()
+                - segment_to_number("000000010000001B00000024", 256).unwrap(),
             713
         );
     }
 
     #[test]
     fn segment_to_number_rejects_malformed() {
-        assert_eq!(segment_to_number(""), None);
-        assert_eq!(segment_to_number("not24"), None);
-        assert_eq!(segment_to_number("abcdefghijklmnopqrstuvwx"), None); // 24 non-hex
-        assert_eq!(segment_to_number("000000010000001B0000002"), None); // 23 chars
-        assert_eq!(segment_to_number("000000010000001B0000002__"), None); // 25 chars
+        assert_eq!(segment_to_number("", 256), None);
+        assert_eq!(segment_to_number("not24", 256), None);
+        assert_eq!(segment_to_number("abcdefghijklmnopqrstuvwx", 256), None); // 24 non-hex
+        assert_eq!(segment_to_number("000000010000001B0000002", 256), None); // 23 chars
+        assert_eq!(segment_to_number("000000010000001B0000002__", 256), None); // 25 chars
+    }
+
+    #[test]
+    fn segment_to_number_non_default_segsize() {
+        // wal_segment_size = 32 MiB → segments_per_log_file = 128. A WAL
+        // file name like 00000001 00000002 0000005A means "log 2, offset
+        // 0x5A" = 2*128 + 0x5A under 32 MiB segsize (vs. 2*256 + 0x5A
+        // = 602 under the 16 MiB hardcode).
+        assert_eq!(
+            segment_to_number("00000001000000020000005A", 128),
+            Some(2 * 128 + 0x5A)
+        );
+        // wal_segment_size = 1 MiB → segments_per_log_file = 4096.
+        assert_eq!(
+            segment_to_number("00000001000000010000000A", 4096),
+            Some(4096 + 0x0A)
+        );
+        // Two segments across an XLogId boundary scale linearly with
+        // segments_per_log_file: same hex inputs, different divisor.
+        let a16 = segment_to_number("000000010000000200000010", 256).unwrap();
+        let b16 = segment_to_number("000000010000000100000010", 256).unwrap();
+        assert_eq!(a16 - b16, 256);
+        let a32 = segment_to_number("000000010000000200000010", 128).unwrap();
+        let b32 = segment_to_number("000000010000000100000010", 128).unwrap();
+        assert_eq!(a32 - b32, 128);
     }
 
     #[test]

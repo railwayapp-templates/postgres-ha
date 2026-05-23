@@ -623,6 +623,18 @@ t_archiving_boot() {
     return
   fi
 
+  # L4: stanza-create timeout sentinel must NOT exist after a successful
+  # bootstrap. The sentinel is only dropped when spawn_bootstrap_stanza_create
+  # hits the 600s deadline (pg_isready or promotion). On the happy path it
+  # never appears, and if a stale one was left from a prior boot the
+  # success-branch cleanup removes it.
+  if docker exec "$leader" test -f /var/lib/postgresql/data/pgdata/.pgbackrest_stanza_create_timeout; then
+    ko t_archiving_boot ".pgbackrest_stanza_create_timeout written on a happy-path boot"
+    fail_dump t_archiving_boot "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
   local archive_mode archive_command
   archive_mode=$(psql_leader "$leader" -At -c "SHOW archive_mode")
   archive_command=$(psql_leader "$leader" -At -c "SHOW archive_command")
@@ -1670,6 +1682,119 @@ t_ha_failover_watcher_handoff() {
   teardown_scope "$scope"
 }
 
+# H7. WAL_ARCHIVE_BUCKET validator rejects junk shapes (unresolved Railway
+# template refs, raw bucket-id UUIDs) before they reach pgBackRest and
+# create a fake PITR gap from what's actually an upstream wiring bug.
+# After validator fires:
+#   - .pgbackrest_invalid_bucket sentinel is on disk for the dashboard
+#   - WAL_ARCHIVE_* env vars are unset → downstream gates treat archive
+#     as off (archive_mode stays off in postgres)
+#
+# Phase 2 of the test re-deploys the same volume with no WAL_ARCHIVE_*
+# at all and asserts the sentinel is cleared by
+# clear_pgbackrest_state_if_disabled (L7).
+t_ha_invalid_bucket_validator() {
+  local scope=t-badbucket-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+
+  # Single-node Patroni cluster — the validator runs on every node
+  # identically, so one node is enough to pin the behavior.
+  local n="${scope}-pg-1"
+  new_volume "${n}-vol"
+  docker run -d --name "$n" --label "$HA_LABEL" --network "$NET" \
+    --hostname "$n" \
+    -e "PATRONI_ENABLED=true" \
+    -e "PATRONI_NAME=${n}" \
+    -e "PATRONI_SCOPE=${scope}" \
+    -e "RAILWAY_PRIVATE_DOMAIN=${n}" \
+    -e "PATRONI_ETCD3_HOSTS=${etcd_hosts}" \
+    -e "POSTGRES_PASSWORD=test" \
+    -e "PATRONI_REPLICATION_PASSWORD=replpass" \
+    -e "PATRONI_SUPERUSER_PASSWORD=test" \
+    -e "PGDATA=/var/lib/postgresql/data/pgdata" \
+    -e 'WAL_ARCHIVE_BUCKET=${{121ccc45-0912-457e-8dc0-76625fe644bb.BUCKET}}' \
+    -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_ARCHIVE_REGION=us-east-1 \
+    -e "WAL_ARCHIVE_KEY=$MINIO_USER" \
+    -e "WAL_ARCHIVE_SECRET=$MINIO_PASS" \
+    -v "${n}-vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  local leader; leader=$(wait_for_leader "$scope" 240) || {
+    ko t_ha_invalid_bucket_validator "no leader (validator should NOT block cluster formation)"
+    fail_dump t_ha_invalid_bucket_validator "$n"
+    teardown_scope "$scope"
+    return
+  }
+
+  # Validator runs in patroni-runner main() before anything else writes
+  # to /etc/pgbackrest. The sentinel lands under $data_dir (==PGDATA).
+  if ! docker exec "$leader" test -f /var/lib/postgresql/data/pgdata/.pgbackrest_invalid_bucket; then
+    ko t_ha_invalid_bucket_validator ".pgbackrest_invalid_bucket sentinel missing after junk-bucket boot"
+    fail_dump t_ha_invalid_bucket_validator "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  local reason
+  reason=$(docker exec "$leader" cat /var/lib/postgresql/data/pgdata/.pgbackrest_invalid_bucket | tr -d '\n\r')
+  if [ "$reason" != "unresolved-template-ref" ]; then
+    ko t_ha_invalid_bucket_validator "sentinel reason mismatch (got '$reason' expected 'unresolved-template-ref')"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # archive_mode must be off — validator unset WAL_ARCHIVE_* so the
+  # patroni.yml renderer didn't inject archive params into DCS.
+  local mode; mode=$(psql_leader "$leader" -At -c "SHOW archive_mode" 2>/dev/null || echo "?")
+  if [ "$mode" = "on" ]; then
+    ko t_ha_invalid_bucket_validator "archive_mode=on despite invalid bucket (got '$mode')"
+    fail_dump t_ha_invalid_bucket_validator "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Phase 2 (L7): redeploy with no WAL_ARCHIVE_*. Sentinel must clear.
+  docker rm -f "$n" >/dev/null 2>&1 || true
+  for e in "${scope}-etcd-1" "${scope}-etcd-2" "${scope}-etcd-3"; do
+    docker rm -f "$e" >/dev/null 2>&1 || true
+    docker volume rm "${e}-vol" >/dev/null 2>&1 || true
+  done
+  local etcd_hosts2; etcd_hosts2=$(setup_etcd_cluster "${scope}-phase2")
+  docker run -d --name "$n" --label "$HA_LABEL" --network "$NET" \
+    --hostname "$n" \
+    -e "PATRONI_ENABLED=true" \
+    -e "PATRONI_NAME=${n}" \
+    -e "PATRONI_SCOPE=${scope}-phase2" \
+    -e "RAILWAY_PRIVATE_DOMAIN=${n}" \
+    -e "PATRONI_ETCD3_HOSTS=${etcd_hosts2}" \
+    -e "POSTGRES_PASSWORD=test" \
+    -e "PATRONI_REPLICATION_PASSWORD=replpass" \
+    -e "PATRONI_SUPERUSER_PASSWORD=test" \
+    -e "PGDATA=/var/lib/postgresql/data/pgdata" \
+    -v "${n}-vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  # wait_for_leader on a stale-sysid volume may not produce a leader
+  # (Patroni refuses to start with a sysid that doesn't match the new
+  # scope's bootstrap). What we need is just enough boot time for
+  # clear_pgbackrest_state_if_disabled to run, which happens in main()
+  # before Patroni starts. ~20s is plenty.
+  sleep 20
+
+  if docker exec "$n" test -f /var/lib/postgresql/data/pgdata/.pgbackrest_invalid_bucket 2>/dev/null; then
+    ko t_ha_invalid_bucket_validator ".pgbackrest_invalid_bucket survived disable; clear function leaks it"
+    fail_dump t_ha_invalid_bucket_validator "$n"
+    teardown_scope "$scope"
+    teardown_scope "${scope}-phase2"
+    return
+  fi
+
+  ok t_ha_invalid_bucket_validator
+  note "validator rejected template-ref → sentinel + archive_mode off; disable cleared sentinel"
+  teardown_scope "$scope"
+  teardown_scope "${scope}-phase2"
+}
+
 # ============================================================================
 # Tests skipped from the ssl harness (with reasons) — see PR body.
 # ============================================================================
@@ -1732,6 +1857,8 @@ ALL_TESTS=(
   t_ha_pghost_pgport_unset
   t_ha_restore_gate_logged_on_every_node
   t_ha_failover_watcher_handoff
+  # audit follow-up (M4 + L7 — see plan ok-fix-all-of-cheerful-wolf.md)
+  t_ha_invalid_bucket_validator
 )
 
 usage() {
