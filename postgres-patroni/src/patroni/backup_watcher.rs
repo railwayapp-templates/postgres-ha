@@ -602,6 +602,125 @@ async fn kick_async_daemon() {
 /// Called every iteration. Idempotent — re-entering the function while
 /// already in recovery just advances the timers / inspects current
 /// catalog max.
+/// Snapshot of every input the gap-recovery decision depends on. All
+/// fields are plain data — no async, no Result, no I/O. The orchestrator
+/// (`gap_recovery_step`) does the I/O to collect this; `decide_gap_recovery`
+/// is pure so it can be exhaustively unit-tested without filesystem or
+/// subprocess mocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GapRecoveryInputs {
+    now: i64,
+    lag: u64,
+    /// `""` when the catalog has no entries for the current timeline (fresh
+    /// stanza, never archived). Non-empty values are 24-char hex WAL names.
+    catalog_max: String,
+    handoff_wal: String,
+    failed_count: i64,
+    marker_present: bool,
+    /// `0` when no recovery cycle is in flight (or wrapper-touched marker
+    /// the watcher hasn't seen yet).
+    detected_at: i64,
+    /// `""` when not yet back-filled.
+    catalog_at_detection: String,
+    /// `0` when never force-recovered this cycle.
+    last_force_recovery_at: i64,
+    force_attempts: u64,
+    last_full_failed: i64,
+    threshold_segments: u64,
+    backoff_seconds: u64,
+}
+
+/// What the orchestrator should do in this iteration. Exactly one variant
+/// per state-machine transition; back-fill writes are their own variants
+/// so the orchestrator never has to combine multiple side-effects in one
+/// dispatch. Trade-off: a wrapper-touched-marker entry path takes up to
+/// two extra iterations before kick logic engages (back-fill detected_at,
+/// then back-fill catalog_at_detection). 60-120s of added latency before
+/// the first kick is acceptable for the simplification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GapRecoveryAction {
+    /// Not in recovery; no entry condition met.
+    NoOp,
+    /// First detection — touch marker, write all four state fields,
+    /// log entry banner. `catalog_at_detection` is the current catalog
+    /// max (may be `""` if the timeline has no archive entries yet).
+    Detect { catalog_at_detection: String },
+    /// In recovery, `detected_at == 0` (wrapper touched the marker
+    /// without the watcher having recorded its own detection time).
+    /// Stamp `last_lag_detected_at = now`.
+    BackFillDetectedAt,
+    /// In recovery, `catalog_at_detection == ""` and `catalog_max != ""`.
+    /// Stamp the baseline so the next iteration's advance check has
+    /// something to compare against.
+    BackFillCatalogAtDetection { value: String },
+    /// Catalog has advanced past the detection point — proof the async
+    /// daemon is pushing again. Run a diff to anchor the restore point.
+    TakeRecoveryDiff,
+    /// Backoff has elapsed since the last action. pkill the async
+    /// daemon, bump attempts, stamp `last_force_recovery_at = now`.
+    KickAsyncDaemon { attempt: u64 },
+    /// In recovery; nothing to do this iteration.
+    Wait,
+}
+
+/// Pure state-machine decision. No I/O, no async. Driven by a
+/// `GapRecoveryInputs` snapshot the orchestrator builds; returns the
+/// single action to dispatch this iteration. Every branch in the
+/// production code path corresponds to one variant of
+/// `GapRecoveryAction` and is unit-tested below.
+fn decide_gap_recovery(inp: &GapRecoveryInputs) -> GapRecoveryAction {
+    if !inp.marker_present {
+        // Not in recovery. Two independent entry conditions:
+        //   - LSN lag ≥ threshold (async wedge / queue-max-trip)
+        //   - failed_count > anchor (foreground hard failure)
+        let lag_trigger = inp.lag >= inp.threshold_segments;
+        let failed_trigger = inp.failed_count > inp.last_full_failed;
+        if lag_trigger || failed_trigger {
+            return GapRecoveryAction::Detect {
+                catalog_at_detection: inp.catalog_max.clone(),
+            };
+        }
+        return GapRecoveryAction::NoOp;
+    }
+
+    // Marker present (we're in recovery). Back-fills run first so the
+    // state file is normalised before the advance/kick logic.
+    if inp.detected_at == 0 {
+        return GapRecoveryAction::BackFillDetectedAt;
+    }
+    if inp.catalog_at_detection.is_empty() {
+        if inp.catalog_max.is_empty() {
+            // Stanza has no archive entries yet; nothing to anchor
+            // against. The kick path is also gated on having a non-empty
+            // baseline (no way to detect "catalog advanced" otherwise),
+            // so just wait.
+            return GapRecoveryAction::Wait;
+        }
+        return GapRecoveryAction::BackFillCatalogAtDetection {
+            value: inp.catalog_max.clone(),
+        };
+    }
+
+    // Advance check: catalog moved past the detection baseline → diff.
+    let curr = segment_to_number(&inp.catalog_max);
+    let det = segment_to_number(&inp.catalog_at_detection);
+    let advanced = matches!((curr, det), (Some(c), Some(d)) if c > d);
+    if advanced {
+        return GapRecoveryAction::TakeRecoveryDiff;
+    }
+
+    // No advance. Backoff elapsed since the last action → kick.
+    let last_action_at = inp.detected_at.max(inp.last_force_recovery_at);
+    let since_action = inp.now.saturating_sub(last_action_at);
+    if since_action >= inp.backoff_seconds as i64 {
+        return GapRecoveryAction::KickAsyncDaemon {
+            attempt: inp.force_attempts + 1,
+        };
+    }
+
+    GapRecoveryAction::Wait
+}
+
 async fn gap_recovery_step(
     data_dir: &str,
     config: &WatcherConfig,
@@ -619,63 +738,72 @@ async fn gap_recovery_step(
         }
     };
 
-    let catalog_max = probe.catalog_max.unwrap_or_default();
-    let lag = probe.lag;
-
-    // In recovery? The marker is the truth — either we set it on a
-    // previous lag detection or the archive-push wrapper touched it on a
-    // hard failure.
-    if Path::new(&gap_marker).exists() {
-        let mut detected_at = read_state_field(&state_path, "last_lag_detected_at")
+    let inp = GapRecoveryInputs {
+        now,
+        lag: probe.lag,
+        catalog_max: probe.catalog_max.unwrap_or_default(),
+        handoff_wal: stats.last_archived_wal.clone(),
+        failed_count: stats.failed_count,
+        marker_present: Path::new(&gap_marker).exists(),
+        detected_at: read_state_field(&state_path, "last_lag_detected_at")
             .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
-        let mut catalog_at_detection =
-            read_state_field(&state_path, "catalog_max_at_detection").unwrap_or_default();
-        let last_force = read_state_field(&state_path, "last_force_recovery_at")
+            .unwrap_or(0),
+        catalog_at_detection: read_state_field(&state_path, "catalog_max_at_detection")
+            .unwrap_or_default(),
+        last_force_recovery_at: read_state_field(&state_path, "last_force_recovery_at")
             .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
-        let mut force_attempts = read_state_field(&state_path, "force_attempts")
+            .unwrap_or(0),
+        force_attempts: read_state_field(&state_path, "force_attempts")
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(0),
+        last_full_failed: read_state_field(&state_path, "last_full_failed_count")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0),
+        threshold_segments: config.lag_threshold_segments,
+        backoff_seconds: config.gap_recovery_backoff,
+    };
 
-        // Back-fill state when the wrapper touched the marker but the
-        // watcher hasn't entered the state machine yet.
-        if detected_at == 0 {
-            detected_at = now;
+    match decide_gap_recovery(&inp) {
+        GapRecoveryAction::NoOp => {}
+
+        GapRecoveryAction::Detect { catalog_at_detection } => {
+            if let Err(e) = fs::write(&gap_marker, "") {
+                warn!(error = %e, "pgbackrest-watcher: failed to write gap marker");
+                return;
+            }
             let _ = write_state_field(&state_path, "last_lag_detected_at", &now.to_string());
-        }
-        // Only write a real value; an empty catalog (fresh stanza, no
-        // archive entries on this timeline yet) leaves the field unset
-        // and the back-fill re-fires next iteration. Writing "" would
-        // set catalog_at_detection equal to the first non-empty
-        // catalog_max captured in a later iteration's back-fill, and
-        // we'd then never see a difference vs. current catalog_max —
-        // recovery couldn't fire.
-        if catalog_at_detection.is_empty() && !catalog_max.is_empty() {
-            catalog_at_detection = catalog_max.clone();
             let _ = write_state_field(
                 &state_path,
                 "catalog_max_at_detection",
                 &catalog_at_detection,
             );
+            let _ = write_state_field(&state_path, "last_force_recovery_at", "0");
+            let _ = write_state_field(&state_path, "force_attempts", "0");
+            info!(
+                handoff = %inp.handoff_wal,
+                catalog_max = %inp.catalog_max,
+                lag = inp.lag,
+                threshold = inp.threshold_segments,
+                failed_count = inp.failed_count,
+                last_full_failed = inp.last_full_failed,
+                backoff_seconds = inp.backoff_seconds,
+                "pgbackrest-watcher: entering gap-recovery, first pkill after backoff if catalog hasn't advanced"
+            );
         }
 
-        // Recovery proof: catalog has advanced past the detection point.
-        // That's the only conclusive proof the async daemon successfully
-        // pushed at least one segment to S3 — async is working again.
-        let advanced = !catalog_max.is_empty()
-            && !catalog_at_detection.is_empty()
-            && catalog_max != catalog_at_detection
-            && matches!(
-                (segment_to_number(&catalog_max), segment_to_number(&catalog_at_detection)),
-                (Some(curr), Some(det)) if curr > det
-            );
+        GapRecoveryAction::BackFillDetectedAt => {
+            let _ = write_state_field(&state_path, "last_lag_detected_at", &now.to_string());
+        }
 
-        if advanced {
+        GapRecoveryAction::BackFillCatalogAtDetection { value } => {
+            let _ = write_state_field(&state_path, "catalog_max_at_detection", &value);
+        }
+
+        GapRecoveryAction::TakeRecoveryDiff => {
             info!(
-                catalog_at_detection = %catalog_at_detection,
-                catalog_max = %catalog_max,
-                force_attempts,
+                catalog_at_detection = %inp.catalog_at_detection,
+                catalog_max = %inp.catalog_max,
+                force_attempts = inp.force_attempts,
                 "pgbackrest-watcher: gap-recovery — catalog advanced, taking diff to anchor restore point"
             );
             // Branch on run_backup's actual return — looking up
@@ -695,66 +823,29 @@ async fn gap_recovery_step(
             } else {
                 warn!("pgbackrest-watcher: gap-recovery diff failed; retry on next iteration");
             }
-            return;
         }
 
-        // No advance yet. Check if it's time to kick (or kick again).
-        let last_action_at = detected_at.max(last_force);
-        let since_action = now.saturating_sub(last_action_at);
-
-        if since_action >= config.gap_recovery_backoff as i64 {
-            force_attempts += 1;
-            let stuck_min = (now - detected_at) / 60;
+        GapRecoveryAction::KickAsyncDaemon { attempt } => {
+            let stuck_min = (now - inp.detected_at) / 60;
             info!(
-                catalog_at_detection = %catalog_at_detection,
-                handoff = %stats.last_archived_wal,
-                lag,
-                attempt = force_attempts,
+                catalog_at_detection = %inp.catalog_at_detection,
+                handoff = %inp.handoff_wal,
+                lag = inp.lag,
+                attempt,
                 stuck_min,
                 "pgbackrest-watcher: gap-recovery — catalog still frozen, pkill async daemon"
             );
             kick_async_daemon().await;
             let _ = write_state_field(&state_path, "last_force_recovery_at", &now.to_string());
-            let _ = write_state_field(&state_path, "force_attempts", &force_attempts.to_string());
+            let _ = write_state_field(&state_path, "force_attempts", &attempt.to_string());
         }
-        // No log line during the wait — per-iteration tracing in the
-        // surrounding watcher_iteration loop already surfaces enough
-        // state; printing the same "still waiting" message every minute
-        // for 10 minutes per backoff cycle is just diagnostic spam.
-        return;
-    }
 
-    // Not in recovery. Two independent entry conditions, both meaning
-    // "WAL coverage is diverging from the catalog":
-    //   - LSN lag ≥ threshold (async wedge / queue-max-trip — postgres
-    //     keeps handing off, async doesn't drain to S3)
-    //   - failed_count grew since the last full's anchor (foreground
-    //     hard failure — archive_command returning non-zero so postgres
-    //     never hands off; lag stays at 0 but archiving is broken just
-    //     the same)
-    let last_full_failed = read_state_field(&state_path, "last_full_failed_count")
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0);
-    let failed_grew = stats.failed_count > last_full_failed;
-    if lag >= config.lag_threshold_segments || failed_grew {
-        if let Err(e) = fs::write(&gap_marker, "") {
-            warn!(error = %e, "pgbackrest-watcher: failed to write gap marker");
-            return;
+        GapRecoveryAction::Wait => {
+            // No log line during the wait — per-iteration tracing in the
+            // surrounding watcher_iteration loop already surfaces enough
+            // state; printing the same "still waiting" message every
+            // minute for 10 minutes per backoff cycle is just spam.
         }
-        let _ = write_state_field(&state_path, "last_lag_detected_at", &now.to_string());
-        let _ = write_state_field(&state_path, "catalog_max_at_detection", &catalog_max);
-        let _ = write_state_field(&state_path, "last_force_recovery_at", "0");
-        let _ = write_state_field(&state_path, "force_attempts", "0");
-        info!(
-            handoff = %stats.last_archived_wal,
-            catalog_max = %catalog_max,
-            lag,
-            threshold = config.lag_threshold_segments,
-            failed_count = stats.failed_count,
-            last_full_failed,
-            backoff_seconds = config.gap_recovery_backoff,
-            "pgbackrest-watcher: entering gap-recovery, first pkill after backoff if catalog hasn't advanced"
-        );
     }
 }
 
@@ -985,7 +1076,32 @@ fn now_epoch() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_catalog_max, segment_to_number};
+    use super::{
+        decide_gap_recovery, parse_catalog_max, segment_to_number, GapRecoveryAction,
+        GapRecoveryInputs,
+    };
+
+    /// Baseline `GapRecoveryInputs` for tests — every field at its
+    /// "nothing happening" default. Individual tests override only the
+    /// fields they care about. Mirrors `WatcherConfig::from_env`
+    /// defaults: threshold=32 segments, backoff=600s.
+    fn base_inputs() -> GapRecoveryInputs {
+        GapRecoveryInputs {
+            now: 10_000,
+            lag: 0,
+            catalog_max: String::new(),
+            handoff_wal: String::new(),
+            failed_count: 0,
+            marker_present: false,
+            detected_at: 0,
+            catalog_at_detection: String::new(),
+            last_force_recovery_at: 0,
+            force_attempts: 0,
+            last_full_failed: 0,
+            threshold_segments: 32,
+            backoff_seconds: 600,
+        }
+    }
 
     #[test]
     fn segment_to_number_real_values() {
@@ -1063,5 +1179,254 @@ mod tests {
         // timeline" rather than a parse error.
         let info = r#"[{"archive":[{"id":"18-1","min":null,"max":null}],"backup":[]}]"#;
         assert_eq!(parse_catalog_max(info, "00000001").unwrap(), None);
+    }
+
+    // ---- decide_gap_recovery: state-machine transitions ----
+    //
+    // The orchestrator (`gap_recovery_step`) is a thin dispatcher around
+    // `decide_gap_recovery`. Every state-machine transition has its own
+    // variant on `GapRecoveryAction`, and each variant has a test below
+    // that pins the conditions that produce it. Future refactors should
+    // change the rule set in `decide_gap_recovery` only; the
+    // orchestrator's match arms are pure I/O.
+
+    #[test]
+    fn not_in_recovery_lag_below_threshold_is_noop() {
+        let inp = GapRecoveryInputs {
+            lag: 31,
+            catalog_max: "000000010000000000000020".into(),
+            ..base_inputs()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::NoOp);
+    }
+
+    #[test]
+    fn not_in_recovery_lag_at_threshold_triggers_detect() {
+        let inp = GapRecoveryInputs {
+            lag: 32,
+            catalog_max: "000000010000000000000020".into(),
+            ..base_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::Detect {
+                catalog_at_detection: "000000010000000000000020".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn not_in_recovery_failed_count_grew_triggers_detect_without_lag() {
+        // Foreground hard-failure path: archive_command returns non-zero,
+        // postgres's last_archived_wal never advances, so lag stays at 0
+        // even though failed_count climbs.
+        let inp = GapRecoveryInputs {
+            lag: 0,
+            failed_count: 13,
+            last_full_failed: 0,
+            ..base_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::Detect {
+                catalog_at_detection: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn not_in_recovery_failed_count_equal_anchor_is_noop() {
+        // Boundary: failed_count *equal* to the anchor isn't growth.
+        // (Tests the `>` vs `>=` mistake that's easy to make.)
+        let inp = GapRecoveryInputs {
+            lag: 0,
+            failed_count: 13,
+            last_full_failed: 13,
+            ..base_inputs()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::NoOp);
+    }
+
+    #[test]
+    fn marker_present_missing_detected_at_back_fills_first() {
+        // Wrapper touched the marker, watcher's first iteration sees it
+        // and hasn't recorded its own detection time yet. Stamp
+        // detected_at = now. Other fields irrelevant on this branch —
+        // back-fill takes priority over everything else.
+        let inp = GapRecoveryInputs {
+            marker_present: true,
+            detected_at: 0,
+            catalog_at_detection: String::new(),
+            catalog_max: "000000010000000000000050".into(),
+            lag: 100,
+            ..base_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::BackFillDetectedAt
+        );
+    }
+
+    #[test]
+    fn marker_present_empty_catalog_max_and_no_baseline_waits() {
+        // Fresh stanza: marker is set, detected_at recorded, but the
+        // catalog still has no archive entries for this timeline, so
+        // there's nothing to anchor against. Just wait — the catalog
+        // will populate once archiving starts, and the next iteration
+        // will back-fill catalog_at_detection.
+        let inp = GapRecoveryInputs {
+            marker_present: true,
+            detected_at: 9_000,
+            catalog_at_detection: String::new(),
+            catalog_max: String::new(),
+            ..base_inputs()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+    }
+
+    #[test]
+    fn marker_present_empty_baseline_with_non_empty_catalog_back_fills() {
+        // Audit #3 fix codified: we only back-fill catalog_at_detection
+        // once catalog_max is non-empty, so the baseline captures a real
+        // segment to compare against on the next iteration.
+        let inp = GapRecoveryInputs {
+            marker_present: true,
+            detected_at: 9_000,
+            catalog_at_detection: String::new(),
+            catalog_max: "000000010000000000000050".into(),
+            ..base_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::BackFillCatalogAtDetection {
+                value: "000000010000000000000050".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn marker_present_catalog_advanced_triggers_diff() {
+        // The whole point of the state machine: catalog moved past the
+        // detection baseline → async is pushing again → diff to anchor
+        // the restore point.
+        let inp = GapRecoveryInputs {
+            marker_present: true,
+            detected_at: 9_000,
+            catalog_at_detection: "000000010000000000000050".into(),
+            catalog_max: "000000010000000000000051".into(),
+            ..base_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::TakeRecoveryDiff
+        );
+    }
+
+    #[test]
+    fn marker_present_catalog_equal_to_baseline_within_backoff_waits() {
+        // No advance, backoff not yet elapsed. Don't kick.
+        let inp = GapRecoveryInputs {
+            now: 10_000,
+            marker_present: true,
+            detected_at: 9_700, // 300s ago (< 600s backoff)
+            catalog_at_detection: "000000010000000000000050".into(),
+            catalog_max: "000000010000000000000050".into(),
+            ..base_inputs()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+    }
+
+    #[test]
+    fn marker_present_catalog_equal_to_baseline_at_backoff_kicks_first_attempt() {
+        // Backoff elapsed since the only prior action (detection) →
+        // first pkill cycle.
+        let inp = GapRecoveryInputs {
+            now: 10_000,
+            marker_present: true,
+            detected_at: 9_400, // 600s ago (== backoff)
+            last_force_recovery_at: 0,
+            force_attempts: 0,
+            catalog_at_detection: "000000010000000000000050".into(),
+            catalog_max: "000000010000000000000050".into(),
+            ..base_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::KickAsyncDaemon { attempt: 1 }
+        );
+    }
+
+    #[test]
+    fn marker_present_within_backoff_after_kick_waits() {
+        // We've kicked once; backoff resets from `last_force_recovery_at`.
+        let inp = GapRecoveryInputs {
+            now: 10_000,
+            marker_present: true,
+            detected_at: 8_000,
+            last_force_recovery_at: 9_700, // 300s ago (< 600s)
+            force_attempts: 1,
+            catalog_at_detection: "000000010000000000000050".into(),
+            catalog_max: "000000010000000000000050".into(),
+            ..base_inputs()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+    }
+
+    #[test]
+    fn marker_present_at_backoff_after_kick_kicks_again_with_incremented_attempt() {
+        // Extended outage: second pkill cycle, attempts bumped to 2.
+        let inp = GapRecoveryInputs {
+            now: 10_000,
+            marker_present: true,
+            detected_at: 8_000,
+            last_force_recovery_at: 9_400, // 600s ago (== backoff)
+            force_attempts: 1,
+            catalog_at_detection: "000000010000000000000050".into(),
+            catalog_max: "000000010000000000000050".into(),
+            ..base_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::KickAsyncDaemon { attempt: 2 }
+        );
+    }
+
+    #[test]
+    fn marker_present_catalog_lower_than_baseline_does_not_diff() {
+        // Edge case: pgbackrest info returned a catalog max that
+        // parses to a lower segment number than catalog_at_detection
+        // (could happen on a stanza rebuild or timeline rollback).
+        // Don't treat that as "advance" — the diff would anchor against
+        // a regressed baseline. Wait until the catalog catches up.
+        let inp = GapRecoveryInputs {
+            now: 10_000,
+            marker_present: true,
+            detected_at: 9_900,
+            catalog_at_detection: "000000010000000000000051".into(),
+            catalog_max: "000000010000000000000050".into(),
+            ..base_inputs()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+    }
+
+    #[test]
+    fn marker_present_advance_takes_priority_over_backoff_kick() {
+        // If the catalog HAS advanced, even with backoff elapsed and
+        // attempts pending, we diff (not kick). Advance is the
+        // higher-signal event.
+        let inp = GapRecoveryInputs {
+            now: 10_000,
+            marker_present: true,
+            detected_at: 8_000, // 2000s ago, way past backoff
+            last_force_recovery_at: 0,
+            force_attempts: 0,
+            catalog_at_detection: "000000010000000000000050".into(),
+            catalog_max: "000000010000000000000051".into(),
+            ..base_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::TakeRecoveryDiff
+        );
     }
 }
