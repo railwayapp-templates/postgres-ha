@@ -145,7 +145,6 @@ fn env_u64_optional(key: &str) -> Option<u64> {
 /// Snapshot of `pg_stat_archiver` for a single iteration.
 #[derive(Default, Clone)]
 struct ArchiverStats {
-    archived_count: i64,
     failed_count: i64,
     /// 24-char hex WAL filename of the most-recent segment Postgres handed
     /// off to the archive process. Empty when `pg_stat_archiver` reports
@@ -375,7 +374,7 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
             "-F",
             " ",
             "-c",
-            "SELECT archived_count, failed_count, \
+            "SELECT failed_count, \
              COALESCE(EXTRACT(EPOCH FROM last_archived_time)::bigint, 0), \
              COALESCE(EXTRACT(EPOCH FROM last_failed_time)::bigint, 0), \
              COALESCE(last_archived_wal, '-') \
@@ -397,18 +396,17 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
         anyhow::bail!("pg_stat_archiver returned empty result");
     }
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 5 {
+    if parts.len() < 4 {
         anyhow::bail!("pg_stat_archiver malformed: {line}");
     }
-    let wal = parts[4];
+    let wal = parts[3];
     let last_archived_wal = if wal == "-" {
         String::new()
     } else {
         wal.to_string()
     };
     Ok(ArchiverStats {
-        archived_count: parts[0].parse().unwrap_or(0),
-        failed_count: parts[1].parse().unwrap_or(0),
+        failed_count: parts[0].parse().unwrap_or(0),
         last_archived_wal,
     })
 }
@@ -870,11 +868,11 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
 
     let now = now_epoch();
 
-    // NEEDS_INITIAL_BACKUP — no full on record, take it now. PR #59
-    // dropped the "archived_count > 0" gate: pgbackrest backup brackets
-    // pg_backup_start/stop and waits for the closing WAL to archive
-    // before declaring success, so a broken archive_command fails the
-    // backup loudly instead of producing an unrestorable base.
+    // NEEDS_INITIAL_BACKUP — no full on record, take it now. pgbackrest
+    // backup brackets the base in pg_backup_start/stop and waits for the
+    // closing WAL to archive before declaring success, so a broken
+    // archive_command fails the backup loudly instead of producing an
+    // unrestorable base.
     if last_full.is_none() {
         return Action::Full;
     }
@@ -908,8 +906,8 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
 
     Action::None {
         reason: format!(
-            "all gates clean (last_full={last_full}, last_diff={:?}, archived={}, failed={}, last_full_failed={last_full_failed})",
-            last_diff, stats.archived_count, stats.failed_count
+            "all gates clean (last_full={last_full}, last_diff={:?}, failed={}, last_full_failed={last_full_failed})",
+            last_diff, stats.failed_count
         ),
     }
 }
