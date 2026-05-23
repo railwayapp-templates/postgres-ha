@@ -157,14 +157,18 @@ struct ArchiverStats {
 /// Spawn the watcher as a tokio task. Returns immediately. Bails (logs
 /// and exits the task) if WAL_ARCHIVE_BUCKET is unset.
 ///
-/// Supervisor: `run()` is wrapped in a respawn loop. If the inner task
-/// errors out or panics, the supervisor logs the cause and restarts it
-/// after a 5s backoff. The marker file + state file live on disk, so a
-/// re-spawned watcher picks the in-flight recovery state up exactly
-/// where the old one left off. The dedicated `tokio::task::spawn` per
-/// iteration is what gives us panic isolation — a panic inside `run`
-/// shows up as a `JoinError::is_panic()` on the supervisor side rather
-/// than aborting the whole patroni-runner process.
+/// Supervisor: `run()` is wrapped in a respawn loop. Each respawn cycle
+/// launches one `tokio::task::spawn(run())` task whose lifetime spans the
+/// entire watcher main loop (all iterations); if any iteration inside
+/// the task panics or returns Err, the task ends, the supervisor logs
+/// the cause, and `tokio::time::sleep(5s)` later it spawns a fresh
+/// task. The boundary is at *task lifetime* — not per iteration —
+/// which gives panic isolation from the rest of patroni-runner (a
+/// panic in `run` surfaces as `JoinError::is_panic()` on this side
+/// rather than aborting the host process). State that needs to
+/// persist across respawns lives on disk (`.pgbackrest_backup_state`
+/// + `.pgbackrest_gap_pending`), so a fresh task picks up the
+/// in-flight recovery state where the old one left off.
 pub fn spawn(data_dir: String) {
     if env::var("WAL_ARCHIVE_BUCKET")
         .ok()
