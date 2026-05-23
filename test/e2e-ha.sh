@@ -1728,15 +1728,18 @@ t_ha_invalid_bucket_validator() {
   }
 
   # Validator runs in patroni-runner main() before anything else writes
-  # to /etc/pgbackrest. The sentinel lands under $data_dir (==PGDATA).
-  if ! docker exec "$leader" test -f /var/lib/postgresql/data/pgdata/.pgbackrest_invalid_bucket; then
+  # to /etc/pgbackrest. The sentinel lands at <volume_root>/.pgbackrest_invalid_bucket
+  # (NOT under PGDATA — see validate_wal_archive_bucket's doc-comment:
+  # Patroni's bootstrap wipes /pgdata on fresh volumes, which would
+  # silently delete the sentinel before the dashboard reads it).
+  if ! docker exec "$leader" test -f /var/lib/postgresql/data/.pgbackrest_invalid_bucket; then
     ko t_ha_invalid_bucket_validator ".pgbackrest_invalid_bucket sentinel missing after junk-bucket boot"
     fail_dump t_ha_invalid_bucket_validator "$leader"
     teardown_scope "$scope"
     return
   fi
   local reason
-  reason=$(docker exec "$leader" cat /var/lib/postgresql/data/pgdata/.pgbackrest_invalid_bucket | tr -d '\n\r')
+  reason=$(docker exec "$leader" cat /var/lib/postgresql/data/.pgbackrest_invalid_bucket | tr -d '\n\r')
   if [ "$reason" != "unresolved-template-ref" ]; then
     ko t_ha_invalid_bucket_validator "sentinel reason mismatch (got '$reason' expected 'unresolved-template-ref')"
     teardown_scope "$scope"
@@ -1781,7 +1784,7 @@ t_ha_invalid_bucket_validator() {
   # before Patroni starts. ~20s is plenty.
   sleep 20
 
-  if docker exec "$n" test -f /var/lib/postgresql/data/pgdata/.pgbackrest_invalid_bucket 2>/dev/null; then
+  if docker exec "$n" test -f /var/lib/postgresql/data/.pgbackrest_invalid_bucket 2>/dev/null; then
     ko t_ha_invalid_bucket_validator ".pgbackrest_invalid_bucket survived disable; clear function leaks it"
     fail_dump t_ha_invalid_bucket_validator "$n"
     teardown_scope "$scope"

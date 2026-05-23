@@ -65,10 +65,17 @@ const VALIDATE_BUCKET_REASON_UUID_SHAPE: &str = "uuid-shape";
 /// `translate_wal_env_to_pgbackrest` exports it as `PGBACKREST_REPO1_S3_BUCKET`.
 /// If invalid, unset the WAL_ARCHIVE_* env vars so every downstream gate
 /// treats archiving as off, then drop a `.pgbackrest_invalid_bucket`
-/// sentinel under `$data_dir` so the admin dashboard can surface the
-/// "PITR enabled but wired to junk" state distinctly from "PITR never
-/// enabled" or "PITR misconfigured creds." Mirrors postgres-ssl
-/// `wrapper.sh::validate_wal_archive_bucket`.
+/// sentinel under the **volume root** (NOT PGDATA) so the admin
+/// dashboard can surface the "PITR enabled but wired to junk" state
+/// distinctly from "PITR never enabled" or "PITR misconfigured creds."
+/// Mirrors postgres-ssl `wrapper.sh::validate_wal_archive_bucket`.
+///
+/// Path choice: PGDATA itself (`<volume_root>/pgdata`) gets wiped/
+/// reinitialized by Patroni's bootstrap on the first boot of a fresh
+/// volume — a sentinel inside it would silently disappear before the
+/// dashboard could read it. The volume root is on the same persistent
+/// volume but outside Patroni's reach, so the sentinel survives
+/// initdb + bootstrap.
 ///
 /// Caught shapes:
 ///   - contains `${{` or `}}` → unresolved Railway template ref leaked
@@ -80,10 +87,17 @@ const VALIDATE_BUCKET_REASON_UUID_SHAPE: &str = "uuid-shape";
 ///
 /// Sentinel cleanup: `clear_pgbackrest_state_if_disabled` removes the
 /// sentinel on disable (WAL_ARCHIVE_BUCKET unset on next boot).
-fn validate_wal_archive_bucket(data_dir: &str) {
+fn validate_wal_archive_bucket(volume_root: &str) {
+    let marker = format!("{volume_root}/.pgbackrest_invalid_bucket");
     let val = match env::var("WAL_ARCHIVE_BUCKET").ok().filter(|s| !s.is_empty()) {
         Some(v) => v,
-        None => return,
+        None => {
+            // Bucket unset → either never configured or already
+            // intentionally disabled. Clear any stale sentinel so the
+            // dashboard doesn't flag a now-disabled service.
+            let _ = fs::remove_file(&marker);
+            return;
+        }
     };
     let invalid = if val.contains("${{") || val.contains("}}") {
         Some(VALIDATE_BUCKET_REASON_TEMPLATE_REF)
@@ -103,7 +117,6 @@ fn validate_wal_archive_bucket(data_dir: &str) {
     let Some(reason) = invalid else {
         // Valid bucket name; remove any stale sentinel from a previous
         // boot's misconfiguration.
-        let marker = format!("{data_dir}/.pgbackrest_invalid_bucket");
         let _ = fs::remove_file(&marker);
         return;
     };
@@ -122,11 +135,9 @@ fn validate_wal_archive_bucket(data_dir: &str) {
             "pgbackrest: WAL_ARCHIVE_BUCKET looks invalid; refusing to enable archiving"
         );
     }
-    let marker = format!("{data_dir}/.pgbackrest_invalid_bucket");
-    // Best-effort: data_dir may not exist yet on first boot (Patroni
-    // hasn't initdb'd PGDATA). The on-disk sentinel is for the monitor's
-    // benefit; the log line is the operator-facing signal regardless.
-    let _ = fs::create_dir_all(data_dir);
+    // postgres_wrapper has already chowned volume_root to postgres:postgres
+    // before exec'ing patroni-runner, so writes here succeed as the
+    // postgres user.
     let _ = fs::write(&marker, format!("{reason}\n"));
     let _ = fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o640));
     for key in [
@@ -457,13 +468,18 @@ fn clear_pgbackrest_state_if_disabled(data_dir: &str) {
         rm(format!("{data_dir}/.pgbackrest_backup_state"));
         rm(format!("{data_dir}/.pgbackrest_gap_pending"));
         rm(format!("{data_dir}/.pgbackrest_repo_path"));
-        // Invalid-bucket sentinel + stanza-create timeout sentinel are
-        // scoped to the configured archive bucket; clear them too so
-        // the monitor doesn't surface "PITR enabled but wired to junk"
-        // or "stanza bootstrap timed out" against a service that's now
+        // Stanza-create timeout sentinel is scoped to the configured
+        // archive bucket; clear it too so the monitor doesn't surface
+        // "stanza bootstrap timed out" against a service that's now
         // intentionally in "no archive" state.
-        rm(format!("{data_dir}/.pgbackrest_invalid_bucket"));
         rm(format!("{data_dir}/.pgbackrest_stanza_create_timeout"));
+        // The invalid-bucket sentinel lives at volume root (NOT under
+        // PGDATA — see validate_wal_archive_bucket for rationale). Clear
+        // it too on archive-disable. Derived from data_dir's parent so
+        // we don't take a second arg.
+        if let Some(parent) = std::path::Path::new(data_dir).parent() {
+            rm(format!("{}/.pgbackrest_invalid_bucket", parent.display()));
+        }
     }
 
     if !recover_enabled {
@@ -990,9 +1006,9 @@ async fn main() -> Result<()> {
     // archive-push-wrapper's pg_wal threshold would eventually trip,
     // creating a real PITR gap from what is actually an upstream wiring
     // bug. Mirrors postgres-ssl PR #57 (validate_wal_archive_bucket).
-    let bootstrap_data_dir =
-        env::var("PGDATA").unwrap_or_else(|_| "/var/lib/postgresql/data/pgdata".to_string());
-    validate_wal_archive_bucket(&bootstrap_data_dir);
+    // Pass volume_root (not PGDATA) so the sentinel survives Patroni's
+    // bootstrap wipe of /pgdata on fresh volumes.
+    validate_wal_archive_bucket(&volume_root());
 
     // Translate the WAL_* env contract into pgBackRest-native PGBACKREST_*
     // before anything reads either set. Done first so Config::from_env() and
