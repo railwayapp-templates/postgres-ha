@@ -540,13 +540,20 @@ async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
 /// the backup we just ran into the failed_count anchor — without this
 /// the next iteration would see failed_count > last_full_failed_count
 /// and immediately re-fire detection.
-async fn clear_gap_recovery_state(data_dir: &str, reason: &str) {
+///
+/// `fallback_failed_count` is what we anchor with when the post-backup
+/// refresh errors (pg restart, brief unavailability right after a long
+/// backup). Without a fallback we'd anchor at 0 and the next iteration
+/// would see `stats.failed_count > 0` and immediately re-enter recovery
+/// on a stale baseline. Callers pass the pre-backup `failed_count` from
+/// the iteration's own stats.
+async fn clear_gap_recovery_state(data_dir: &str, reason: &str, fallback_failed_count: i64) {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
     let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
     let failed_count = refresh_archiver_stats()
         .await
         .map(|s| s.failed_count)
-        .unwrap_or(0);
+        .unwrap_or(fallback_failed_count);
     let _ = write_state_field(
         &state_path,
         "last_full_failed_count",
@@ -671,22 +678,22 @@ async fn gap_recovery_step(
                 force_attempts,
                 "pgbackrest-watcher: gap-recovery — catalog advanced, taking diff to anchor restore point"
             );
-            run_backup(data_dir, Action::Diff, stats).await;
-            // run_backup writes last_diff_at on success but doesn't
-            // touch gap state for diffs; clear it explicitly here. On
-            // failure, the marker stays and we retry next iteration.
-            // We re-check the marker post-run_backup: run_backup's
-            // success path doesn't unconditionally clear, but a diff
-            // failure path leaves it for retry.
-            let last_diff_str = read_state_field(&state_path, "last_diff_at");
-            let recent_diff = last_diff_str
-                .and_then(|s| s.parse::<i64>().ok())
-                .map(|t| (now_epoch() - t).abs() < 120)
-                .unwrap_or(false);
-            if recent_diff {
-                clear_gap_recovery_state(data_dir, "cleared by gap-recovery diff").await;
+            // Branch on run_backup's actual return — looking up
+            // last_diff_at as a "did it succeed?" proxy would match an
+            // unrelated periodic diff that happened to land seconds
+            // earlier, and incorrectly clear state on a recovery diff
+            // that actually failed. stats.failed_count is the
+            // pre-backup fallback for clear_gap_recovery_state's
+            // post-backup refresh.
+            if run_backup(data_dir, Action::Diff, stats).await {
+                clear_gap_recovery_state(
+                    data_dir,
+                    "cleared by gap-recovery diff",
+                    stats.failed_count,
+                )
+                .await;
             } else {
-                warn!("pgbackrest-watcher: gap-recovery diff did not complete; will retry next iteration");
+                warn!("pgbackrest-watcher: gap-recovery diff failed; retry on next iteration");
             }
             return;
         }
@@ -816,11 +823,17 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     }
 }
 
-async fn run_backup(data_dir: &str, action: Action, _stats_pre: &ArchiverStats) {
+/// Run `pgbackrest backup --type=<type>` and apply the post-success
+/// bookkeeping (state-file timestamps, gap-recovery state clear on a
+/// full, PITR anchor emit). Returns `true` if the backup succeeded so
+/// callers can branch on the actual exit code rather than guessing from
+/// `last_diff_at` proxies that could match an unrelated periodic diff
+/// completed seconds earlier.
+async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -> bool {
     let backup_type = match action {
         Action::Full => "full",
         Action::Diff => "diff",
-        Action::None { .. } => return,
+        Action::None { .. } => return false,
     };
     info!(backup_type = %backup_type, "pgbackrest-watcher: running backup");
 
@@ -867,8 +880,10 @@ async fn run_backup(data_dir: &str, action: Action, _stats_pre: &ArchiverStats) 
                     // clear_gap_recovery_state refreshes pg_stat_archiver
                     // and writes last_full_failed_count itself — folds any
                     // failure-during-backup into the anchor so the next
-                    // iteration doesn't re-fire detection.
-                    clear_gap_recovery_state(data_dir, "cleared by full backup").await;
+                    // iteration doesn't re-fire detection. Pre-backup
+                    // failed_count is the fallback if the post-backup
+                    // refresh errors (pg restart, brief unavailability).
+                    clear_gap_recovery_state(data_dir, "cleared by full backup", stats_pre.failed_count).await;
                 }
                 "diff" => {
                     let _ = write_state_field(&state_path, "last_diff_at", &now.to_string());
@@ -877,11 +892,16 @@ async fn run_backup(data_dir: &str, action: Action, _stats_pre: &ArchiverStats) 
             }
             info!(backup_type = %backup_type, "pgbackrest-watcher: backup completed");
             emit_pitr_anchor().await;
+            true
         }
         Ok(s) => {
-            warn!(status = ?s, backup_type = %backup_type, "pgbackrest-watcher: backup failed (will retry next poll)")
+            warn!(status = ?s, backup_type = %backup_type, "pgbackrest-watcher: backup failed (will retry next poll)");
+            false
         }
-        Err(e) => warn!(error = %e, "pgbackrest-watcher: backup invocation failed"),
+        Err(e) => {
+            warn!(error = %e, "pgbackrest-watcher: backup invocation failed");
+            false
+        }
     }
 }
 

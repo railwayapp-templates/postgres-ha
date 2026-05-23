@@ -542,7 +542,7 @@ archive_env() {
 # Same but with watcher-friendly cadence overrides.
 archive_env_fast_watcher() {
   archive_env
-  printf ' -e WAL_BACKUP_POLL_INTERVAL_SECONDS=5 -e WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS=10 -e WAL_BACKUP_INITIAL_POLL_SECONDS=2'
+  printf ' -e WAL_BACKUP_POLL_INTERVAL_SECONDS=5 -e WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS=10 -e WAL_BACKUP_INITIAL_POLL_SECONDS=2'
 }
 
 # ============================================================================
@@ -931,20 +931,29 @@ t_watcher_gap_recovery_full() {
   psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
   wait_for_watcher_backup "$leader" full 120 || { ko t_watcher_gap_recovery_full "no initial full"; teardown_scope "$scope"; return; }
 
-  local before_count
-  before_count=$(count_watcher_backup_logs "$leader" full)
+  local before_diff_count
+  before_diff_count=$(count_watcher_backup_logs "$leader" diff)
 
+  # Inject a marker by hand (simulates a wrapper-touched failure). On
+  # the next iteration, gap_recovery_step sees the marker, back-fills
+  # state with current catalog max, then waits for catalog advance.
   docker exec -u postgres "$leader" touch /var/lib/postgresql/data/pgdata/.pgbackrest_gap_pending
 
+  # Drive WAL so archive-push runs and catalog advances past the
+  # back-filled detection point — the recovery diff fires the iteration
+  # AFTER catalog advance is observed. Loop the WAL switch because the
+  # state machine needs to see the catalog actually move; a single
+  # switch may race the next iteration.
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    local now_count
-    now_count=$(count_watcher_backup_logs "$leader" full)
-    if [ "$now_count" -gt "$before_count" ]; then hit=1; break; fi
+    psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null 2>&1
+    local now_diff_count
+    now_diff_count=$(count_watcher_backup_logs "$leader" diff)
+    if [ "$now_diff_count" -gt "$before_diff_count" ]; then hit=1; break; fi
     sleep 3
   done
   if [ "$hit" != "1" ]; then
-    ko t_watcher_gap_recovery_full "no gap-recovery full"
+    ko t_watcher_gap_recovery_full "no gap-recovery diff"
     fail_dump t_watcher_gap_recovery_full "$leader"
     teardown_scope "$scope"
     return
@@ -955,8 +964,10 @@ t_watcher_gap_recovery_full() {
     teardown_scope "$scope"
     return
   fi
-  if ! docker logs "$leader" 2>&1 | grep -q "cleared gap marker"; then
-    ko t_watcher_gap_recovery_full "expected 'cleared gap marker' log line"
+  # The Rust clear_gap_recovery_state emits "gap-recovery state cleared"
+  # with the reason as a structured tracing field.
+  if ! docker logs "$leader" 2>&1 | grep -q "gap-recovery state cleared"; then
+    ko t_watcher_gap_recovery_full "expected 'gap-recovery state cleared' log line"
     teardown_scope "$scope"
     return
   fi
@@ -1632,7 +1643,7 @@ t_ha_failover_watcher_handoff() {
   # confirms the watcher is alive on the new leader.
   local deadline2=$(($(date +%s) + 120)) handoff=0
   while [ "$(date +%s)" -lt "$deadline2" ]; do
-    if docker logs "$leader2" 2>&1 | grep -E -q "pgbackrest-watcher: (no action|backup completed|cleared gap marker|running backup)"; then
+    if docker logs "$leader2" 2>&1 | grep -E -q "pgbackrest-watcher: (no action|backup completed|gap-recovery state cleared|running backup)"; then
       handoff=1
       break
     fi
