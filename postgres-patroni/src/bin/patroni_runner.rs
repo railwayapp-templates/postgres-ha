@@ -480,13 +480,15 @@ fn clear_pgbackrest_state_if_disabled(data_dir: &str) {
         // "stanza bootstrap timed out" against a service that's now
         // intentionally in "no archive" state.
         rm(format!("{data_dir}/.pgbackrest_stanza_create_timeout"));
-        // The invalid-bucket sentinel lives at volume root (NOT under
-        // PGDATA — see validate_wal_archive_bucket for rationale). Clear
-        // it too on archive-disable. Derived from data_dir's parent so
-        // we don't take a second arg.
-        if let Some(parent) = std::path::Path::new(data_dir).parent() {
-            rm(format!("{}/.pgbackrest_invalid_bucket", parent.display()));
-        }
+        //
+        // Intentionally NOT clearing .pgbackrest_invalid_bucket here:
+        // validate_wal_archive_bucket unsets WAL_ARCHIVE_BUCKET on
+        // rejection, which makes this function see archive_enabled=false
+        // and would race-delete the sentinel the validator just wrote
+        // (~20 ms apart). The validator handles the sentinel lifecycle
+        // itself: writes on a true rejection, removes when the env var
+        // is unset by the operator. Letting it own that file end-to-end
+        // avoids the self-overwrite.
     }
 
     if !recover_enabled {
