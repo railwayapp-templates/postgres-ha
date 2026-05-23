@@ -507,10 +507,22 @@ async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
 
 /// Clears all gap-recovery state (marker file + state fields). Called
 /// after a successful diff (recovery confirmed) or full (re-anchors the
-/// baseline).
-fn clear_gap_recovery_state(data_dir: &str, reason: &str) {
+/// baseline). Re-reads pg_stat_archiver to fold any failed pushes during
+/// the backup we just ran into the failed_count anchor — without this
+/// the next iteration would see failed_count > last_full_failed_count
+/// and immediately re-fire detection.
+async fn clear_gap_recovery_state(data_dir: &str, reason: &str) {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
     let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
+    let failed_count = refresh_archiver_stats()
+        .await
+        .map(|s| s.failed_count)
+        .unwrap_or(0);
+    let _ = write_state_field(
+        &state_path,
+        "last_full_failed_count",
+        &failed_count.to_string(),
+    );
     let _ = write_state_field(&state_path, "last_lag_detected_at", "0");
     let _ = write_state_field(&state_path, "catalog_max_at_detection", "");
     let _ = write_state_field(&state_path, "last_force_recovery_at", "0");
@@ -631,7 +643,7 @@ async fn gap_recovery_step(
                 .map(|t| (now_epoch() - t).abs() < 120)
                 .unwrap_or(false);
             if recent_diff {
-                clear_gap_recovery_state(data_dir, "cleared by gap-recovery diff");
+                clear_gap_recovery_state(data_dir, "cleared by gap-recovery diff").await;
             } else {
                 warn!("pgbackrest-watcher: gap-recovery diff did not complete; will retry next iteration");
             }
@@ -669,8 +681,19 @@ async fn gap_recovery_step(
         return;
     }
 
-    // Not in recovery. New detection?
-    if lag >= config.lag_threshold_segments {
+    // Not in recovery. Two independent entry conditions, both meaning
+    // "WAL coverage is diverging from the catalog":
+    //   - LSN lag ≥ threshold (async wedge / queue-max-trip — postgres
+    //     keeps handing off, async doesn't drain to S3)
+    //   - failed_count grew since the last full's anchor (foreground
+    //     hard failure — archive_command returning non-zero so postgres
+    //     never hands off; lag stays at 0 but archiving is broken just
+    //     the same)
+    let last_full_failed = read_state_field(&state_path, "last_full_failed_count")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let failed_grew = stats.failed_count > last_full_failed;
+    if lag >= config.lag_threshold_segments || failed_grew {
         if let Err(e) = fs::write(&gap_marker, "") {
             warn!(error = %e, "pgbackrest-watcher: failed to write gap marker");
             return;
@@ -684,8 +707,10 @@ async fn gap_recovery_step(
             catalog_max = %catalog_max,
             lag,
             threshold = config.lag_threshold_segments,
+            failed_count = stats.failed_count,
+            last_full_failed,
             backoff_seconds = config.gap_recovery_backoff,
-            "pgbackrest-watcher: lag ≥ threshold — entering gap-recovery, first pkill after backoff if catalog hasn't advanced"
+            "pgbackrest-watcher: entering gap-recovery, first pkill after backoff if catalog hasn't advanced"
         );
     }
 }
@@ -803,18 +828,11 @@ async fn run_backup(data_dir: &str, action: Action, _stats_pre: &ArchiverStats) 
                 "full" => {
                     let _ = write_state_field(&state_path, "last_full_at", &now.to_string());
                     let _ = write_state_field(&state_path, "last_diff_at", &now.to_string());
-                    // Re-read failed_count *after* the backup so a
-                    // failure during the backup itself is folded into
-                    // the high-water mark; otherwise the next iteration
-                    // would see growth and re-trigger immediately.
-                    if let Ok(post_stats) = refresh_archiver_stats().await {
-                        let _ = write_state_field(
-                            &state_path,
-                            "last_full_failed_count",
-                            &post_stats.failed_count.to_string(),
-                        );
-                    }
-                    clear_gap_recovery_state(data_dir, "cleared by full backup");
+                    // clear_gap_recovery_state refreshes pg_stat_archiver
+                    // and writes last_full_failed_count itself — folds any
+                    // failure-during-backup into the anchor so the next
+                    // iteration doesn't re-fire detection.
+                    clear_gap_recovery_state(data_dir, "cleared by full backup").await;
                 }
                 "diff" => {
                     let _ = write_state_field(&state_path, "last_diff_at", &now.to_string());
