@@ -146,11 +146,18 @@ fn env_u64_optional(key: &str) -> Option<u64> {
 #[derive(Default, Clone)]
 struct ArchiverStats {
     failed_count: i64,
+    last_archived_epoch: i64,
+    last_failed_epoch: i64,
     /// 24-char hex WAL filename of the most-recent segment Postgres handed
     /// off to the archive process. Empty when `pg_stat_archiver` reports
     /// NULL (cluster just started, never archived). Used by the LSN-lag
     /// probe to compare against `pgbackrest info`'s repo high-water.
     last_archived_wal: String,
+    /// 24-char hex WAL filename of the most-recent failed archive attempt.
+    /// Sticky until postgres restart — always check `last_failed_epoch >
+    /// last_archived_epoch` before acting on it to confirm the failure is
+    /// currently active rather than historical.
+    last_failed_wal: String,
     /// `0x100000000 / wal_segment_size` — how many WAL segments fit per
     /// XLogId. Default 256 for the standard 16 MiB segsize. Postgres
     /// allows any power-of-2 between 1 MiB and 1 GiB at initdb (via
@@ -245,11 +252,7 @@ async fn run(data_dir: String) -> Result<()> {
     }
 }
 
-async fn watcher_iteration(
-    data_dir: &str,
-    config: &WatcherConfig,
-    client: &reqwest::Client,
-) {
+async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqwest::Client) {
     // Sync per-cluster repo path on every iteration. The marker may not
     // exist on the very first iteration if patroni-runner's bootstrap
     // subshell hasn't run yet; later iterations pick it up.
@@ -377,9 +380,9 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
     // pages (pg_settings's PGC_INTERNAL unit for this GUC). Folding both
     // into a single round-trip keeps watcher iteration cheap.
     //
-    // COALESCE last_archived_wal to '-' so split_whitespace() doesn't
-    // collapse an empty trailing column into the preceding one and corrupt
-    // the bind. The sentinel is stripped below.
+    // COALESCE WAL names to '-' so split_whitespace() doesn't collapse an
+    // empty trailing column into the preceding one and corrupt the bind.
+    // The sentinel is stripped below.
     let out = Command::new("psql")
         .args([
             "-U",
@@ -394,6 +397,7 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
              COALESCE(EXTRACT(EPOCH FROM last_archived_time)::bigint, 0), \
              COALESCE(EXTRACT(EPOCH FROM last_failed_time)::bigint, 0), \
              COALESCE(last_archived_wal, '-'), \
+             COALESCE(last_failed_wal, '-'), \
              (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') \
              FROM pg_stat_archiver",
         ])
@@ -413,14 +417,15 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
         anyhow::bail!("pg_stat_archiver returned empty result");
     }
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 5 {
+    if parts.len() < 6 {
         anyhow::bail!("pg_stat_archiver malformed: {line}");
     }
-    let wal = parts[3];
-    let last_archived_wal = if wal == "-" {
-        String::new()
-    } else {
-        wal.to_string()
+    let sentinel_to_empty = |s: &str| {
+        if s == "-" {
+            String::new()
+        } else {
+            s.to_string()
+        }
     };
     // wal_segment_size is reported as the number of 8 KiB pages per
     // segment. Convert to bytes, then to segments-per-XLogId. Fall back
@@ -428,7 +433,7 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
     // strictly better than panicking, and a wrong-by-power-of-2 scaling
     // gets the watcher firing on a slightly different threshold rather
     // than not at all.
-    let segments_per_log_file = parts[4]
+    let segments_per_log_file = parts[5]
         .parse::<u64>()
         .ok()
         .filter(|&p| p > 0)
@@ -442,7 +447,10 @@ async fn refresh_archiver_stats() -> Result<ArchiverStats> {
         .unwrap_or(DEFAULT_SEGMENTS_PER_LOG_FILE);
     Ok(ArchiverStats {
         failed_count: parts[0].parse().unwrap_or(0),
-        last_archived_wal,
+        last_archived_epoch: parts[1].parse().unwrap_or(0),
+        last_failed_epoch: parts[2].parse().unwrap_or(0),
+        last_archived_wal: sentinel_to_empty(parts[3]),
+        last_failed_wal: sentinel_to_empty(parts[4]),
         segments_per_log_file,
     })
 }
@@ -507,9 +515,9 @@ struct CatalogProbe {
 /// collapsed both into "lag=0" and silently masked real wedges.
 fn parse_catalog_max(info_json: &str, tl_hex: &str) -> Result<Option<String>> {
     let v: serde_json::Value = serde_json::from_str(info_json)?;
-    let stanzas = v.as_array().ok_or_else(|| {
-        anyhow::anyhow!("pgbackrest info JSON top-level not an array")
-    })?;
+    let stanzas = v
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("pgbackrest info JSON top-level not an array"))?;
     let mut best: Option<String> = None;
     for stanza in stanzas {
         let Some(archives) = stanza.get("archive").and_then(|a| a.as_array()) else {
@@ -544,7 +552,9 @@ async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
         return Ok(CatalogProbe::default());
     }
     let handed_off = segment_to_number(&stats.last_archived_wal, stats.segments_per_log_file)
-        .ok_or_else(|| anyhow::anyhow!("malformed last_archived_wal: {}", stats.last_archived_wal))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("malformed last_archived_wal: {}", stats.last_archived_wal)
+        })?;
 
     let out = tokio::time::timeout(
         Duration::from_secs(30),
@@ -573,6 +583,111 @@ async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
         None => 0,
     };
     Ok(CatalogProbe { catalog_max, lag })
+}
+
+/// Self-heals a WAL_REGRESSION condition by migrating archiving to a new S3
+/// path suffix (e.g. cluster-SYSID → cluster-SYSID-2). WAL_REGRESSION occurs
+/// when a volume snapshot rollback restores the data directory to an earlier
+/// LSN while S3 retains the pre-rollback WAL at the same segment names.
+/// pgBackRest refuses to overwrite existing S3 objects with different content
+/// (exit 45) — grace periods and pkill-async cycles cannot fix this.
+///
+/// Migration is non-destructive: old path and all its backups stay in S3.
+/// Both the archive-push wrapper and this watcher re-read
+/// `.pgbackrest_repo_path` on every call/iteration, so writing the new path
+/// there takes effect without a redeploy. All backup state is then reset so
+/// the next iteration enters NEEDS_INITIAL_BACKUP at the new path.
+fn migrate_to_new_archive_path(data_dir: &str) {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
+    let repo_path_marker = format!("{data_dir}/{REPO_PATH_MARKER}");
+
+    let old_path = env::var("PGBACKREST_REPO1_PATH").unwrap_or_default();
+
+    // Store the original (gen 0) path once so successive migrations produce
+    // -2, -3, … instead of chaining suffixes like -2-2.
+    let orig_path = read_state_field(&state_path, "wal_regression_orig_path")
+        .unwrap_or_else(|| old_path.clone());
+    if read_state_field(&state_path, "wal_regression_orig_path").is_none() {
+        let _ = write_state_field(&state_path, "wal_regression_orig_path", &orig_path);
+    }
+    let gen = read_state_field(&state_path, "wal_regression_gen")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+        + 1;
+    let _ = write_state_field(&state_path, "wal_regression_gen", &gen.to_string());
+
+    // Suffix: gen=1 → -2, gen=2 → -3, etc.
+    let new_path = format!("{orig_path}-{}", gen + 1);
+
+    info!(
+        old_path = %old_path,
+        new_path = %new_path,
+        "pgbackrest-watcher: wal-regression: migrating archive path; old backups preserved"
+    );
+
+    if let Err(e) = fs::write(&repo_path_marker, &new_path) {
+        warn!(error = %e, "pgbackrest-watcher: wal-regression: failed to write repo path marker");
+        return;
+    }
+    env::set_var("PGBACKREST_REPO1_PATH", &new_path);
+
+    // Reset all backup/gap state so the next iteration enters
+    // NEEDS_INITIAL_BACKUP at the new path. GAP_MARKER cleared so
+    // decide_action is unblocked.
+    let _ = write_state_field(&state_path, "last_full_at", "");
+    let _ = write_state_field(&state_path, "last_diff_at", "");
+    let _ = write_state_field(&state_path, "last_full_failed_count", "0");
+    let _ = write_state_field(&state_path, "last_lag_detected_at", "0");
+    let _ = write_state_field(&state_path, "catalog_max_at_detection", "");
+    let _ = write_state_field(&state_path, "last_force_recovery_at", "0");
+    let _ = write_state_field(&state_path, "force_attempts", "0");
+    let _ = fs::remove_file(&gap_marker);
+
+    info!(
+        new_path = %new_path,
+        "pgbackrest-watcher: wal-regression: state reset; next iteration will initialize stanza and take full backup"
+    );
+}
+
+/// Returns true (and calls `migrate_to_new_archive_path`) when the data is
+/// consistent with WAL_REGRESSION: `last_failed_wal` is behind the S3
+/// catalog max on the same timeline, and the failure is currently active
+/// (`last_failed_epoch > last_archived_epoch`).
+fn check_wal_regression(data_dir: &str, stats: &ArchiverStats, catalog_max: &str) -> bool {
+    if stats.last_failed_wal.is_empty() || catalog_max.is_empty() {
+        return false;
+    }
+    // Guard: failure must be currently active (more recent than last success).
+    // pg_stat_archiver.last_failed_wal is sticky until postgres restart.
+    if stats.last_failed_epoch == 0 || stats.last_failed_epoch <= stats.last_archived_epoch {
+        return false;
+    }
+    if stats.last_failed_wal.len() != 24 || catalog_max.len() != 24 {
+        return false;
+    }
+    // Must be on the same timeline.
+    if &stats.last_failed_wal[..8] != &catalog_max[..8] {
+        return false;
+    }
+    let failed_n = match segment_to_number(&stats.last_failed_wal, stats.segments_per_log_file) {
+        Some(n) => n,
+        None => return false,
+    };
+    let catalog_n = match segment_to_number(catalog_max, stats.segments_per_log_file) {
+        Some(n) => n,
+        None => return false,
+    };
+    if failed_n >= catalog_n {
+        return false;
+    }
+    info!(
+        failed_wal = %stats.last_failed_wal,
+        catalog_max = %catalog_max,
+        "pgbackrest-watcher: wal-regression: detected (failed_wal < catalog_max on same timeline) — self-healing"
+    );
+    migrate_to_new_archive_path(data_dir);
+    true
 }
 
 /// Clears all gap-recovery state (marker file + state fields). Called
@@ -766,11 +881,7 @@ fn decide_gap_recovery(inp: &GapRecoveryInputs) -> GapRecoveryAction {
     GapRecoveryAction::Wait
 }
 
-async fn gap_recovery_step(
-    data_dir: &str,
-    config: &WatcherConfig,
-    stats: &ArchiverStats,
-) {
+async fn gap_recovery_step(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) {
     let now = now_epoch();
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
     let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
@@ -782,11 +893,19 @@ async fn gap_recovery_step(
             return;
         }
     };
+    let catalog_max = probe.catalog_max.unwrap_or_default();
+
+    // WAL_REGRESSION is structural (archive path conflict after volume
+    // rollback), not a transient async lag. Migrate to a new non-conflicting
+    // repo path and return so the next iteration starts clean.
+    if check_wal_regression(data_dir, stats, &catalog_max) {
+        return;
+    }
 
     let inp = GapRecoveryInputs {
         now,
         lag: probe.lag,
-        catalog_max: probe.catalog_max.unwrap_or_default(),
+        catalog_max,
         handoff_wal: stats.last_archived_wal.clone(),
         failed_count: stats.failed_count,
         marker_present: Path::new(&gap_marker).exists(),
@@ -812,7 +931,9 @@ async fn gap_recovery_step(
     match decide_gap_recovery(&inp) {
         GapRecoveryAction::NoOp => {}
 
-        GapRecoveryAction::Detect { catalog_at_detection } => {
+        GapRecoveryAction::Detect {
+            catalog_at_detection,
+        } => {
             if let Err(e) = fs::write(&gap_marker, "") {
                 warn!(error = %e, "pgbackrest-watcher: failed to write gap marker");
                 return;
@@ -1020,7 +1141,12 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
                     // iteration doesn't re-fire detection. Pre-backup
                     // failed_count is the fallback if the post-backup
                     // refresh errors (pg restart, brief unavailability).
-                    clear_gap_recovery_state(data_dir, "cleared by full backup", stats_pre.failed_count).await;
+                    clear_gap_recovery_state(
+                        data_dir,
+                        "cleared by full backup",
+                        stats_pre.failed_count,
+                    )
+                    .await;
                 }
                 "diff" => {
                     let _ = write_state_field(&state_path, "last_diff_at", &now.to_string());
@@ -1082,7 +1208,9 @@ async fn emit_pitr_anchor() {
             stderr = %String::from_utf8_lossy(&o.stderr),
             "pgbackrest-watcher: pitr anchor emit failed (non-fatal)"
         ),
-        Err(e) => warn!(error = %e, "pgbackrest-watcher: pitr anchor invocation failed (non-fatal)"),
+        Err(e) => {
+            warn!(error = %e, "pgbackrest-watcher: pitr anchor invocation failed (non-fatal)")
+        }
     }
 }
 
