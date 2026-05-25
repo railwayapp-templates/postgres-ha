@@ -54,6 +54,131 @@ fn translate_wal_env_to_pgbackrest() {
     }
 }
 
+/// Reasons `validate_wal_archive_bucket` may reject `WAL_ARCHIVE_BUCKET`.
+/// Each value is the sentinel-file payload that the admin monitor reads
+/// to distinguish "never enabled" from one of these misconfigurations.
+const VALIDATE_BUCKET_REASON_TEMPLATE_REF: &str = "unresolved-template-ref";
+const VALIDATE_BUCKET_REASON_WHITESPACE: &str = "whitespace";
+const VALIDATE_BUCKET_REASON_UUID_SHAPE: &str = "uuid-shape";
+
+/// Screen `WAL_ARCHIVE_BUCKET` for known-bogus shapes before
+/// `translate_wal_env_to_pgbackrest` exports it as `PGBACKREST_REPO1_S3_BUCKET`.
+/// If invalid, unset the WAL_ARCHIVE_* env vars so every downstream gate
+/// treats archiving as off, then drop a `.pgbackrest_invalid_bucket`
+/// sentinel under the **volume root** (NOT PGDATA) so the admin
+/// dashboard can surface the "PITR enabled but wired to junk" state
+/// distinctly from "PITR never enabled" or "PITR misconfigured creds."
+/// Mirrors postgres-ssl `wrapper.sh::validate_wal_archive_bucket`.
+///
+/// Path choice: PGDATA itself (`<volume_root>/pgdata`) gets wiped/
+/// reinitialized by Patroni's bootstrap on the first boot of a fresh
+/// volume — a sentinel inside it would silently disappear before the
+/// dashboard could read it. The volume root is on the same persistent
+/// volume but outside Patroni's reach, so the sentinel survives
+/// initdb + bootstrap.
+///
+/// Caught shapes:
+///   - contains `${{` or `}}` → unresolved Railway template ref leaked
+///     by the resolver (most common misconfiguration cause)
+///   - whitespace or control chars → typo or shell-escape mishap
+///   - UUID 8-4-4-4-12 hex → almost certainly a raw bucket-id from a
+///     tombstoned bucket; opt out via `WAL_ARCHIVE_BUCKET_ALLOW_UUID=1`
+///     if you legitimately use a UUID-named bucket.
+///
+/// Sentinel cleanup: `clear_pgbackrest_state_if_disabled` removes the
+/// sentinel on disable (WAL_ARCHIVE_BUCKET unset on next boot).
+fn validate_wal_archive_bucket(volume_root: &str) {
+    let marker = format!("{volume_root}/.pgbackrest_invalid_bucket");
+    let val = match env::var("WAL_ARCHIVE_BUCKET").ok().filter(|s| !s.is_empty()) {
+        Some(v) => v,
+        None => {
+            // Bucket unset → either never configured or already
+            // intentionally disabled. Clear any stale sentinel so the
+            // dashboard doesn't flag a now-disabled service.
+            let _ = fs::remove_file(&marker);
+            return;
+        }
+    };
+    let invalid = if val.contains("${{") || val.contains("}}") {
+        Some(VALIDATE_BUCKET_REASON_TEMPLATE_REF)
+    } else if val.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        Some(VALIDATE_BUCKET_REASON_WHITESPACE)
+    } else if env::var("WAL_ARCHIVE_BUCKET_ALLOW_UUID")
+        .ok()
+        .filter(|s| s == "1")
+        .is_none()
+        && is_uuid_shape(&val)
+    {
+        Some(VALIDATE_BUCKET_REASON_UUID_SHAPE)
+    } else {
+        None
+    };
+
+    let Some(reason) = invalid else {
+        // Valid bucket name; remove any stale sentinel from a previous
+        // boot's misconfiguration.
+        let _ = fs::remove_file(&marker);
+        return;
+    };
+
+    if reason == VALIDATE_BUCKET_REASON_UUID_SHAPE {
+        warn!(
+            value = %val,
+            reason = %reason,
+            "pgbackrest: WAL_ARCHIVE_BUCKET looks invalid (uuid-shape); refusing to enable archiving. \
+             If this UUID is your legitimate bucket name, set WAL_ARCHIVE_BUCKET_ALLOW_UUID=1 to override."
+        );
+    } else {
+        warn!(
+            value = %val,
+            reason = %reason,
+            "pgbackrest: WAL_ARCHIVE_BUCKET looks invalid; refusing to enable archiving"
+        );
+    }
+    // postgres_wrapper has already chowned volume_root to postgres:postgres
+    // before exec'ing patroni-runner, so writes here succeed as the
+    // postgres user. Log errors loudly — silent failures here mean the
+    // dashboard wouldn't show the misconfiguration and operators would
+    // think PITR was never enabled (rather than wired to junk).
+    match fs::write(&marker, format!("{reason}\n")) {
+        Ok(()) => info!(marker = %marker, "pgbackrest: invalid-bucket sentinel written"),
+        Err(e) => warn!(marker = %marker, error = %e, "pgbackrest: failed to write invalid-bucket sentinel"),
+    }
+    if let Err(e) = fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o640)) {
+        warn!(marker = %marker, error = %e, "pgbackrest: failed to set sentinel permissions");
+    }
+    for key in [
+        "WAL_ARCHIVE_BUCKET",
+        "WAL_ARCHIVE_KEY",
+        "WAL_ARCHIVE_SECRET",
+        "WAL_ARCHIVE_REGION",
+        "WAL_ARCHIVE_ENDPOINT",
+    ] {
+        env::remove_var(key);
+    }
+}
+
+/// Returns `true` when `s` matches the literal 8-4-4-4-12 lowercase-hex
+/// UUID shape (no version/variant nibble enforcement — Railway's bucket
+/// ids are random enough that any uuid-shaped string is likely a leak).
+fn is_uuid_shape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    let dash_positions = [8usize, 13, 18, 23];
+    for (i, b) in bytes.iter().enumerate() {
+        if dash_positions.contains(&i) {
+            if *b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() || b.is_ascii_uppercase() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Copy a `WAL_<role>_*` quintuple onto a `PGBACKREST_<repo>_S3_*` quintuple
 /// (plus the non-S3-prefixed `_PATH` knob). Path defaults to `/pgbackrest`
 /// when unset, matching the wrapper.sh behavior in postgres-ssl.
@@ -350,6 +475,20 @@ fn clear_pgbackrest_state_if_disabled(data_dir: &str) {
         rm(format!("{data_dir}/.pgbackrest_backup_state"));
         rm(format!("{data_dir}/.pgbackrest_gap_pending"));
         rm(format!("{data_dir}/.pgbackrest_repo_path"));
+        // Stanza-create timeout sentinel is scoped to the configured
+        // archive bucket; clear it too so the monitor doesn't surface
+        // "stanza bootstrap timed out" against a service that's now
+        // intentionally in "no archive" state.
+        rm(format!("{data_dir}/.pgbackrest_stanza_create_timeout"));
+        //
+        // Intentionally NOT clearing .pgbackrest_invalid_bucket here:
+        // validate_wal_archive_bucket unsets WAL_ARCHIVE_BUCKET on
+        // rejection, which makes this function see archive_enabled=false
+        // and would race-delete the sentinel the validator just wrote
+        // (~20 ms apart). The validator handles the sentinel lifecycle
+        // itself: writes on a true rejection, removes when the env var
+        // is unset by the operator. Letting it own that file end-to-end
+        // avoids the self-overwrite.
     }
 
     if !recover_enabled {
@@ -461,6 +600,17 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
         Ok(b) if !b.is_empty() => b,
         _ => return Ok(()),
     };
+    // Skip when this volume has already completed recovery — the source
+    // bucket's read credentials are no longer needed for archive-get on
+    // a long-promoted cluster (archive_command uses the main pgbackrest
+    // conf, not the recovery-source conf). Rewriting on every boot leaks
+    // credentials onto disk for no functional benefit. Mirrors
+    // postgres-ssl wrapper.sh's L6 gate.
+    if Path::new(&format!("{data_dir}/.pgbackrest_restored")).exists()
+        || Path::new(&format!("{data_dir}/.pitr_configured")).exists()
+    {
+        return Ok(());
+    }
     let key = env::var("WAL_RECOVER_FROM_KEY").unwrap_or_default();
     let secret = env::var("WAL_RECOVER_FROM_SECRET").unwrap_or_default();
     let region = env::var("WAL_RECOVER_FROM_REGION").unwrap_or_default();
@@ -669,10 +819,22 @@ fn spawn_bootstrap_stanza_create() {
         .is_some();
 
     tokio::spawn(async move {
+        let timeout_sentinel = format!("{data_dir}/.pgbackrest_stanza_create_timeout");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
         loop {
             if tokio::time::Instant::now() >= deadline {
                 warn!("pgbackrest: timed out waiting for Postgres before stanza-create");
+                // Drop a sentinel so the monitor can distinguish
+                // "stanza bootstrap timed out" from "archiving never
+                // enabled" — the latter has archive_command unset; the
+                // former has archive_command set but no stanza in the
+                // bucket. Cleared on success below and by
+                // clear_pgbackrest_state_if_disabled on archive disable.
+                let _ = fs::write(&timeout_sentinel, "pg_isready-timeout\n");
+                let _ = fs::set_permissions(
+                    &timeout_sentinel,
+                    std::fs::Permissions::from_mode(0o640),
+                );
                 return;
             }
             let probe = tokio::process::Command::new("pg_isready")
@@ -721,6 +883,18 @@ fn spawn_bootstrap_stanza_create() {
         loop {
             if tokio::time::Instant::now() >= deadline {
                 warn!("pgbackrest: timed out waiting for primary promotion before stanza-create");
+                // Same sentinel as the pg_isready timeout above —
+                // surfaces "stanza bootstrap did not run" to the monitor
+                // regardless of which deadline branch fired. Replicas
+                // legitimately reach this on every boot; they don't have
+                // WAL_ARCHIVE_BUCKET=set without also being primary in
+                // production, so the sentinel reflects an actual
+                // misconfiguration rather than normal HA topology.
+                let _ = fs::write(&timeout_sentinel, "promotion-timeout\n");
+                let _ = fs::set_permissions(
+                    &timeout_sentinel,
+                    std::fs::Permissions::from_mode(0o640),
+                );
                 return;
             }
             let out = tokio::process::Command::new("psql")
@@ -778,6 +952,13 @@ fn spawn_bootstrap_stanza_create() {
             match out {
                 Ok(s) if s.success() => {
                     info!("pgbackrest: stanza-create completed");
+                    // Clear the timeout sentinel — a successful
+                    // stanza-create either arrived inside the deadline
+                    // (no sentinel) or after a previous boot's timeout
+                    // (stale sentinel from disk). Either way, the
+                    // current state is "stanza present"; the dashboard
+                    // should treat the timeout as resolved.
+                    let _ = fs::remove_file(&timeout_sentinel);
                     break;
                 }
                 Ok(s) => {
@@ -826,6 +1007,17 @@ fn spawn_bootstrap_stanza_create() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _guard = init_logging("patroni-runner");
+
+    // Screen WAL_ARCHIVE_BUCKET shape before translation so a junk value
+    // (unresolved Railway template ref, raw bucket-id UUID, whitespace)
+    // doesn't get exported as PGBACKREST_REPO1_S3_BUCKET — pgBackRest
+    // would then hard-fail every archive_command and the
+    // archive-push-wrapper's pg_wal threshold would eventually trip,
+    // creating a real PITR gap from what is actually an upstream wiring
+    // bug. Mirrors postgres-ssl PR #57 (validate_wal_archive_bucket).
+    // Pass volume_root (not PGDATA) so the sentinel survives Patroni's
+    // bootstrap wipe of /pgdata on fresh volumes.
+    validate_wal_archive_bucket(&volume_root());
 
     // Translate the WAL_* env contract into pgBackRest-native PGBACKREST_*
     // before anything reads either set. Done first so Config::from_env() and
@@ -919,6 +1111,30 @@ async fn main() -> Result<()> {
     // (WAL_ARCHIVE_BUCKET set). Has only repo1 = the service's own bucket.
     render_pgbackrest_conf(&config.data_dir, queue_max_mib)?;
 
+    // Synchronously write the per-cluster repo-path marker if pg_control
+    // is on disk and archive is enabled. Without this, an existing-volume
+    // first-enable-after-image-upgrade can race: Patroni starts postgres,
+    // archive_command fires on the first WAL switch (≤archive_timeout=60s),
+    // and the archive-push wrapper reads no marker → uses the default
+    // repo1-path (bucket root, no cluster-<sysid> sub-prefix). The
+    // spawn_bootstrap_stanza_create task can't write the marker until
+    // pg_isready + promotion check succeed, which is later. on_role_change
+    // covers post-promotion writes; this covers the first-boot path before
+    // any promotion event. Fresh-init is handled separately (initdb hook).
+    if env::var("WAL_ARCHIVE_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+        && Path::new(&format!("{}/global/pg_control", config.data_dir)).exists()
+        && !Path::new(&format!("{}/.pgbackrest_repo_path", config.data_dir)).exists()
+    {
+        let repo_path = derive_pgbackrest_repo_path(&config.data_dir);
+        info!(
+            repo_path = %repo_path,
+            "pgbackrest: pre-Patroni repo-path marker rendered (existing-volume first-enable path)"
+        );
+    }
+
     // Render /etc/pgbackrest/pgbackrest-recovery-source.conf when
     // WAL_RECOVER_FROM_BUCKET is set. Has only the source bucket as
     // repo1 (per-config numbering). Used by restore_command (archive-get
@@ -1002,4 +1218,56 @@ async fn main() -> Result<()> {
     spawn_backup_watcher(config.data_dir.clone());
 
     run_monitoring_loop(&config, child, &telemetry).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_uuid_shape;
+
+    #[test]
+    fn is_uuid_shape_accepts_canonical() {
+        assert!(is_uuid_shape("121ccc45-0912-457e-8dc0-76625fe644bb"));
+        assert!(is_uuid_shape("00000000-0000-0000-0000-000000000000"));
+        assert!(is_uuid_shape("deadbeef-cafe-babe-c0de-feedfacef00d"));
+    }
+
+    #[test]
+    fn is_uuid_shape_rejects_uppercase_hex() {
+        // Bucket-id leaks are always lowercase. Reject uppercase so an
+        // operator's intentionally-mixed-case bucket like
+        // "Acme-2024-08" doesn't trip the validator just because of
+        // its hex character set.
+        assert!(!is_uuid_shape("121CCC45-0912-457E-8DC0-76625FE644BB"));
+    }
+
+    #[test]
+    fn is_uuid_shape_rejects_wrong_length() {
+        assert!(!is_uuid_shape(""));
+        assert!(!is_uuid_shape("121ccc45-0912-457e-8dc0-76625fe644b")); // 35
+        assert!(!is_uuid_shape("121ccc45-0912-457e-8dc0-76625fe644bbb")); // 37
+    }
+
+    #[test]
+    fn is_uuid_shape_rejects_non_hex() {
+        assert!(!is_uuid_shape("121ccc45-0912-457e-8dc0-76625fe644bg")); // g
+        assert!(!is_uuid_shape("121ccc45-0912-457e-8dc0-76625fe644b!"));
+    }
+
+    #[test]
+    fn is_uuid_shape_rejects_misplaced_dashes() {
+        // All four dashes must be at positions 8, 13, 18, 23.
+        assert!(!is_uuid_shape("121ccc450-912-457e-8dc0-76625fe644bb"));
+        assert!(!is_uuid_shape("121ccc45-0912-457e-8dc076-625fe644bb"));
+        assert!(!is_uuid_shape("121ccc4509124-57e-8dc0-76625fe644bb"));
+    }
+
+    #[test]
+    fn is_uuid_shape_rejects_plausible_bucket_names() {
+        // Real-world bucket names that the validator must NOT reject.
+        assert!(!is_uuid_shape("pgbackrest"));
+        assert!(!is_uuid_shape("railway-pgbackrest-prod"));
+        assert!(!is_uuid_shape("my-bucket-with-dashes"));
+        // Looks UUID-ish but isn't 8-4-4-4-12.
+        assert!(!is_uuid_shape("121ccc45-0912-457e-8dc0"));
+    }
 }
