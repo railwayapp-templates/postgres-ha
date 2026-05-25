@@ -1,41 +1,45 @@
 #!/bin/bash
 # pgbackrest-archive-push-wrapper.sh — invoked by Postgres as archive_command.
 #
-# Wraps `pgbackrest archive-push` so that any kind of archive failure (hard
-# repo error, stuck async worker, anything else) cannot fill pg_wal/ and halt
-# Postgres. When pgbackrest fails AND pg_wal/ has grown past a threshold
-# (WAL_DROP_THRESHOLD_MB; sized by patroni_runner's compute_volume_thresholds
-# to min(500 MiB, ~10% of volume) with operator override via this env var
-# or the legacy PGBACKREST_DROP_THRESHOLD_MB), the wrapper returns success
-# to Postgres anyway. Postgres recycles the WAL segment as if archiving were
-# disabled. The PITR window gets a coverage gap from this segment forward;
-# the dashboard reads pg_stat_archiver to surface "PITR broken — fix
-# archiving config" so the underlying issue (bad creds, deleted bucket,
-# expired keys, …) gets fixed.
+# Wraps `pgbackrest archive-push` to keep Postgres alive when archiving can't
+# keep up with WAL generation. Three drop paths, all touch the gap_marker so
+# pgbackrest-backup-watcher.sh takes a fresh diff once archiving recovers
+# (sealing forward-restore coverage; the dropped segments themselves are
+# unrestorable, by design):
 #
-# Special case: if the bucket actively does not exist (S3 NoSuchBucket error),
-# there is no recovery without operator action — retrying is pointless and
-# letting WAL accumulate up to the threshold wastes disk. In that case the
-# wrapper drops immediately (returns 0) regardless of pg_wal size.
+#   1. PRE-ARCHIVE size check — before calling pgbackrest, drop the incoming
+#      segment if pg_wal is already past WAL_DROP_THRESHOLD_MB. Bounds the
+#      backlog when archiving succeeds individually but the async-push rate
+#      lags WAL generation (the failure mode that crashed junior.mtdn.dev:
+#      ~28 GiB pg_wal accumulated while pg_stat_archiver.failed_count stayed
+#      at 0 and every archive_command returned 0; the reactive check below
+#      never fired until disk filled and Postgres was already crashing).
 #
-# Why ≤500 MiB here, vs pgBackRest's archive-push-queue-max ≤5GiB:
-# the two thresholds gate orthogonal failure regimes. archive-push-queue-max
-# governs the SPOOL — graceful absorption of transient S3 stalls, where the
-# async worker keeps retrying and most segments eventually get pushed. A
-# generous buffer there absorbs hours of outage cleanly. This wrapper-side
-# threshold gates the HARD-FAILURE path: bad creds, deleted bucket, expired
-# keys — pgbackrest's foreground returns non-zero immediately and there's
-# no realistic chance the next retry succeeds without operator intervention.
-# Holding 5 GiB of pg_wal hostage waiting for a fix that requires a config
-# change wastes data-volume disk; 500 MiB is enough to ride out a multi-
-# minute config-redeploy window without eating into customer disk budgets.
-# Both ceilings scale down proportionally on small volumes (1 GiB Hobby ⇒
-# ~100 MiB pg_wal / ~512 MiB spool) so a tiny volume isn't dominated by
-# archive buffers; on ≥25 GiB volumes both caps hold.
+#   2. PRE-ARCHIVE free-disk check — drop if the data volume has less free
+#      space than WAL_DROP_THRESHOLD_MB, regardless of what's filling it.
+#      Mirrors the pg_wal cap so both protect Postgres uptime symmetrically:
+#      the cap is both the max pg_wal we retain AND the minimum free disk we
+#      keep available for Postgres to operate.
 #
-# Below the threshold the wrapper surfaces pgbackrest's failure to Postgres
-# normally, so transient errors retry on the next archive_timeout instead
-# of being silently dropped.
+#   3. POST-FAILURE check — if pgbackrest exited non-zero AND pg_wal is past
+#      threshold, drop. Catches hard failures (bad creds, deleted bucket,
+#      expired keys) where the foreground returns non-zero immediately and
+#      retrying without operator intervention has zero chance of success.
+#      Below threshold, pgbackrest's non-zero exit surfaces to Postgres so
+#      pg_stat_archiver.failed_count climbs and the dashboard surfaces
+#      "PITR broken — fix archiving config" before the threshold trips and
+#      the failure signal disappears.
+#
+# Special case: NoSuchBucket / InvalidAccessKeyId always drop immediately
+# regardless of pg_wal size — no recovery is possible without operator
+# action, so holding any pg_wal hostage just wastes disk.
+#
+# Threshold sizing (WAL_DROP_THRESHOLD_MB; defaults set by patroni_runner's
+# compute_volume_thresholds): ~10% of volume, capped at 5 GiB, floor 64 MiB.
+# Matches pgBackRest's archive-push-queue-max=5 GiB spool cap so pg_wal and
+# spool consume symmetric on-disk budgets under sustained outage. Operator
+# override via the WAL_DROP_THRESHOLD_MB env var (or the legacy
+# PGBACKREST_DROP_THRESHOLD_MB).
 
 set -u
 
@@ -46,8 +50,35 @@ if [ -z "$WAL_FILE" ]; then
 fi
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
-PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-${PGBACKREST_DROP_THRESHOLD_MB:-500}}"
+PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-${PGBACKREST_DROP_THRESHOLD_MB:-5120}}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
+
+mark_gap_and_log() {
+  # $1 = reason string; logs + touches the gap marker so the watcher takes
+  # a fresh diff once archiving recovers, anchoring forward-restore coverage.
+  echo "pgbackrest-wrapper: $1; dropping ${WAL_FILE} to keep Postgres up" >&2
+  touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
+}
+
+# Pre-archive safety. Drop without invoking pgbackrest when EITHER pg_wal is
+# already past threshold OR free disk is below threshold. The post-failure
+# check below only fires on pgbackrest non-zero exit, which leaves the
+# "archive succeeds individually but throughput < WAL generation" regime
+# undefended — every call returned 0, the reactive du never ran, pg_wal grew
+# to 28 GiB before Postgres ran out of disk.
+PGWAL_BYTES=$(du -sb "$PGDATA/pg_wal" 2>/dev/null | awk '{print $1}')
+FREE_BYTES=$(df -P -k "$PGDATA" 2>/dev/null | awk 'NR==2 {print $4 * 1024}')
+
+if [ -n "${PGWAL_BYTES:-}" ] && [ "$PGWAL_BYTES" -ge "$PGWAL_THRESHOLD_BYTES" ]; then
+  PGWAL_MB=$(( PGWAL_BYTES / 1024 / 1024 ))
+  mark_gap_and_log "pg_wal at ${PGWAL_MB} MiB before archive-push (threshold ${PGWAL_THRESHOLD_MB} MiB)"
+  exit 0
+fi
+if [ -n "${FREE_BYTES:-}" ] && [ "$FREE_BYTES" -lt "$PGWAL_THRESHOLD_BYTES" ]; then
+  FREE_MB=$(( FREE_BYTES / 1024 / 1024 ))
+  mark_gap_and_log "${FREE_MB} MiB free on ${PGDATA} (threshold ${PGWAL_THRESHOLD_MB} MiB)"
+  exit 0
+fi
 
 # Per-cluster repo-path: read the marker written by patroni-runner's
 # bootstrap subshell. Without this, every archive-push would go to the
@@ -79,11 +110,14 @@ fi
 # on the PUT. Both errors mean no recovery without operator action — drop
 # immediately rather than accumulating WAL up to the threshold.
 if printf '%s\n' "$pgb_out" | grep -qE 'NoSuchBucket|InvalidAccessKeyId'; then
-  echo "pgbackrest-wrapper: bucket gone or credentials revoked; dropping ${WAL_FILE} immediately" >&2
-  touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
+  mark_gap_and_log "bucket gone or credentials revoked"
   exit 0
 fi
 
+# Post-failure check: re-read pg_wal size in case it grew during the
+# pgbackrest invocation. Drop if past threshold; otherwise surface
+# pgbackrest's non-zero exit so pg_stat_archiver.failed_count climbs and
+# operators see the underlying issue while there's still time to fix it.
 PGWAL_BYTES=$(du -sb "$PGDATA/pg_wal" 2>/dev/null | awk '{print $1}')
 if [ -z "${PGWAL_BYTES:-}" ]; then
   exit "$PGB_RC"
@@ -91,12 +125,7 @@ fi
 
 if [ "$PGWAL_BYTES" -ge "$PGWAL_THRESHOLD_BYTES" ]; then
   PGWAL_MB=$(( PGWAL_BYTES / 1024 / 1024 ))
-  echo "pgbackrest-wrapper: pg_wal at ${PGWAL_MB} MiB (threshold ${PGWAL_THRESHOLD_MB} MiB) and archive-push failing; dropping ${WAL_FILE} to keep Postgres up" >&2
-  # Mark the gap so the backup watcher takes a fresh full once archiving
-  # recovers. Without this, gap detection collapses to single-signal
-  # (failed_count growth from foreground archive_command failures), but the
-  # wrapper-drop path returns 0 to Postgres so failed_count never grows.
-  touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
+  mark_gap_and_log "pg_wal at ${PGWAL_MB} MiB (threshold ${PGWAL_THRESHOLD_MB} MiB) and archive-push failing"
   exit 0
 fi
 

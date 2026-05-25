@@ -124,21 +124,23 @@ fn env_or_clamp(var: &str, default: u32) -> u32 {
 }
 
 /// pg_wal drop ceiling (MiB) and pgBackRest archive-push spool ceiling (MiB),
-/// both scaled DOWN from absolute defaults (500 / 5120) on small volumes —
-/// never up. Hobby's 1 GiB volume can't carry a 5 GiB spool, and 500 MiB of
-/// pg_wal is half that disk; on volumes ≥25 GiB the absolutes hold.
+/// both scaled DOWN from the absolute default (5 GiB) on small volumes — never
+/// up. Hobby's 1 GiB volume can't carry 5 GiB of either; on volumes ≥50 GiB
+/// both absolutes hold.
 ///
-/// Ratios: wal-drop ~10% of volume (hard-failure pg_wal hostage), queue-max
-/// ~50% of volume (transient-stall spool absorption). The ~10× spread between
-/// the two budgets is preserved across all volume sizes — hard failures still
-/// bail fast, transient stalls still absorb generously.
+/// Ratios: wal-drop ~10% of volume, queue-max ~50% of volume. wal-drop bounds
+/// pg_wal AND the minimum free disk we keep available for Postgres to operate;
+/// queue-max is the spool budget for absorbing transient S3 stalls. Both cap
+/// at 5 GiB so pg_wal + spool together can never exceed ~10 GiB of WAL-related
+/// on-disk footprint, regardless of how big the customer's data volume is.
 ///
-/// Floors: 64 MiB wal-drop (~4 WAL segments — one short stall), 128 MiB
-/// queue-max (~8 segments). Below these archiving is effectively off and the
-/// dashboard surfaces it via pg_stat_archiver.
+/// Floors: 64 MiB wal-drop (~4 WAL segments), 128 MiB queue-max (~8 segments).
+/// Below these archiving is effectively off and the dashboard surfaces it via
+/// pg_stat_archiver.
 fn compute_volume_thresholds(volume_path: &str) -> (u32, u32) {
     use nix::sys::statvfs::statvfs;
 
+    let cap_max: u32 = 5 * 1024;
     let total_mib = statvfs(Path::new(volume_path))
         .ok()
         .and_then(|s| {
@@ -148,12 +150,12 @@ fn compute_volume_thresholds(volume_path: &str) -> (u32, u32) {
         .unwrap_or(0);
 
     if total_mib == 0 {
-        info!("pgbackrest: volume size unknown; using absolute thresholds wal-drop=500 MiB queue-max=5 GiB");
-        return (500, 5 * 1024);
+        info!("pgbackrest: volume size unknown; using absolute thresholds wal-drop=5 GiB queue-max=5 GiB");
+        return (cap_max, cap_max);
     }
 
-    let wal_drop = (total_mib / 10).clamp(64, 500);
-    let queue_max = (total_mib / 2).clamp(128, 5 * 1024);
+    let wal_drop = (total_mib / 10).clamp(64, cap_max);
+    let queue_max = (total_mib / 2).clamp(128, cap_max);
 
     info!(
         volume_mib = total_mib,
@@ -281,11 +283,13 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 ///
 /// The `archive-async=y` + `archive-push-queue-max` combination is one of
 /// the two thresholds that keep Postgres alive under archiving failure; the
-/// other is `pgbackrest-archive-push-wrapper.sh`'s `WAL_DROP_THRESHOLD_MB`
-/// on `pg_wal/`. Either tripping drops WAL and keeps the DB up at the cost
-/// of a truncated PITR window. Both ceilings come from
-/// `compute_volume_thresholds` (≤500 MiB pg_wal, ≤5 GiB spool on volumes
-/// ≥25 GiB; scaled down proportionally below that).
+/// other is `pgbackrest-archive-push-wrapper.sh`'s `WAL_DROP_THRESHOLD_MB`,
+/// which bounds both pg_wal/ size AND the minimum free disk we keep
+/// available for Postgres. Either tripping drops WAL and keeps the DB up at
+/// the cost of a truncated PITR window; the watcher takes a fresh diff
+/// once archiving recovers to anchor forward coverage. Both ceilings come
+/// from `compute_volume_thresholds` (≤5 GiB each on volumes ≥50 GiB;
+/// scaled down proportionally below that).
 ///
 /// Spool lives under `$PGDATA/pgbackrest-spool` so segments staged but not
 /// yet pushed to S3 survive container restarts on the Railway volume.
@@ -902,10 +906,10 @@ async fn main() -> Result<()> {
     clear_pgbackrest_state_if_disabled(&config.data_dir);
 
     // Size archive-push-queue-max and pg_wal drop ceiling against the
-    // mounted volume. Both scale DOWN from absolute defaults (500 MiB /
-    // 5 GiB) on small volumes — never up. WAL_DROP_THRESHOLD_MB is exported
-    // here because the bash archive_command wrapper reads it from env;
-    // patroni → postgres → archive_command inherits.
+    // mounted volume. Both scale DOWN from the absolute 5 GiB default on
+    // small volumes — never up. WAL_DROP_THRESHOLD_MB is exported here
+    // because the bash archive_command wrapper reads it from env; patroni
+    // → postgres → archive_command inherits.
     let (wal_drop_mib, queue_max_mib) = compute_volume_thresholds(&volume_root);
     if env::var("WAL_DROP_THRESHOLD_MB")
         .ok()
