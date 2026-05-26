@@ -46,6 +46,25 @@ if [ -z "$WAL_FILE" ]; then
 fi
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
+
+# Defensive gate: if WAL_ARCHIVE_BUCKET is unset or empty at the time
+# archive_command fires, archiving is not configured for this service.
+# The normal path is patroni-runner's disable cleanup (and Patroni's DCS
+# reconcile) removing archive_command before postgres starts — but the
+# setting can still leak via an older image without that cleanup, a
+# Patroni reconcile that hasn't run since the customer blanked the
+# variable, or an ALTER SYSTEM SET archive_command parked in
+# postgresql.auto.conf. Surfacing pgbackrest's FileMissingError (exit
+# 103) to Postgres in that state produces tens of thousands of
+# "archive_command failed" lines a day for a service whose PITR is
+# intentionally off. Return 0 so pg_wal recycles; the log line below is
+# the only signal admins need to clear the stale config (redeploy, or
+# unset archive_command in DCS / postgresql.auto.conf).
+if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
+  echo "pgbackrest-wrapper: WAL_ARCHIVE_BUCKET is unset; archive_command should not be installed. Dropping ${WAL_FILE} to keep Postgres up — redeploy the cluster so the disable cleanup can drop archive_command, or update the source image if a redeploy doesn't fix it." >&2
+  exit 0
+fi
+
 PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-${PGBACKREST_DROP_THRESHOLD_MB:-500}}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 
