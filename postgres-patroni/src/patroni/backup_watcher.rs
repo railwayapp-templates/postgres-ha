@@ -796,6 +796,26 @@ async fn finalize_wal_regression_migration(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    // Escalate to SIGKILL if SIGTERM wasn't enough — a daemon still alive here
+    // may write stale `.ok/.error` status files for the old repo path after the
+    // new archive path is active. Matches the shell implementation's
+    // kill-then-drain logic.
+    if async_daemon_running().await {
+        warn!("pgbackrest-watcher: wal-regression: async daemon did not exit on SIGTERM; sending SIGKILL");
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-f", "archive-push:async"])
+            .status()
+            .await;
+        let kill_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < kill_deadline && async_daemon_running().await {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if async_daemon_running().await {
+            warn!("pgbackrest-watcher: wal-regression: async daemon still alive after SIGKILL; will retry finalization");
+            return false;
+        }
+    }
+
     if let Err(e) = clean_spool_status_files(data_dir) {
         warn!(error = %e, "pgbackrest-watcher: wal-regression: failed to clean async status files; will retry finalization");
         return false;
@@ -1790,6 +1810,24 @@ mod tests {
         // timeline" rather than a parse error.
         let info = r#"[{"archive":[{"id":"18-1","min":null,"max":null}],"backup":[]}]"#;
         assert_eq!(parse_catalog_max(info, "00000001").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_catalog_max_handles_pretty_printed_json() {
+        // Review feedback: JSON output may include spaces/newlines. The old
+        // substring matcher would silently return None here.
+        let info = r#"[
+          {
+            "archive": [
+              { "id": "18-1", "min": "000000010000000000000001", "max": "000000010000001B00000024" }
+            ],
+            "backup": []
+          }
+        ]"#;
+        assert_eq!(
+            parse_catalog_max(info, "00000001").unwrap(),
+            Some("000000010000001B00000024".to_string())
+        );
     }
 
     // ---- decide_gap_recovery: state-machine transitions ----
