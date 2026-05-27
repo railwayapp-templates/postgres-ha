@@ -67,12 +67,28 @@ pub enum TelemetryEvent {
     ReplicaUnavailable { node: String, scope: String, servers: Vec<String> },
 
     /// Self-heal supervisor issued POST /reinitialize against the local
-    /// Patroni REST API. Replica only; never fires against a leader. Leader
-    /// must be reachable at action time so the re-clone has a source.
+    /// Patroni REST API and Patroni accepted the call. Replica only; never
+    /// fires against a leader. Leader must be reachable at action time so
+    /// the re-clone has a source.
     SelfHealReinitTriggered {
         node: String,
         reason: String,
         attempt: u32,
+    },
+
+    /// Self-heal supervisor attempted POST /reinitialize but Patroni REST
+    /// errored or was unreachable. Distinguishes "we tried but couldn't
+    /// reach Patroni" from `SelfHealReinitTriggered`'s "Patroni accepted
+    /// our reinit request"; without it, operators paged on a Triggered
+    /// event would look for a reinit in progress and find none. The cap
+    /// still ticks on failed attempts so a chronically-wedged Patroni
+    /// REST escalates to `SelfHealGaveUp` instead of being retried
+    /// forever.
+    SelfHealReinitRequestFailed {
+        node: String,
+        reason: String,
+        attempt: u32,
+        error: String,
     },
 
     /// Replica returned to healthy state (running/streaming) after one or
@@ -168,6 +184,7 @@ impl TelemetryEvent {
             Self::DcsUnavailable { .. } => "POSTGRES_HA_DCS_UNAVAILABLE",
             Self::ReplicaUnavailable { .. } => "POSTGRES_HA_REPLICA_UNAVAILABLE",
             Self::SelfHealReinitTriggered { .. } => "POSTGRES_HA_SELF_HEAL_REINIT_TRIGGERED",
+            Self::SelfHealReinitRequestFailed { .. } => "POSTGRES_HA_SELF_HEAL_REINIT_REQUEST_FAILED",
             Self::SelfHealRecovered { .. } => "POSTGRES_HA_SELF_HEAL_RECOVERED",
             Self::SelfHealGaveUp { .. } => "POSTGRES_HA_SELF_HEAL_GAVE_UP",
             Self::EtcdBootstrap { .. } => "ETCD_CLUSTER_BOOTSTRAP",
@@ -250,6 +267,12 @@ impl TelemetryEvent {
                 format!(
                     "Self-heal: reinitializing {} (reason: {}, attempt {})",
                     node, reason, attempt
+                )
+            }
+            Self::SelfHealReinitRequestFailed { node, reason, attempt, error } => {
+                format!(
+                    "Self-heal: reinitialize request for {} failed (reason: {}, attempt {}, error: {})",
+                    node, reason, attempt, error
                 )
             }
             Self::SelfHealRecovered { node, recovered_in_secs, attempts } => {

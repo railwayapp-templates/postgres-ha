@@ -415,11 +415,22 @@ async fn iteration(
     }
 
     // 5. Recovery detection: we acted, postgres has been stable since.
+    // Recovery detection requires (a) postgres state is healthy, (b)
+    // exactly one stable postmaster_start_time observed in the window
+    // (no flickers — a crash loop would have ≥ 2, an empty deque 0;
+    // both reject), and (c) that observation was made at or after the
+    // action timestamp. Without (c), a stale pre-action entry that
+    // happens to still be inside the window would satisfy the count
+    // check and fire `EmitRecovered` with a misleading
+    // `recovered_in_secs` measured against `last_action_at` — most
+    // visible on a watcher that restored `action_pending_recovery`
+    // from disk on cold start.
     let recovery_seen_after_action = match (*action_pending_recovery, &local.state) {
-        (Some(_), Some(s)) if s == "running" || s == "streaming" => {
-            // Stable: at least one full window has passed where
-            // postmaster_start_time stayed constant.
-            pg_starts_in_window <= 1
+        (Some(action_t), Some(s)) if s == "running" || s == "streaming" => {
+            pg_starts_in_window == 1
+                && starts_seen
+                    .front()
+                    .is_some_and(|(t, _)| *t >= action_t)
         }
         _ => false,
     };
@@ -449,24 +460,38 @@ async fn iteration(
                 attempt,
                 "self-heal: triggering POST /reinitialize"
             );
-            // Record telemetry *before* the API call so we capture the
-            // intent even if the call itself errors out.
-            telemetry.send(TelemetryEvent::SelfHealReinitTriggered {
-                node: member_name.clone(),
-                reason: reason.clone(),
-                attempt,
-            });
-            // Persist before the API call too — see backup_watcher comment
-            // on state-before-action: a mid-call crash leaves us
-            // re-counting on next iteration, which is harmless because
-            // the backoff window covers it.
+            // Persist state *before* the API call so backoff/cap apply
+            // even if Patroni REST is wedged — otherwise we'd hammer it
+            // every poll. A mid-call crash leaves us re-counting on next
+            // iteration, which is harmless because backoff covers it.
             let _ = write_state_field(state_path, "last_action_at", &now.to_string());
             append_attempt(state_path, now);
             *action_pending_recovery = Some(now);
 
+            // Telemetry is split by outcome: `SelfHealReinitTriggered`
+            // means Patroni accepted the call (reinit is in flight);
+            // `SelfHealReinitRequestFailed` means we tried but couldn't
+            // reach Patroni. Without the split, operators paged on
+            // Triggered would hunt for a reinit in progress and find
+            // none when the API call had actually failed.
             match issue_reinitialize(client).await {
-                Ok(()) => info!("self-heal: reinitialize accepted"),
-                Err(e) => warn!(error = %e, "self-heal: reinitialize API call failed"),
+                Ok(()) => {
+                    info!("self-heal: reinitialize accepted");
+                    telemetry.send(TelemetryEvent::SelfHealReinitTriggered {
+                        node: member_name.clone(),
+                        reason: reason.clone(),
+                        attempt,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "self-heal: reinitialize API call failed");
+                    telemetry.send(TelemetryEvent::SelfHealReinitRequestFailed {
+                        node: member_name.clone(),
+                        reason: reason.clone(),
+                        attempt,
+                        error: e.to_string(),
+                    });
+                }
             }
         }
         SelfHealAction::EmitRecovered {
