@@ -781,7 +781,6 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
     Ok(())
 }
 
-
 /// Post-Postgres-ready pgBackRest setup: mkdir the spool dir, then run
 /// stanza-create. Forks a background poller so patroni-runner can stay on
 /// its existing exec path.

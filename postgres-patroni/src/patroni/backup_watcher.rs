@@ -77,7 +77,8 @@
 use anyhow::Result;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -85,7 +86,10 @@ use tracing::{info, warn};
 const STATE_FILENAME: &str = ".pgbackrest_backup_state";
 const GAP_MARKER_FILENAME: &str = ".pgbackrest_gap_pending";
 const REPO_PATH_MARKER: &str = ".pgbackrest_repo_path";
+const PGBACKREST_CONF_FILE: &str = "/etc/pgbackrest/pgbackrest.conf";
 const PATRONI_LEADER_URL: &str = "http://localhost:8008/leader";
+const PATRONI_CONFIG_URL: &str = "http://localhost:8008/config";
+const PATRONI_REPO_PATH_CONFIG_KEY: &str = "pgbackrest_repo1_path";
 
 /// Knobs read from env at startup. All durations in seconds.
 struct WatcherConfig {
@@ -294,6 +298,14 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
         }
     }
 
+    if finalize_pending_wal_regression_migration_if_needed(data_dir, client).await {
+        return;
+    }
+
+    if let Err(e) = converge_repo_path_with_patroni_dcs(data_dir, client).await {
+        warn!(error = %e, "pgbackrest-watcher: failed to converge repo path with Patroni DCS");
+    }
+
     if !config.heartbeat_disabled {
         emit_wal_heartbeat().await;
     }
@@ -310,7 +322,7 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
     // drives the kick-and-diff sequence. Runs every iteration;
     // pgbackrest info is cheap enough that throttling isn't worth the
     // false-negative window the earlier throttled version introduced.
-    gap_recovery_step(data_dir, config, &stats).await;
+    gap_recovery_step(data_dir, config, client, &stats).await;
 
     let action = decide_action(data_dir, config, &stats);
     match action {
@@ -585,77 +597,446 @@ async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
     Ok(CatalogProbe { catalog_max, lag })
 }
 
-/// Self-heals a WAL_REGRESSION condition by migrating archiving to a new S3
-/// path suffix (e.g. cluster-SYSID → cluster-SYSID-2). WAL_REGRESSION occurs
-/// when a volume snapshot rollback restores the data directory to an earlier
-/// LSN while S3 retains the pre-rollback WAL at the same segment names.
-/// pgBackRest refuses to overwrite existing S3 objects with different content
-/// (exit 45) — grace periods and pkill-async cycles cannot fix this.
-///
-/// Migration is non-destructive: old path and all its backups stay in S3.
-/// Both the archive-push wrapper and this watcher re-read
-/// `.pgbackrest_repo_path` on every call/iteration, so writing the new path
-/// there takes effect without a redeploy. All backup state is then reset so
-/// the next iteration enters NEEDS_INITIAL_BACKUP at the new path.
-fn migrate_to_new_archive_path(data_dir: &str) {
+fn repo_path_marker(data_dir: &str) -> String {
+    format!("{data_dir}/{REPO_PATH_MARKER}")
+}
+
+fn spool_status_dir(data_dir: &str) -> String {
+    format!("{data_dir}/pgbackrest-spool/archive/main/out")
+}
+
+/// Rewrite repo1-path in pgbackrest.conf. The marker/env path is authoritative;
+/// this is defense-in-depth for bare `docker exec pgbackrest info` diagnostics.
+fn rewrite_pgbackrest_conf_path(data_dir: &str, path: &str) -> Result<()> {
+    let conf_path = Path::new(PGBACKREST_CONF_FILE);
+    if !conf_path.exists() {
+        return Ok(());
+    }
+    let existing = fs::read_to_string(conf_path)?;
+    let mut replaced = false;
+    let mut out = String::new();
+    for line in existing.lines() {
+        if line.starts_with("repo1-path=") {
+            out.push_str(&format!("repo1-path={path}\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !replaced {
+        out.push_str(&format!("repo1-path={path}\n"));
+    }
+
+    let tmp = format!("{data_dir}/.pgbackrest_conf.{}", std::process::id());
+    fs::write(&tmp, out)?;
+    let copy_res = fs::copy(&tmp, conf_path);
+    let _ = fs::remove_file(&tmp);
+    copy_res?;
+    Ok(())
+}
+
+/// Source-of-truth setter for the active archive path. Updates the marker
+/// atomically (read by archive-push on every WAL), rewrites pgbackrest.conf for
+/// bare-shell diagnostics, and updates this watcher's process env. Idempotent.
+fn apply_active_path(data_dir: &str, path: &str) -> Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("empty repo path");
+    }
+    let marker = repo_path_marker(data_dir);
+    let tmp = format!("{marker}.{}", std::process::id());
+    fs::write(&tmp, format!("{path}\n"))?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o640))?;
+    if let Err(e) = fs::rename(&tmp, &marker) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = rewrite_pgbackrest_conf_path(data_dir, path) {
+        warn!(error = %e, "pgbackrest-watcher: apply_active_path: failed to rewrite repo1-path in pgbackrest.conf (marker + env are authoritative)");
+    }
+    env::set_var("PGBACKREST_REPO1_PATH", path);
+    Ok(())
+}
+
+async fn patroni_dcs_repo_path(client: &reqwest::Client) -> Result<Option<String>> {
+    let resp = client.get(PATRONI_CONFIG_URL).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Patroni /config GET returned {}", resp.status());
+    }
+    let json: serde_json::Value = resp.json().await?;
+    Ok(json
+        .get(PATRONI_REPO_PATH_CONFIG_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned))
+}
+
+async fn patch_patroni_dcs_repo_path(client: &reqwest::Client, path: &str) -> Result<()> {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        PATRONI_REPO_PATH_CONFIG_KEY.to_string(),
+        serde_json::Value::String(path.to_string()),
+    );
+    let resp = client.patch(PATRONI_CONFIG_URL).json(&body).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Patroni /config PATCH returned {}", resp.status());
+    }
+    Ok(())
+}
+
+/// HA path-drift guard: replicas inherit `.pgbackrest_repo_path` during base
+/// backup, but later leader-side WAL_REGRESSION migrations do not propagate
+/// through PG state. The leader broadcasts the active path through Patroni's
+/// DCS, and each leader iteration adopts it before archive activity.
+async fn reset_local_backup_state_for_new_archive_path(data_dir: &str) -> Result<()> {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    let failed_anchor = refresh_archiver_stats()
+        .await
+        .map(|s| s.failed_count)
+        .unwrap_or(0);
+    write_state_field(
+        &state_path,
+        "last_full_failed_count",
+        &failed_anchor.to_string(),
+    )?;
+    write_state_field(&state_path, "last_full_at", "")?;
+    write_state_field(&state_path, "last_diff_at", "")?;
+    write_state_field(&state_path, "last_lag_detected_at", "0")?;
+    write_state_field(&state_path, "catalog_max_at_detection", "")?;
+    write_state_field(&state_path, "last_force_recovery_at", "0")?;
+    write_state_field(&state_path, "force_attempts", "0")?;
     let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
-    let repo_path_marker = format!("{data_dir}/{REPO_PATH_MARKER}");
-
-    let old_path = env::var("PGBACKREST_REPO1_PATH").unwrap_or_default();
-
-    // Store the original (gen 0) path once so successive migrations produce
-    // -2, -3, … instead of chaining suffixes like -2-2.
-    let orig_path = read_state_field(&state_path, "wal_regression_orig_path")
-        .unwrap_or_else(|| old_path.clone());
-    if read_state_field(&state_path, "wal_regression_orig_path").is_none() {
-        let _ = write_state_field(&state_path, "wal_regression_orig_path", &orig_path);
-    }
-    let gen = read_state_field(&state_path, "wal_regression_gen")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0)
-        + 1;
-    let _ = write_state_field(&state_path, "wal_regression_gen", &gen.to_string());
-
-    // Suffix: gen=1 → -2, gen=2 → -3, etc.
-    let new_path = format!("{orig_path}-{}", gen + 1);
-
-    info!(
-        old_path = %old_path,
-        new_path = %new_path,
-        "pgbackrest-watcher: wal-regression: migrating archive path; old backups preserved"
-    );
-
-    if let Err(e) = fs::write(&repo_path_marker, &new_path) {
-        warn!(error = %e, "pgbackrest-watcher: wal-regression: failed to write repo path marker");
-        return;
-    }
-    env::set_var("PGBACKREST_REPO1_PATH", &new_path);
-
-    // Reset all backup/gap state so the next iteration enters
-    // NEEDS_INITIAL_BACKUP at the new path. GAP_MARKER cleared so
-    // decide_action is unblocked.
-    let _ = write_state_field(&state_path, "last_full_at", "");
-    let _ = write_state_field(&state_path, "last_diff_at", "");
-    let _ = write_state_field(&state_path, "last_full_failed_count", "0");
-    let _ = write_state_field(&state_path, "last_lag_detected_at", "0");
-    let _ = write_state_field(&state_path, "catalog_max_at_detection", "");
-    let _ = write_state_field(&state_path, "last_force_recovery_at", "0");
-    let _ = write_state_field(&state_path, "force_attempts", "0");
     let _ = fs::remove_file(&gap_marker);
+    Ok(())
+}
 
-    info!(
-        new_path = %new_path,
-        "pgbackrest-watcher: wal-regression: state reset; next iteration will initialize stanza and take full backup"
-    );
+async fn converge_repo_path_with_patroni_dcs(
+    data_dir: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    if read_state_field(&state_path, "wal_regression_pending_new_path").is_some() {
+        return Ok(());
+    }
+
+    let active = env::var("PGBACKREST_REPO1_PATH")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let dcs = patroni_dcs_repo_path(client).await?;
+    match (active, dcs) {
+        (Some(active), Some(dcs_path)) if active != dcs_path => {
+            info!(active = %active, dcs_path = %dcs_path, "pgbackrest-watcher: adopting repo path from Patroni DCS");
+            reset_local_backup_state_for_new_archive_path(data_dir).await?;
+            apply_active_path(data_dir, &dcs_path)?;
+        }
+        (Some(active), None) => {
+            patch_patroni_dcs_repo_path(client, &active).await?;
+            info!(repo_path = %active, "pgbackrest-watcher: seeded repo path into Patroni DCS");
+        }
+        (None, Some(dcs_path)) => {
+            info!(dcs_path = %dcs_path, "pgbackrest-watcher: adopting repo path from Patroni DCS");
+            reset_local_backup_state_for_new_archive_path(data_dir).await?;
+            apply_active_path(data_dir, &dcs_path)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn write_state_field_required(state_path: &str, field: &str, value: &str) -> bool {
+    if let Err(e) = write_state_field(state_path, field, value) {
+        warn!(error = %e, field = %field, "pgbackrest-watcher: state-write failed; refusing unsafe archive-path migration step");
+        return false;
+    }
+    true
+}
+
+async fn async_daemon_running() -> bool {
+    matches!(
+        Command::new("pgrep")
+            .args(["-f", "archive-push:async"])
+            .status()
+            .await,
+        Ok(s) if s.success()
+    )
+}
+
+fn clean_spool_status_files(data_dir: &str) -> Result<()> {
+    let dir = spool_status_dir(data_dir);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".error") || name.ends_with(".ok") {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Finalizes a marker-flipped WAL_REGRESSION migration by forcing pgBackRest's
+/// async daemon to re-read repo1-path, clearing stale async status files from
+/// the old path, broadcasting the path through Patroni DCS, then clearing the
+/// pending sentinel. If any step fails, the pending field remains and the next
+/// iteration retries finalization rather than trusting stale `.ok/.error` files.
+async fn finalize_wal_regression_migration(
+    data_dir: &str,
+    client: &reqwest::Client,
+    path: &str,
+) -> bool {
+    info!("pgbackrest-watcher: wal-regression: kicking async daemon to pick up new repo1-path");
+    kick_async_daemon().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && async_daemon_running().await {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    if let Err(e) = clean_spool_status_files(data_dir) {
+        warn!(error = %e, "pgbackrest-watcher: wal-regression: failed to clean async status files; will retry finalization");
+        return false;
+    }
+    if let Err(e) = patch_patroni_dcs_repo_path(client, path).await {
+        warn!(error = %e, "pgbackrest-watcher: wal-regression: failed to publish repo path to Patroni DCS; will retry finalization");
+        return false;
+    }
+
+    let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
+    let _ = fs::remove_file(&gap_marker);
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    if !write_state_field_required(&state_path, "wal_regression_pending_new_path", "") {
+        warn!("pgbackrest-watcher: wal-regression: failed to clear pending migration marker; will retry finalization");
+        return false;
+    }
+
+    info!(path = %path, "pgbackrest-watcher: wal-regression: migration finalized; async status cache cleared");
+    true
+}
+
+async fn finalize_pending_wal_regression_migration_if_needed(
+    data_dir: &str,
+    client: &reqwest::Client,
+) -> bool {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    let Some(pending) = read_state_field(&state_path, "wal_regression_pending_new_path") else {
+        return false;
+    };
+    if env::var("PGBACKREST_REPO1_PATH").ok().as_deref() != Some(pending.as_str()) {
+        return false;
+    }
+    info!(pending = %pending, "pgbackrest-watcher: wal-regression: finalizing pending archive-path migration");
+    finalize_wal_regression_migration(data_dir, client, &pending).await;
+    true
+}
+
+fn wal_has_async_archive_duplicate_error(
+    data_dir: &str,
+    wal: &str,
+    segments_per_log_file: u64,
+) -> bool {
+    if segment_to_number(wal, segments_per_log_file).is_none() {
+        return false;
+    }
+    let path = format!("{}/{}.error", spool_status_dir(data_dir), wal);
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.lines().next().map(ToOwned::to_owned))
+        .as_deref()
+        == Some("45")
+}
+
+/// Async-spool probe for ArchiveDuplicateError (exit 45). Catches quiet-DB
+/// regressions where pgBackRest async wrote an error but foreground
+/// archive_command has not re-run, so pg_stat_archiver is still NULL/stale.
+fn probe_async_duplicate_error(
+    data_dir: &str,
+    catalog_max: &str,
+    segments_per_log_file: u64,
+) -> Option<String> {
+    let dir_s = spool_status_dir(data_dir);
+    let dir = Path::new(&dir_s);
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.ends_with(".error"))
+        })
+        .collect();
+    files.sort();
+
+    let catalog_n = if catalog_max.is_empty() {
+        None
+    } else {
+        segment_to_number(catalog_max, segments_per_log_file)
+    };
+    for path in files {
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(base) = name.strip_suffix(".error") else {
+            continue;
+        };
+        if segment_to_number(base, segments_per_log_file).is_none() {
+            continue;
+        }
+        let first_line = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.lines().next().map(ToOwned::to_owned));
+        if first_line.as_deref() != Some("45") {
+            continue;
+        }
+        if !catalog_max.is_empty() {
+            if &base[..8] != &catalog_max[..8] {
+                continue;
+            }
+            let Some(c_n) = catalog_n else {
+                continue;
+            };
+            let Some(d_n) = segment_to_number(base, segments_per_log_file) else {
+                continue;
+            };
+            if d_n > c_n {
+                continue;
+            }
+        }
+        return Some(base.to_string());
+    }
+    None
+}
+
+async fn repo_max_for_wal(wal: &str, current: &str) -> Result<Option<String>> {
+    if !current.is_empty() && current.len() == 24 && &current[..8] == &wal[..8] {
+        return Ok(Some(current.to_string()));
+    }
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new("pgbackrest")
+            .args(["--stanza=main", "--repo=1", "info", "--output=json"])
+            .env_remove("PGHOST")
+            .env_remove("PGPORT")
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("pgbackrest info timed out"))??;
+    if !out.status.success() {
+        anyhow::bail!(
+            "pgbackrest info exited non-zero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let info_json = String::from_utf8_lossy(&out.stdout);
+    parse_catalog_max(&info_json, &wal[..8])
+}
+
+/// Self-heals a WAL_REGRESSION condition by migrating archiving to a fresh S3
+/// path suffix (cluster-SYSID-<epoch>). The old path and all backups remain in
+/// S3; mono's PITR restore UI enumerates cluster-* histories so orphaned
+/// backups remain selectable. Epoch suffixes avoid collisions after repeated
+/// volume snapshot rollbacks to pre-self-heal PGDATA.
+async fn migrate_to_new_archive_path(
+    data_dir: &str,
+    client: &reqwest::Client,
+    stats: &ArchiverStats,
+) -> bool {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    let Ok(old_path) = env::var("PGBACKREST_REPO1_PATH") else {
+        warn!("pgbackrest-watcher: wal-regression: PGBACKREST_REPO1_PATH unset (marker missing, no env override); cannot migrate");
+        return false;
+    };
+    if old_path.is_empty() {
+        warn!("pgbackrest-watcher: wal-regression: PGBACKREST_REPO1_PATH empty; cannot migrate");
+        return false;
+    }
+
+    let orig_path = match read_state_field(&state_path, "wal_regression_orig_path") {
+        Some(path) => path,
+        None => {
+            if !write_state_field_required(&state_path, "wal_regression_orig_path", &old_path) {
+                return false;
+            }
+            old_path.clone()
+        }
+    };
+
+    let new_path = match read_state_field(&state_path, "wal_regression_pending_new_path") {
+        Some(path) => path,
+        None => {
+            let path = format!("{orig_path}-{}", now_epoch());
+            if !write_state_field_required(&state_path, "wal_regression_pending_new_path", &path) {
+                return false;
+            }
+            path
+        }
+    };
+
+    if old_path == new_path {
+        info!(new_path = %new_path, "pgbackrest-watcher: wal-regression: finalizing pending archive-path migration");
+        return finalize_wal_regression_migration(data_dir, client, &new_path).await;
+    }
+
+    info!(old_path = %old_path, new_path = %new_path, "pgbackrest-watcher: wal-regression: migrating archive path; old backups preserved at former path");
+
+    let failed_anchor = refresh_archiver_stats()
+        .await
+        .map(|s| s.failed_count)
+        .unwrap_or(stats.failed_count);
+    if !write_state_field_required(
+        &state_path,
+        "last_full_failed_count",
+        &failed_anchor.to_string(),
+    ) || !write_state_field_required(&state_path, "last_full_at", "")
+        || !write_state_field_required(&state_path, "last_diff_at", "")
+        || !write_state_field_required(&state_path, "last_lag_detected_at", "0")
+        || !write_state_field_required(&state_path, "catalog_max_at_detection", "")
+        || !write_state_field_required(&state_path, "last_force_recovery_at", "0")
+        || !write_state_field_required(&state_path, "force_attempts", "0")
+    {
+        return false;
+    }
+
+    if let Err(e) = apply_active_path(data_dir, &new_path) {
+        warn!(error = %e, new_path = %new_path, "pgbackrest-watcher: wal-regression: failed to apply new archive path; will retry");
+        return false;
+    }
+
+    if !finalize_wal_regression_migration(data_dir, client, &new_path).await {
+        return false;
+    }
+
+    info!(new_path = %new_path, "pgbackrest-watcher: wal-regression: state reset; next iteration will initialize stanza and take full backup");
+    true
 }
 
 /// Returns true (and calls `migrate_to_new_archive_path`) when the data is
-/// consistent with WAL_REGRESSION: `last_failed_wal` is behind the S3
+/// consistent with WAL_REGRESSION: `last_failed_wal` is at or before the S3
 /// catalog max on the same timeline, and the failure is currently active
 /// (`last_failed_epoch > last_archived_epoch`).
-fn check_wal_regression(data_dir: &str, stats: &ArchiverStats, catalog_max: &str) -> bool {
-    if stats.last_failed_wal.is_empty() || catalog_max.is_empty() {
+async fn check_wal_regression(
+    data_dir: &str,
+    client: &reqwest::Client,
+    stats: &ArchiverStats,
+    catalog_max: &str,
+) -> bool {
+    if stats.last_failed_wal.is_empty() || stats.last_failed_wal.len() != 24 {
+        return false;
+    }
+    // Require the file-specific async status code 45 (ArchiveDuplicateError);
+    // last_failed_wal <= catalog_max alone only proves the failure is at/before
+    // the repo frontier, not that pgBackRest refused a different-checksum WAL.
+    if !wal_has_async_archive_duplicate_error(
+        data_dir,
+        &stats.last_failed_wal,
+        stats.segments_per_log_file,
+    ) {
         return false;
     }
     // Guard: failure must be currently active (more recent than last success).
@@ -663,30 +1044,34 @@ fn check_wal_regression(data_dir: &str, stats: &ArchiverStats, catalog_max: &str
     if stats.last_failed_epoch == 0 || stats.last_failed_epoch <= stats.last_archived_epoch {
         return false;
     }
-    if stats.last_failed_wal.len() != 24 || catalog_max.len() != 24 {
+    let catalog_max = match repo_max_for_wal(&stats.last_failed_wal, catalog_max).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return false,
+        Err(e) => {
+            warn!(error = %e, "pgbackrest-watcher: wal-regression catalog probe failed");
+            return false;
+        }
+    };
+    if catalog_max.len() != 24 || &stats.last_failed_wal[..8] != &catalog_max[..8] {
         return false;
     }
-    // Must be on the same timeline.
-    if &stats.last_failed_wal[..8] != &catalog_max[..8] {
+    let Some(failed_n) = segment_to_number(&stats.last_failed_wal, stats.segments_per_log_file)
+    else {
         return false;
-    }
-    let failed_n = match segment_to_number(&stats.last_failed_wal, stats.segments_per_log_file) {
-        Some(n) => n,
-        None => return false,
     };
-    let catalog_n = match segment_to_number(catalog_max, stats.segments_per_log_file) {
-        Some(n) => n,
-        None => return false,
+    let Some(repo_n) = segment_to_number(&catalog_max, stats.segments_per_log_file) else {
+        return false;
     };
-    if failed_n >= catalog_n {
+    if failed_n > repo_n {
         return false;
     }
     info!(
         failed_wal = %stats.last_failed_wal,
         catalog_max = %catalog_max,
-        "pgbackrest-watcher: wal-regression: detected (failed_wal < catalog_max on same timeline) — self-healing"
+        failed_count = stats.failed_count,
+        "pgbackrest-watcher: wal-regression: detected (failed_wal <= catalog_max on same timeline) — self-healing"
     );
-    migrate_to_new_archive_path(data_dir);
+    migrate_to_new_archive_path(data_dir, client, stats).await;
     true
 }
 
@@ -881,7 +1266,12 @@ fn decide_gap_recovery(inp: &GapRecoveryInputs) -> GapRecoveryAction {
     GapRecoveryAction::Wait
 }
 
-async fn gap_recovery_step(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) {
+async fn gap_recovery_step(
+    data_dir: &str,
+    config: &WatcherConfig,
+    client: &reqwest::Client,
+    stats: &ArchiverStats,
+) {
     let now = now_epoch();
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
     let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
@@ -895,10 +1285,24 @@ async fn gap_recovery_step(data_dir: &str, config: &WatcherConfig, stats: &Archi
     };
     let catalog_max = probe.catalog_max.unwrap_or_default();
 
+    // Async-spool WAL_REGRESSION probe runs before pg_stat-based detection.
+    // pgBackRest async writes `<wal>.error` before foreground archive_command
+    // has necessarily re-run, so pg_stat_archiver can still be NULL/stale on
+    // quiet DBs. With empty catalog_max (common after postgres restart), exit
+    // 45 is sufficient proof: the segment already exists remotely with a
+    // different checksum.
+    if let Some(dup_seg) =
+        probe_async_duplicate_error(data_dir, &catalog_max, stats.segments_per_log_file)
+    {
+        info!(dup_seg = %dup_seg, catalog_max = %catalog_max, "pgbackrest-watcher: wal-regression: async spool ArchiveDuplicateError — self-healing");
+        migrate_to_new_archive_path(data_dir, client, stats).await;
+        return;
+    }
+
     // WAL_REGRESSION is structural (archive path conflict after volume
     // rollback), not a transient async lag. Migrate to a new non-conflicting
     // repo path and return so the next iteration starts clean.
-    if check_wal_regression(data_dir, stats, &catalog_max) {
+    if check_wal_regression(data_dir, client, stats, &catalog_max).await {
         return;
     }
 
@@ -1251,9 +1655,10 @@ fn now_epoch() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_gap_recovery, parse_catalog_max, segment_to_number, GapRecoveryAction,
-        GapRecoveryInputs,
+        decide_gap_recovery, parse_catalog_max, probe_async_duplicate_error, segment_to_number,
+        wal_has_async_archive_duplicate_error, GapRecoveryAction, GapRecoveryInputs,
     };
+    use std::fs;
 
     /// Baseline `GapRecoveryInputs` for tests — every field at its
     /// "nothing happening" default. Individual tests override only the
@@ -1634,5 +2039,47 @@ mod tests {
             decide_gap_recovery(&inp),
             GapRecoveryAction::TakeRecoveryDiff
         );
+    }
+
+    #[test]
+    fn probe_async_duplicate_error_filters_to_exit45_wal_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("pgbackrest-spool/archive/main/out");
+        fs::create_dir_all(&out_dir).unwrap();
+
+        // Backup-history files archive through the same path but must not
+        // short-circuit the scan with a non-segment basename.
+        fs::write(
+            out_dir.join("000000010000000000000002.00000028.backup.error"),
+            "45\nArchiveDuplicateError\n",
+        )
+        .unwrap();
+        // Wrong exit code: not WAL_REGRESSION.
+        fs::write(out_dir.join("000000010000000000000003.error"), "82\n").unwrap();
+        // Valid exit-45 WAL segment at or before catalog max.
+        fs::write(
+            out_dir.join("000000010000000000000004.error"),
+            "45\nArchiveDuplicateError\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            probe_async_duplicate_error(
+                tmp.path().to_str().unwrap(),
+                "000000010000000000000004",
+                256,
+            ),
+            Some("000000010000000000000004".to_string())
+        );
+        assert!(wal_has_async_archive_duplicate_error(
+            tmp.path().to_str().unwrap(),
+            "000000010000000000000004",
+            256,
+        ));
+        assert!(!wal_has_async_archive_duplicate_error(
+            tmp.path().to_str().unwrap(),
+            "000000010000000000000003",
+            256,
+        ));
     }
 }
