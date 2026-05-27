@@ -1461,6 +1461,19 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
 
     let now = now_epoch();
 
+    // WAL_REGRESSION migration in-flight: async daemon was killed and the
+    // marker was flipped, but spool cleanup or DCS broadcast may not have
+    // completed yet. Stale old-path .ok files would let archive_command
+    // return success without uploading WAL to the new path, producing an
+    // unrestorable backup. Block all backups until finalization clears the
+    // field. finalize_pending_wal_regression_migration_if_needed runs at
+    // the top of every watcher_iteration and retries until it succeeds.
+    if read_state_field(&state_path, "wal_regression_pending_new_path").is_some() {
+        return Action::None {
+            reason: "wal_regression migration pending finalization".to_string(),
+        };
+    }
+
     // NEEDS_INITIAL_BACKUP — no full on record, take it now. pgbackrest
     // backup brackets the base in pg_backup_start/stop and waits for the
     // closing WAL to archive before declaring success, so a broken
