@@ -66,15 +66,6 @@ pub enum TelemetryEvent {
     /// Replica backend unavailable - no healthy replicas for read traffic
     ReplicaUnavailable { node: String, scope: String, servers: Vec<String> },
 
-    /// Replica observed in a stuck postgres state that Patroni won't recover
-    /// from on its own (WAL-too-old after rewind, pg_control corruption,
-    /// stuck-starting, etc.). Detection only — no action yet.
-    SelfHealDetected {
-        node: String,
-        reason: String,
-        signals: Vec<String>,
-    },
-
     /// Self-heal supervisor issued POST /reinitialize against the local
     /// Patroni REST API. Replica only; never fires against a leader. Leader
     /// must be reachable at action time so the re-clone has a source.
@@ -176,7 +167,6 @@ impl TelemetryEvent {
             Self::ProcessDied { .. } => "POSTGRES_HA_PROCESS_DIED",
             Self::DcsUnavailable { .. } => "POSTGRES_HA_DCS_UNAVAILABLE",
             Self::ReplicaUnavailable { .. } => "POSTGRES_HA_REPLICA_UNAVAILABLE",
-            Self::SelfHealDetected { .. } => "POSTGRES_HA_SELF_HEAL_DETECTED",
             Self::SelfHealReinitTriggered { .. } => "POSTGRES_HA_SELF_HEAL_REINIT_TRIGGERED",
             Self::SelfHealRecovered { .. } => "POSTGRES_HA_SELF_HEAL_RECOVERED",
             Self::SelfHealGaveUp { .. } => "POSTGRES_HA_SELF_HEAL_GAVE_UP",
@@ -253,16 +243,6 @@ impl TelemetryEvent {
                     format!(
                         "Replica unavailable - {} reports no healthy replicas in {} (read-only traffic affected): {}",
                         node, scope, servers.join(", ")
-                    )
-                }
-            }
-            Self::SelfHealDetected { node, reason, signals } => {
-                if signals.is_empty() {
-                    format!("Self-heal: {} stuck ({}), no action yet", node, reason)
-                } else {
-                    format!(
-                        "Self-heal: {} stuck ({}), signals: {}",
-                        node, reason, signals.join(", ")
                     )
                 }
             }

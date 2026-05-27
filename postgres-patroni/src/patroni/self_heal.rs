@@ -325,7 +325,15 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
     // Sliding window of recent postmaster_start_time observations.
     let mut starts_seen: VecDeque<(i64, String)> = VecDeque::new();
     // "We acted recently and now postgres is stable" → emit Recovered once.
-    let mut action_pending_recovery: Option<i64> = None;
+    // Rebuilt from disk on startup so a container restart between reinit
+    // and stabilization still emits SelfHealRecovered when postgres comes
+    // back healthy.
+    let mut action_pending_recovery: Option<i64> =
+        read_state_field(&state_path, "last_action_at").and_then(|s| s.parse::<i64>().ok());
+    // Dedupe SelfHealGaveUp: the decide function returns EmitGaveUp on
+    // every iteration while the cap is tripped (up to ~1h until the
+    // oldest attempt ages out). Emit telemetry once per breach.
+    let mut gave_up_emitted = false;
 
     loop {
         if let Err(e) = iteration(
@@ -334,6 +342,7 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
             &state_path,
             &mut starts_seen,
             &mut action_pending_recovery,
+            &mut gave_up_emitted,
             &telemetry,
         )
         .await
@@ -350,6 +359,7 @@ async fn iteration(
     state_path: &str,
     starts_seen: &mut VecDeque<(i64, String)>,
     action_pending_recovery: &mut Option<i64>,
+    gave_up_emitted: &mut bool,
     telemetry: &Telemetry,
 ) -> Result<()> {
     let now = now_epoch();
@@ -398,6 +408,11 @@ async fn iteration(
     let last_action_at =
         read_state_field(state_path, "last_action_at").and_then(|s| s.parse::<i64>().ok());
     let action_attempts_in_window = recent_action_count(state_path, now);
+    // Clear the dedupe latch once we're back under the cap so a fresh
+    // breach in a future window emits again.
+    if action_attempts_in_window < cfg.thresholds.max_attempts_per_hour {
+        *gave_up_emitted = false;
+    }
 
     // 5. Recovery detection: we acted, postgres has been stable since.
     let recovery_seen_after_action = match (*action_pending_recovery, &local.state) {
@@ -465,20 +480,29 @@ async fn iteration(
                 attempts,
             });
             // Clear the pending-recovery flag and the action history.
+            // Field name is "attempt" (singular) — that's the prefix
+            // append_attempt writes and recent_action_count reads.
             *action_pending_recovery = None;
             let _ = clear_state_field(state_path, "last_action_at");
-            let _ = clear_state_field(state_path, "attempts");
+            let _ = clear_state_field(state_path, "attempt");
         }
         SelfHealAction::EmitGaveUp {
             last_reason,
             attempts,
         } => {
-            warn!(attempts, last_reason = %last_reason, "self-heal: giving up");
-            telemetry.send(TelemetryEvent::SelfHealGaveUp {
-                node: member_name.clone(),
-                attempts,
-                last_reason,
-            });
+            // Dedupe: decide_self_heal returns EmitGaveUp every iteration
+            // while the cap is tripped. Emit telemetry once per breach;
+            // the latch clears when action_attempts_in_window drops below
+            // the cap again.
+            if !*gave_up_emitted {
+                warn!(attempts, last_reason = %last_reason, "self-heal: giving up");
+                telemetry.send(TelemetryEvent::SelfHealGaveUp {
+                    node: member_name.clone(),
+                    attempts,
+                    last_reason,
+                });
+                *gave_up_emitted = true;
+            }
             // Don't clear attempts — operator action required to reset.
         }
     }
@@ -544,17 +568,16 @@ async fn check_leader_reachable(client: &reqwest::Client, timeout_secs: u64) -> 
         return false;
     };
     // Patroni's /health endpoint mirrors /leader on the leader: 200 if
-    // healthy, 503 otherwise.
+    // healthy, 503 otherwise. Reuse the shared client with a per-request
+    // timeout override so we keep the connection pool warm across polls.
     let url = format!("{}/health", api_url.trim_end_matches('/'));
-    let _ = leader; // silence unused-name lints in case fields shift
-    let probe = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .build();
-    let Ok(probe) = probe else {
-        return false;
-    };
     matches!(
-        probe.get(&url).send().await.map(|r| r.status().as_u16()),
+        client
+            .get(&url)
+            .timeout(Duration::from_secs(timeout_secs))
+            .send()
+            .await
+            .map(|r| r.status().as_u16()),
         Ok(200)
     )
 }
@@ -563,7 +586,7 @@ async fn issue_reinitialize(client: &reqwest::Client) -> Result<()> {
     let body = serde_json::json!({ "force": true });
     let resp = client.post(PATRONI_REINIT_URL).json(&body).send().await?;
     let status = resp.status();
-    if !status.is_success() && status.as_u16() != 202 {
+    if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("POST /reinitialize returned {}: {}", status, body);
     }
@@ -573,7 +596,17 @@ async fn issue_reinitialize(client: &reqwest::Client) -> Result<()> {
 fn parse_role(s: Option<&str>) -> Role {
     match s {
         Some("master") | Some("primary") | Some("leader") => Role::Leader,
-        Some("replica") | Some("standby") | Some("sync_standby") => Role::Replica,
+        // standby_leader is the head of a cascading-replication chain — still
+        // a replica from the primary's POV, safe to reinit just like any
+        // other replica. sync_standby is treated the same way: from
+        // Patroni's lifecycle perspective, it's a replica we can re-clone.
+        Some("replica") | Some("standby") | Some("sync_standby") | Some("standby_leader") => {
+            Role::Replica
+        }
+        // "uninitialized" (node still joining) and anything else map to
+        // Unknown. Unknown alone won't trigger reinit — only Unknown
+        // combined with a crash-loop signal will, which is the right
+        // behavior for a fresh bootstrap that's genuinely failing.
         _ => Role::Unknown,
     }
 }
@@ -842,6 +875,12 @@ mod tests {
         assert_eq!(parse_role(Some("replica")), Role::Replica);
         assert_eq!(parse_role(Some("standby")), Role::Replica);
         assert_eq!(parse_role(Some("sync_standby")), Role::Replica);
+        // Cascading-replication head: still a replica from Patroni's
+        // perspective; safe to reinit.
+        assert_eq!(parse_role(Some("standby_leader")), Role::Replica);
+        // Joining a fresh cluster or unrecognized states fall to Unknown,
+        // which alone won't trigger reinit.
+        assert_eq!(parse_role(Some("uninitialized")), Role::Unknown);
         assert_eq!(parse_role(Some("")), Role::Unknown);
         assert_eq!(parse_role(None), Role::Unknown);
     }
@@ -880,6 +919,29 @@ mod tests {
         append_attempt(&p, now - 1800); // 30m ago — inside
         append_attempt(&p, now - 60); //    1m ago  — inside
         assert_eq!(recent_action_count(&p, now), 2);
+        let _ = fs::remove_file(&p);
+    }
+
+    /// Regression for the field-name typo: recovery used to call
+    /// `clear_state_field("attempts")` while writes/reads used `"attempt"`
+    /// (singular). The clear matched nothing, so attempts leaked across
+    /// recovery cycles and the rolling-hour cap tripped early on
+    /// re-occurrences. This test pins the singular spelling.
+    #[test]
+    fn clearing_attempt_removes_all_attempt_lines_and_preserves_others() {
+        let p = tmp_path();
+        let _ = fs::remove_file(&p);
+        let now = now_epoch();
+        append_attempt(&p, now - 100);
+        append_attempt(&p, now - 50);
+        write_state_field(&p, "last_action_at", "12345").unwrap();
+        assert_eq!(recent_action_count(&p, now), 2);
+
+        clear_state_field(&p, "attempt").unwrap();
+
+        assert_eq!(recent_action_count(&p, now), 0);
+        // Unrelated fields untouched.
+        assert_eq!(read_state_field(&p, "last_action_at"), Some("12345".into()));
         let _ = fs::remove_file(&p);
     }
 }
