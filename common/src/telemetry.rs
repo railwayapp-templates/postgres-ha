@@ -66,6 +66,41 @@ pub enum TelemetryEvent {
     /// Replica backend unavailable - no healthy replicas for read traffic
     ReplicaUnavailable { node: String, scope: String, servers: Vec<String> },
 
+    /// Replica observed in a stuck postgres state that Patroni won't recover
+    /// from on its own (WAL-too-old after rewind, pg_control corruption,
+    /// stuck-starting, etc.). Detection only — no action yet.
+    SelfHealDetected {
+        node: String,
+        reason: String,
+        signals: Vec<String>,
+    },
+
+    /// Self-heal supervisor issued POST /reinitialize against the local
+    /// Patroni REST API. Replica only; never fires against a leader. Leader
+    /// must be reachable at action time so the re-clone has a source.
+    SelfHealReinitTriggered {
+        node: String,
+        reason: String,
+        attempt: u32,
+    },
+
+    /// Replica returned to healthy state (running/streaming) after one or
+    /// more self-heal actions. Emitted once per recovery cycle.
+    SelfHealRecovered {
+        node: String,
+        recovered_in_secs: u64,
+        attempts: u32,
+    },
+
+    /// Self-heal supervisor exhausted its per-hour attempt cap on this
+    /// replica without recovery. Further action suppressed; escalates to
+    /// operators via this event.
+    SelfHealGaveUp {
+        node: String,
+        attempts: u32,
+        last_reason: String,
+    },
+
     // === etcd Events ===
     /// etcd cluster bootstrap initiated
     EtcdBootstrap {
@@ -141,6 +176,10 @@ impl TelemetryEvent {
             Self::ProcessDied { .. } => "POSTGRES_HA_PROCESS_DIED",
             Self::DcsUnavailable { .. } => "POSTGRES_HA_DCS_UNAVAILABLE",
             Self::ReplicaUnavailable { .. } => "POSTGRES_HA_REPLICA_UNAVAILABLE",
+            Self::SelfHealDetected { .. } => "POSTGRES_HA_SELF_HEAL_DETECTED",
+            Self::SelfHealReinitTriggered { .. } => "POSTGRES_HA_SELF_HEAL_REINIT_TRIGGERED",
+            Self::SelfHealRecovered { .. } => "POSTGRES_HA_SELF_HEAL_RECOVERED",
+            Self::SelfHealGaveUp { .. } => "POSTGRES_HA_SELF_HEAL_GAVE_UP",
             Self::EtcdBootstrap { .. } => "ETCD_CLUSTER_BOOTSTRAP",
             Self::EtcdNodeJoined { .. } => "ETCD_NODE_JOINED",
             Self::EtcdNodePromoted { .. } => "ETCD_NODE_PROMOTED",
@@ -216,6 +255,34 @@ impl TelemetryEvent {
                         node, scope, servers.join(", ")
                     )
                 }
+            }
+            Self::SelfHealDetected { node, reason, signals } => {
+                if signals.is_empty() {
+                    format!("Self-heal: {} stuck ({}), no action yet", node, reason)
+                } else {
+                    format!(
+                        "Self-heal: {} stuck ({}), signals: {}",
+                        node, reason, signals.join(", ")
+                    )
+                }
+            }
+            Self::SelfHealReinitTriggered { node, reason, attempt } => {
+                format!(
+                    "Self-heal: reinitializing {} (reason: {}, attempt {})",
+                    node, reason, attempt
+                )
+            }
+            Self::SelfHealRecovered { node, recovered_in_secs, attempts } => {
+                format!(
+                    "Self-heal: {} recovered after {} attempt(s) in {}s",
+                    node, attempts, recovered_in_secs
+                )
+            }
+            Self::SelfHealGaveUp { node, attempts, last_reason } => {
+                format!(
+                    "Self-heal: giving up on {} after {} attempts (last: {}); manual intervention required",
+                    node, attempts, last_reason
+                )
             }
             Self::EtcdBootstrap {
                 node,

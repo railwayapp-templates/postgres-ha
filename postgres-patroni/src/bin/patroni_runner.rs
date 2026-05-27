@@ -10,7 +10,7 @@ use nix::sys::stat::{umask, Mode};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
-    spawn_backup_watcher, update_pg_hba_for_replication, Config,
+    spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
 };
 use postgres_patroni::pgbackrest::derive_pgbackrest_repo_path;
 use postgres_patroni::{volume_root, Telemetry};
@@ -1216,6 +1216,13 @@ async fn main() -> Result<()> {
     // within one poll cycle after failover. No-op when
     // WAL_ARCHIVE_BUCKET is unset.
     spawn_backup_watcher(config.data_dir.clone());
+
+    // Spawn the replica-only self-heal watcher. Polls Patroni REST for
+    // postmaster_start_time and POSTs /reinitialize when a replica is
+    // crash-looping in a state Patroni's built-in recovery doesn't
+    // catch (notably WAL-too-old after demoted-leader pg_rewind). No-op
+    // on leaders. Honors SELF_HEAL_DISABLED=1 as a kill switch.
+    spawn_self_heal_watcher(volume_root.clone(), telemetry.clone());
 
     run_monitoring_loop(&config, child, &telemetry).await
 }
