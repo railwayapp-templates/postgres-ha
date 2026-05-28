@@ -1297,9 +1297,63 @@ async fn gap_recovery_step(
     let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
 
     let probe = match probe_catalog_max(stats).await {
-        Ok(p) => p,
+        Ok(p) => {
+            // Probe succeeded — reset consecutive-failure tracking.
+            let _ = write_state_field(&state_path, "probe_fail_since", "0");
+            let _ = write_state_field(&state_path, "probe_fail_wal_at_start", "");
+            p
+        }
         Err(e) => {
+            // S3 blind-spot kick: probe_catalog_max requires S3 reads. When
+            // S3 is completely unreachable (e.g. Tigris outage), every probe
+            // times out — the lag-threshold path never fires and a hung async
+            // worker is never killed even though the spool keeps accumulating
+            // WAL behind a queue-max-trip.
+            //
+            // If the blackout exceeds gap_recovery_backoff AND
+            // last_archived_wal has advanced (postgres is still handing WAL
+            // to the spool), pkill the async daemon. The hung S3 connection
+            // is torn down; archive_command respawns the async process on the
+            // next WAL switch, which retries once S3 recovers. The clock
+            // resets after each kick so we don't pkill every iteration.
             warn!(error = %e, "pgbackrest-watcher: pgbackrest info probe failed; leaving gap-recovery state unchanged");
+
+            let probe_fail_since: i64 = read_state_field(&state_path, "probe_fail_since")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let probe_fail_wal: String =
+                read_state_field(&state_path, "probe_fail_wal_at_start").unwrap_or_default();
+
+            if probe_fail_since == 0 {
+                let _ = write_state_field(&state_path, "probe_fail_since", &now.to_string());
+                let _ = write_state_field(
+                    &state_path,
+                    "probe_fail_wal_at_start",
+                    &stats.last_archived_wal,
+                );
+            } else {
+                let blackout_s = now - probe_fail_since;
+                let wal_advanced = !stats.last_archived_wal.is_empty()
+                    && !probe_fail_wal.is_empty()
+                    && stats.last_archived_wal != probe_fail_wal;
+                if blackout_s >= config.gap_recovery_backoff as i64 && wal_advanced {
+                    warn!(
+                        blackout_s = blackout_s,
+                        wal_at_start = %probe_fail_wal,
+                        wal_now = %stats.last_archived_wal,
+                        "pgbackrest-watcher: S3 unreachable while postgres keeps handing WAL — kicking async daemon (blind-spot kick)"
+                    );
+                    kick_async_daemon().await;
+                    // Reset so the next kick fires after another full backoff.
+                    let _ =
+                        write_state_field(&state_path, "probe_fail_since", &now.to_string());
+                    let _ = write_state_field(
+                        &state_path,
+                        "probe_fail_wal_at_start",
+                        &stats.last_archived_wal,
+                    );
+                }
+            }
             return;
         }
     };
