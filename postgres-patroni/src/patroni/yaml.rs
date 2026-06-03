@@ -7,8 +7,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tracing::info;
 
-/// Generate Patroni YAML configuration
-pub fn generate_patroni_config(config: &Config) -> String {
+/// Generate Patroni YAML configuration.
+///
+/// `wal_level` is the level seeded into `bootstrap.dcs.postgresql.parameters`.
+/// Pass `logical` to preserve logical replication on an adopted cluster that
+/// was already running it; otherwise `replica` (the HA default). The caller
+/// resolves this from the on-disk cluster via `pgbackrest::read_wal_level`.
+pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // Opt-in pgBackRest archiving: adds archive_mode/archive_command/
     // archive_timeout to the cluster's postgresql.parameters when
     // WAL_ARCHIVE_BUCKET is set.
@@ -85,7 +90,7 @@ bootstrap:
       remove_data_directory_on_rewind_failure: true
       remove_data_directory_on_diverged_timelines: true
       parameters:
-        wal_level: replica
+        wal_level: {wal_level}
         hot_standby: "on"
         max_wal_senders: 10
         max_replication_slots: 10
