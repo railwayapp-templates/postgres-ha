@@ -1838,6 +1838,132 @@ t_ha_invalid_bucket_validator() {
 #                                     against the watcher; behavior is identical
 #                                     to ssl. Covered there.
 
+# Seed $vol with a vanilla (non-HA) PostgreSQL data dir running at the given
+# wal_level, mirroring a standalone Railway Postgres about to be converted to
+# HA. For wal_level=logical it also creates a Fivetran-style publication +
+# logical slot. Clean-shuts-down so pg_control persists wal_level for the HA
+# image's `read_wal_level` to detect on adoption. Returns non-zero on failure.
+_seed_standalone_pgdata() {
+  local vol="$1" name="$2" wlvl="$3"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label "$HA_LABEL" --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -v "${vol}:/var/lib/postgresql/data" \
+    "postgres:${PG_VERSION}" \
+    -c "wal_level=${wlvl}" -c max_replication_slots=10 -c max_wal_senders=10 >/dev/null
+  local up=0 _i
+  for _i in $(seq 1 60); do
+    if docker exec "$name" pg_isready -U postgres -q >/dev/null 2>&1; then up=1; break; fi
+    sleep 1
+  done
+  if [ "$up" != 1 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; return 1; fi
+  if [ "$wlvl" = logical ]; then
+    docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 -q \
+      -c "CREATE PUBLICATION fivetran_pub FOR ALL TABLES;" \
+      -c "SELECT pg_create_logical_replication_slot('fivetran_pgoutput_slot','pgoutput');" \
+      >/dev/null || { docker rm -f "$name" >/dev/null 2>&1 || true; return 1; }
+  fi
+  # Clean shutdown → checkpoint persists wal_level setting into pg_control.
+  docker stop -t 30 "$name" >/dev/null
+  docker rm "$name" >/dev/null
+}
+
+# Boot a single HA node adopting an already-seeded volume. Mirrors the
+# converted root (postgres-1) in a standalone→HA conversion.
+_boot_adopting_node() {
+  local node="$1" scope="$2" etcd_hosts="$3" vol="$4"
+  docker run -d --name "$node" --label "$HA_LABEL" --network "$NET" --hostname "$node" \
+    -e PATRONI_ENABLED=true \
+    -e PATRONI_NAME="$node" \
+    -e PATRONI_SCOPE="$scope" \
+    -e RAILWAY_PRIVATE_DOMAIN="$node" \
+    -e PATRONI_ETCD3_HOSTS="$etcd_hosts" \
+    -e PATRONI_ADOPT_EXISTING_DATA=true \
+    -e POSTGRES_PASSWORD=test \
+    -e PATRONI_REPLICATION_PASSWORD=replpass \
+    -e PATRONI_SUPERUSER_PASSWORD=test \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -v "${vol}:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+}
+
+# Converting a standalone DB that runs logical replication (e.g. Fivetran)
+# must NOT downgrade wal_level to replica — that disables logical decoding and
+# breaks the existing slots. The HA image detects the adopted cluster's
+# wal_level from pg_control and preserves `logical`.
+t_ha_adopt_preserves_logical() {
+  local scope=t-logical-${PG_VERSION}
+  local node="${scope}-pg-1" vol="${scope}-pg-1-vol"
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  new_volume "$vol"
+
+  if ! _seed_standalone_pgdata "$vol" "${scope}-seed" logical; then
+    ko t_ha_adopt_preserves_logical "failed to seed standalone logical pgdata"
+    teardown_scope "$scope"; return
+  fi
+
+  _boot_adopting_node "$node" "$scope" "$etcd_hosts" "$vol"
+
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || {
+    ko t_ha_adopt_preserves_logical "no leader after adopting logical cluster"
+    fail_dump t_ha_adopt_preserves_logical "$node"; teardown_scope "$scope"; return
+  }
+
+  local lvl; lvl=$(psql_leader "$leader" -At -c "SHOW wal_level" 2>/dev/null)
+  if ! assert_eq "$lvl" "logical" "adopted wal_level preserved"; then
+    ko t_ha_adopt_preserves_logical "wal_level downgraded to '$lvl' on HA conversion"
+    fail_dump t_ha_adopt_preserves_logical "$node"; teardown_scope "$scope"; return
+  fi
+
+  # The Fivetran-style slot + publication must survive the conversion.
+  local slot pub
+  slot=$(psql_leader "$leader" -At -c "SELECT slot_name FROM pg_replication_slots WHERE slot_name='fivetran_pgoutput_slot'" 2>/dev/null)
+  pub=$(psql_leader "$leader" -At -c "SELECT pubname FROM pg_publication WHERE pubname='fivetran_pub'" 2>/dev/null)
+  if [ "$slot" != "fivetran_pgoutput_slot" ] || [ "$pub" != "fivetran_pub" ]; then
+    ko t_ha_adopt_preserves_logical "logical slot/publication lost (slot='$slot' pub='$pub')"
+    fail_dump t_ha_adopt_preserves_logical "$node"; teardown_scope "$scope"; return
+  fi
+
+  ok t_ha_adopt_preserves_logical
+  note "adopted wal_level=logical preserved; slot=$slot pub=$pub survived"
+  teardown_scope "$scope"
+}
+
+# The inverse: a standalone at the default wal_level=replica stays replica
+# after conversion — we only preserve logical when the source already had it,
+# never force a fleet-wide upgrade. Guards against hardcoding the level.
+t_ha_adopt_default_replica() {
+  local scope=t-replica-${PG_VERSION}
+  local node="${scope}-pg-1" vol="${scope}-pg-1-vol"
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  new_volume "$vol"
+
+  if ! _seed_standalone_pgdata "$vol" "${scope}-seed" replica; then
+    ko t_ha_adopt_default_replica "failed to seed standalone replica pgdata"
+    teardown_scope "$scope"; return
+  fi
+
+  _boot_adopting_node "$node" "$scope" "$etcd_hosts" "$vol"
+
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || {
+    ko t_ha_adopt_default_replica "no leader after adopting replica cluster"
+    fail_dump t_ha_adopt_default_replica "$node"; teardown_scope "$scope"; return
+  }
+
+  local lvl; lvl=$(psql_leader "$leader" -At -c "SHOW wal_level" 2>/dev/null)
+  if ! assert_eq "$lvl" "replica" "non-logical cluster stays replica"; then
+    ko t_ha_adopt_default_replica "expected replica, got '$lvl' (detection wrongly forced an upgrade)"
+    fail_dump t_ha_adopt_default_replica "$node"; teardown_scope "$scope"; return
+  fi
+
+  ok t_ha_adopt_default_replica
+  note "adopted wal_level=replica stayed replica (no fleet-wide logical tax)"
+  teardown_scope "$scope"
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -1862,6 +1988,9 @@ ALL_TESTS=(
   t_ha_failover_watcher_handoff
   # audit follow-up (M4 + L7 — see plan ok-fix-all-of-cheerful-wolf.md)
   t_ha_invalid_bucket_validator
+  # standalone→HA conversion: wal_level preservation (logical replication)
+  t_ha_adopt_preserves_logical
+  t_ha_adopt_default_replica
 )
 
 usage() {
