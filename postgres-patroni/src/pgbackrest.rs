@@ -33,6 +33,74 @@ pub fn read_postgres_sysid(data_dir: &str) -> Option<String> {
     None
 }
 
+/// Read the cluster's configured `wal_level` (`minimal` / `replica` /
+/// `logical`) from pg_control via `pg_controldata`. Returns None when
+/// pg_control isn't on disk yet (fresh volume, pre-initdb) or parsing fails.
+///
+/// Used during HA conversion to detect whether the adopted standalone cluster
+/// was running logical replication (e.g. a CDC pipeline like Fivetran) so the
+/// generated Patroni bootstrap config preserves `wal_level: logical` instead
+/// of silently downgrading it to `replica` — `replica` disables logical
+/// decoding and breaks the customer's existing replication slots.
+pub fn read_wal_level(data_dir: &str) -> Option<String> {
+    let pg_control = format!("{data_dir}/global/pg_control");
+    if !Path::new(&pg_control).exists() {
+        return None;
+    }
+    let out = std::process::Command::new("pg_controldata")
+        .arg(data_dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_wal_level(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the `wal_level setting:` line out of `pg_controldata` stdout.
+fn parse_wal_level(controldata_stdout: &str) -> Option<String> {
+    for line in controldata_stdout.lines() {
+        if let Some(rest) = line.strip_prefix("wal_level setting:") {
+            let level = rest.trim();
+            if !level.is_empty() {
+                return Some(level.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_wal_level;
+
+    // Real `pg_controldata` output uses the label "wal_level setting:" padded
+    // with spaces before the value.
+    const SAMPLE: &str = "\
+Database cluster state:               in production
+Latest checkpoint location:           0/1A2B3C0
+wal_level setting:                    logical
+wal_log_hints setting:                off
+max_connections setting:              200
+";
+
+    #[test]
+    fn parses_logical() {
+        assert_eq!(parse_wal_level(SAMPLE).as_deref(), Some("logical"));
+    }
+
+    #[test]
+    fn parses_replica() {
+        let out = SAMPLE.replace("logical", "replica");
+        assert_eq!(parse_wal_level(&out).as_deref(), Some("replica"));
+    }
+
+    #[test]
+    fn none_when_absent() {
+        assert_eq!(parse_wal_level("Database cluster state: in production\n"), None);
+    }
+}
+
 fn write_pgbackrest_repo_path_marker(marker: &str, path: &str) {
     if let Err(e) = fs::write(marker, format!("{path}\n")) {
         warn!(error = %e, marker = %marker, "pgbackrest: failed to write repo-path marker");

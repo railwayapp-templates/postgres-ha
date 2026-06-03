@@ -12,7 +12,7 @@ use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
     spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
 };
-use postgres_patroni::pgbackrest::derive_pgbackrest_repo_path;
+use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -1068,8 +1068,25 @@ async fn main() -> Result<()> {
         wait_for_cluster_in_etcd(&config).await?;
     }
 
+    // Preserve logical replication across HA conversion. If the adopted
+    // cluster was already running `wal_level=logical` (e.g. a Fivetran/CDC
+    // pipeline replicating off the standalone DB), keep it rather than
+    // downgrading to `replica` — `replica` disables logical decoding and
+    // silently breaks the customer's existing replication slots. New clusters
+    // (no pg_control yet) and non-logical clusters stay on the HA default of
+    // `replica`, so we never tax clusters that don't need it. bootstrap.dcs
+    // parameters only seed at first cluster init, so this is decided on the
+    // bootstrapping primary; replicas inherit wal_level from the DCS.
+    let wal_level = match read_wal_level(&config.data_dir).as_deref() {
+        Some("logical") => "logical",
+        _ => "replica",
+    };
+    if wal_level == "logical" {
+        info!("Adopted cluster has wal_level=logical; preserving it in Patroni bootstrap config");
+    }
+
     // Generate and write Patroni config
-    let patroni_config = generate_patroni_config(&config);
+    let patroni_config = generate_patroni_config(&config, wal_level);
     fs::create_dir_all("/etc/patroni").context("Failed to create /etc/patroni directory")?;
     fs::write("/etc/patroni/patroni.yml", &patroni_config)
         .context("Failed to write patroni.yml")?;
