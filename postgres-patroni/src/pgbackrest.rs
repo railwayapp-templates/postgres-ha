@@ -15,6 +15,9 @@ pub fn read_postgres_sysid(data_dir: &str) -> Option<String> {
         return None;
     }
     let out = std::process::Command::new("pg_controldata")
+        // Force untranslated output so prefix matching on the English labels
+        // below is stable regardless of the service's locale env.
+        .env("LC_ALL", "C")
         .arg(data_dir)
         .output()
         .ok()?;
@@ -45,16 +48,42 @@ pub fn read_postgres_sysid(data_dir: &str) -> Option<String> {
 pub fn read_wal_level(data_dir: &str) -> Option<String> {
     let pg_control = format!("{data_dir}/global/pg_control");
     if !Path::new(&pg_control).exists() {
+        // Fresh volume, pre-initdb. `replica` is the correct default; this is
+        // not an adopted cluster, so there's nothing to preserve.
         return None;
     }
-    let out = std::process::Command::new("pg_controldata")
+    // From here on pg_control EXISTS, so this is an existing (potentially
+    // adopted) cluster. Any failure to read its wal_level means we fall back to
+    // `replica` — which, if the cluster was actually `logical`, silently
+    // downgrades it and breaks logical replication. That's the exact failure
+    // this code prevents, so make it observable rather than swallowing it.
+    let out = match std::process::Command::new("pg_controldata")
+        // Force untranslated output so prefix matching in parse_wal_level is
+        // stable regardless of the service's locale env.
+        .env("LC_ALL", "C")
         .arg(data_dir)
         .output()
-        .ok()?;
+    {
+        Ok(out) => out,
+        Err(e) => {
+            warn!(error = %e, data_dir, "pg_controldata failed to spawn; cannot determine wal_level of existing cluster, defaulting to replica");
+            return None;
+        }
+    };
     if !out.status.success() {
+        warn!(
+            status = ?out.status.code(),
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            data_dir,
+            "pg_controldata exited non-zero; cannot determine wal_level of existing cluster, defaulting to replica"
+        );
         return None;
     }
-    parse_wal_level(&String::from_utf8_lossy(&out.stdout))
+    let level = parse_wal_level(&String::from_utf8_lossy(&out.stdout));
+    if level.is_none() {
+        warn!(data_dir, "pg_controldata output had no parseable wal_level line; defaulting to replica");
+    }
+    level
 }
 
 /// Parse the `wal_level setting:` line out of `pg_controldata` stdout.
