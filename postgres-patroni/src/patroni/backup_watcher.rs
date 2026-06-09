@@ -244,6 +244,13 @@ async fn run(data_dir: String) -> Result<()> {
         .timeout(Duration::from_secs(5))
         .build()?;
 
+    // Mark that a startup diff is pending. Cleared on first successful backup
+    // so it never fires twice per watcher spawn. Seals WAL gaps at the crash
+    // boundary (pg_stat_archiver resets on restart, so lag-detection can't see
+    // historical pre-crash gaps) without waiting for the periodic diff interval.
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    let _ = write_state_field(&state_path, "startup_diff_pending", "1");
+
     loop {
         watcher_iteration(&data_dir, &config, &client).await;
         let state_path = format!("{data_dir}/{STATE_FILENAME}");
@@ -1556,6 +1563,16 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
         return Action::Full;
     }
 
+    // Startup diff — fires once per watcher spawn (startup_diff_pending is
+    // written in run() before the loop and cleared in run_backup on success).
+    // Ensures WAL lost at the crash boundary is sealed before the next periodic
+    // diff would otherwise fire. Gap-marker check above already returned if gap
+    // recovery is running; the startup diff fires on the first clean iteration
+    // after gap recovery clears its own marker.
+    if read_state_field(&state_path, "startup_diff_pending").as_deref() == Some("1") {
+        return Action::Diff;
+    }
+
     // Periodic diff.
     if config.diff_interval > 0 {
         let diff_anchor = last_diff.unwrap_or(last_full);
@@ -1644,6 +1661,11 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
                 }
                 _ => {}
             }
+            // Consume the startup-diff flag so it never fires again this run,
+            // regardless of what type of backup completed (full subsumes it;
+            // diff fulfills it; gap-recovery diff also clears it so the next
+            // iteration doesn't double-fire).
+            let _ = write_state_field(&state_path, "startup_diff_pending", "0");
             info!(backup_type = %backup_type, "pgbackrest-watcher: backup completed");
             emit_pitr_anchor().await;
             true
