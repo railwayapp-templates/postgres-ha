@@ -117,14 +117,14 @@ struct WatcherConfig {
     /// race), or a volume that survived a redeploy with stale state. 0
     /// disables the verify (NEEDS_INITIAL_BACKUP still fires on empty state).
     catalog_verify_interval: u64,
-    /// Deadlock breaker: `pgbackrest info` errors (rc≠0 / unparseable) are
-    /// "inconclusive" — could be an S3 outage OR a `backup.info` pgBackRest
-    /// rejects after an interrupted first full. The former also halts
-    /// archiving; the latter keeps WAL flowing. When the inconclusive run has
-    /// lasted this long AND `pg_stat_archiver.last_archived_time` advanced
-    /// (S3 reachable → catalog broken, not down), stanza-create + clear
-    /// last_full_at to re-take the first full instead of skipping forever.
-    catalog_verify_selfheal_after: u64,
+    /// Minimum spacing between full-backup *attempts*. NEEDS_INITIAL_BACKUP and
+    /// the catalog-verify rc=1 clear both leave `last_full_at` empty, which
+    /// makes decide_action want a full every poll — so a full that keeps
+    /// FAILING (S3 down, broken backup.info) would hammer S3 with full-sized
+    /// pushes. `last_full_attempt_at` is stamped at the start of each full;
+    /// decide_action suppresses the next full until this elapses. The first
+    /// attempt on a fresh enable is never delayed (no prior attempt recorded).
+    full_retry_backoff: u64,
 }
 
 impl WatcherConfig {
@@ -153,10 +153,7 @@ impl WatcherConfig {
                 "WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS",
                 3600,
             ),
-            catalog_verify_selfheal_after: env_u64(
-                "WAL_BACKUP_CATALOG_VERIFY_SELFHEAL_AFTER_SECONDS",
-                1800,
-            ),
+            full_retry_backoff: env_u64("WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS", 600),
         }
     }
 }
@@ -351,7 +348,7 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
     // actually has one. May clear last_full_at (catalog says no full, or a
     // persistently-broken backup.info while WAL keeps flowing), in which case
     // the decide_action below sees no full and re-fires NEEDS_INITIAL_BACKUP.
-    catalog_verify_step(data_dir, config, &stats).await;
+    catalog_verify_step(data_dir, config).await;
 
     let action = decide_action(data_dir, config, &stats);
     match action {
@@ -733,19 +730,28 @@ async fn log_catalog_probe_error() {
 /// else reconciles it. postgres-ssl's bash watcher had this; the Rust port
 /// did not — this closes the gap.
 ///
-/// - `FullPresent`  → stamp the verify time, reset the inconclusive run.
-/// - `NoFull`       → clear `last_full_at`; decide_action re-fires the full.
-/// - `Inconclusive` → could be S3 down (archiving also halts) or a broken
-///   backup.info (WAL keeps flowing). Track the run; once it has lasted
-///   `catalog_verify_selfheal_after` AND `last_archived_time` advanced over
-///   the run (proof S3 is reachable), log the swallowed stderr, run
-///   stanza-create, and clear `last_full_at`.
+/// - `FullPresent`  → nothing to do.
+/// - `NoFull`       → conclusive (info succeeded, empty backup list). Clear
+///   `last_full_at`; decide_action re-fires the full (subject to the
+///   full-retry backoff). Safe on a single rc=1 — it's a successful probe, so
+///   it can't be a transient.
+/// - `Inconclusive` → info errored (S3 hiccup, auth, or a rejected
+///   backup.info). Don't clear `last_full_at` — that would burn a full on
+///   every transient info error, which are common. Instead log the otherwise-
+///   swallowed stderr and run an idempotent `stanza-create`: cheap, and it
+///   repairs a missing/half-written backup.info so the *next* verify returns
+///   rc=1 and the clear path takes over. A truly-unreachable S3 makes
+///   stanza-create a no-op; nothing is burned.
+///
+/// `last_catalog_verify_at` is stamped on every outcome (including rc=2), so
+/// the probe — and the rc=2 stanza-create — run at most once per interval, not
+/// every poll.
 ///
 /// Skips while the gap-recovery marker or a WAL_REGRESSION migration is in
 /// flight — those own remediation, and clearing `last_full_at` underneath
 /// them would let decide_action take a full mid-recovery (bypassing the
 /// gap-marker guard).
-async fn catalog_verify_step(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) {
+async fn catalog_verify_step(data_dir: &str, config: &WatcherConfig) {
     if config.catalog_verify_interval == 0 {
         return;
     }
@@ -772,79 +778,34 @@ async fn catalog_verify_step(data_dir: &str, config: &WatcherConfig, stats: &Arc
     }
 
     info!("pgbackrest-watcher: verifying S3 catalog has full backup");
-    match catalog_check_backup().await {
+    let outcome = catalog_check_backup().await;
+    let _ = write_state_field(&state_path, "last_catalog_verify_at", &now.to_string());
+    match outcome {
         CatalogBackupState::FullPresent => {
-            let _ = write_state_field(&state_path, "last_catalog_verify_at", &now.to_string());
-            let _ = write_state_field(&state_path, "catalog_verify_inconclusive_since", "0");
             info!("pgbackrest-watcher: catalog verified — full backup present in S3");
         }
         CatalogBackupState::NoFull => {
-            let _ = write_state_field(&state_path, "last_catalog_verify_at", &now.to_string());
-            let _ = write_state_field(&state_path, "catalog_verify_inconclusive_since", "0");
             info!("pgbackrest-watcher: catalog shows no full backup despite local state; clearing last_full_at to trigger new full");
             let _ = write_state_field(&state_path, "last_full_at", "");
         }
         CatalogBackupState::Inconclusive => {
-            let since = read_state_field(&state_path, "catalog_verify_inconclusive_since")
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            if since == 0 {
-                let _ = write_state_field(
-                    &state_path,
-                    "catalog_verify_inconclusive_since",
-                    &now.to_string(),
-                );
-                let _ = write_state_field(
-                    &state_path,
-                    "catalog_verify_inconclusive_archived_epoch_at_start",
-                    &stats.last_archived_epoch.to_string(),
-                );
-                info!("pgbackrest-watcher: catalog check inconclusive (S3 unreachable or backup.info not readable); skipping (run started)");
-            } else {
-                let archived_epoch_start = read_state_field(
-                    &state_path,
-                    "catalog_verify_inconclusive_archived_epoch_at_start",
-                )
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-                let inconclusive_for = now - since;
-                let archiving_advanced = stats.last_archived_epoch > archived_epoch_start;
-                if inconclusive_for >= config.catalog_verify_selfheal_after as i64
-                    && archiving_advanced
-                {
-                    warn!(
-                        inconclusive_for = inconclusive_for,
-                        "pgbackrest-watcher: catalog check inconclusive while WAL keeps archiving — backup.info is broken, not S3 down; self-healing"
-                    );
-                    log_catalog_probe_error().await;
-                    let sc = Command::new("pgbackrest")
-                        .args(["--stanza=main", "stanza-create"])
-                        .env_remove("PGHOST")
-                        .env_remove("PGPORT")
-                        .status()
-                        .await;
-                    match sc {
-                        Ok(s) if s.success() => {
-                            info!("pgbackrest-watcher: stanza-create completed (self-heal)")
-                        }
-                        Ok(s) => {
-                            warn!(status = ?s, "pgbackrest-watcher: stanza-create failed (self-heal)")
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "pgbackrest-watcher: stanza-create invocation failed (self-heal)")
-                        }
-                    }
-                    let _ = write_state_field(&state_path, "catalog_verify_inconclusive_since", "0");
-                    let _ =
-                        write_state_field(&state_path, "last_catalog_verify_at", &now.to_string());
-                    info!("pgbackrest-watcher: clearing last_full_at to re-trigger initial full");
-                    let _ = write_state_field(&state_path, "last_full_at", "");
-                } else {
-                    info!(
-                        inconclusive_for = inconclusive_for,
-                        archiving_advanced = archiving_advanced,
-                        "pgbackrest-watcher: catalog check inconclusive (S3 unreachable or backup.info not readable); skipping"
-                    );
+            info!("pgbackrest-watcher: catalog check inconclusive (pgbackrest info errored); logging probe error + running idempotent stanza-create");
+            log_catalog_probe_error().await;
+            let sc = Command::new("pgbackrest")
+                .args(["--stanza=main", "stanza-create"])
+                .env_remove("PGHOST")
+                .env_remove("PGPORT")
+                .status()
+                .await;
+            match sc {
+                Ok(s) if s.success() => {
+                    info!("pgbackrest-watcher: stanza-create completed (catalog-verify repair)")
+                }
+                Ok(s) => {
+                    warn!(status = ?s, "pgbackrest-watcher: stanza-create failed (catalog-verify repair)")
+                }
+                Err(e) => {
+                    warn!(error = %e, "pgbackrest-watcher: stanza-create invocation failed (catalog-verify repair)")
                 }
             }
         }
@@ -1782,13 +1743,30 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
         };
     }
 
+    // Full-attempt backoff. NEEDS_INITIAL and the catalog-verify rc=1 clear
+    // both leave last_full_at empty, so a full that keeps FAILING (S3 down,
+    // broken backup.info) would otherwise be re-attempted every poll, hammering
+    // S3 with full-sized pushes. last_full_attempt_at is stamped at the start
+    // of every full in run_backup; space successive attempts at least
+    // full_retry_backoff apart. The first attempt on a fresh enable fires
+    // immediately (no prior attempt recorded), so a healthy initial full is
+    // never delayed.
+    let full_attempt_ok = read_state_field(&state_path, "last_full_attempt_at")
+        .and_then(|s| s.parse::<i64>().ok())
+        .map_or(true, |t| now >= t + config.full_retry_backoff as i64);
+
     // NEEDS_INITIAL_BACKUP — no full on record, take it now. pgbackrest
     // backup brackets the base in pg_backup_start/stop and waits for the
     // closing WAL to archive before declaring success, so a broken
     // archive_command fails the backup loudly instead of producing an
     // unrestorable base.
     if last_full.is_none() {
-        return Action::Full;
+        if full_attempt_ok {
+            return Action::Full;
+        }
+        return Action::None {
+            reason: "initial full within retry backoff".to_string(),
+        };
     }
     let last_full = last_full.unwrap();
 
@@ -1805,9 +1783,15 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     }
 
     // Periodic full. full_interval=0 disables periodic fulls (gap +
-    // initial still fire).
+    // initial still fire). Same retry backoff so a failing periodic full
+    // doesn't re-fire every poll once it's due.
     if config.full_interval > 0 && now >= last_full + config.full_interval as i64 {
-        return Action::Full;
+        if full_attempt_ok {
+            return Action::Full;
+        }
+        return Action::None {
+            reason: "periodic full within retry backoff".to_string(),
+        };
     }
 
     // Periodic diff.
@@ -1839,6 +1823,14 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
         Action::None { .. } => return false,
     };
     info!(backup_type = %backup_type, "pgbackrest-watcher: running backup");
+
+    // Stamp the attempt time up front (success or fail) so decide_action's
+    // full_retry_backoff spacing applies to a full that keeps failing, rather
+    // than re-firing it every poll.
+    if matches!(action, Action::Full) {
+        let state_path = format!("{data_dir}/{STATE_FILENAME}");
+        let _ = write_state_field(&state_path, "last_full_attempt_at", &now_epoch().to_string());
+    }
 
     let mut res = Command::new("pgbackrest")
         .args(["--stanza=main", "backup", &format!("--type={backup_type}")])
