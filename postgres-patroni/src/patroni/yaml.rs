@@ -94,7 +94,7 @@ bootstrap:
         hot_standby: "on"
         max_wal_senders: 10
         max_replication_slots: 10
-        max_connections: 200
+        max_connections: 500
         password_encryption: scram-sha-256
         shared_preload_libraries: pg_stat_statements
 {pgbackrest_archive_params}
