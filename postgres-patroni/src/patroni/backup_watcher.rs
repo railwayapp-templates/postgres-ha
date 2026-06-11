@@ -339,6 +339,12 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
         }
     };
 
+    // Idempotent stanza health — every iteration. A no-op (2 S3 reads) when
+    // the stanza is healthy; repairs a missing or corrupt backup.info on the
+    // spot. Running every iteration means a broken stanza is fixed on the next
+    // poll rather than waiting up to catalog_verify_interval (default 3600 s).
+    stanza_create_step().await;
+
     // Gap-recovery state machine — detects WAL/catalog divergence and
     // drives the kick-and-diff sequence. Runs every iteration;
     // pgbackrest info is cheap enough that throttling isn't worth the
@@ -722,6 +728,40 @@ async fn log_catalog_probe_error() {
     }
 }
 
+/// Runs `pgbackrest stanza-create` every watcher iteration.
+///
+/// `stanza-create` is idempotent: when the stanza already exists and
+/// `backup.info` is valid it does a couple of S3 reads and exits 0 (silent
+/// from the caller's perspective). It only writes when `backup.info` is missing
+/// or corrupt — exactly the rc=2 deadlock scenario. Running every iteration
+/// decouples stanza repair from the catalog-verify interval so a broken stanza
+/// is fixed on the next poll (~60 s) rather than waiting up to
+/// `catalog_verify_interval` (default 3600 s). Logs only on failure.
+async fn stanza_create_step() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        Command::new("pgbackrest")
+            .args(["--stanza=main", "stanza-create"])
+            .env_remove("PGHOST")
+            .env_remove("PGPORT")
+            .output(),
+    )
+    .await;
+    match result {
+        Ok(Ok(o)) if o.status.success() => {}
+        Ok(Ok(o)) => {
+            let stderr: String = String::from_utf8_lossy(&o.stderr)
+                .replace('\n', " ")
+                .chars()
+                .take(300)
+                .collect();
+            warn!(status = ?o.status, stderr = %stderr, "pgbackrest-watcher: stanza-create failed");
+        }
+        Ok(Err(e)) => warn!(error = %e, "pgbackrest-watcher: stanza-create invocation failed"),
+        Err(_) => warn!("pgbackrest-watcher: stanza-create timed out"),
+    }
+}
+
 /// Periodically reconcile local `last_full_at` against the S3 catalog, and
 /// break the inconclusive-forever deadlock.
 ///
@@ -738,15 +778,13 @@ async fn log_catalog_probe_error() {
 ///   it can't be a transient.
 /// - `Inconclusive` → info errored (S3 hiccup, auth, or a rejected
 ///   backup.info). Don't clear `last_full_at` — that would burn a full on
-///   every transient info error, which are common. Instead log the otherwise-
-///   swallowed stderr and run an idempotent `stanza-create`: cheap, and it
-///   repairs a missing/half-written backup.info so the *next* verify returns
-///   rc=1 and the clear path takes over. A truly-unreachable S3 makes
-///   stanza-create a no-op; nothing is burned.
+///   every transient info error, which are common. Log the otherwise-swallowed
+///   stderr. `stanza_create_step` already ran this iteration and will repair a
+///   missing/half-written `backup.info`; the *next* verify will then see
+///   `NoFull` and the clear path takes over.
 ///
-/// `last_catalog_verify_at` is stamped on every outcome (including rc=2), so
-/// the probe — and the rc=2 stanza-create — run at most once per interval, not
-/// every poll.
+/// `last_catalog_verify_at` is stamped on every outcome (including Inconclusive)
+/// so the probe runs at most once per interval, not every poll.
 ///
 /// Skips while the gap-recovery marker or a WAL_REGRESSION migration is in
 /// flight — those own remediation, and clearing `last_full_at` underneath
@@ -790,25 +828,8 @@ async fn catalog_verify_step(data_dir: &str, config: &WatcherConfig) {
             let _ = write_state_field(&state_path, "last_full_at", "");
         }
         CatalogBackupState::Inconclusive => {
-            info!("pgbackrest-watcher: catalog check inconclusive (pgbackrest info errored); logging probe error + running idempotent stanza-create");
+            info!("pgbackrest-watcher: catalog check inconclusive (pgbackrest info errored); logging probe error (stanza-create ran this iteration)");
             log_catalog_probe_error().await;
-            let sc = Command::new("pgbackrest")
-                .args(["--stanza=main", "stanza-create"])
-                .env_remove("PGHOST")
-                .env_remove("PGPORT")
-                .status()
-                .await;
-            match sc {
-                Ok(s) if s.success() => {
-                    info!("pgbackrest-watcher: stanza-create completed (catalog-verify repair)")
-                }
-                Ok(s) => {
-                    warn!(status = ?s, "pgbackrest-watcher: stanza-create failed (catalog-verify repair)")
-                }
-                Err(e) => {
-                    warn!(error = %e, "pgbackrest-watcher: stanza-create invocation failed (catalog-verify repair)")
-                }
-            }
         }
     }
 }
