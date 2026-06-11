@@ -117,13 +117,14 @@ struct WatcherConfig {
     /// race), or a volume that survived a redeploy with stale state. 0
     /// disables the verify (NEEDS_INITIAL_BACKUP still fires on empty state).
     catalog_verify_interval: u64,
-    /// Minimum spacing between full-backup *attempts*. NEEDS_INITIAL_BACKUP and
-    /// the catalog-verify rc=1 clear both leave `last_full_at` empty, which
-    /// makes decide_action want a full every poll — so a full that keeps
-    /// FAILING (S3 down, broken backup.info) would hammer S3 with full-sized
-    /// pushes. `last_full_attempt_at` is stamped at the start of each full;
-    /// decide_action suppresses the next full until this elapses. The first
-    /// attempt on a fresh enable is never delayed (no prior attempt recorded).
+    /// Minimum spacing between retries of a FAILING full backup.
+    /// NEEDS_INITIAL_BACKUP and the catalog-verify rc=1 clear both leave
+    /// `last_full_at` empty, which makes decide_action want a full every poll —
+    /// so a full that keeps failing (S3 down, broken backup.info) would hammer
+    /// S3 with full-sized pushes. run_backup records `last_full_failure_at`
+    /// only on a failed full (cleared on success); decide_action suppresses the
+    /// next full until this elapses. A full after a *deliberate* `last_full_at`
+    /// clear carries no fresh failure marker, so it fires immediately.
     full_retry_backoff: u64,
 }
 
@@ -1743,15 +1744,15 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
         };
     }
 
-    // Full-attempt backoff. NEEDS_INITIAL and the catalog-verify rc=1 clear
-    // both leave last_full_at empty, so a full that keeps FAILING (S3 down,
-    // broken backup.info) would otherwise be re-attempted every poll, hammering
-    // S3 with full-sized pushes. last_full_attempt_at is stamped at the start
-    // of every full in run_backup; space successive attempts at least
-    // full_retry_backoff apart. The first attempt on a fresh enable fires
-    // immediately (no prior attempt recorded), so a healthy initial full is
-    // never delayed.
-    let full_attempt_ok = read_state_field(&state_path, "last_full_attempt_at")
+    // Full-retry backoff. NEEDS_INITIAL and the catalog-verify rc=1 clear both
+    // leave last_full_at empty, so a full that keeps FAILING (S3 down, broken
+    // backup.info) would otherwise be re-attempted every poll, hammering S3
+    // with full-sized pushes. run_backup records last_full_failure_at only when
+    // a full FAILS (and clears it on success), so this gates retries of a
+    // failing full without ever delaying a full that follows a deliberate
+    // last_full_at clear (fresh enable, rc=1 self-heal, WAL_REGRESSION migrate
+    // — none of which leave a fresh failure marker).
+    let full_attempt_ok = read_state_field(&state_path, "last_full_failure_at")
         .and_then(|s| s.parse::<i64>().ok())
         .map_or(true, |t| now >= t + config.full_retry_backoff as i64);
 
@@ -1824,14 +1825,6 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
     };
     info!(backup_type = %backup_type, "pgbackrest-watcher: running backup");
 
-    // Stamp the attempt time up front (success or fail) so decide_action's
-    // full_retry_backoff spacing applies to a full that keeps failing, rather
-    // than re-firing it every poll.
-    if matches!(action, Action::Full) {
-        let state_path = format!("{data_dir}/{STATE_FILENAME}");
-        let _ = write_state_field(&state_path, "last_full_attempt_at", &now_epoch().to_string());
-    }
-
     let mut res = Command::new("pgbackrest")
         .args(["--stanza=main", "backup", &format!("--type={backup_type}")])
         .env_remove("PGHOST")
@@ -1872,6 +1865,11 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
                 "full" => {
                     let _ = write_state_field(&state_path, "last_full_at", &now.to_string());
                     let _ = write_state_field(&state_path, "last_diff_at", &now.to_string());
+                    // Clear the failure marker so a subsequent deliberate
+                    // last_full_at clear (catalog-verify rc=1, WAL_REGRESSION
+                    // migrate) re-fires the full immediately rather than
+                    // inheriting this run's backoff.
+                    let _ = write_state_field(&state_path, "last_full_failure_at", "");
                     // clear_gap_recovery_state refreshes pg_stat_archiver
                     // and writes last_full_failed_count itself — folds any
                     // failure-during-backup into the anchor so the next
@@ -1895,10 +1893,23 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
             true
         }
         Ok(s) => {
+            // Record failure time only for fulls so decide_action can space
+            // failing-full retries (full_retry_backoff) without hammering S3
+            // every poll. Diffs aren't gated.
+            if backup_type == "full" {
+                let state_path = format!("{data_dir}/{STATE_FILENAME}");
+                let _ =
+                    write_state_field(&state_path, "last_full_failure_at", &now_epoch().to_string());
+            }
             warn!(status = ?s, backup_type = %backup_type, "pgbackrest-watcher: backup failed (will retry next poll)");
             false
         }
         Err(e) => {
+            if backup_type == "full" {
+                let state_path = format!("{data_dir}/{STATE_FILENAME}");
+                let _ =
+                    write_state_field(&state_path, "last_full_failure_at", &now_epoch().to_string());
+            }
             warn!(error = %e, "pgbackrest-watcher: backup invocation failed");
             false
         }
