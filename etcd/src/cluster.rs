@@ -370,10 +370,19 @@ pub async fn start_etcd(
         "Starting etcd"
     );
 
-    let child = Command::new("/usr/local/bin/etcd")
-        .arg("--auto-compaction-retention=1")
-        .arg("--snapshot-count=1000")
-        .arg("--max-learners=2")
+    let mut cmd = Command::new("/usr/local/bin/etcd");
+
+    // Apply wrapper defaults as CLI flags only when the operator hasn't set the
+    // corresponding ETCD_* env var. etcd 3.6 treats a flag that is also set via
+    // its env var as a fatal conflict ("conflicting environment variable ... is
+    // shadowed by corresponding command-line flag") and refuses to start. A user
+    // tuning a documented setting like ETCD_AUTO_COMPACTION_RETENTION would
+    // otherwise crash the node, so let the env var win and skip our default.
+    apply_default_flag(&mut cmd, "--auto-compaction-retention", "ETCD_AUTO_COMPACTION_RETENTION", "1");
+    apply_default_flag(&mut cmd, "--snapshot-count", "ETCD_SNAPSHOT_COUNT", "1000");
+    apply_default_flag(&mut cmd, "--max-learners", "ETCD_MAX_LEARNERS", "2");
+
+    let child = cmd
         .env("ETCD_INITIAL_CLUSTER", initial_cluster)
         .env("ETCD_INITIAL_CLUSTER_STATE", initial_cluster_state)
         .stdin(Stdio::null())
@@ -383,4 +392,23 @@ pub async fn start_etcd(
         .context("Failed to start etcd")?;
 
     Ok(child)
+}
+
+/// Apply a wrapper default as a CLI flag, but only when the operator has not set
+/// the corresponding `ETCD_*` environment variable.
+///
+/// etcd 3.6 fatally rejects startup when a flag is supplied that is also set via
+/// its matching env var, so hardcoding the flag unconditionally would crash any
+/// node whose owner tuned the setting through the documented env var. Deferring
+/// to the env var keeps operator configuration authoritative while still
+/// providing a sane default when it is absent.
+fn apply_default_flag(cmd: &mut Command, flag: &str, env_key: &str, default: &str) {
+    match std::env::var(env_key) {
+        Ok(value) if !value.trim().is_empty() => {
+            info!(flag = %flag, env = %env_key, value = %value, "Operator set env var; deferring to it instead of default flag");
+        }
+        _ => {
+            cmd.arg(format!("{}={}", flag, default));
+        }
+    }
 }
