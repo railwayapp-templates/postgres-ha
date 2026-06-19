@@ -476,11 +476,20 @@ async fn probe_cluster_leader(config: &Config) -> Option<String> {
 
 /// Remove every entry inside `data_dir` (the contents, not the mount point),
 /// so Patroni sees an empty pgdata and performs a fresh pg_basebackup.
+///
+/// Symlinks are unlinked, never followed: `pg_tblspc/<oid>` and a relocated
+/// `pg_wal` are symlinks pointing outside pgdata, and a recursive
+/// `remove_dir_all` through one would delete data on another filesystem. We
+/// only recurse into a *real* directory; for a symlink (even one targeting a
+/// directory) we drop just the link. `DirEntry::file_type` does not traverse
+/// symlinks, so the explicit `is_symlink` check below is belt-and-suspenders
+/// to keep that invariant obvious and robust.
 fn wipe_pgdata_contents(data_dir: &str) -> Result<()> {
     for entry in fs::read_dir(data_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
             fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
         } else {
             fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
@@ -1483,6 +1492,29 @@ mod tests {
         assert!(dir.exists());
         assert!(!data_dir_nonempty(p));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wipe_unlinks_symlinks_without_following_them() {
+        // pg_tblspc / relocated pg_wal are symlinks out of pgdata; the wipe
+        // must drop the link, never recurse into and delete the target.
+        let base = std::env::temp_dir().join(format!("wipe_symlink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pgdata = base.join("pgdata");
+        let external = base.join("external_tablespace");
+        std::fs::create_dir_all(&pgdata).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("keepme"), b"data").unwrap();
+        std::os::unix::fs::symlink(&external, pgdata.join("pg_tblspc_link")).unwrap();
+        std::fs::write(pgdata.join("PG_VERSION"), b"17").unwrap();
+
+        wipe_pgdata_contents(pgdata.to_str().unwrap()).unwrap();
+
+        // pgdata emptied, but the symlink target and its file survive.
+        assert!(!data_dir_nonempty(pgdata.to_str().unwrap()));
+        assert!(external.join("keepme").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

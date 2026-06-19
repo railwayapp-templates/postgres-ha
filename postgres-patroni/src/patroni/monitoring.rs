@@ -49,12 +49,27 @@ pub async fn run_monitoring_loop(
     // global/pg_control LAST that leaves a non-empty pgdata with no control
     // file, which Patroni then refuses to start ("system ID is invalid"),
     // wedging the replica permanently. So we only accrue toward the recovery
-    // exit while volume usage is NOT growing: any growth is a clone/replay in
-    // flight (data files being laid down, or post-clone WAL streaming into
-    // pg_wal + spool) and resets the clock, while a genuinely stalled startup
-    // (no progress for max_startup_timeout) still exits for recovery.
+    // exit while the node is making NO progress, where progress is either of
+    // two independent signals:
+    //   1. Volume usage growing — pg_basebackup laying data files down. This is
+    //      the only signal available before Patroni's REST API answers.
+    //   2. WAL position (received/replayed LSN) advancing — covers the
+    //      post-basebackup catch-up phase, where the replica streams + replays
+    //      WAL with disk usage ~flat (segments recycled about as fast as they
+    //      arrive) yet the LSN keeps climbing. Volume bytes alone would read
+    //      that as "stalled" and wrongly kill a healthy catch-up.
+    // A genuinely stalled startup — and a hung clone (dead replication socket) —
+    // advances NEITHER signal, so it still exits for recovery after the timeout.
     let mut startup_elapsed = 0u64;
     let mut last_volume_used = volume_used_bytes(&config.data_dir);
+    let mut last_xlog_pos: Option<i64> = None;
+    // Short-timeout client for polling Patroni's local REST API for WAL
+    // progress. Best-effort: if it can't be built we fall back to the
+    // volume-usage signal alone.
+    let patroni_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok();
     loop {
         tokio::select! {
             _ = sigterm.recv() => {
@@ -80,9 +95,26 @@ pub async fn run_monitoring_loop(
             }
             _ = sleep(Duration::from_secs(5)) => {
                 let healthy = check_health(config.health_check_timeout).await;
+
                 let used = volume_used_bytes(&config.data_dir);
-                let progressing = used > last_volume_used;
+                let volume_grew = used > last_volume_used;
                 last_volume_used = used;
+
+                // WAL position is the progress signal whole-volume bytes miss:
+                // during catch-up the replica streams + replays WAL while disk
+                // usage stays ~flat, but received/replayed LSN keeps advancing.
+                // Absent during pg_basebackup (no xlog yet) — that phase is
+                // covered by volume growth instead.
+                let xlog_pos = match patroni_client.as_ref() {
+                    Some(c) => fetch_patroni_xlog_position(c).await,
+                    None => None,
+                };
+                let lsn_advanced = xlog_advanced(last_xlog_pos, xlog_pos);
+                if xlog_pos.is_some() {
+                    last_xlog_pos = xlog_pos;
+                }
+
+                let progressing = volume_grew || lsn_advanced;
 
                 match classify_startup_tick(
                     healthy,
@@ -99,7 +131,10 @@ pub async fn run_monitoring_loop(
                         if startup_elapsed > 0 {
                             info!(
                                 volume_used_bytes = used,
-                                "Startup making progress (volume usage growing); resetting startup timeout"
+                                volume_grew,
+                                xlog_position = xlog_pos.unwrap_or(0),
+                                lsn_advanced,
+                                "Startup making progress (clone bytes landing or WAL replay advancing); resetting startup timeout"
                             );
                         }
                         startup_elapsed = 0;
@@ -108,7 +143,7 @@ pub async fn run_monitoring_loop(
                         error!(
                             elapsed_without_progress = startup_elapsed,
                             max = config.max_startup_timeout,
-                            "Patroni not healthy and no clone/startup progress (volume usage flat) within timeout - exiting for recovery"
+                            "Patroni not healthy, and neither volume usage nor WAL position advanced within timeout - exiting for recovery"
                         );
                         telemetry.send(TelemetryEvent::HealthCheckFailed {
                             node: config.name.clone(),
@@ -227,15 +262,12 @@ fn classify_startup_tick(
 }
 
 /// Used bytes on the filesystem holding `path` (O(1) `statvfs`, no tree walk).
-/// Used as the startup "is the clone making progress" signal: a clone in flight
-/// grows the volume — pg_basebackup writing data files, and (post-clone) the WAL
-/// receiver streaming segments into pg_wal + replay churning the spool. Keying
-/// on whole-volume usage rather than a recursive pgdata size means a large
-/// replica still reads as "progressing" while it catches up after the base
-/// backup, not just while files are first laid down — and it costs one syscall
-/// instead of stat'ing every relation file every 5s. Best-effort: a missing
-/// path or `statvfs` error returns 0 (the next successful read then registers
-/// as growth, i.e. progress).
+/// The startup progress signal for the pg_basebackup phase: a clone in flight
+/// grows the volume as data files land, and it costs one syscall instead of
+/// stat'ing every relation file every 5s. (The catch-up phase, where disk
+/// usage holds flat while WAL replays, is covered by [`xlog_advanced`]
+/// instead.) Best-effort: a missing path or `statvfs` error returns 0 (the
+/// next successful read then registers as growth, i.e. progress).
 fn volume_used_bytes(path: &str) -> u64 {
     use nix::sys::statvfs::statvfs;
 
@@ -247,6 +279,41 @@ fn volume_used_bytes(path: &str) -> u64 {
             used_blocks.checked_mul(frag)
         })
         .unwrap_or(0)
+}
+
+/// True when the replica's WAL position advanced between two startup polls —
+/// progress that whole-volume byte growth misses during catch-up (WAL streamed
+/// in ≈ recycled out holds disk usage flat while received/replayed LSN climbs).
+/// Pure/unit-tested. A missing baseline or current reading (node still in
+/// pg_basebackup with no xlog yet, or the REST API not answering) is NOT
+/// advancement, so it never masks a hung clone — that path falls back to the
+/// volume-usage signal, which a dead clone also leaves flat → still stalls.
+fn xlog_advanced(last: Option<i64>, current: Option<i64>) -> bool {
+    matches!((last, current), (Some(l), Some(c)) if c > l)
+}
+
+/// Best-effort read of this node's furthest WAL position (max of received /
+/// replayed location) from the local Patroni REST API (`/patroni`, which
+/// answers 200 on the leader and 503 on replicas with the same body shape).
+/// None during pg_basebackup (no xlog block yet) or on any transport/parse
+/// error.
+async fn fetch_patroni_xlog_position(client: &reqwest::Client) -> Option<i64> {
+    let resp = client
+        .get("http://localhost:8008/patroni")
+        .send()
+        .await
+        .ok()?;
+    let body = resp.text().await.ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let xlog = v.get("xlog")?;
+    let received = xlog.get("received_location").and_then(|x| x.as_i64());
+    let replayed = xlog.get("replayed_location").and_then(|x| x.as_i64());
+    match (received, replayed) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +364,22 @@ mod tests {
             classify_startup_tick(false, false, 295, 300),
             StartupTick::Waiting
         );
+    }
+
+    #[test]
+    fn xlog_advance_only_on_a_higher_position_with_a_baseline() {
+        // Catch-up: LSN climbed since last poll → progress.
+        assert!(xlog_advanced(Some(1_000), Some(2_000)));
+        // Frozen LSN (stalled replay) → no progress.
+        assert!(!xlog_advanced(Some(2_000), Some(2_000)));
+        // Regressed/garbage reading → not progress.
+        assert!(!xlog_advanced(Some(2_000), Some(1_000)));
+        // First reading (no baseline yet) → not yet progress; sets the baseline.
+        assert!(!xlog_advanced(None, Some(2_000)));
+        // No current reading (pg_basebackup, no xlog / REST down) → defer to the
+        // volume signal; never counts as WAL progress on its own.
+        assert!(!xlog_advanced(Some(2_000), None));
+        assert!(!xlog_advanced(None, None));
     }
 
     #[test]
