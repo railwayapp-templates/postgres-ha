@@ -29,6 +29,21 @@
 //! the leader, lost DCS, was demoted, pg_rewind succeeded, then
 //! WAL-too-old on every streaming attempt for 13 days.
 //!
+//! A second, distinct gap is a **foreign data directory** — a replica whose
+//! pgdata belongs to a *different* postgres cluster (mismatched system
+//! identifier), e.g. after a volume was reused or restored from elsewhere.
+//! Patroni refuses to start it, logging `data dir for the cluster is not
+//! empty, but system ID is invalid; consider doing reinitialize`, and waits
+//! indefinitely for a manual reinit. The built-in
+//! `remove_data_directory_on_diverged_timelines` does NOT cover this: it keys
+//! off the *timeline*, which needs a valid same-cluster system ID to compare,
+//! so a foreign sysid never matches that path. The postmaster never starts, so
+//! the crash-loop detector sees nothing, and Patroni reports `stopped` rather
+//! than `start failed`, so that trigger misses it too. Comtrack / production
+//! (fleet analysis, 2026-06-19) sat stuck this way: replica running the latest
+//! image, redeployed, still looping "system ID is invalid" — one live node, no
+//! HA. The fix is the same reinit (full pg_basebackup from the leader).
+//!
 //! ## Detection
 //! We don't scrape postgres logs (Patroni-managed Postgres writes to
 //! stderr, not to a file we can tail). Instead we poll Patroni REST
@@ -151,6 +166,14 @@ pub struct SelfHealInputs {
     /// state, *or makes any forward progress* (timeline switch or WAL cursor
     /// advance), so only a true stall ever accrues.
     pub diverged_for_secs: u64,
+    /// This node's pgdata system identifier (from `/patroni`'s
+    /// `database_system_identifier`). `None` when unknown (e.g. empty data dir
+    /// pre-clone, or Patroni omitted it) — a `None` on either side never trips
+    /// the mismatch, so it can only fire on two known, differing IDs.
+    pub local_system_id: Option<String>,
+    /// The leader's pgdata system identifier (the cluster's source of truth),
+    /// from the leader's `/patroni`. `None` when the leader didn't report it.
+    pub leader_system_id: Option<String>,
     pub last_action_at: Option<i64>,
     pub action_attempts_in_window: u32,
     pub recovery_seen_after_action: bool,
@@ -166,6 +189,11 @@ pub enum ReinitTrigger {
     StartFailed,
     CrashLoop,
     TimelineDivergence,
+    /// Local pgdata belongs to a different cluster than the leader (mismatched
+    /// system identifier — a foreign data directory). Like `TimelineDivergence`
+    /// it's a single-signal destructive case, so the orchestrator re-reads both
+    /// system IDs immediately before acting.
+    SystemIdMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,8 +264,9 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
     let patroni_says_failed = s.patroni_state == "start failed";
     let is_crash_loop = s.pg_starts_in_window >= s.thresholds.crash_loop_threshold;
     let stalled_divergence = stalled_timeline_divergence(s);
+    let foreign_data_dir = system_id_mismatch(s.role, &s.local_system_id, &s.leader_system_id);
 
-    if patroni_says_failed || is_crash_loop || stalled_divergence.is_some() {
+    if patroni_says_failed || is_crash_loop || stalled_divergence.is_some() || foreign_data_dir {
         let (trigger, reason) = if patroni_says_failed {
             (
                 ReinitTrigger::StartFailed,
@@ -251,15 +280,19 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
                     s.pg_starts_in_window, s.thresholds.recent_window_secs
                 ),
             )
-        } else {
-            // Only reachable when stalled_divergence is Some.
-            let (local, leader) = stalled_divergence.expect("checked is_some above");
+        } else if let Some((local, leader)) = stalled_divergence {
             (
                 ReinitTrigger::TimelineDivergence,
                 format!(
                     "timeline_diverged:tl{local}_behind_leader_tl{leader}_for_{}s",
                     s.diverged_for_secs
                 ),
+            )
+        } else {
+            // Only reachable when foreign_data_dir is true.
+            (
+                ReinitTrigger::SystemIdMismatch,
+                "system_id_mismatch:local_pgdata_belongs_to_a_different_cluster".to_string(),
             )
         };
         return SelfHealAction::Reinitialize {
@@ -284,6 +317,31 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
 /// 3. Both timelines are known.
 /// 4. The leader is clearly ahead — at least `min_gap` timelines — not just
 ///    one borderline/in-flight switch.
+/// Pure predicate for "this replica's pgdata is a foreign data directory" —
+/// its system identifier differs from the leader's, so it belongs to a
+/// different postgres cluster and will never stream. Unlike a timeline gap this
+/// is structural and stable (not a flaky single-poll artifact), so it needs no
+/// dwell; the orchestrator still re-reads both IDs immediately before the
+/// destructive wipe. Safety guards:
+/// 1. We are a `Replica` — never a leader (the cluster's source of truth) and
+///    never `Unknown` (a joining node whose sysid isn't meaningful yet).
+/// 2. Both system IDs are known — a `None` on either side proves nothing (empty
+///    data dir pre-clone, or Patroni omitted the field) and never fires.
+/// 3. The two known IDs differ.
+fn system_id_mismatch(
+    role: Role,
+    local_system_id: &Option<String>,
+    leader_system_id: &Option<String>,
+) -> bool {
+    if !matches!(role, Role::Replica) {
+        return false;
+    }
+    match (local_system_id, leader_system_id) {
+        (Some(local), Some(leader)) => local != leader,
+        _ => false,
+    }
+}
+
 fn timeline_divergence_present(
     role: Role,
     patroni_state: &str,
@@ -613,6 +671,8 @@ async fn iteration(
     let leader_reachable = leader.reachable;
     let leader_timeline = leader.timeline;
     let local_timeline = local.timeline;
+    let local_system_id = local.database_system_identifier.clone();
+    let leader_system_id = leader.system_id.clone();
 
     // 3b. Accrue the divergence dwell, but ONLY against an explicit stall: the
     // window matures while the local timeline sits frozen below the leader's
@@ -681,6 +741,8 @@ async fn iteration(
         local_timeline,
         leader_timeline,
         diverged_for_secs,
+        local_system_id,
+        leader_system_id,
         last_action_at,
         action_attempts_in_window,
         recovery_seen_after_action,
@@ -716,6 +778,18 @@ async fn iteration(
                 info!(
                     reason = %reason,
                     "self-heal: timeline-divergence re-check did not confirm on fresh read, skipping reinit"
+                );
+                return Ok(());
+            }
+
+            // Same fresh-read guard for the foreign-data-dir wipe: re-read both
+            // system IDs right now and only proceed if they still differ.
+            if trigger == ReinitTrigger::SystemIdMismatch
+                && !confirm_system_id_mismatch(client, cfg).await
+            {
+                info!(
+                    reason = %reason,
+                    "self-heal: system-id-mismatch re-check did not confirm on fresh read, skipping reinit"
                 );
                 return Ok(());
             }
@@ -811,6 +885,27 @@ struct PatroniLocal {
     postmaster_start_time: Option<String>,
     timeline: Option<i64>,
     xlog: Option<Xlog>,
+    /// pgdata's system identifier, read by Patroni from pg_controldata — present
+    /// even when postgres won't start, so a foreign data dir still reports its
+    /// (mismatched) ID. Patroni serializes it as a JSON number; capture it as a
+    /// string so the comparison is exact and width-agnostic.
+    #[serde(default, deserialize_with = "de_system_id")]
+    database_system_identifier: Option<String>,
+}
+
+/// Patroni emits `database_system_identifier` as a JSON number (a 64-bit
+/// identifier). Accept number or string and normalize to a string so the
+/// equality check never depends on numeric parsing/precision.
+fn de_system_id<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
+        _ => Ok(None),
+    }
 }
 
 /// Replication progress block from `/patroni`. On a replica these report the
@@ -862,10 +957,14 @@ struct ClusterMember {
 /// What we learn about the leader from one `/cluster` poll: whether it is
 /// reachable and healthy (so a reinit has a clone source) and its current
 /// timeline (so we can spot a replica stuck behind it).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct LeaderProbe {
     reachable: bool,
     timeline: Option<i64>,
+    /// The leader's pgdata system identifier — the cluster's canonical ID, used
+    /// to detect a replica whose data dir came from a different cluster. `None`
+    /// when the leader's `/patroni` wasn't fetched/parsed.
+    system_id: Option<String>,
 }
 
 async fn probe_leader(client: &reqwest::Client, timeout_secs: u64) -> LeaderProbe {
@@ -892,18 +991,21 @@ async fn probe_leader(client: &reqwest::Client, timeout_secs: u64) -> LeaderProb
         return LeaderProbe {
             reachable: false,
             timeline,
+            system_id: None,
         };
     }
     let Some(api_url) = leader.api_url.as_ref() else {
         return LeaderProbe {
             reachable: false,
             timeline,
+            system_id: None,
         };
     };
+    let base = api_url.trim_end_matches('/');
     // Patroni's /health endpoint mirrors /leader on the leader: 200 if
     // healthy, 503 otherwise. Reuse the shared client with a per-request
     // timeout override so we keep the connection pool warm across polls.
-    let url = format!("{}/health", api_url.trim_end_matches('/'));
+    let url = format!("{base}/health");
     let reachable = matches!(
         client
             .get(&url)
@@ -913,10 +1015,33 @@ async fn probe_leader(client: &reqwest::Client, timeout_secs: u64) -> LeaderProb
             .map(|r| r.status().as_u16()),
         Ok(200)
     );
+    // The leader's pgdata system identifier — the cluster's canonical ID. Read
+    // from the leader's /patroni so a replica with a foreign data dir can be
+    // spotted. Best-effort: a miss leaves system_id None and the mismatch never
+    // fires (a None can't differ).
+    let system_id = fetch_system_id(client, &format!("{base}/patroni"), timeout_secs).await;
     LeaderProbe {
         reachable,
         timeline,
+        system_id,
     }
+}
+
+/// Best-effort fetch of a Patroni node's `database_system_identifier` from its
+/// `/patroni` endpoint. Returns `None` on any transport/parse failure — the
+/// caller treats an unknown ID as "cannot prove a mismatch".
+async fn fetch_system_id(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Option<String> {
+    let resp = client
+        .get(url)
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .ok()?;
+    // Patroni returns 503 on a non-leader but the body is still the full
+    // /patroni JSON, so take the body regardless of status.
+    let body = resp.text().await.ok()?;
+    let parsed: PatroniLocal = serde_json::from_str(&body).ok()?;
+    parsed.database_system_identifier
 }
 
 /// Independent re-confirmation of a timeline divergence taken immediately
@@ -943,6 +1068,27 @@ async fn confirm_timeline_divergence(client: &reqwest::Client, cfg: &WatcherConf
         cfg.thresholds.divergence_min_gap,
     )
     .is_some()
+}
+
+/// Independent re-confirmation of a foreign-data-dir (system-ID mismatch) taken
+/// immediately before the destructive reinit. Fresh-reads local `/patroni` and
+/// the leader's system ID, requires the leader reachable, and re-applies the
+/// exact [`system_id_mismatch`] guard. Any disagreement (leader gone, an ID
+/// no longer readable, or the IDs now match) returns `false` and the caller
+/// backs off.
+async fn confirm_system_id_mismatch(client: &reqwest::Client, cfg: &WatcherConfig) -> bool {
+    let Ok(local) = fetch_local_patroni(client).await else {
+        return false;
+    };
+    let leader = probe_leader(client, cfg.leader_health_timeout_secs).await;
+    if !leader.reachable {
+        return false;
+    }
+    system_id_mismatch(
+        parse_role(local.role.as_deref()),
+        &local.database_system_identifier,
+        &leader.system_id,
+    )
 }
 
 async fn issue_reinitialize(client: &reqwest::Client) -> Result<()> {
@@ -1071,6 +1217,8 @@ mod tests {
             local_timeline: None,
             leader_timeline: None,
             diverged_for_secs: 0,
+            local_system_id: None,
+            leader_system_id: None,
             last_action_at: None,
             action_attempts_in_window: 0,
             recovery_seen_after_action: false,
@@ -1506,5 +1654,103 @@ mod tests {
         // Unrelated fields untouched.
         assert_eq!(read_state_field(&p, "last_action_at"), Some("12345".into()));
         let _ = fs::remove_file(&p);
+    }
+
+    // ---- system-id mismatch (foreign data directory) ----
+
+    /// A replica whose pgdata system ID differs from the leader's: postmaster
+    /// never starts (so no crash loop), Patroni reports `stopped` (so not
+    /// `start failed`), timelines unknown (so no divergence). Only the
+    /// system-id mismatch trigger catches it. This is the Comtrack case.
+    fn foreign_data_dir() -> SelfHealInputs {
+        let mut s = base();
+        s.patroni_state = "stopped".into();
+        s.local_system_id = Some("7111111111111111111".into());
+        s.leader_system_id = Some("7222222222222222222".into());
+        s
+    }
+
+    #[test]
+    fn system_id_mismatch_predicate() {
+        // Replica with two known, differing IDs → foreign data dir.
+        assert!(system_id_mismatch(
+            Role::Replica,
+            &Some("a".into()),
+            &Some("b".into())
+        ));
+        // Matching IDs → same cluster, not foreign.
+        assert!(!system_id_mismatch(
+            Role::Replica,
+            &Some("a".into()),
+            &Some("a".into())
+        ));
+        // Unknown on either side proves nothing.
+        assert!(!system_id_mismatch(Role::Replica, &None, &Some("b".into())));
+        assert!(!system_id_mismatch(Role::Replica, &Some("a".into()), &None));
+        // Never on a leader (would be a destructive self-wipe) or Unknown.
+        assert!(!system_id_mismatch(
+            Role::Leader,
+            &Some("a".into()),
+            &Some("b".into())
+        ));
+        assert!(!system_id_mismatch(
+            Role::Unknown,
+            &Some("a".into()),
+            &Some("b".into())
+        ));
+    }
+
+    #[test]
+    fn foreign_data_dir_triggers_reinit() {
+        match decide_self_heal(&foreign_data_dir()) {
+            SelfHealAction::Reinitialize {
+                reason,
+                attempt: 1,
+                trigger,
+            } => {
+                assert!(reason.starts_with("system_id_mismatch"));
+                assert_eq!(trigger, ReinitTrigger::SystemIdMismatch);
+            }
+            other => panic!("expected Reinitialize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matching_system_ids_is_noop() {
+        let mut s = foreign_data_dir();
+        s.leader_system_id = s.local_system_id.clone();
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn foreign_data_dir_on_leader_never_wiped() {
+        let mut s = foreign_data_dir();
+        s.role = Role::Leader;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn foreign_data_dir_waits_when_leader_unreachable() {
+        let mut s = foreign_data_dir();
+        s.leader_reachable = false;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::Wait);
+    }
+
+    /// `database_system_identifier` arrives from Patroni as a JSON number; the
+    /// custom deserializer must accept both number and string and normalize to
+    /// a string so the equality check is exact.
+    #[test]
+    fn parses_system_id_as_number_or_string() {
+        let from_num: PatroniLocal =
+            serde_json::from_str(r#"{"database_system_identifier": 7111111111111111111}"#).unwrap();
+        assert_eq!(
+            from_num.database_system_identifier.as_deref(),
+            Some("7111111111111111111")
+        );
+        let from_str: PatroniLocal =
+            serde_json::from_str(r#"{"database_system_identifier": "7222"}"#).unwrap();
+        assert_eq!(from_str.database_system_identifier.as_deref(), Some("7222"));
+        let absent: PatroniLocal = serde_json::from_str(r#"{"state": "running"}"#).unwrap();
+        assert_eq!(absent.database_system_identifier, None);
     }
 }
