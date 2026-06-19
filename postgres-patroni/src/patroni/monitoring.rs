@@ -49,11 +49,12 @@ pub async fn run_monitoring_loop(
     // global/pg_control LAST that leaves a non-empty pgdata with no control
     // file, which Patroni then refuses to start ("system ID is invalid"),
     // wedging the replica permanently. So we only accrue toward the recovery
-    // exit while pgdata is NOT growing: any growth is a clone in flight and
-    // resets the clock, while a genuinely stalled startup (no progress for
-    // max_startup_timeout) still exits for recovery.
+    // exit while volume usage is NOT growing: any growth is a clone/replay in
+    // flight (data files being laid down, or post-clone WAL streaming into
+    // pg_wal + spool) and resets the clock, while a genuinely stalled startup
+    // (no progress for max_startup_timeout) still exits for recovery.
     let mut startup_elapsed = 0u64;
-    let mut last_pgdata_size = pgdata_size(&config.data_dir);
+    let mut last_volume_used = volume_used_bytes(&config.data_dir);
     loop {
         tokio::select! {
             _ = sigterm.recv() => {
@@ -79,9 +80,9 @@ pub async fn run_monitoring_loop(
             }
             _ = sleep(Duration::from_secs(5)) => {
                 let healthy = check_health(config.health_check_timeout).await;
-                let size = pgdata_size(&config.data_dir);
-                let progressing = size > last_pgdata_size;
-                last_pgdata_size = size;
+                let used = volume_used_bytes(&config.data_dir);
+                let progressing = used > last_volume_used;
+                last_volume_used = used;
 
                 match classify_startup_tick(
                     healthy,
@@ -94,11 +95,11 @@ pub async fn run_monitoring_loop(
                         break;
                     }
                     StartupTick::Progressing => {
-                        // Clone/initdb advancing — never count it toward the kill.
+                        // Clone/initdb/catch-up advancing — never count it toward the kill.
                         if startup_elapsed > 0 {
                             info!(
-                                pgdata_bytes = size,
-                                "Startup making progress (pgdata growing); resetting startup timeout"
+                                volume_used_bytes = used,
+                                "Startup making progress (volume usage growing); resetting startup timeout"
                             );
                         }
                         startup_elapsed = 0;
@@ -107,7 +108,7 @@ pub async fn run_monitoring_loop(
                         error!(
                             elapsed_without_progress = startup_elapsed,
                             max = config.max_startup_timeout,
-                            "Patroni not healthy and no clone/startup progress within timeout - exiting for recovery"
+                            "Patroni not healthy and no clone/startup progress (volume usage flat) within timeout - exiting for recovery"
                         );
                         telemetry.send(TelemetryEvent::HealthCheckFailed {
                             node: config.name.clone(),
@@ -125,7 +126,7 @@ pub async fn run_monitoring_loop(
                             warn!(
                                 elapsed_without_progress = startup_elapsed,
                                 max = config.max_startup_timeout,
-                                "Still waiting for Patroni to become healthy (no pgdata progress)"
+                                "Still waiting for Patroni to become healthy (no volume-usage progress)"
                             );
                         }
                     }
@@ -225,29 +226,27 @@ fn classify_startup_tick(
     }
 }
 
-/// Total bytes of regular files under `path` (recursive, symlinks not
-/// followed). Used as the startup "is the clone making progress" signal — a
-/// growing pgdata means pg_basebackup/initdb is advancing. Best-effort: any
-/// unreadable entry is skipped, and a missing dir returns 0.
-fn pgdata_size(path: &str) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![std::path::PathBuf::from(path)];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_dir() {
-                stack.push(entry.path());
-            } else if ft.is_file() {
-                if let Ok(md) = entry.metadata() {
-                    total += md.len();
-                }
-            }
-        }
-    }
-    total
+/// Used bytes on the filesystem holding `path` (O(1) `statvfs`, no tree walk).
+/// Used as the startup "is the clone making progress" signal: a clone in flight
+/// grows the volume — pg_basebackup writing data files, and (post-clone) the WAL
+/// receiver streaming segments into pg_wal + replay churning the spool. Keying
+/// on whole-volume usage rather than a recursive pgdata size means a large
+/// replica still reads as "progressing" while it catches up after the base
+/// backup, not just while files are first laid down — and it costs one syscall
+/// instead of stat'ing every relation file every 5s. Best-effort: a missing
+/// path or `statvfs` error returns 0 (the next successful read then registers
+/// as growth, i.e. progress).
+fn volume_used_bytes(path: &str) -> u64 {
+    use nix::sys::statvfs::statvfs;
+
+    statvfs(std::path::Path::new(path))
+        .ok()
+        .and_then(|s| {
+            let frag = s.fragment_size() as u64;
+            let used_blocks = (s.blocks() as u64).checked_sub(s.blocks_free() as u64)?;
+            used_blocks.checked_mul(frag)
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -301,18 +300,16 @@ mod tests {
     }
 
     #[test]
-    fn pgdata_size_missing_dir_is_zero() {
-        assert_eq!(pgdata_size("/nonexistent/path/for/test"), 0);
+    fn volume_used_bytes_missing_path_is_zero() {
+        assert_eq!(volume_used_bytes("/nonexistent/path/for/test"), 0);
     }
 
     #[test]
-    fn pgdata_size_sums_nested_files() {
-        let dir = std::env::temp_dir().join(format!("pgdata_size_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("base/1")).unwrap();
-        std::fs::write(dir.join("PG_VERSION"), b"17").unwrap(); // 2 bytes
-        std::fs::write(dir.join("base/1/relfile"), vec![0u8; 1000]).unwrap();
-        assert_eq!(pgdata_size(dir.to_str().unwrap()), 1002);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn volume_used_bytes_reports_nonzero_for_real_fs() {
+        // statvfs of any existing path resolves to its filesystem; a live fs
+        // always has some blocks in use, so this is the "progress signal works"
+        // smoke test without needing to spin Patroni.
+        let dir = std::env::temp_dir();
+        assert!(volume_used_bytes(dir.to_str().unwrap()) > 0);
     }
 }

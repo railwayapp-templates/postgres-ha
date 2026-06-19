@@ -397,18 +397,35 @@ fn data_dir_nonempty(data_dir: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True when PGDATA is a dedicated subdirectory of the volume (the standard
+/// `<volume_root>/pgdata` layout) rather than the volume root itself. The
+/// interrupted-clone wipe is only safe in the former: at the volume root it
+/// would also delete the sibling state we persist there (the bootstrap marker,
+/// the invalid-bucket sentinel, TLS certs). Trailing-slash insensitive.
+fn pgdata_is_dedicated_subdir(data_dir: &str, volume_root: &str) -> bool {
+    data_dir.trim_end_matches('/') != volume_root.trim_end_matches('/')
+}
+
 /// Pure safety predicate for the interrupted-clone wipe (unit-tested). Only
-/// wipe when: pg_control is absent, the dir is non-empty, and a leader is
-/// known whose name differs from ours. A `None` leader (no lock / etcd
-/// unreachable) or a leader that is *us* (a stale lock — we can't be a healthy
-/// leader without pg_control) blocks the wipe so we never destroy the only copy.
+/// wipe when: pgdata is a dedicated subdir of the volume (not the volume root
+/// itself), pg_control is absent, the dir is non-empty, and a leader is known
+/// whose name differs from ours. A `None` leader (no lock / etcd unreachable)
+/// or a leader that is *us* (a stale lock — we can't be a healthy leader
+/// without pg_control) blocks the wipe so we never destroy the only copy.
+/// `pgdata_is_dedicated_subdir` guards the non-standard `PGDATA=<volume_root>`
+/// layout, where wiping pgdata would also take out the sibling state we keep at
+/// the volume root (bootstrap marker, invalid-bucket sentinel, TLS certs).
 fn should_wipe_incomplete_clone(
     has_pg_control: bool,
     data_dir_nonempty: bool,
+    pgdata_is_dedicated_subdir: bool,
     leader: Option<&str>,
     my_name: &str,
 ) -> bool {
-    !has_pg_control && data_dir_nonempty && matches!(leader, Some(l) if l != my_name)
+    !has_pg_control
+        && data_dir_nonempty
+        && pgdata_is_dedicated_subdir
+        && matches!(leader, Some(l) if l != my_name)
 }
 
 /// Read the current leader's member name from etcd (`/service/{scope}/leader`).
@@ -1154,8 +1171,21 @@ async fn main() -> Result<()> {
     // itself be a healthy leader). Without a distinct leader we leave the dir
     // for manual recovery rather than risk wiping the only copy.
     if !has_pg_control && data_dir_nonempty(&config.data_dir) {
-        let leader = probe_cluster_leader(&config).await;
-        if should_wipe_incomplete_clone(has_pg_control, true, leader.as_deref(), &config.name) {
+        let dedicated = pgdata_is_dedicated_subdir(&config.data_dir, &volume_root);
+        // Skip the etcd probe entirely when pgdata is the volume root — we
+        // won't wipe regardless, so there's no point asking who the leader is.
+        let leader = if dedicated {
+            probe_cluster_leader(&config).await
+        } else {
+            None
+        };
+        if should_wipe_incomplete_clone(
+            has_pg_control,
+            true,
+            dedicated,
+            leader.as_deref(),
+            &config.name,
+        ) {
             warn!(
                 data_dir = %config.data_dir,
                 leader = %leader.as_deref().unwrap_or("?"),
@@ -1166,8 +1196,10 @@ async fn main() -> Result<()> {
         } else {
             warn!(
                 data_dir = %config.data_dir,
+                volume_root = %volume_root,
+                pgdata_is_dedicated_subdir = dedicated,
                 leader = ?leader,
-                "Incomplete clone detected (non-empty pgdata, missing pg_control) but no distinct leader to clone from — leaving intact for manual recovery"
+                "Incomplete clone detected (non-empty pgdata, missing pg_control) but not safe to wipe (need a distinct leader AND pgdata as a dedicated subdir) — leaving intact for manual recovery"
             );
         }
     }
@@ -1359,20 +1391,24 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        data_dir_nonempty, is_uuid_shape, should_wipe_incomplete_clone, wipe_pgdata_contents,
+        data_dir_nonempty, is_uuid_shape, pgdata_is_dedicated_subdir, should_wipe_incomplete_clone,
+        wipe_pgdata_contents,
     };
 
     #[test]
     fn wipe_only_with_pg_control_absent_nonempty_and_distinct_leader() {
-        // The Comtrack case: no pg_control, non-empty dir, a different leader.
+        // The Comtrack case: no pg_control, non-empty dir, dedicated pgdata, a
+        // different leader.
         assert!(should_wipe_incomplete_clone(
             false,
+            true,
             true,
             Some("postgres-1"),
             "postgres-3"
         ));
         // pg_control present → valid (or foreign) dir, never our problem here.
         assert!(!should_wipe_incomplete_clone(
+            true,
             true,
             true,
             Some("postgres-1"),
@@ -1382,12 +1418,23 @@ mod tests {
         assert!(!should_wipe_incomplete_clone(
             false,
             false,
+            true,
+            Some("postgres-1"),
+            "postgres-3"
+        ));
+        // pgdata IS the volume root → wiping would nuke the bootstrap marker /
+        // certs, so refuse even with a distinct leader.
+        assert!(!should_wipe_incomplete_clone(
+            false,
+            true,
+            false,
             Some("postgres-1"),
             "postgres-3"
         ));
         // No leader / etcd unreachable → no clone source, don't destroy the copy.
         assert!(!should_wipe_incomplete_clone(
             false,
+            true,
             true,
             None,
             "postgres-3"
@@ -1396,8 +1443,28 @@ mod tests {
         assert!(!should_wipe_incomplete_clone(
             false,
             true,
+            true,
             Some("postgres-3"),
             "postgres-3"
+        ));
+    }
+
+    #[test]
+    fn pgdata_dedicated_subdir_detection() {
+        // Standard layout: pgdata is a subdir of the volume root.
+        assert!(pgdata_is_dedicated_subdir(
+            "/var/lib/postgresql/data/pgdata",
+            "/var/lib/postgresql/data"
+        ));
+        // Non-standard: PGDATA points straight at the volume root.
+        assert!(!pgdata_is_dedicated_subdir(
+            "/var/lib/postgresql/data",
+            "/var/lib/postgresql/data"
+        ));
+        // Trailing-slash insensitive.
+        assert!(!pgdata_is_dedicated_subdir(
+            "/var/lib/postgresql/data/",
+            "/var/lib/postgresql/data"
         ));
     }
 
