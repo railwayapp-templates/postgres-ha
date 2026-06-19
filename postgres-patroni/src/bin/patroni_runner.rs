@@ -89,10 +89,7 @@ const VALIDATE_BUCKET_REASON_UUID_SHAPE: &str = "uuid-shape";
 /// sentinel on disable (WAL_ARCHIVE_BUCKET unset on next boot).
 fn validate_wal_archive_bucket(volume_root: &str) {
     let marker = format!("{volume_root}/.pgbackrest_invalid_bucket");
-    let val = match env::var("WAL_ARCHIVE_BUCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
+    let val = match env::var("WAL_ARCHIVE_BUCKET").ok().filter(|s| !s.is_empty()) {
         Some(v) => v,
         None => {
             // Bucket unset → either never configured or already
@@ -145,9 +142,7 @@ fn validate_wal_archive_bucket(volume_root: &str) {
     // think PITR was never enabled (rather than wired to junk).
     match fs::write(&marker, format!("{reason}\n")) {
         Ok(()) => info!(marker = %marker, "pgbackrest: invalid-bucket sentinel written"),
-        Err(e) => {
-            warn!(marker = %marker, error = %e, "pgbackrest: failed to write invalid-bucket sentinel")
-        }
+        Err(e) => warn!(marker = %marker, error = %e, "pgbackrest: failed to write invalid-bucket sentinel"),
     }
     if let Err(e) = fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o640)) {
         warn!(marker = %marker, error = %e, "pgbackrest: failed to set sentinel permissions");
@@ -835,8 +830,10 @@ fn spawn_bootstrap_stanza_create() {
                 // bucket. Cleared on success below and by
                 // clear_pgbackrest_state_if_disabled on archive disable.
                 let _ = fs::write(&timeout_sentinel, "pg_isready-timeout\n");
-                let _ =
-                    fs::set_permissions(&timeout_sentinel, std::fs::Permissions::from_mode(0o640));
+                let _ = fs::set_permissions(
+                    &timeout_sentinel,
+                    std::fs::Permissions::from_mode(0o640),
+                );
                 return;
             }
             let probe = tokio::process::Command::new("pg_isready")
@@ -893,8 +890,10 @@ fn spawn_bootstrap_stanza_create() {
                 // production, so the sentinel reflects an actual
                 // misconfiguration rather than normal HA topology.
                 let _ = fs::write(&timeout_sentinel, "promotion-timeout\n");
-                let _ =
-                    fs::set_permissions(&timeout_sentinel, std::fs::Permissions::from_mode(0o640));
+                let _ = fs::set_permissions(
+                    &timeout_sentinel,
+                    std::fs::Permissions::from_mode(0o640),
+                );
                 return;
             }
             let out = tokio::process::Command::new("psql")
