@@ -13,7 +13,7 @@ use postgres_patroni::patroni::{
     spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
-use postgres_patroni::{volume_root, Telemetry};
+use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -1202,6 +1202,13 @@ async fn main() -> Result<()> {
             );
             wipe_pgdata_contents(&config.data_dir)
                 .context("Failed to wipe incomplete-clone data directory")?;
+            // Surface the recovery so the fleet monitor can see it fire (and spot
+            // a wipe→reclone→wipe loop, e.g. a replica volume too small for the
+            // primary). Without a telemetry event the self-heal is invisible in prod.
+            telemetry.send(TelemetryEvent::IncompleteCloneWiped {
+                node: config.name.clone(),
+                leader: leader.as_deref().unwrap_or("unknown").to_string(),
+            });
         } else {
             warn!(
                 data_dir = %config.data_dir,
