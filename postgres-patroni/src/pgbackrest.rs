@@ -81,7 +81,10 @@ pub fn read_wal_level(data_dir: &str) -> Option<String> {
     }
     let level = parse_wal_level(&String::from_utf8_lossy(&out.stdout));
     if level.is_none() {
-        warn!(data_dir, "pg_controldata output had no parseable wal_level line; defaulting to replica");
+        warn!(
+            data_dir,
+            "pg_controldata output had no parseable wal_level line; defaulting to replica"
+        );
     }
     level
 }
@@ -126,7 +129,10 @@ max_connections setting:              200
 
     #[test]
     fn none_when_absent() {
-        assert_eq!(parse_wal_level("Database cluster state: in production\n"), None);
+        assert_eq!(
+            parse_wal_level("Database cluster state: in production\n"),
+            None
+        );
     }
 }
 
