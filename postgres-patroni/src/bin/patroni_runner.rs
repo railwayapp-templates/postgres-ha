@@ -89,7 +89,10 @@ const VALIDATE_BUCKET_REASON_UUID_SHAPE: &str = "uuid-shape";
 /// sentinel on disable (WAL_ARCHIVE_BUCKET unset on next boot).
 fn validate_wal_archive_bucket(volume_root: &str) {
     let marker = format!("{volume_root}/.pgbackrest_invalid_bucket");
-    let val = match env::var("WAL_ARCHIVE_BUCKET").ok().filter(|s| !s.is_empty()) {
+    let val = match env::var("WAL_ARCHIVE_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         Some(v) => v,
         None => {
             // Bucket unset → either never configured or already
@@ -142,7 +145,9 @@ fn validate_wal_archive_bucket(volume_root: &str) {
     // think PITR was never enabled (rather than wired to junk).
     match fs::write(&marker, format!("{reason}\n")) {
         Ok(()) => info!(marker = %marker, "pgbackrest: invalid-bucket sentinel written"),
-        Err(e) => warn!(marker = %marker, error = %e, "pgbackrest: failed to write invalid-bucket sentinel"),
+        Err(e) => {
+            warn!(marker = %marker, error = %e, "pgbackrest: failed to write invalid-bucket sentinel")
+        }
     }
     if let Err(e) = fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o640)) {
         warn!(marker = %marker, error = %e, "pgbackrest: failed to set sentinel permissions");
@@ -383,6 +388,88 @@ async fn wait_for_cluster_in_etcd(config: &Config) -> Result<()> {
         );
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// True if `data_dir` exists and contains at least one entry.
+fn data_dir_nonempty(data_dir: &str) -> bool {
+    fs::read_dir(data_dir)
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Pure safety predicate for the interrupted-clone wipe (unit-tested). Only
+/// wipe when: pg_control is absent, the dir is non-empty, and a leader is
+/// known whose name differs from ours. A `None` leader (no lock / etcd
+/// unreachable) or a leader that is *us* (a stale lock — we can't be a healthy
+/// leader without pg_control) blocks the wipe so we never destroy the only copy.
+fn should_wipe_incomplete_clone(
+    has_pg_control: bool,
+    data_dir_nonempty: bool,
+    leader: Option<&str>,
+    my_name: &str,
+) -> bool {
+    !has_pg_control && data_dir_nonempty && matches!(leader, Some(l) if l != my_name)
+}
+
+/// Read the current leader's member name from etcd (`/service/{scope}/leader`).
+/// Returns None when no leader holds the lock or etcd is unreachable — both
+/// block the destructive wipe. Best-effort across all etcd hosts.
+async fn probe_cluster_leader(config: &Config) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let leader_key = format!("/service/{}/leader", config.scope);
+    let key_base64 = BASE64.encode(leader_key.as_bytes());
+    for host in config.etcd_hosts.split(',') {
+        let url = format!("http://{}/v3/kv/range", host.trim());
+        let request = EtcdRangeRequest {
+            key: key_base64.clone(),
+        };
+        let Ok(resp) = client.post(&url).json(&request).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(range) = resp.json::<EtcdRangeResponse>().await else {
+            continue;
+        };
+        // etcd v3 returns the value base64-encoded; Patroni stores the holding
+        // member's name as the leader-key value.
+        let value_b64 = range
+            .kvs
+            .as_ref()
+            .and_then(|kvs| kvs.first())
+            .and_then(|kv| kv.get("value"))
+            .and_then(|v| v.as_str());
+        if let Some(b64) = value_b64 {
+            if let Ok(bytes) = BASE64.decode(b64) {
+                if let Ok(name) = String::from_utf8(bytes) {
+                    let name = name.trim().to_string();
+                    if !name.is_empty() {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Remove every entry inside `data_dir` (the contents, not the mount point),
+/// so Patroni sees an empty pgdata and performs a fresh pg_basebackup.
+fn wipe_pgdata_contents(data_dir: &str) -> Result<()> {
+    for entry in fs::read_dir(data_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+        } else {
+            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 async fn start_patroni() -> Result<tokio::process::Child> {
@@ -830,10 +917,8 @@ fn spawn_bootstrap_stanza_create() {
                 // bucket. Cleared on success below and by
                 // clear_pgbackrest_state_if_disabled on archive disable.
                 let _ = fs::write(&timeout_sentinel, "pg_isready-timeout\n");
-                let _ = fs::set_permissions(
-                    &timeout_sentinel,
-                    std::fs::Permissions::from_mode(0o640),
-                );
+                let _ =
+                    fs::set_permissions(&timeout_sentinel, std::fs::Permissions::from_mode(0o640));
                 return;
             }
             let probe = tokio::process::Command::new("pg_isready")
@@ -890,10 +975,8 @@ fn spawn_bootstrap_stanza_create() {
                 // production, so the sentinel reflects an actual
                 // misconfiguration rather than normal HA topology.
                 let _ = fs::write(&timeout_sentinel, "promotion-timeout\n");
-                let _ = fs::set_permissions(
-                    &timeout_sentinel,
-                    std::fs::Permissions::from_mode(0o640),
-                );
+                let _ =
+                    fs::set_permissions(&timeout_sentinel, std::fs::Permissions::from_mode(0o640));
                 return;
             }
             let out = tokio::process::Command::new("psql")
@@ -1057,6 +1140,36 @@ async fn main() -> Result<()> {
         info!("Found pg_control but NO bootstrap marker - stale data");
     } else {
         info!("No PostgreSQL data found");
+    }
+
+    // Recover the debris of an interrupted clone. A non-empty data directory
+    // with NO pg_control is what a pg_basebackup killed mid-stream leaves
+    // behind (it writes global/pg_control LAST). Patroni refuses such a dir
+    // ("data dir is not empty, but system ID is invalid; consider doing
+    // reinitialize") and never re-clones it, so the replica is wedged
+    // permanently. Wipe it here — BEFORE Patroni starts, so there is never an
+    // in-progress clone to destroy — but only when a DIFFERENT member holds
+    // the leader lock. That proves a clone source exists AND guarantees we
+    // never wipe the primary's own data (a node missing pg_control cannot
+    // itself be a healthy leader). Without a distinct leader we leave the dir
+    // for manual recovery rather than risk wiping the only copy.
+    if !has_pg_control && data_dir_nonempty(&config.data_dir) {
+        let leader = probe_cluster_leader(&config).await;
+        if should_wipe_incomplete_clone(has_pg_control, true, leader.as_deref(), &config.name) {
+            warn!(
+                data_dir = %config.data_dir,
+                leader = %leader.as_deref().unwrap_or("?"),
+                "Incomplete clone detected (non-empty pgdata, missing pg_control) — wiping so Patroni re-clones from the leader"
+            );
+            wipe_pgdata_contents(&config.data_dir)
+                .context("Failed to wipe incomplete-clone data directory")?;
+        } else {
+            warn!(
+                data_dir = %config.data_dir,
+                leader = ?leader,
+                "Incomplete clone detected (non-empty pgdata, missing pg_control) but no distinct leader to clone from — leaving intact for manual recovery"
+            );
+        }
     }
 
     // Prevent race condition during HA conversion:
@@ -1245,7 +1358,75 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_uuid_shape;
+    use super::{
+        data_dir_nonempty, is_uuid_shape, should_wipe_incomplete_clone, wipe_pgdata_contents,
+    };
+
+    #[test]
+    fn wipe_only_with_pg_control_absent_nonempty_and_distinct_leader() {
+        // The Comtrack case: no pg_control, non-empty dir, a different leader.
+        assert!(should_wipe_incomplete_clone(
+            false,
+            true,
+            Some("postgres-1"),
+            "postgres-3"
+        ));
+        // pg_control present → valid (or foreign) dir, never our problem here.
+        assert!(!should_wipe_incomplete_clone(
+            true,
+            true,
+            Some("postgres-1"),
+            "postgres-3"
+        ));
+        // Empty dir → nothing to wipe (fresh volume, Patroni will clone).
+        assert!(!should_wipe_incomplete_clone(
+            false,
+            false,
+            Some("postgres-1"),
+            "postgres-3"
+        ));
+        // No leader / etcd unreachable → no clone source, don't destroy the copy.
+        assert!(!should_wipe_incomplete_clone(
+            false,
+            true,
+            None,
+            "postgres-3"
+        ));
+        // Leader is us (stale lock) → never wipe our own dir.
+        assert!(!should_wipe_incomplete_clone(
+            false,
+            true,
+            Some("postgres-3"),
+            "postgres-3"
+        ));
+    }
+
+    #[test]
+    fn data_dir_nonempty_and_wipe_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("wipe_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("base/1")).unwrap();
+        std::fs::write(dir.join("PG_VERSION"), b"17").unwrap();
+        std::fs::write(dir.join("base/1/relfile"), vec![0u8; 16]).unwrap();
+        let p = dir.to_str().unwrap();
+
+        assert!(data_dir_nonempty(p));
+        wipe_pgdata_contents(p).unwrap();
+        // The mount point survives; only its contents are gone.
+        assert!(dir.exists());
+        assert!(!data_dir_nonempty(p));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_dir_nonempty_false_for_missing_or_empty() {
+        assert!(!data_dir_nonempty("/nonexistent/pgdata/xyz"));
+        let dir = std::env::temp_dir().join(format!("empty_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!data_dir_nonempty(dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn is_uuid_shape_accepts_canonical() {
