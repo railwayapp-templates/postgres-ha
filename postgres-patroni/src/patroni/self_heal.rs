@@ -83,6 +83,18 @@ const DEFAULT_RECENT_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_ACTION_BACKOFF_SECONDS: u64 = 600;
 const DEFAULT_MAX_ATTEMPTS_PER_HOUR: u32 = 5;
 const DEFAULT_LEADER_HEALTH_TIMEOUT_SECONDS: u64 = 3;
+// How long a replica's timeline must sit continuously below the leader's,
+// while Patroni still considers it healthy, before we treat it as a silent
+// stall and reinitialize. Long enough that a normal post-failover replica —
+// which fast-forwards onto the new timeline within seconds — never accrues it.
+const DEFAULT_DIVERGENCE_DWELL_SECONDS: u64 = 300;
+// Minimum number of timelines the leader must be ahead before a divergence
+// reinit is even considered. A healthy streaming replica is on the *same*
+// timeline as the leader; being behind at all is abnormal, but we require a
+// clear margin (missed ≥2 promotions) so a single borderline/in-flight switch
+// can never trip a destructive wipe. This is a false-positive guard, not a
+// correctness one — raise it to be stricter, never below 1.
+const DEFAULT_DIVERGENCE_MIN_GAP: i64 = 2;
 
 // ====================================================================
 // Public types
@@ -101,6 +113,8 @@ pub struct Thresholds {
     pub recent_window_secs: u64,
     pub action_backoff_secs: u64,
     pub max_attempts_per_hour: u32,
+    pub divergence_dwell_secs: u64,
+    pub divergence_min_gap: i64,
 }
 
 impl Default for Thresholds {
@@ -110,6 +124,8 @@ impl Default for Thresholds {
             recent_window_secs: DEFAULT_RECENT_WINDOW_SECONDS,
             action_backoff_secs: DEFAULT_ACTION_BACKOFF_SECONDS,
             max_attempts_per_hour: DEFAULT_MAX_ATTEMPTS_PER_HOUR,
+            divergence_dwell_secs: DEFAULT_DIVERGENCE_DWELL_SECONDS,
+            divergence_min_gap: DEFAULT_DIVERGENCE_MIN_GAP,
         }
     }
 }
@@ -123,10 +139,33 @@ pub struct SelfHealInputs {
     pub leader_reachable: bool,
     pub patroni_state: String,
     pub pg_starts_in_window: u32,
+    /// This node's Patroni timeline (from `/patroni`). `None` if unknown.
+    pub local_timeline: Option<i64>,
+    /// The current leader's timeline (from `/cluster`). `None` when the leader
+    /// is unknown or unreachable.
+    pub leader_timeline: Option<i64>,
+    /// Seconds the node has been *continuously* observed behind the leader with
+    /// **nothing progressing** — same timeline, same WAL cursor — while Patroni
+    /// reports it healthy. `0` when not currently diverged. The orchestrator
+    /// resets this to `0` the instant the node catches up, leaves a healthy
+    /// state, *or makes any forward progress* (timeline switch or WAL cursor
+    /// advance), so only a true stall ever accrues.
+    pub diverged_for_secs: u64,
     pub last_action_at: Option<i64>,
     pub action_attempts_in_window: u32,
     pub recovery_seen_after_action: bool,
     pub thresholds: Thresholds,
+}
+
+/// Which signal drove a reinit. Lets the orchestrator treat the
+/// single-signal, destructive `TimelineDivergence` case more cautiously (an
+/// independent re-read before acting) than the multi-poll-evidenced crash-loop
+/// and start-failed cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReinitTrigger {
+    StartFailed,
+    CrashLoop,
+    TimelineDivergence,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,6 +175,7 @@ pub enum SelfHealAction {
     Reinitialize {
         reason: String,
         attempt: u32,
+        trigger: ReinitTrigger,
     },
     EmitRecovered {
         recovered_in_secs: u64,
@@ -195,23 +235,164 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
 
     let patroni_says_failed = s.patroni_state == "start failed";
     let is_crash_loop = s.pg_starts_in_window >= s.thresholds.crash_loop_threshold;
+    let stalled_divergence = stalled_timeline_divergence(s);
 
-    if patroni_says_failed || is_crash_loop {
-        let reason = if patroni_says_failed {
-            "patroni_start_failed".to_string()
+    if patroni_says_failed || is_crash_loop || stalled_divergence.is_some() {
+        let (trigger, reason) = if patroni_says_failed {
+            (
+                ReinitTrigger::StartFailed,
+                "patroni_start_failed".to_string(),
+            )
+        } else if is_crash_loop {
+            (
+                ReinitTrigger::CrashLoop,
+                format!(
+                    "postgres_crash_loop:{}_restarts_in_{}s",
+                    s.pg_starts_in_window, s.thresholds.recent_window_secs
+                ),
+            )
         } else {
-            format!(
-                "postgres_crash_loop:{}_restarts_in_{}s",
-                s.pg_starts_in_window, s.thresholds.recent_window_secs
+            // Only reachable when stalled_divergence is Some.
+            let (local, leader) = stalled_divergence.expect("checked is_some above");
+            (
+                ReinitTrigger::TimelineDivergence,
+                format!(
+                    "timeline_diverged:tl{local}_behind_leader_tl{leader}_for_{}s",
+                    s.diverged_for_secs
+                ),
             )
         };
         return SelfHealAction::Reinitialize {
             reason,
             attempt: s.action_attempts_in_window + 1,
+            trigger,
         };
     }
 
     SelfHealAction::NoOp
+}
+
+/// Pure predicate for "this looks like a stuck-behind replica right now",
+/// independent of how long it has been so. Shared by the decision function and
+/// the pre-action re-read so both judge divergence by exactly the same rules.
+///
+/// All four false-positive guards live here:
+/// 1. We are a `Replica` — never a leader (destructive) and never `Unknown`
+///    (a joining/uninitialized node whose timeline isn't meaningful yet).
+/// 2. Patroni reports us healthy (`running`/`streaming`) — never mid-clone
+///    (`creating replica`/`starting`), where a lower timeline is expected.
+/// 3. Both timelines are known.
+/// 4. The leader is clearly ahead — at least `min_gap` timelines — not just
+///    one borderline/in-flight switch.
+fn timeline_divergence_present(
+    role: Role,
+    patroni_state: &str,
+    local_timeline: Option<i64>,
+    leader_timeline: Option<i64>,
+    min_gap: i64,
+) -> Option<(i64, i64)> {
+    if !matches!(role, Role::Replica) {
+        return None;
+    }
+    if patroni_state != "running" && patroni_state != "streaming" {
+        return None;
+    }
+    let local = local_timeline?;
+    let leader = leader_timeline?;
+    if leader.saturating_sub(local) < min_gap {
+        return None;
+    }
+    Some((local, leader))
+}
+
+/// The silent-stall case: a replica Patroni still considers healthy
+/// (`running`/`streaming`, postmaster stable so no crash-loop signal) whose
+/// timeline has sat clearly below the leader's past the dwell. Patroni's own
+/// `remove_data_directory_on_diverged_timelines` only re-evaluates on a
+/// (re)start, so a node that came up "following leader" on a stale timeline and
+/// never restarts is invisible to it — and to the crash-loop detector. A full
+/// reinit (pg_basebackup from the leader) is the only fix.
+///
+/// Returns `(local_timeline, leader_timeline)` when it applies, else `None`.
+/// The dwell itself is accrued by the orchestrator (`diverged_for_secs`); the
+/// structural guards live in [`timeline_divergence_present`]. Pure and
+/// unit-testable.
+fn stalled_timeline_divergence(s: &SelfHealInputs) -> Option<(i64, i64)> {
+    if s.diverged_for_secs < s.thresholds.divergence_dwell_secs {
+        return None;
+    }
+    timeline_divergence_present(
+        s.role,
+        &s.patroni_state,
+        s.local_timeline,
+        s.leader_timeline,
+        s.thresholds.divergence_min_gap,
+    )
+}
+
+/// One poll's progress fingerprint for an actively-diverged replica: the local
+/// timeline and the replication cursor (highest of received/replayed WAL
+/// position). Together these are *every* axis on which a healthy replica can
+/// make forward progress — a timeline switch as it crosses a switchpoint, or a
+/// climbing WAL position as it streams/replays. A wedged replica advances
+/// neither.
+#[derive(Debug, Clone, Copy)]
+struct DivergenceObs {
+    local_tl: i64,
+    /// Highest of `received_location`/`replayed_location` from `/patroni`'s
+    /// `xlog`. `None` when Patroni reported no cursor — treated as "cannot
+    /// prove a stall", which restarts the window rather than risk wiping a node
+    /// that might be progressing unseen.
+    progress: Option<i64>,
+}
+
+/// An in-progress timeline-divergence dwell window: the epoch it opened and the
+/// progress fingerprint it opened on. The dwell matures only while *both* axes
+/// stay frozen, so it measures an explicit stall — never a node catching up.
+#[derive(Debug, Clone, Copy)]
+struct DivergenceWindow {
+    since: i64,
+    local_tl: i64,
+    progress: Option<i64>,
+}
+
+/// Advance the divergence dwell window given this poll's observation, so the
+/// dwell accrues ONLY on an explicit, fully-stalled divergence — we want to be
+/// certain nothing has progressed since the window opened before we wipe.
+///
+/// - Not diverged this poll → clear the window (caught up, mid-clone, leader
+///   unknown, role unclear, or gap closed).
+/// - Diverged, and *both* the timeline and the WAL cursor have stayed frozen
+///   since the window opened → keep accruing. This is the only path that lets
+///   the dwell mature into a reinit.
+/// - Diverged but the timeline advanced, the cursor advanced, or the cursor is
+///   unmeasurable on either side → (re)start the clock at this observation. The
+///   node may be replaying across the gap (catching up), so it must not inherit
+///   prior dwell.
+fn accrue_divergence_window(
+    current: Option<DivergenceObs>,
+    window: Option<DivergenceWindow>,
+    now: i64,
+) -> Option<DivergenceWindow> {
+    let Some(obs) = current else {
+        return None;
+    };
+    if let Some(w) = window {
+        let timeline_frozen = obs.local_tl <= w.local_tl;
+        let progress_frozen = match (w.progress, obs.progress) {
+            (Some(opened_at), Some(cur)) => cur <= opened_at,
+            // Unknown cursor on either side → cannot prove a stall.
+            _ => false,
+        };
+        if timeline_frozen && progress_frozen {
+            return Some(w);
+        }
+    }
+    Some(DivergenceWindow {
+        since: now,
+        local_tl: obs.local_tl,
+        progress: obs.progress,
+    })
 }
 
 // ====================================================================
@@ -238,6 +419,8 @@ pub fn spawn(volume_root: String, telemetry: Telemetry) {
         recent_window_secs = cfg.thresholds.recent_window_secs,
         action_backoff_secs = cfg.thresholds.action_backoff_secs,
         max_attempts_per_hour = cfg.thresholds.max_attempts_per_hour,
+        divergence_dwell_secs = cfg.thresholds.divergence_dwell_secs,
+        divergence_min_gap = cfg.thresholds.divergence_min_gap,
         volume_root = %volume_root,
         "self-heal: starting watcher"
     );
@@ -293,6 +476,15 @@ impl WatcherConfig {
                     "SELF_HEAL_MAX_ATTEMPTS_PER_HOUR",
                     DEFAULT_MAX_ATTEMPTS_PER_HOUR,
                 ),
+                divergence_dwell_secs: env_u64(
+                    "SELF_HEAL_DIVERGENCE_DWELL_SECONDS",
+                    DEFAULT_DIVERGENCE_DWELL_SECONDS,
+                ),
+                divergence_min_gap: env_i64(
+                    "SELF_HEAL_DIVERGENCE_MIN_GAP",
+                    DEFAULT_DIVERGENCE_MIN_GAP,
+                )
+                .max(1),
             },
         }
     }
@@ -306,6 +498,13 @@ fn env_u64(k: &str, default: u64) -> u64 {
 }
 
 fn env_u32(k: &str, default: u32) -> u32 {
+    env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(k: &str, default: i64) -> i64 {
     env::var(k)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -334,6 +533,11 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
     // every iteration while the cap is tripped (up to ~1h until the
     // oldest attempt ages out). Emit telemetry once per breach.
     let mut gave_up_emitted = false;
+    // Open dwell window for a replica observed stalled behind the leader on a
+    // fixed timeline while healthy; None when caught up or making progress.
+    // In-memory like `starts_seen` — a container restart re-arms Patroni's own
+    // startup divergence check anyway.
+    let mut divergence_window: Option<DivergenceWindow> = None;
 
     loop {
         if let Err(e) = iteration(
@@ -343,6 +547,7 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
             &mut starts_seen,
             &mut action_pending_recovery,
             &mut gave_up_emitted,
+            &mut divergence_window,
             &telemetry,
         )
         .await
@@ -360,6 +565,7 @@ async fn iteration(
     starts_seen: &mut VecDeque<(i64, String)>,
     action_pending_recovery: &mut Option<i64>,
     gave_up_emitted: &mut bool,
+    divergence_window: &mut Option<DivergenceWindow>,
     telemetry: &Telemetry,
 ) -> Result<()> {
     let now = now_epoch();
@@ -401,8 +607,41 @@ async fn iteration(
     }
     let pg_starts_in_window = starts_seen.len() as u32;
 
-    // 3. Is the leader reachable (so a reinit has a clone source)?
-    let leader_reachable = check_leader_reachable(client, cfg.leader_health_timeout_secs).await;
+    // 3. Leader probe: reachable (clone source for a reinit) + its timeline
+    //    (so we can detect a replica stuck behind it).
+    let leader = probe_leader(client, cfg.leader_health_timeout_secs).await;
+    let leader_reachable = leader.reachable;
+    let leader_timeline = leader.timeline;
+    let local_timeline = local.timeline;
+
+    // 3b. Accrue the divergence dwell, but ONLY against an explicit stall: the
+    // window matures while the local timeline sits frozen below the leader's
+    // (replica, healthy, leader clearly ahead — the same predicate the decision
+    // uses). Any forward progress of the local timeline restarts the clock — a
+    // node replaying across the gap is catching up, not wedged — and any
+    // non-diverged observation (caught up, mid-clone, leader unknown, role
+    // unclear, gap too small) clears it. A normal post-failover replica
+    // fast-forwards within a poll or two and so never reaches the dwell; a
+    // silently stuck one, frozen on a stale timeline, does.
+    let patroni_state = local.state.clone().unwrap_or_default();
+    // Highest WAL position Patroni reports for this node — the axis (besides the
+    // timeline) on which a catching-up replica makes visible progress.
+    let local_progress = local.xlog.and_then(|x| x.highest_location());
+    let current_obs = timeline_divergence_present(
+        role,
+        &patroni_state,
+        local_timeline,
+        leader_timeline,
+        cfg.thresholds.divergence_min_gap,
+    )
+    .map(|(local_tl, _leader_tl)| DivergenceObs {
+        local_tl,
+        progress: local_progress,
+    });
+    *divergence_window = accrue_divergence_window(current_obs, *divergence_window, now);
+    let diverged_for_secs = divergence_window
+        .map(|w| now.saturating_sub(w.since).max(0) as u64)
+        .unwrap_or(0);
 
     // 4. Persistent counters.
     let last_action_at =
@@ -427,10 +666,7 @@ async fn iteration(
     // from disk on cold start.
     let recovery_seen_after_action = match (*action_pending_recovery, &local.state) {
         (Some(action_t), Some(s)) if s == "running" || s == "streaming" => {
-            pg_starts_in_window == 1
-                && starts_seen
-                    .front()
-                    .is_some_and(|(t, _)| *t >= action_t)
+            pg_starts_in_window == 1 && starts_seen.front().is_some_and(|(t, _)| *t >= action_t)
         }
         _ => false,
     };
@@ -440,8 +676,11 @@ async fn iteration(
         now,
         role,
         leader_reachable,
-        patroni_state: local.state.clone().unwrap_or_default(),
+        patroni_state,
         pg_starts_in_window,
+        local_timeline,
+        leader_timeline,
+        diverged_for_secs,
         last_action_at,
         action_attempts_in_window,
         recovery_seen_after_action,
@@ -454,7 +693,33 @@ async fn iteration(
     match action {
         SelfHealAction::NoOp => {}
         SelfHealAction::Wait => {}
-        SelfHealAction::Reinitialize { reason, attempt } => {
+        SelfHealAction::Reinitialize {
+            reason,
+            attempt,
+            trigger,
+        } => {
+            // Double-check destructive divergence wipes against an independent,
+            // fresh read taken right now — guards against acting on a single
+            // stale or flaky poll. Crash-loop and start-failed are evidenced
+            // across many polls already, so they skip this. If the re-read no
+            // longer agrees, the state changed under us: reset the dwell and
+            // wait for it to re-accrue rather than wipe on stale data.
+            if trigger == ReinitTrigger::TimelineDivergence
+                && !confirm_timeline_divergence(client, cfg).await
+            {
+                // Skip this cycle without consuming an attempt or starting
+                // backoff. We deliberately leave the divergence window alone: if
+                // the node genuinely caught up or made progress, the next
+                // iteration's top-level accrual resets it; if this was just a
+                // flaky read, the dwell stands and we retry next poll instead of
+                // paying a full re-accrual.
+                info!(
+                    reason = %reason,
+                    "self-heal: timeline-divergence re-check did not confirm on fresh read, skipping reinit"
+                );
+                return Ok(());
+            }
+
             info!(
                 reason = %reason,
                 attempt,
@@ -544,6 +809,30 @@ struct PatroniLocal {
     state: Option<String>,
     role: Option<String>,
     postmaster_start_time: Option<String>,
+    timeline: Option<i64>,
+    xlog: Option<Xlog>,
+}
+
+/// Replication progress block from `/patroni`. On a replica these report the
+/// WAL byte position received from / replayed off the primary; both climb while
+/// the node is making progress and freeze when it stalls.
+#[derive(Debug, Deserialize, Clone, Copy)]
+struct Xlog {
+    received_location: Option<i64>,
+    replayed_location: Option<i64>,
+}
+
+impl Xlog {
+    /// Highest position observed across both cursors — the most generous
+    /// "is it progressing" reading, so any advance on either resets the dwell.
+    fn highest_location(self) -> Option<i64> {
+        match (self.received_location, self.replayed_location) {
+            (Some(r), Some(p)) => Some(r.max(p)),
+            (Some(r), None) => Some(r),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        }
+    }
 }
 
 async fn fetch_local_patroni(client: &reqwest::Client) -> Result<PatroniLocal> {
@@ -567,9 +856,19 @@ struct ClusterMember {
     role: String,
     state: String,
     api_url: Option<String>,
+    timeline: Option<i64>,
 }
 
-async fn check_leader_reachable(client: &reqwest::Client, timeout_secs: u64) -> bool {
+/// What we learn about the leader from one `/cluster` poll: whether it is
+/// reachable and healthy (so a reinit has a clone source) and its current
+/// timeline (so we can spot a replica stuck behind it).
+#[derive(Debug, Default, Clone, Copy)]
+struct LeaderProbe {
+    reachable: bool,
+    timeline: Option<i64>,
+}
+
+async fn probe_leader(client: &reqwest::Client, timeout_secs: u64) -> LeaderProbe {
     let cluster: ClusterResponse = match client
         .get(PATRONI_CLUSTER_URL)
         .send()
@@ -578,25 +877,34 @@ async fn check_leader_reachable(client: &reqwest::Client, timeout_secs: u64) -> 
     {
         Ok(r) => match r.json().await {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(_) => return LeaderProbe::default(),
         },
-        Err(_) => return false,
+        Err(_) => return LeaderProbe::default(),
     };
-    let leader = cluster.members.iter().find(|m| m.role == "leader");
-    let Some(leader) = leader else {
-        return false;
+    let Some(leader) = cluster.members.iter().find(|m| m.role == "leader") else {
+        return LeaderProbe::default();
     };
+    // Carry the leader's timeline even before the health probe — the divergence
+    // check needs it, and a leader that fails the /health probe still pins the
+    // timeline a stuck replica should be measured against.
+    let timeline = leader.timeline;
     if leader.state != "running" {
-        return false;
+        return LeaderProbe {
+            reachable: false,
+            timeline,
+        };
     }
     let Some(api_url) = leader.api_url.as_ref() else {
-        return false;
+        return LeaderProbe {
+            reachable: false,
+            timeline,
+        };
     };
     // Patroni's /health endpoint mirrors /leader on the leader: 200 if
     // healthy, 503 otherwise. Reuse the shared client with a per-request
     // timeout override so we keep the connection pool warm across polls.
     let url = format!("{}/health", api_url.trim_end_matches('/'));
-    matches!(
+    let reachable = matches!(
         client
             .get(&url)
             .timeout(Duration::from_secs(timeout_secs))
@@ -604,7 +912,37 @@ async fn check_leader_reachable(client: &reqwest::Client, timeout_secs: u64) -> 
             .await
             .map(|r| r.status().as_u16()),
         Ok(200)
+    );
+    LeaderProbe {
+        reachable,
+        timeline,
+    }
+}
+
+/// Independent re-confirmation of a timeline divergence taken immediately
+/// before the destructive reinit. Does its own fresh reads of `/patroni`
+/// (local) and `/cluster` (leader) — not the snapshot the decision was made
+/// from — then re-applies the exact structural guards via
+/// [`timeline_divergence_present`] plus an explicit active-leader check
+/// (`reachable`, i.e. leader present, `running`, and `/health` 200). Any
+/// disagreement returns `false` and the caller backs off. This is the final
+/// safety net against acting on a single stale or flaky poll.
+async fn confirm_timeline_divergence(client: &reqwest::Client, cfg: &WatcherConfig) -> bool {
+    let Ok(local) = fetch_local_patroni(client).await else {
+        return false;
+    };
+    let leader = probe_leader(client, cfg.leader_health_timeout_secs).await;
+    if !leader.reachable {
+        return false;
+    }
+    timeline_divergence_present(
+        parse_role(local.role.as_deref()),
+        &local.state.unwrap_or_default(),
+        local.timeline,
+        leader.timeline,
+        cfg.thresholds.divergence_min_gap,
     )
+    .is_some()
 }
 
 async fn issue_reinitialize(client: &reqwest::Client) -> Result<()> {
@@ -730,11 +1068,25 @@ mod tests {
             leader_reachable: true,
             patroni_state: "running".into(),
             pg_starts_in_window: 0,
+            local_timeline: None,
+            leader_timeline: None,
+            diverged_for_secs: 0,
             last_action_at: None,
             action_attempts_in_window: 0,
             recovery_seen_after_action: false,
             thresholds: Thresholds::default(),
         }
+    }
+
+    /// A replica healthy in Patroni's eyes but stuck behind the leader's
+    /// timeline past the dwell.
+    fn diverged() -> SelfHealInputs {
+        let mut s = base();
+        s.patroni_state = "running".into();
+        s.local_timeline = Some(3);
+        s.leader_timeline = Some(7);
+        s.diverged_for_secs = s.thresholds.divergence_dwell_secs;
+        s
     }
 
     #[test]
@@ -768,9 +1120,14 @@ mod tests {
         let mut s = base();
         s.pg_starts_in_window = 3;
         match decide_self_heal(&s) {
-            SelfHealAction::Reinitialize { reason, attempt } => {
+            SelfHealAction::Reinitialize {
+                reason,
+                attempt,
+                trigger,
+            } => {
                 assert!(reason.starts_with("postgres_crash_loop"));
                 assert_eq!(attempt, 1);
+                assert_eq!(trigger, ReinitTrigger::CrashLoop);
             }
             other => panic!("expected Reinitialize, got {other:?}"),
         }
@@ -781,8 +1138,13 @@ mod tests {
         let mut s = base();
         s.patroni_state = "start failed".into();
         match decide_self_heal(&s) {
-            SelfHealAction::Reinitialize { reason, attempt: 1 } => {
+            SelfHealAction::Reinitialize {
+                reason,
+                attempt: 1,
+                trigger,
+            } => {
                 assert_eq!(reason, "patroni_start_failed");
+                assert_eq!(trigger, ReinitTrigger::StartFailed);
             }
             other => panic!("expected Reinitialize, got {other:?}"),
         }
@@ -854,6 +1216,182 @@ mod tests {
             } => {}
             other => panic!("expected EmitRecovered, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stalled_divergence_triggers_reinit() {
+        let s = diverged();
+        match decide_self_heal(&s) {
+            SelfHealAction::Reinitialize {
+                reason,
+                attempt: 1,
+                trigger,
+            } => {
+                assert!(reason.starts_with("timeline_diverged"), "got {reason}");
+                assert!(reason.contains("tl3"), "got {reason}");
+                assert!(reason.contains("tl7"), "got {reason}");
+                assert_eq!(trigger, ReinitTrigger::TimelineDivergence);
+            }
+            other => panic!("expected Reinitialize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn divergence_requires_replica_role() {
+        // An Unknown-role node (joining/uninitialized) whose timeline reads low
+        // must never be wiped for divergence — only crash-loop evidence can act
+        // on a non-replica.
+        let mut s = diverged();
+        s.role = Role::Unknown;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn divergence_below_min_gap_is_noop() {
+        // One timeline behind is not "clearly ahead" — could be a single
+        // in-flight switch. Require the configured margin.
+        let mut s = diverged();
+        s.local_timeline = Some(6);
+        s.leader_timeline = Some(7); // gap 1 < default min_gap 2
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn divergence_at_exactly_min_gap_acts() {
+        let mut s = diverged();
+        s.local_timeline = Some(5);
+        s.leader_timeline = Some(7); // gap 2 == default min_gap
+        match decide_self_heal(&s) {
+            SelfHealAction::Reinitialize {
+                trigger: ReinitTrigger::TimelineDivergence,
+                ..
+            } => {}
+            other => panic!("expected divergence Reinitialize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn divergence_below_dwell_is_noop() {
+        let mut s = diverged();
+        s.diverged_for_secs = s.thresholds.divergence_dwell_secs - 1;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn divergence_only_acts_in_healthy_state() {
+        // Mid-clone states sit on a lower timeline legitimately; never act.
+        let mut s = diverged();
+        s.patroni_state = "creating replica".into();
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn streaming_state_is_eligible_for_divergence() {
+        let mut s = diverged();
+        s.patroni_state = "streaming".into();
+        match decide_self_heal(&s) {
+            SelfHealAction::Reinitialize { .. } => {}
+            other => panic!("expected Reinitialize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caught_up_replica_is_noop_even_past_dwell() {
+        let mut s = diverged();
+        s.local_timeline = Some(7);
+        s.leader_timeline = Some(7);
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn unknown_timelines_never_trigger_divergence() {
+        let mut s = diverged();
+        s.leader_timeline = None;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn divergence_respects_leader_unreachable() {
+        // No clone source → Wait, even with a long-stalled divergence.
+        let mut s = diverged();
+        s.leader_reachable = false;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::Wait);
+    }
+
+    #[test]
+    fn divergence_respects_backoff_and_cap() {
+        let mut s = diverged();
+        s.last_action_at = Some(s.now - 30);
+        s.thresholds.action_backoff_secs = 600;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::Wait);
+
+        let mut s = diverged();
+        s.action_attempts_in_window = 5;
+        s.thresholds.max_attempts_per_hour = 5;
+        match decide_self_heal(&s) {
+            SelfHealAction::EmitGaveUp { .. } => {}
+            other => panic!("expected EmitGaveUp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leader_never_acted_on_even_when_diverged() {
+        // A leader reporting a lower timeline than some stale member view must
+        // never be wiped — safety #1 wins.
+        let mut s = diverged();
+        s.role = Role::Leader;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    fn obs(local_tl: i64, progress: Option<i64>) -> Option<DivergenceObs> {
+        Some(DivergenceObs { local_tl, progress })
+    }
+
+    #[test]
+    fn dwell_accrues_only_while_fully_frozen() {
+        // Window opens on the first diverged poll, then a later poll with the
+        // same timeline AND the same WAL cursor must not reset the clock.
+        let w0 = accrue_divergence_window(obs(3, Some(100)), None, 1_000).unwrap();
+        assert_eq!(w0.since, 1_000);
+        let w1 = accrue_divergence_window(obs(3, Some(100)), Some(w0), 1_060).unwrap();
+        assert_eq!(w1.since, 1_000, "a fully-frozen poll must keep accruing");
+    }
+
+    #[test]
+    fn replay_progress_resets_dwell_even_on_stale_timeline() {
+        // The catch-up case: timeline still 3 (below the leader) but the WAL
+        // cursor is climbing as the node replays toward the switchpoint. That
+        // is forward progress — the clock must restart so it is never wiped.
+        let w0 = accrue_divergence_window(obs(3, Some(100)), None, 1_000).unwrap();
+        let w1 = accrue_divergence_window(obs(3, Some(200)), Some(w0), 1_060).unwrap();
+        assert_eq!(
+            w1.since, 1_060,
+            "WAL progress on a stale timeline must reset"
+        );
+        assert_eq!(w1.progress, Some(200));
+    }
+
+    #[test]
+    fn timeline_progress_resets_dwell() {
+        let w0 = accrue_divergence_window(obs(3, Some(100)), None, 1_000).unwrap();
+        let w1 = accrue_divergence_window(obs(4, Some(100)), Some(w0), 1_060).unwrap();
+        assert_eq!(w1.since, 1_060, "crossing a switchpoint must reset");
+    }
+
+    #[test]
+    fn unknown_cursor_never_accrues() {
+        // Without a measurable cursor we cannot prove a stall, so the window
+        // restarts every poll and the dwell never matures. Fail-safe: a node
+        // whose progress we can't see is never wiped for divergence.
+        let w0 = accrue_divergence_window(obs(3, None), None, 1_000).unwrap();
+        let w1 = accrue_divergence_window(obs(3, None), Some(w0), 1_060).unwrap();
+        assert_eq!(w1.since, 1_060, "unmeasurable cursor must not accrue");
+    }
+
+    #[test]
+    fn not_diverged_clears_window() {
+        let w0 = accrue_divergence_window(obs(3, Some(100)), None, 1_000).unwrap();
+        assert!(accrue_divergence_window(None, Some(w0), 1_060).is_none());
     }
 
     #[test]
