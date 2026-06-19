@@ -88,6 +88,13 @@ const DEFAULT_LEADER_HEALTH_TIMEOUT_SECONDS: u64 = 3;
 // stall and reinitialize. Long enough that a normal post-failover replica —
 // which fast-forwards onto the new timeline within seconds — never accrues it.
 const DEFAULT_DIVERGENCE_DWELL_SECONDS: u64 = 300;
+// Minimum number of timelines the leader must be ahead before a divergence
+// reinit is even considered. A healthy streaming replica is on the *same*
+// timeline as the leader; being behind at all is abnormal, but we require a
+// clear margin (missed ≥2 promotions) so a single borderline/in-flight switch
+// can never trip a destructive wipe. This is a false-positive guard, not a
+// correctness one — raise it to be stricter, never below 1.
+const DEFAULT_DIVERGENCE_MIN_GAP: i64 = 2;
 
 // ====================================================================
 // Public types
@@ -107,6 +114,7 @@ pub struct Thresholds {
     pub action_backoff_secs: u64,
     pub max_attempts_per_hour: u32,
     pub divergence_dwell_secs: u64,
+    pub divergence_min_gap: i64,
 }
 
 impl Default for Thresholds {
@@ -117,6 +125,7 @@ impl Default for Thresholds {
             action_backoff_secs: DEFAULT_ACTION_BACKOFF_SECONDS,
             max_attempts_per_hour: DEFAULT_MAX_ATTEMPTS_PER_HOUR,
             divergence_dwell_secs: DEFAULT_DIVERGENCE_DWELL_SECONDS,
+            divergence_min_gap: DEFAULT_DIVERGENCE_MIN_GAP,
         }
     }
 }
@@ -146,6 +155,17 @@ pub struct SelfHealInputs {
     pub thresholds: Thresholds,
 }
 
+/// Which signal drove a reinit. Lets the orchestrator treat the
+/// single-signal, destructive `TimelineDivergence` case more cautiously (an
+/// independent re-read before acting) than the multi-poll-evidenced crash-loop
+/// and start-failed cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReinitTrigger {
+    StartFailed,
+    CrashLoop,
+    TimelineDivergence,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelfHealAction {
     NoOp,
@@ -153,6 +173,7 @@ pub enum SelfHealAction {
     Reinitialize {
         reason: String,
         attempt: u32,
+        trigger: ReinitTrigger,
     },
     EmitRecovered {
         recovered_in_secs: u64,
@@ -215,58 +236,96 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
     let stalled_divergence = stalled_timeline_divergence(s);
 
     if patroni_says_failed || is_crash_loop || stalled_divergence.is_some() {
-        let reason = if patroni_says_failed {
-            "patroni_start_failed".to_string()
+        let (trigger, reason) = if patroni_says_failed {
+            (
+                ReinitTrigger::StartFailed,
+                "patroni_start_failed".to_string(),
+            )
         } else if is_crash_loop {
-            format!(
-                "postgres_crash_loop:{}_restarts_in_{}s",
-                s.pg_starts_in_window, s.thresholds.recent_window_secs
+            (
+                ReinitTrigger::CrashLoop,
+                format!(
+                    "postgres_crash_loop:{}_restarts_in_{}s",
+                    s.pg_starts_in_window, s.thresholds.recent_window_secs
+                ),
             )
         } else {
             // Only reachable when stalled_divergence is Some.
             let (local, leader) = stalled_divergence.expect("checked is_some above");
-            format!(
-                "timeline_diverged:tl{local}_behind_leader_tl{leader}_for_{}s",
-                s.diverged_for_secs
+            (
+                ReinitTrigger::TimelineDivergence,
+                format!(
+                    "timeline_diverged:tl{local}_behind_leader_tl{leader}_for_{}s",
+                    s.diverged_for_secs
+                ),
             )
         };
         return SelfHealAction::Reinitialize {
             reason,
             attempt: s.action_attempts_in_window + 1,
+            trigger,
         };
     }
 
     SelfHealAction::NoOp
 }
 
+/// Pure predicate for "this looks like a stuck-behind replica right now",
+/// independent of how long it has been so. Shared by the decision function and
+/// the pre-action re-read so both judge divergence by exactly the same rules.
+///
+/// All four false-positive guards live here:
+/// 1. We are a `Replica` — never a leader (destructive) and never `Unknown`
+///    (a joining/uninitialized node whose timeline isn't meaningful yet).
+/// 2. Patroni reports us healthy (`running`/`streaming`) — never mid-clone
+///    (`creating replica`/`starting`), where a lower timeline is expected.
+/// 3. Both timelines are known.
+/// 4. The leader is clearly ahead — at least `min_gap` timelines — not just
+///    one borderline/in-flight switch.
+fn timeline_divergence_present(
+    role: Role,
+    patroni_state: &str,
+    local_timeline: Option<i64>,
+    leader_timeline: Option<i64>,
+    min_gap: i64,
+) -> Option<(i64, i64)> {
+    if !matches!(role, Role::Replica) {
+        return None;
+    }
+    if patroni_state != "running" && patroni_state != "streaming" {
+        return None;
+    }
+    let local = local_timeline?;
+    let leader = leader_timeline?;
+    if leader.saturating_sub(local) < min_gap {
+        return None;
+    }
+    Some((local, leader))
+}
+
 /// The silent-stall case: a replica Patroni still considers healthy
 /// (`running`/`streaming`, postmaster stable so no crash-loop signal) whose
-/// timeline has sat below the leader's past the dwell. Patroni's own
+/// timeline has sat clearly below the leader's past the dwell. Patroni's own
 /// `remove_data_directory_on_diverged_timelines` only re-evaluates on a
 /// (re)start, so a node that came up "following leader" on a stale timeline and
 /// never restarts is invisible to it — and to the crash-loop detector. A full
 /// reinit (pg_basebackup from the leader) is the only fix.
 ///
 /// Returns `(local_timeline, leader_timeline)` when it applies, else `None`.
-/// The dwell itself is accrued by the orchestrator (`diverged_for_secs`); here
-/// we only confirm the node is in a healthy-looking state and genuinely behind,
-/// keeping the function pure and unit-testable.
+/// The dwell itself is accrued by the orchestrator (`diverged_for_secs`); the
+/// structural guards live in [`timeline_divergence_present`]. Pure and
+/// unit-testable.
 fn stalled_timeline_divergence(s: &SelfHealInputs) -> Option<(i64, i64)> {
-    // Never act mid-clone: states like "creating replica"/"starting" legitimately
-    // sit on a lower timeline while catching up. Only a node Patroni reports as
-    // up-and-following qualifies.
-    if s.patroni_state != "running" && s.patroni_state != "streaming" {
-        return None;
-    }
-    let local = s.local_timeline?;
-    let leader = s.leader_timeline?;
-    if local >= leader {
-        return None;
-    }
     if s.diverged_for_secs < s.thresholds.divergence_dwell_secs {
         return None;
     }
-    Some((local, leader))
+    timeline_divergence_present(
+        s.role,
+        &s.patroni_state,
+        s.local_timeline,
+        s.leader_timeline,
+        s.thresholds.divergence_min_gap,
+    )
 }
 
 // ====================================================================
@@ -294,6 +353,7 @@ pub fn spawn(volume_root: String, telemetry: Telemetry) {
         action_backoff_secs = cfg.thresholds.action_backoff_secs,
         max_attempts_per_hour = cfg.thresholds.max_attempts_per_hour,
         divergence_dwell_secs = cfg.thresholds.divergence_dwell_secs,
+        divergence_min_gap = cfg.thresholds.divergence_min_gap,
         volume_root = %volume_root,
         "self-heal: starting watcher"
     );
@@ -353,6 +413,11 @@ impl WatcherConfig {
                     "SELF_HEAL_DIVERGENCE_DWELL_SECONDS",
                     DEFAULT_DIVERGENCE_DWELL_SECONDS,
                 ),
+                divergence_min_gap: env_i64(
+                    "SELF_HEAL_DIVERGENCE_MIN_GAP",
+                    DEFAULT_DIVERGENCE_MIN_GAP,
+                )
+                .max(1),
             },
         }
     }
@@ -366,6 +431,13 @@ fn env_u64(k: &str, default: u64) -> u64 {
 }
 
 fn env_u32(k: &str, default: u32) -> u32 {
+    env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(k: &str, default: i64) -> i64 {
     env::var(k)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -474,16 +546,21 @@ async fn iteration(
     let leader_timeline = leader.timeline;
     let local_timeline = local.timeline;
 
-    // 3b. Accrue divergence dwell. Count only while Patroni reports the node
-    // healthy *and* its timeline is below the leader's; any other observation
-    // (caught up, mid-clone, leader unknown) resets the clock. This makes a
-    // normal post-failover replica — which fast-forwards onto the new timeline
-    // within a poll or two — never reach the dwell, while a silently stuck one
-    // (running, following, but pinned on an old timeline) does.
-    let healthy_state =
-        local.state.as_deref() == Some("running") || local.state.as_deref() == Some("streaming");
-    let currently_diverged =
-        healthy_state && matches!((local_timeline, leader_timeline), (Some(l), Some(ld)) if l < ld);
+    // 3b. Accrue divergence dwell. Count only while the full structural
+    // divergence condition holds (replica, healthy, leader clearly ahead — the
+    // same predicate the decision uses); any other observation (caught up,
+    // mid-clone, leader unknown, role unclear, gap too small) resets the clock.
+    // A normal post-failover replica fast-forwards within a poll or two and so
+    // never reaches the dwell; a silently stuck one does.
+    let patroni_state = local.state.clone().unwrap_or_default();
+    let currently_diverged = timeline_divergence_present(
+        role,
+        &patroni_state,
+        local_timeline,
+        leader_timeline,
+        cfg.thresholds.divergence_min_gap,
+    )
+    .is_some();
     if currently_diverged {
         if diverged_since.is_none() {
             *diverged_since = Some(now);
@@ -528,7 +605,7 @@ async fn iteration(
         now,
         role,
         leader_reachable,
-        patroni_state: local.state.clone().unwrap_or_default(),
+        patroni_state,
         pg_starts_in_window,
         local_timeline,
         leader_timeline,
@@ -545,7 +622,32 @@ async fn iteration(
     match action {
         SelfHealAction::NoOp => {}
         SelfHealAction::Wait => {}
-        SelfHealAction::Reinitialize { reason, attempt } => {
+        SelfHealAction::Reinitialize {
+            reason,
+            attempt,
+            trigger,
+        } => {
+            // Double-check destructive divergence wipes against an independent,
+            // fresh read taken right now — guards against acting on a single
+            // stale or flaky poll. Crash-loop and start-failed are evidenced
+            // across many polls already, so they skip this. If the re-read no
+            // longer agrees, the state changed under us: reset the dwell and
+            // wait for it to re-accrue rather than wipe on stale data.
+            if trigger == ReinitTrigger::TimelineDivergence
+                && !confirm_timeline_divergence(client, cfg).await
+            {
+                // Skip this cycle without consuming an attempt or starting
+                // backoff. We deliberately leave `diverged_since` alone: if the
+                // node genuinely caught up, the next iteration's top-level check
+                // resets it; if this was just a flaky read, the dwell stands and
+                // we retry next poll instead of paying a full re-accrual.
+                info!(
+                    reason = %reason,
+                    "self-heal: timeline-divergence re-check did not confirm on fresh read, skipping reinit"
+                );
+                return Ok(());
+            }
+
             info!(
                 reason = %reason,
                 attempt,
@@ -720,6 +822,32 @@ async fn probe_leader(client: &reqwest::Client, timeout_secs: u64) -> LeaderProb
         reachable,
         timeline,
     }
+}
+
+/// Independent re-confirmation of a timeline divergence taken immediately
+/// before the destructive reinit. Does its own fresh reads of `/patroni`
+/// (local) and `/cluster` (leader) — not the snapshot the decision was made
+/// from — then re-applies the exact structural guards via
+/// [`timeline_divergence_present`] plus an explicit active-leader check
+/// (`reachable`, i.e. leader present, `running`, and `/health` 200). Any
+/// disagreement returns `false` and the caller backs off. This is the final
+/// safety net against acting on a single stale or flaky poll.
+async fn confirm_timeline_divergence(client: &reqwest::Client, cfg: &WatcherConfig) -> bool {
+    let Ok(local) = fetch_local_patroni(client).await else {
+        return false;
+    };
+    let leader = probe_leader(client, cfg.leader_health_timeout_secs).await;
+    if !leader.reachable {
+        return false;
+    }
+    timeline_divergence_present(
+        parse_role(local.role.as_deref()),
+        &local.state.unwrap_or_default(),
+        local.timeline,
+        leader.timeline,
+        cfg.thresholds.divergence_min_gap,
+    )
+    .is_some()
 }
 
 async fn issue_reinitialize(client: &reqwest::Client) -> Result<()> {
@@ -897,9 +1025,14 @@ mod tests {
         let mut s = base();
         s.pg_starts_in_window = 3;
         match decide_self_heal(&s) {
-            SelfHealAction::Reinitialize { reason, attempt } => {
+            SelfHealAction::Reinitialize {
+                reason,
+                attempt,
+                trigger,
+            } => {
                 assert!(reason.starts_with("postgres_crash_loop"));
                 assert_eq!(attempt, 1);
+                assert_eq!(trigger, ReinitTrigger::CrashLoop);
             }
             other => panic!("expected Reinitialize, got {other:?}"),
         }
@@ -910,8 +1043,13 @@ mod tests {
         let mut s = base();
         s.patroni_state = "start failed".into();
         match decide_self_heal(&s) {
-            SelfHealAction::Reinitialize { reason, attempt: 1 } => {
+            SelfHealAction::Reinitialize {
+                reason,
+                attempt: 1,
+                trigger,
+            } => {
                 assert_eq!(reason, "patroni_start_failed");
+                assert_eq!(trigger, ReinitTrigger::StartFailed);
             }
             other => panic!("expected Reinitialize, got {other:?}"),
         }
@@ -989,12 +1127,51 @@ mod tests {
     fn stalled_divergence_triggers_reinit() {
         let s = diverged();
         match decide_self_heal(&s) {
-            SelfHealAction::Reinitialize { reason, attempt: 1 } => {
+            SelfHealAction::Reinitialize {
+                reason,
+                attempt: 1,
+                trigger,
+            } => {
                 assert!(reason.starts_with("timeline_diverged"), "got {reason}");
                 assert!(reason.contains("tl3"), "got {reason}");
                 assert!(reason.contains("tl7"), "got {reason}");
+                assert_eq!(trigger, ReinitTrigger::TimelineDivergence);
             }
             other => panic!("expected Reinitialize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn divergence_requires_replica_role() {
+        // An Unknown-role node (joining/uninitialized) whose timeline reads low
+        // must never be wiped for divergence — only crash-loop evidence can act
+        // on a non-replica.
+        let mut s = diverged();
+        s.role = Role::Unknown;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn divergence_below_min_gap_is_noop() {
+        // One timeline behind is not "clearly ahead" — could be a single
+        // in-flight switch. Require the configured margin.
+        let mut s = diverged();
+        s.local_timeline = Some(6);
+        s.leader_timeline = Some(7); // gap 1 < default min_gap 2
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn divergence_at_exactly_min_gap_acts() {
+        let mut s = diverged();
+        s.local_timeline = Some(5);
+        s.leader_timeline = Some(7); // gap 2 == default min_gap
+        match decide_self_heal(&s) {
+            SelfHealAction::Reinitialize {
+                trigger: ReinitTrigger::TimelineDivergence,
+                ..
+            } => {}
+            other => panic!("expected divergence Reinitialize, got {other:?}"),
         }
     }
 
