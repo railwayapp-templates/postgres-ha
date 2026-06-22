@@ -547,6 +547,14 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
         .filter(|v| *v > 0)
         .unwrap_or(14);
 
+    // pg1-database is hardcoded to template1 so pgBackRest's libpq connection
+    // (stanza-create, the watcher's backups, archive-push) never depends on the
+    // customer's POSTGRES_DB/PGDATABASE existing. pgBackRest only needs *a*
+    // connectable database to reach the postmaster — backups are
+    // physical/cluster-wide, and pg_backup_start/stop are cluster-global — so a
+    // renamed or dropped app DB must not break archiving. template1 is the one
+    // database that always exists and can't be dropped. pg1-user is left unset
+    // (custom-POSTGRES_USER is handled by the Patroni post_bootstrap compat role).
     let conf = format!(
         "[global]\n\
          repo1-type=s3\n\
@@ -576,7 +584,8 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
          \n\
          [main]\n\
          pg1-path={data_dir}\n\
-         pg1-port=5432\n",
+         pg1-port=5432\n\
+         pg1-database=template1\n",
     );
 
     fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
