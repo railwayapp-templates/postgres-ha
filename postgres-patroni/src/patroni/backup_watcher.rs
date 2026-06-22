@@ -126,6 +126,15 @@ struct WatcherConfig {
     /// next full until this elapses. A full after a *deliberate* `last_full_at`
     /// clear carries no fresh failure marker, so it fires immediately.
     full_retry_backoff: u64,
+    /// Like `full_retry_backoff` but for the INITIAL full (none on record yet).
+    /// Deliberately much shorter: a cluster with no full at all is completely
+    /// unprotected, so a transient archive hiccup on the first attempt — e.g. a
+    /// cold-start async archive-push that blows pgbackrest's archive-timeout on
+    /// the very first segment — must not leave it without ANY base backup for a
+    /// full `full_retry_backoff`. The S3-hammering the long backoff guards
+    /// against only matters once a full already exists; until then, retrying
+    /// promptly (once the hiccup clears) is the safer trade.
+    initial_full_retry_backoff: u64,
 }
 
 impl WatcherConfig {
@@ -155,6 +164,7 @@ impl WatcherConfig {
                 3600,
             ),
             full_retry_backoff: env_u64("WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS", 600),
+            initial_full_retry_backoff: env_u64("WAL_BACKUP_INITIAL_FULL_RETRY_BACKOFF_SECONDS", 30),
         }
     }
 }
@@ -1738,6 +1748,15 @@ enum Action {
     None { reason: String },
 }
 
+/// Whether a full backup may be (re)attempted given the last failure time.
+/// `None` last-failure (a clean state, or a deliberate `last_full_at` clear
+/// that left no failure marker) is always ready. After a failure, the caller
+/// passes the appropriate backoff: the short `initial_full_retry_backoff` while
+/// no full exists yet, the long `full_retry_backoff` once one does.
+fn full_retry_ready(last_full_failure_at: Option<i64>, now: i64, backoff: u64) -> bool {
+    last_full_failure_at.map_or(true, |t| now >= t + backoff as i64)
+}
+
 fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) -> Action {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
     let gap_marker = format!("{data_dir}/{GAP_MARKER_FILENAME}");
@@ -1773,17 +1792,19 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     // failing full without ever delaying a full that follows a deliberate
     // last_full_at clear (fresh enable, rc=1 self-heal, WAL_REGRESSION migrate
     // — none of which leave a fresh failure marker).
-    let full_attempt_ok = read_state_field(&state_path, "last_full_failure_at")
-        .and_then(|s| s.parse::<i64>().ok())
-        .map_or(true, |t| now >= t + config.full_retry_backoff as i64);
+    let last_full_failure_at = read_state_field(&state_path, "last_full_failure_at")
+        .and_then(|s| s.parse::<i64>().ok());
 
     // NEEDS_INITIAL_BACKUP — no full on record, take it now. pgbackrest
     // backup brackets the base in pg_backup_start/stop and waits for the
     // closing WAL to archive before declaring success, so a broken
     // archive_command fails the backup loudly instead of producing an
-    // unrestorable base.
+    // unrestorable base. A failed initial full retries on the SHORT
+    // initial_full_retry_backoff (not full_retry_backoff): with no base backup
+    // at all the cluster is unprotected, so we don't sit out a 10-minute
+    // backoff after a transient first-attempt hiccup.
     if last_full.is_none() {
-        if full_attempt_ok {
+        if full_retry_ready(last_full_failure_at, now, config.initial_full_retry_backoff) {
             return Action::Full;
         }
         return Action::None {
@@ -1808,7 +1829,7 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     // initial still fire). Same retry backoff so a failing periodic full
     // doesn't re-fire every poll once it's due.
     if config.full_interval > 0 && now >= last_full + config.full_interval as i64 {
-        if full_attempt_ok {
+        if full_retry_ready(last_full_failure_at, now, config.full_retry_backoff) {
             return Action::Full;
         }
         return Action::None {
@@ -2020,9 +2041,9 @@ fn now_epoch() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_gap_recovery, parse_catalog_max, parse_has_full, probe_async_duplicate_error,
-        segment_to_number, wal_has_async_archive_duplicate_error, GapRecoveryAction,
-        GapRecoveryInputs,
+        decide_gap_recovery, full_retry_ready, parse_catalog_max, parse_has_full,
+        probe_async_duplicate_error, segment_to_number, wal_has_async_archive_duplicate_error,
+        GapRecoveryAction, GapRecoveryInputs,
     };
     use std::fs;
 
@@ -2047,6 +2068,33 @@ mod tests {
             backoff_seconds: 600,
             segments_per_log_file: 256,
         }
+    }
+
+    #[test]
+    fn full_retry_ready_no_prior_failure_is_always_ready() {
+        // Clean state / deliberate last_full_at clear (no failure marker) →
+        // fire immediately, regardless of backoff.
+        assert!(full_retry_ready(None, 10_000, 600));
+        assert!(full_retry_ready(None, 0, 600));
+    }
+
+    #[test]
+    fn full_retry_ready_respects_backoff_window() {
+        // Failed at t=1000; not ready until t >= 1000 + backoff.
+        assert!(!full_retry_ready(Some(1000), 1029, 30)); // 29s elapsed < 30
+        assert!(full_retry_ready(Some(1000), 1030, 30)); // exactly at the window
+        assert!(full_retry_ready(Some(1000), 5000, 30)); // well past
+    }
+
+    #[test]
+    fn initial_full_retries_far_sooner_than_periodic_full() {
+        // The whole point of the fix: after the same first-attempt failure, the
+        // initial full (short backoff) is ready long before a periodic full
+        // (long backoff) would be. 60s after a failure with the defaults:
+        let failed_at = Some(1000_i64);
+        let now = 1060; // 60s later
+        assert!(full_retry_ready(failed_at, now, 30)); // initial: ready
+        assert!(!full_retry_ready(failed_at, now, 600)); // periodic: still backing off
     }
 
     #[test]

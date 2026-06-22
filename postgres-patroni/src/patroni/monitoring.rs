@@ -42,7 +42,34 @@ pub async fn run_monitoring_loop(
         "Waiting for Patroni to initialize"
     );
 
+    // `startup_elapsed` counts time WITHOUT progress, not wall-clock. A
+    // pg_basebackup clone (or initdb) of a large primary keeps Patroni
+    // "unhealthy" far longer than max_startup_timeout — a wall-clock kill would
+    // SIGKILL the clone mid-stream, and since pg_basebackup writes
+    // global/pg_control LAST that leaves a non-empty pgdata with no control
+    // file, which Patroni then refuses to start ("system ID is invalid"),
+    // wedging the replica permanently. So we only accrue toward the recovery
+    // exit while the node is making NO progress, where progress is either of
+    // two independent signals:
+    //   1. Volume usage growing — pg_basebackup laying data files down. This is
+    //      the only signal available before Patroni's REST API answers.
+    //   2. WAL position (received/replayed LSN) advancing — covers the
+    //      post-basebackup catch-up phase, where the replica streams + replays
+    //      WAL with disk usage ~flat (segments recycled about as fast as they
+    //      arrive) yet the LSN keeps climbing. Volume bytes alone would read
+    //      that as "stalled" and wrongly kill a healthy catch-up.
+    // A genuinely stalled startup — and a hung clone (dead replication socket) —
+    // advances NEITHER signal, so it still exits for recovery after the timeout.
     let mut startup_elapsed = 0u64;
+    let mut last_volume_used = volume_used_bytes(&config.data_dir);
+    let mut last_xlog_pos: Option<i64> = None;
+    // Short-timeout client for polling Patroni's local REST API for WAL
+    // progress. Best-effort: if it can't be built we fall back to the
+    // volume-usage signal alone.
+    let patroni_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok();
     loop {
         tokio::select! {
             _ = sigterm.recv() => {
@@ -67,37 +94,77 @@ pub async fn run_monitoring_loop(
                 std::process::exit(1);
             }
             _ = sleep(Duration::from_secs(5)) => {
-                startup_elapsed += 5;
-                if check_health(config.health_check_timeout).await {
-                    info!(elapsed = startup_elapsed, "Patroni healthy, starting monitoring");
-                    break;
+                let healthy = check_health(config.health_check_timeout).await;
+
+                let used = volume_used_bytes(&config.data_dir);
+                let volume_grew = used > last_volume_used;
+                last_volume_used = used;
+
+                // WAL position is the progress signal whole-volume bytes miss:
+                // during catch-up the replica streams + replays WAL while disk
+                // usage stays ~flat, but received/replayed LSN keeps advancing.
+                // Absent during pg_basebackup (no xlog yet) — that phase is
+                // covered by volume growth instead.
+                let xlog_pos = match patroni_client.as_ref() {
+                    Some(c) => fetch_patroni_xlog_position(c).await,
+                    None => None,
+                };
+                let lsn_advanced = xlog_advanced(last_xlog_pos, xlog_pos);
+                if xlog_pos.is_some() {
+                    last_xlog_pos = xlog_pos;
                 }
 
-                // Check if we've exceeded max startup timeout
-                if startup_elapsed >= config.max_startup_timeout {
-                    error!(
-                        elapsed = startup_elapsed,
-                        max = config.max_startup_timeout,
-                        "Patroni failed to become healthy within timeout - exiting for recovery"
-                    );
-                    telemetry.send(TelemetryEvent::HealthCheckFailed {
-                        node: config.name.clone(),
-                        consecutive_failures: (startup_elapsed / 5) as u32,
-                        max_failures: (config.max_startup_timeout / 5) as u32,
-                    });
-                    let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
-                    sleep(Duration::from_secs(2)).await;
-                    let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGKILL);
-                    std::process::exit(1);
-                }
+                let progressing = volume_grew || lsn_advanced;
 
-                // Log progress after grace period
-                if startup_elapsed >= config.startup_grace_period && startup_elapsed % 30 == 0 {
-                    warn!(
-                        elapsed = startup_elapsed,
-                        max = config.max_startup_timeout,
-                        "Still waiting for Patroni to become healthy"
-                    );
+                match classify_startup_tick(
+                    healthy,
+                    progressing,
+                    startup_elapsed,
+                    config.max_startup_timeout,
+                ) {
+                    StartupTick::Healthy => {
+                        info!(elapsed_without_progress = startup_elapsed, "Patroni healthy, starting monitoring");
+                        break;
+                    }
+                    StartupTick::Progressing => {
+                        // Clone/initdb/catch-up advancing — never count it toward the kill.
+                        if startup_elapsed > 0 {
+                            info!(
+                                volume_used_bytes = used,
+                                volume_grew,
+                                xlog_position = xlog_pos.unwrap_or(0),
+                                lsn_advanced,
+                                "Startup making progress (clone bytes landing or WAL replay advancing); resetting startup timeout"
+                            );
+                        }
+                        startup_elapsed = 0;
+                    }
+                    StartupTick::Stalled => {
+                        error!(
+                            elapsed_without_progress = startup_elapsed,
+                            max = config.max_startup_timeout,
+                            "Patroni not healthy, and neither volume usage nor WAL position advanced within timeout - exiting for recovery"
+                        );
+                        telemetry.send(TelemetryEvent::HealthCheckFailed {
+                            node: config.name.clone(),
+                            consecutive_failures: (startup_elapsed / 5) as u32,
+                            max_failures: (config.max_startup_timeout / 5) as u32,
+                        });
+                        let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
+                        sleep(Duration::from_secs(2)).await;
+                        let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGKILL);
+                        std::process::exit(1);
+                    }
+                    StartupTick::Waiting => {
+                        startup_elapsed += 5;
+                        if startup_elapsed >= config.startup_grace_period && startup_elapsed % 30 == 0 {
+                            warn!(
+                                elapsed_without_progress = startup_elapsed,
+                                max = config.max_startup_timeout,
+                                "Still waiting for Patroni to become healthy (no volume-usage progress)"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -159,5 +226,173 @@ pub async fn run_monitoring_loop(
                 }
             }
         }
+    }
+}
+
+/// Outcome of one 5s startup poll. Pure so the progress-gated timeout is
+/// unit-testable without spinning Patroni.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupTick {
+    /// Patroni reports healthy — leave the startup wait.
+    Healthy,
+    /// Not healthy yet but pgdata is growing — a clone/initdb is in flight, so
+    /// the no-progress clock resets (never kill a clone mid-stream).
+    Progressing,
+    /// Not healthy and no progress for `max_startup_timeout` — exit for recovery.
+    Stalled,
+    /// Not healthy, no progress yet, still under the timeout — keep waiting.
+    Waiting,
+}
+
+fn classify_startup_tick(
+    healthy: bool,
+    progressing: bool,
+    elapsed_without_progress: u64,
+    max_timeout: u64,
+) -> StartupTick {
+    if healthy {
+        StartupTick::Healthy
+    } else if progressing {
+        StartupTick::Progressing
+    } else if elapsed_without_progress >= max_timeout {
+        StartupTick::Stalled
+    } else {
+        StartupTick::Waiting
+    }
+}
+
+/// Used bytes on the filesystem holding `path` (O(1) `statvfs`, no tree walk).
+/// The startup progress signal for the pg_basebackup phase: a clone in flight
+/// grows the volume as data files land, and it costs one syscall instead of
+/// stat'ing every relation file every 5s. (The catch-up phase, where disk
+/// usage holds flat while WAL replays, is covered by [`xlog_advanced`]
+/// instead.) Best-effort: a missing path or `statvfs` error returns 0 (the
+/// next successful read then registers as growth, i.e. progress).
+fn volume_used_bytes(path: &str) -> u64 {
+    use nix::sys::statvfs::statvfs;
+
+    statvfs(std::path::Path::new(path))
+        .ok()
+        .and_then(|s| {
+            let frag = s.fragment_size() as u64;
+            let used_blocks = (s.blocks() as u64).checked_sub(s.blocks_free() as u64)?;
+            used_blocks.checked_mul(frag)
+        })
+        .unwrap_or(0)
+}
+
+/// True when the replica's WAL position advanced between two startup polls —
+/// progress that whole-volume byte growth misses during catch-up (WAL streamed
+/// in ≈ recycled out holds disk usage flat while received/replayed LSN climbs).
+/// Pure/unit-tested. A missing baseline or current reading (node still in
+/// pg_basebackup with no xlog yet, or the REST API not answering) is NOT
+/// advancement, so it never masks a hung clone — that path falls back to the
+/// volume-usage signal, which a dead clone also leaves flat → still stalls.
+fn xlog_advanced(last: Option<i64>, current: Option<i64>) -> bool {
+    matches!((last, current), (Some(l), Some(c)) if c > l)
+}
+
+/// Best-effort read of this node's furthest WAL position (max of received /
+/// replayed location) from the local Patroni REST API (`/patroni`, which
+/// answers 200 on the leader and 503 on replicas with the same body shape).
+/// None during pg_basebackup (no xlog block yet) or on any transport/parse
+/// error.
+async fn fetch_patroni_xlog_position(client: &reqwest::Client) -> Option<i64> {
+    let resp = client
+        .get("http://localhost:8008/patroni")
+        .send()
+        .await
+        .ok()?;
+    let body = resp.text().await.ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let xlog = v.get("xlog")?;
+    let received = xlog.get("received_location").and_then(|x| x.as_i64());
+    let replayed = xlog.get("replayed_location").and_then(|x| x.as_i64());
+    match (received, replayed) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn healthy_breaks_regardless_of_progress_or_elapsed() {
+        assert_eq!(
+            classify_startup_tick(true, false, 9_999, 300),
+            StartupTick::Healthy
+        );
+        assert_eq!(
+            classify_startup_tick(true, true, 0, 300),
+            StartupTick::Healthy
+        );
+    }
+
+    #[test]
+    fn progress_resets_even_past_the_timeout() {
+        // A large clone can run far past max_startup_timeout in wall-clock; as
+        // long as it's progressing it must never be classified Stalled.
+        assert_eq!(
+            classify_startup_tick(false, true, 100_000, 300),
+            StartupTick::Progressing
+        );
+    }
+
+    #[test]
+    fn no_progress_past_timeout_stalls() {
+        assert_eq!(
+            classify_startup_tick(false, false, 300, 300),
+            StartupTick::Stalled
+        );
+        assert_eq!(
+            classify_startup_tick(false, false, 305, 300),
+            StartupTick::Stalled
+        );
+    }
+
+    #[test]
+    fn no_progress_under_timeout_waits() {
+        assert_eq!(
+            classify_startup_tick(false, false, 0, 300),
+            StartupTick::Waiting
+        );
+        assert_eq!(
+            classify_startup_tick(false, false, 295, 300),
+            StartupTick::Waiting
+        );
+    }
+
+    #[test]
+    fn xlog_advance_only_on_a_higher_position_with_a_baseline() {
+        // Catch-up: LSN climbed since last poll → progress.
+        assert!(xlog_advanced(Some(1_000), Some(2_000)));
+        // Frozen LSN (stalled replay) → no progress.
+        assert!(!xlog_advanced(Some(2_000), Some(2_000)));
+        // Regressed/garbage reading → not progress.
+        assert!(!xlog_advanced(Some(2_000), Some(1_000)));
+        // First reading (no baseline yet) → not yet progress; sets the baseline.
+        assert!(!xlog_advanced(None, Some(2_000)));
+        // No current reading (pg_basebackup, no xlog / REST down) → defer to the
+        // volume signal; never counts as WAL progress on its own.
+        assert!(!xlog_advanced(Some(2_000), None));
+        assert!(!xlog_advanced(None, None));
+    }
+
+    #[test]
+    fn volume_used_bytes_missing_path_is_zero() {
+        assert_eq!(volume_used_bytes("/nonexistent/path/for/test"), 0);
+    }
+
+    #[test]
+    fn volume_used_bytes_reports_nonzero_for_real_fs() {
+        // statvfs of any existing path resolves to its filesystem; a live fs
+        // always has some blocks in use, so this is the "progress signal works"
+        // smoke test without needing to spin Patroni.
+        let dir = std::env::temp_dir();
+        assert!(volume_used_bytes(dir.to_str().unwrap()) > 0);
     }
 }

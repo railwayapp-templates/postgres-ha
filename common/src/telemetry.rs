@@ -108,6 +108,14 @@ pub enum TelemetryEvent {
         last_reason: String,
     },
 
+    /// Preflight wiped a non-empty data directory that had no `global/pg_control`
+    /// — the debris a `pg_basebackup` killed mid-clone leaves behind — so Patroni
+    /// re-clones from the leader. Replica only; fires only when a distinct member
+    /// holds the leader lock (a clone source exists and it is never the primary's
+    /// own data). A recurring event for one node signals a re-clone that keeps
+    /// failing (e.g. a replica volume smaller than the primary).
+    IncompleteCloneWiped { node: String, leader: String },
+
     // === etcd Events ===
     /// etcd cluster bootstrap initiated
     EtcdBootstrap {
@@ -187,6 +195,7 @@ impl TelemetryEvent {
             Self::SelfHealReinitRequestFailed { .. } => "POSTGRES_HA_SELF_HEAL_REINIT_REQUEST_FAILED",
             Self::SelfHealRecovered { .. } => "POSTGRES_HA_SELF_HEAL_RECOVERED",
             Self::SelfHealGaveUp { .. } => "POSTGRES_HA_SELF_HEAL_GAVE_UP",
+            Self::IncompleteCloneWiped { .. } => "POSTGRES_HA_INCOMPLETE_CLONE_WIPED",
             Self::EtcdBootstrap { .. } => "ETCD_CLUSTER_BOOTSTRAP",
             Self::EtcdNodeJoined { .. } => "ETCD_NODE_JOINED",
             Self::EtcdNodePromoted { .. } => "ETCD_NODE_PROMOTED",
@@ -285,6 +294,12 @@ impl TelemetryEvent {
                 format!(
                     "Self-heal: giving up on {} after {} attempts (last: {}); manual intervention required",
                     node, attempts, last_reason
+                )
+            }
+            Self::IncompleteCloneWiped { node, leader } => {
+                format!(
+                    "Wiped incomplete-clone data dir on {} (non-empty, missing pg_control) — re-cloning from leader {}",
+                    node, leader
                 )
             }
             Self::EtcdBootstrap {
