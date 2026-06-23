@@ -427,14 +427,6 @@ pub fn disabled() -> bool {
 /// True when a Patroni/Postgres stderr line is the WAL-too-old streaming error:
 /// the leader recycled a WAL segment this replica still needs, so it can never
 /// stream-catch-up and a plain restart hits the same wall. Requires *both*
-/// fragments of the canonical PostgreSQL phrasing
-/// (`requested WAL segment <X> has already been removed`) so unrelated
-/// "has already been removed" log lines (archiver / pgBackRest cleanup) can't
-/// trip a destructive reinit.
-pub fn is_wal_too_old_line(line: &str) -> bool {
-    line.contains("WAL segment") && line.contains("has already been removed")
-}
-
 /// Build the same short-timeout HTTP client the watcher uses. Best-effort.
 pub fn http_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
@@ -1502,24 +1494,6 @@ mod tests {
     fn not_diverged_clears_window() {
         let w0 = accrue_divergence_window(obs(3, Some(100)), None, 1_000).unwrap();
         assert!(accrue_divergence_window(None, Some(w0), 1_060).is_none());
-    }
-
-    #[test]
-    fn wal_too_old_line_requires_both_fragments() {
-        // The canonical PostgreSQL streaming error → trigger.
-        assert!(is_wal_too_old_line(
-            "FATAL:  requested WAL segment 0000000200000130000000B1 has already been removed"
-        ));
-        // Unrelated cleanup lines that merely say "has already been removed"
-        // must NOT trip a destructive reinit.
-        assert!(!is_wal_too_old_line(
-            "INFO: backup set 20260619-010101F has already been removed"
-        ));
-        // "WAL segment" alone (e.g. normal recovery logging) is not enough.
-        assert!(!is_wal_too_old_line(
-            "LOG:  restored log file WAL segment from archive"
-        ));
-        assert!(!is_wal_too_old_line("nothing to see here"));
     }
 
     #[test]

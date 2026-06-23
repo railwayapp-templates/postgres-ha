@@ -9,7 +9,6 @@ use nix::unistd::Pid;
 use std::time::Duration;
 use tokio::process::Child;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -24,7 +23,6 @@ pub async fn run_monitoring_loop(
     config: &Config,
     mut child: Child,
     telemetry: &Telemetry,
-    wal_stream_error: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let patroni_pid = child
         .id()
@@ -65,6 +63,16 @@ pub async fn run_monitoring_loop(
     let mut startup_elapsed = 0u64;
     let mut last_volume_used = volume_used_bytes(&config.data_dir);
     let mut last_xlog_pos: Option<i64> = None;
+    // Set once any xlog position is reported by Patroni's REST API.
+    // A replica stuck on WAL-too-old reports a non-zero replayed_location
+    // (from the pg_rewind point) that never advances — distinguishable from a
+    // fresh clone where xlog_pos is None until basebackup finishes.
+    let mut xlog_ever_seen = false;
+    // Ticks (×5s each) since xlog was last observed advancing, after it was
+    // ever seen. When this hits 30s and volume is also flat, the replica is
+    // almost certainly stuck on WAL-too-old and we reinitialize early rather
+    // than waiting out the full stall timeout.
+    let mut xlog_stall_elapsed = 0u64;
     // One forced reinitialize per container start. A replica that stalls before
     // ever becoming healthy is usually wedged in a way a restart can't fix — see
     // [`try_reinitialize_stalled_replica`]. We try a reinitialize once instead of
@@ -120,6 +128,14 @@ pub async fn run_monitoring_loop(
                 let lsn_advanced = xlog_advanced(last_xlog_pos, xlog_pos);
                 if xlog_pos.is_some() {
                     last_xlog_pos = xlog_pos;
+                    xlog_ever_seen = true;
+                }
+                // Track consecutive seconds of no xlog advance after it was
+                // first seen — the early-reinit signal for WAL-too-old stalls.
+                if xlog_ever_seen && !lsn_advanced && !volume_grew {
+                    xlog_stall_elapsed += 5;
+                } else {
+                    xlog_stall_elapsed = 0;
                 }
 
                 let progressing = volume_grew || lsn_advanced;
@@ -164,6 +180,8 @@ pub async fn run_monitoring_loop(
                             // fresh clone starts laying bytes down.
                             last_volume_used = volume_used_bytes(&config.data_dir);
                             last_xlog_pos = None;
+                            xlog_ever_seen = false;
+                            xlog_stall_elapsed = 0;
                             continue;
                         }
 
@@ -184,20 +202,14 @@ pub async fn run_monitoring_loop(
                     }
                     StartupTick::Waiting => {
                         startup_elapsed += 5;
-                        // WAL-too-old detected in Patroni's log output: the replica
-                        // can't stream-catch-up because the leader already recycled
-                        // the WAL segment it needs. A plain restart hits the same
-                        // wall immediately. Reinitialize now rather than waiting
-                        // out the remaining stall budget — the fresh pg_basebackup
-                        // clone then grows the volume, which the progress gate above
-                        // reads as Progressing and protects to completion.
-                        // Read the flag into a local so the watch read-guard is
-                        // dropped before the await below — holding it across the
-                        // reinit would block the stderr scanner's `send` (the
-                        // WAL-too-old line repeats sub-second), stalling stderr
-                        // draining while the reinit HTTP calls run.
-                        let wal_too_old = *wal_stream_error.borrow();
-                        if wal_too_old
+                        // WAL-too-old: the replica's LSN was seen (Patroni REST
+                        // reports replayed_location from the pg_rewind point) but
+                        // hasn't advanced for 30s while volume is also flat —
+                        // streaming keeps dying on FATAL "WAL segment already
+                        // removed". Reinitialize early; the fresh pg_basebackup
+                        // clone then grows the volume, which the progress gate
+                        // above reads as Progressing and protects to completion.
+                        if xlog_stall_elapsed >= 30
                             && !reinit_attempted
                             && try_reinitialize_stalled_replica(config, telemetry, "wal_too_old").await
                         {
@@ -205,6 +217,8 @@ pub async fn run_monitoring_loop(
                             startup_elapsed = 0;
                             last_volume_used = volume_used_bytes(&config.data_dir);
                             last_xlog_pos = None;
+                            xlog_ever_seen = false;
+                            xlog_stall_elapsed = 0;
                             continue;
                         }
                         if startup_elapsed >= config.startup_grace_period && startup_elapsed % 30 == 0 {
