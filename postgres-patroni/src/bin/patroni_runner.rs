@@ -9,8 +9,9 @@ use common::init_logging;
 use nix::sys::stat::{umask, Mode};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
-    generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
-    spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
+    generate_patroni_config, is_wal_too_old_line, reconcile_pgbackrest_archive_config,
+    run_monitoring_loop, spawn_backup_watcher, spawn_self_heal_watcher,
+    update_pg_hba_for_replication, Config,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
@@ -21,7 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -1353,16 +1354,33 @@ async fn main() -> Result<()> {
 
     // Scan Patroni's stderr for the WAL-too-old error so the monitoring loop
     // can reinitialize immediately rather than waiting out the full stall
-    // timeout. Each line is forwarded to the container's own stderr so logs
-    // are unaffected by the pipe.
+    // timeout. Every line is forwarded verbatim to the container's own stderr so
+    // logs are unaffected by the pipe. We read raw bytes and decode lossily for
+    // the scan only: Postgres can emit non-UTF-8 on stderr (SQL_ASCII/LATIN1
+    // databases, error text echoing arbitrary client bytes), and a line-based
+    // UTF-8 reader would error out on the first such byte, leaving the pipe with
+    // no reader — Patroni's next stderr write then gets EPIPE/SIGPIPE and all
+    // logs are lost for the life of the container. So we never stop draining on a
+    // decode error; we only stop at EOF or a broken pipe.
     let (wal_too_old_tx, wal_too_old_rx) = watch::channel(false);
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("{line}");
-                if line.contains("has already been removed") {
-                    let _ = wal_too_old_tx.send(true);
+            let mut reader = BufReader::new(stderr);
+            let mut out = tokio::io::stderr();
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    // EOF: Patroni's stderr closed (it's exiting).
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let _ = out.write_all(&buf).await;
+                        if is_wal_too_old_line(&String::from_utf8_lossy(&buf)) {
+                            let _ = wal_too_old_tx.send(true);
+                        }
+                    }
+                    // Broken pipe / transport error — nothing left to drain.
+                    Err(_) => break,
                 }
             }
         });

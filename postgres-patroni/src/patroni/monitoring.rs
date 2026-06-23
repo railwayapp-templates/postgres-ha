@@ -191,7 +191,13 @@ pub async fn run_monitoring_loop(
                         // out the remaining stall budget — the fresh pg_basebackup
                         // clone then grows the volume, which the progress gate above
                         // reads as Progressing and protects to completion.
-                        if *wal_stream_error.borrow()
+                        // Read the flag into a local so the watch read-guard is
+                        // dropped before the await below — holding it across the
+                        // reinit would block the stderr scanner's `send` (the
+                        // WAL-too-old line repeats sub-second), stalling stderr
+                        // draining while the reinit HTTP calls run.
+                        let wal_too_old = *wal_stream_error.borrow();
+                        if wal_too_old
                             && !reinit_attempted
                             && try_reinitialize_stalled_replica(config, telemetry, "wal_too_old").await
                         {
@@ -290,11 +296,21 @@ async fn try_reinitialize_stalled_replica(
 ) -> bool {
     use super::self_heal;
 
+    // Honor the operator kill switch: when self-heal is disabled, fall back to
+    // the recovery exit instead of wiping pgdata behind the operator's back.
+    if self_heal::disabled() {
+        warn!("startup self-heal: SELF_HEAL_DISABLED=1, deferring to restart");
+        return false;
+    }
+
     let Some(client) = self_heal::http_client() else {
         return false;
     };
-    // Only act on a role we can positively confirm as non-leader from Patroni;
-    // never wipe a leader.
+    // Require a role from Patroni's local REST before acting (None = REST didn't
+    // answer → defer to restart). We never wipe a confirmed leader; an Unknown
+    // role (a joining/uninitialized node) is treated as actionable, because a
+    // fresh clone is the right recovery for one genuinely stalled with a
+    // reachable leader — see [`self_heal::should_reinit_stalled`].
     let Some(role) = self_heal::local_role(&client).await else {
         warn!("startup self-heal: local Patroni role unknown, deferring to restart");
         return false;
@@ -302,6 +318,10 @@ async fn try_reinitialize_stalled_replica(
     let leader_reachable = self_heal::is_leader_reachable(&client, 3).await;
     let cap = self_heal::reinit_attempt_cap();
     let attempts = self_heal::recent_reinit_attempts();
+    // Unlike the watcher we deliberately do NOT apply `action_backoff_secs` here:
+    // the caller's one-reinit-per-container-start guard plus the shared per-hour
+    // cap already bound the rate, and a stalled startup shouldn't wait out a
+    // 10-minute backoff before its first clone attempt.
     if !self_heal::should_reinit_stalled(role, leader_reachable, attempts, cap) {
         warn!(
             ?role,
@@ -321,8 +341,7 @@ async fn try_reinitialize_stalled_replica(
         Ok(()) => {
             warn!(
                 reason,
-                attempt,
-                "startup self-heal: forced reinitialize on stalled replica"
+                attempt, "startup self-heal: forced reinitialize on stalled replica"
             );
             telemetry.send(TelemetryEvent::SelfHealReinitTriggered {
                 node: config.name.clone(),
