@@ -169,14 +169,25 @@ pub async fn run_monitoring_loop(
                         next_wal_probe_at = WAL_PROBE_GRACE_SECS;
                     }
                     StartupTick::Stalled => {
-                        // No progress for the full stall timeout. A plain restart
-                        // can't fix this — force a reinitialize so a fresh
-                        // pg_basebackup gives the volume something to grow again,
-                        // which the progress gate above protects to completion.
-                        // Falls through to the recovery exit when we're the leader,
-                        // the leader is unreachable, or the per-hour cap is exhausted.
+                        // No progress for the full stall timeout. We do NOT wipe
+                        // pgdata on a stall we can't explain — a full re-clone of a
+                        // large volume is expensive, and most stalls a restart can
+                        // resolve. The destructive reinitialize fires only on the
+                        // same authoritative fact the Waiting probe uses: the WAL
+                        // the replica must resume from is provably gone from the
+                        // leader (no archive fallback), so streaming can never
+                        // recover. This is the last-chance check for the narrow
+                        // window where the leader was unreachable during every
+                        // backed-off Waiting probe but is reachable now; any other
+                        // stall falls through to the recovery exit and the next
+                        // boot re-probes from scratch.
+                        let unrecoverable = match patroni_client.as_ref() {
+                            Some(c) => self_heal::confirm_wal_unrecoverable(c, config).await,
+                            None => false,
+                        };
                         if !reinit_attempted
-                            && try_reinitialize_stalled_replica(config, telemetry, "stalled_startup").await
+                            && unrecoverable
+                            && try_reinitialize_stalled_replica(config, telemetry, "wal_unrecoverable").await
                         {
                             reinit_attempted = true;
                             startup_elapsed = 0;

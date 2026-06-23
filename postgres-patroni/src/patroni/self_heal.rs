@@ -441,9 +441,6 @@ pub fn disabled() -> bool {
     env::var("SELF_HEAL_DISABLED").ok().as_deref() == Some("1")
 }
 
-/// True when a Patroni/Postgres stderr line is the WAL-too-old streaming error:
-/// the leader recycled a WAL segment this replica still needs, so it can never
-/// stream-catch-up and a plain restart hits the same wall. Requires *both*
 /// Build the same short-timeout HTTP client the watcher uses. Best-effort.
 pub fn http_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
