@@ -9,9 +9,8 @@ use common::init_logging;
 use nix::sys::stat::{umask, Mode};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
-    generate_patroni_config, reconcile_pgbackrest_archive_config,
-    run_monitoring_loop, spawn_backup_watcher, spawn_self_heal_watcher,
-    update_pg_hba_for_replication, Config,
+    generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
+    spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};

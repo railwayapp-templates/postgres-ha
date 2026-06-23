@@ -2,7 +2,7 @@
 //!
 //! Handles the monitoring loop, signal handling, and health check management.
 
-use super::{check_health, Config};
+use super::{check_health, self_heal, Config};
 use common::{Telemetry, TelemetryEvent};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -11,6 +11,14 @@ use tokio::process::Child;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+
+/// Seconds of no startup progress before we begin asking the leader whether
+/// the WAL the replica needs still exists. Below this we assume a normal
+/// clone/catch-up is in flight and don't probe.
+const WAL_PROBE_GRACE_SECS: u64 = 30;
+/// Cadence of the authoritative WAL-availability probe while stalled. Only
+/// rate-limits the leader query — the reinit decision is the probe's verdict.
+const WAL_PROBE_INTERVAL_SECS: u64 = 30;
 
 /// Run the main monitoring loop for Patroni
 ///
@@ -63,16 +71,6 @@ pub async fn run_monitoring_loop(
     let mut startup_elapsed = 0u64;
     let mut last_volume_used = volume_used_bytes(&config.data_dir);
     let mut last_xlog_pos: Option<i64> = None;
-    // Set once any xlog position is reported by Patroni's REST API.
-    // A replica stuck on WAL-too-old reports a non-zero replayed_location
-    // (from the pg_rewind point) that never advances — distinguishable from a
-    // fresh clone where xlog_pos is None until basebackup finishes.
-    let mut xlog_ever_seen = false;
-    // Ticks (×5s each) since xlog was last observed advancing, after it was
-    // ever seen. When this hits 30s and volume is also flat, the replica is
-    // almost certainly stuck on WAL-too-old and we reinitialize early rather
-    // than waiting out the full stall timeout.
-    let mut xlog_stall_elapsed = 0u64;
     // One forced reinitialize per container start. A replica that stalls before
     // ever becoming healthy is usually wedged in a way a restart can't fix — see
     // [`try_reinitialize_stalled_replica`]. We try a reinitialize once instead of
@@ -128,14 +126,6 @@ pub async fn run_monitoring_loop(
                 let lsn_advanced = xlog_advanced(last_xlog_pos, xlog_pos);
                 if xlog_pos.is_some() {
                     last_xlog_pos = xlog_pos;
-                    xlog_ever_seen = true;
-                }
-                // Track consecutive seconds of no xlog advance after it was
-                // first seen — the early-reinit signal for WAL-too-old stalls.
-                if xlog_ever_seen && !lsn_advanced && !volume_grew {
-                    xlog_stall_elapsed += 5;
-                } else {
-                    xlog_stall_elapsed = 0;
                 }
 
                 let progressing = volume_grew || lsn_advanced;
@@ -180,8 +170,6 @@ pub async fn run_monitoring_loop(
                             // fresh clone starts laying bytes down.
                             last_volume_used = volume_used_bytes(&config.data_dir);
                             last_xlog_pos = None;
-                            xlog_ever_seen = false;
-                            xlog_stall_elapsed = 0;
                             continue;
                         }
 
@@ -202,24 +190,35 @@ pub async fn run_monitoring_loop(
                     }
                     StartupTick::Waiting => {
                         startup_elapsed += 5;
-                        // WAL-too-old: the replica's LSN was seen (Patroni REST
-                        // reports replayed_location from the pg_rewind point) but
-                        // hasn't advanced for 30s while volume is also flat —
-                        // streaming keeps dying on FATAL "WAL segment already
-                        // removed". Reinitialize early; the fresh pg_basebackup
-                        // clone then grows the volume, which the progress gate
-                        // above reads as Progressing and protects to completion.
-                        if xlog_stall_elapsed >= 30
-                            && !reinit_attempted
-                            && try_reinitialize_stalled_replica(config, telemetry, "wal_too_old").await
+                        // Authoritative WAL-too-old check. Once we've gone
+                        // WAL_PROBE_GRACE_SECS with no progress at all (so a
+                        // healthy clone/catch-up is never probed) we ask the
+                        // leader the exact question Postgres itself fails on:
+                        // "do you still have the WAL segment this replica must
+                        // resume from?" If it's been recycled (and standbys have
+                        // no archive fallback), the node can never stream-catch-up
+                        // — reinitialize now instead of waiting out the full
+                        // max_startup_timeout. The grace/interval only rate-limit
+                        // the leader query; the *decision* is the WAL-availability
+                        // fact, not a timer. `confirm_wal_unrecoverable` returns
+                        // false on any uncertainty, so we never wipe on a maybe.
+                        if !reinit_attempted
+                            && startup_elapsed >= WAL_PROBE_GRACE_SECS
+                            && startup_elapsed % WAL_PROBE_INTERVAL_SECS == 0
                         {
-                            reinit_attempted = true;
-                            startup_elapsed = 0;
-                            last_volume_used = volume_used_bytes(&config.data_dir);
-                            last_xlog_pos = None;
-                            xlog_ever_seen = false;
-                            xlog_stall_elapsed = 0;
-                            continue;
+                            let unrecoverable = match patroni_client.as_ref() {
+                                Some(c) => self_heal::confirm_wal_unrecoverable(c, config).await,
+                                None => false,
+                            };
+                            if unrecoverable
+                                && try_reinitialize_stalled_replica(config, telemetry, "wal_unrecoverable").await
+                            {
+                                reinit_attempted = true;
+                                startup_elapsed = 0;
+                                last_volume_used = volume_used_bytes(&config.data_dir);
+                                last_xlog_pos = None;
+                                continue;
+                            }
                         }
                         if startup_elapsed >= config.startup_grace_period && startup_elapsed % 30 == 0 {
                             warn!(
@@ -308,8 +307,6 @@ async fn try_reinitialize_stalled_replica(
     telemetry: &Telemetry,
     reason: &str,
 ) -> bool {
-    use super::self_heal;
-
     // Honor the operator kill switch: when self-heal is disabled, fall back to
     // the recovery exit instead of wiping pgdata behind the operator's back.
     if self_heal::disabled() {
