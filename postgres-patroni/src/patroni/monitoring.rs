@@ -73,7 +73,7 @@ pub async fn run_monitoring_loop(
     let mut last_xlog_pos: Option<i64> = None;
     // One forced reinitialize per container start. A replica that stalls before
     // ever becoming healthy is usually wedged in a way a restart can't fix — see
-    // [`try_reinitialize_stalled_replica`]. We try a reinitialize once instead of
+    // try_reinitialize_stalled_replica. We try a reinitialize once instead of
     // restarting into the same wall; if it doesn't take, the next boot re-decides
     // against the persistent per-hour cap rather than re-wiping a half-laid clone.
     let mut reinit_attempted = false;

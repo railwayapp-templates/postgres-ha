@@ -756,6 +756,12 @@ fn streaming_unrecoverable(
 /// bound) for the "replica never becomes healthy" manifestation.
 pub async fn confirm_wal_unrecoverable(client: &reqwest::Client, config: &Config) -> bool {
     let resume_upper_bound = local_resume_upper_bound(&config.data_dir).await;
+    if resume_upper_bound.is_none() {
+        warn!(
+            data_dir = %config.data_dir,
+            "self-heal: could not read pg_wal or pg_controldata — WAL-too-old probe cannot fire"
+        );
+    }
     let Some((host, port)) = leader_pg_endpoint(client).await else {
         return false;
     };
