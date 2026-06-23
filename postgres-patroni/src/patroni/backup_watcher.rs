@@ -1912,6 +1912,16 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
                     // migrate) re-fires the full immediately rather than
                     // inheriting this run's backoff.
                     let _ = write_state_field(&state_path, "last_full_failure_at", "");
+                    // pgbackrest backup exiting 0 is proof S3 has the full.
+                    // Stamp last_catalog_verify_at so catalog_verify_step
+                    // skips the next-iteration immediate check (which fires
+                    // whenever last_catalog_verify_at is unset) and defers to
+                    // the normal catalog_verify_interval cadence instead.
+                    let _ = write_state_field(
+                        &state_path,
+                        "last_catalog_verify_at",
+                        &now.to_string(),
+                    );
                     // clear_gap_recovery_state refreshes pg_stat_archiver
                     // and writes last_full_failed_count itself — folds any
                     // failure-during-backup into the anchor so the next

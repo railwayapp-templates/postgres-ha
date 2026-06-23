@@ -2,7 +2,7 @@
 //!
 //! Handles the monitoring loop, signal handling, and health check management.
 
-use super::{check_health, Config};
+use super::{check_health, self_heal, Config};
 use common::{Telemetry, TelemetryEvent};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -11,6 +11,14 @@ use tokio::process::Child;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+
+/// Seconds of no startup progress before we begin asking the leader whether
+/// the WAL the replica needs still exists. Below this we assume a normal
+/// clone/catch-up is in flight and don't probe.
+const WAL_PROBE_GRACE_SECS: u64 = 30;
+/// Upper bound on the (exponentially backing-off) gap between WAL-availability
+/// probes, so a long stall keeps the query rate on the leader bounded.
+const WAL_PROBE_MAX_INTERVAL_SECS: u64 = 240;
 
 /// Run the main monitoring loop for Patroni
 ///
@@ -63,6 +71,22 @@ pub async fn run_monitoring_loop(
     let mut startup_elapsed = 0u64;
     let mut last_volume_used = volume_used_bytes(&config.data_dir);
     let mut last_xlog_pos: Option<i64> = None;
+    // One forced reinitialize per container start. A replica that stalls before
+    // ever becoming healthy is usually wedged in a way a restart can't fix — see
+    // try_reinitialize_stalled_replica. We try a reinitialize once instead of
+    // restarting into the same wall; if it doesn't take, the next boot re-decides
+    // against the persistent per-hour cap rather than re-wiping a half-laid clone.
+    let mut reinit_attempted = false;
+    // Backoff schedule for the WAL-availability probe (see the
+    // `Waiting` branch). The WAL-too-old fact is already true at the first
+    // probe, so we front-load: probe at the grace mark, then double the gap
+    // each time. A node stalled for some *other* reason (WAL still present)
+    // is probed only a few times before the `max_startup_timeout` exit takes
+    // over — so we never hammer an already-busy leader with a query every 30s
+    // for the full timeout. Both reset whenever `startup_elapsed` does (a new
+    // stall episode earns fresh, prompt detection).
+    let mut wal_probe_interval = WAL_PROBE_GRACE_SECS;
+    let mut next_wal_probe_at = WAL_PROBE_GRACE_SECS;
     // Short-timeout client for polling Patroni's local REST API for WAL
     // progress. Best-effort: if it can't be built we fall back to the
     // volume-usage signal alone.
@@ -138,8 +162,44 @@ pub async fn run_monitoring_loop(
                             );
                         }
                         startup_elapsed = 0;
+                        // New stall episode (if one follows) earns a fresh,
+                        // prompt probe schedule rather than the backed-off gap
+                        // left over from the previous stall.
+                        wal_probe_interval = WAL_PROBE_GRACE_SECS;
+                        next_wal_probe_at = WAL_PROBE_GRACE_SECS;
                     }
                     StartupTick::Stalled => {
+                        // No progress for the full stall timeout. We do NOT wipe
+                        // pgdata on a stall we can't explain — a full re-clone of a
+                        // large volume is expensive, and most stalls a restart can
+                        // resolve. The destructive reinitialize fires only on the
+                        // same WAL-too-old probe the Waiting branch uses, a
+                        // SUFFICIENT condition: an upper bound on the segment the
+                        // replica must resume from is older than the oldest WAL the
+                        // leader retains, so it is *provably* too far behind to
+                        // stream-catch-up (no archive fallback). This is the last-
+                        // chance check for the narrow window where the leader was
+                        // unreachable during every backed-off Waiting probe but is
+                        // reachable now; any other stall falls through to the
+                        // recovery exit and the next boot re-probes from scratch.
+                        let unrecoverable = match patroni_client.as_ref() {
+                            Some(c) => self_heal::confirm_wal_unrecoverable(c, config).await,
+                            None => false,
+                        };
+                        if !reinit_attempted
+                            && unrecoverable
+                            && try_reinitialize_stalled_replica(config, telemetry, "wal_unrecoverable").await
+                        {
+                            reinit_attempted = true;
+                            startup_elapsed = 0;
+                            // Rebaseline progress signals: the reinit wipes pgdata
+                            // (volume shrinks, WAL cursor disappears) before the
+                            // fresh clone starts laying bytes down.
+                            last_volume_used = volume_used_bytes(&config.data_dir);
+                            last_xlog_pos = None;
+                            continue;
+                        }
+
                         error!(
                             elapsed_without_progress = startup_elapsed,
                             max = config.max_startup_timeout,
@@ -157,6 +217,48 @@ pub async fn run_monitoring_loop(
                     }
                     StartupTick::Waiting => {
                         startup_elapsed += 5;
+                        // WAL-too-old probe. Once we've gone WAL_PROBE_GRACE_SECS
+                        // with no progress at all (so a healthy clone/catch-up is
+                        // never probed) we ask the leader whether it still retains
+                        // WAL as old as an UPPER BOUND on the segment this replica
+                        // must stream from (the successor of its newest local WAL
+                        // segment). If even that is gone (and standbys have no
+                        // archive fallback), the node can never stream-catch-up, so
+                        // reinitialize now instead of waiting out the full
+                        // max_startup_timeout. Because we compare an upper bound the
+                        // probe is a SUFFICIENT condition: it only fires when the
+                        // replica is provably unrecoverable, so it never wipes a
+                        // node a restart could have fixed (it may instead MISS a
+                        // genuine case in a narrow boundary band — a safe false
+                        // negative that just restart-loops as today). See
+                        // `confirm_wal_unrecoverable`. Probing backs off
+                        // exponentially (see the schedule vars) so an already-
+                        // struggling leader isn't queried every cycle.
+                        // `confirm_wal_unrecoverable` returns false on any
+                        // uncertainty, so we never wipe on a maybe.
+                        if !reinit_attempted && startup_elapsed >= next_wal_probe_at {
+                            // Schedule the next probe before running this one,
+                            // doubling the gap up to the cap — so even a slow
+                            // query can't re-enter early, and a long stall keeps
+                            // the leader's query load bounded.
+                            wal_probe_interval =
+                                (wal_probe_interval * 2).min(WAL_PROBE_MAX_INTERVAL_SECS);
+                            next_wal_probe_at = startup_elapsed + wal_probe_interval;
+
+                            let unrecoverable = match patroni_client.as_ref() {
+                                Some(c) => self_heal::confirm_wal_unrecoverable(c, config).await,
+                                None => false,
+                            };
+                            if unrecoverable
+                                && try_reinitialize_stalled_replica(config, telemetry, "wal_unrecoverable").await
+                            {
+                                reinit_attempted = true;
+                                startup_elapsed = 0;
+                                last_volume_used = volume_used_bytes(&config.data_dir);
+                                last_xlog_pos = None;
+                                continue;
+                            }
+                        }
                         if startup_elapsed >= config.startup_grace_period && startup_elapsed % 30 == 0 {
                             warn!(
                                 elapsed_without_progress = startup_elapsed,
@@ -225,6 +327,93 @@ pub async fn run_monitoring_loop(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Force a Patroni reinitialize on a replica whose startup stalled before it
+/// ever became healthy — the case the in-process self-heal watcher misses
+/// because this gate keeps restarting the container before the watcher's
+/// crash-loop signal can accrue, and the node never reaches the healthy state
+/// its timeline-divergence path requires (see [`super::self_heal`]). Returns
+/// true when a reinitialize was issued — the caller then keeps the container
+/// alive and lets the fresh clone proceed (the progress gate above protects
+/// it). Returns false to fall back to the recovery exit: we're the leader, the
+/// leader is unreachable, the per-hour reinit cap is exhausted, or the local
+/// Patroni REST didn't answer.
+async fn try_reinitialize_stalled_replica(
+    config: &Config,
+    telemetry: &Telemetry,
+    reason: &str,
+) -> bool {
+    // Honor the operator kill switch: when self-heal is disabled, fall back to
+    // the recovery exit instead of wiping pgdata behind the operator's back.
+    if self_heal::disabled() {
+        warn!("startup self-heal: SELF_HEAL_DISABLED=1, deferring to restart");
+        return false;
+    }
+
+    let Some(client) = self_heal::http_client() else {
+        return false;
+    };
+    // Require a role from Patroni's local REST before acting (None = REST didn't
+    // answer → defer to restart). We never wipe a confirmed leader; an Unknown
+    // role (a joining/uninitialized node) is treated as actionable, because a
+    // fresh clone is the right recovery for one genuinely stalled with a
+    // reachable leader — see [`self_heal::should_reinit_stalled`].
+    let Some(role) = self_heal::local_role(&client).await else {
+        warn!("startup self-heal: local Patroni role unknown, deferring to restart");
+        return false;
+    };
+    let leader_reachable = self_heal::is_leader_reachable(&client, 3).await;
+    let cap = self_heal::reinit_attempt_cap();
+    let attempts = self_heal::recent_reinit_attempts();
+    // Unlike the watcher we deliberately do NOT apply `action_backoff_secs` here:
+    // the caller's one-reinit-per-container-start guard plus the shared per-hour
+    // cap already bound the rate, and a stalled startup shouldn't wait out a
+    // 10-minute backoff before its first clone attempt.
+    if !self_heal::should_reinit_stalled(role, leader_reachable, attempts, cap) {
+        warn!(
+            ?role,
+            leader_reachable,
+            attempts,
+            cap,
+            "startup self-heal: conditions not met (leader, unreachable leader, or cap reached); restarting for recovery"
+        );
+        return false;
+    }
+
+    // Count before issuing — shared per-hour budget with the watcher — so a
+    // wedged Patroni REST can't drive unbounded reinitializes.
+    self_heal::record_reinit_attempt();
+    let attempt = attempts + 1;
+    match self_heal::force_reinitialize(&client).await {
+        Ok(()) => {
+            warn!(
+                reason,
+                attempt, "startup self-heal: forced reinitialize on stalled replica"
+            );
+            telemetry.send(TelemetryEvent::SelfHealReinitTriggered {
+                node: config.name.clone(),
+                reason: reason.to_string(),
+                attempt,
+            });
+            true
+        }
+        Err(e) => {
+            warn!(
+                reason,
+                error = %e,
+                attempt,
+                "startup self-heal: reinitialize request failed; restarting for recovery"
+            );
+            telemetry.send(TelemetryEvent::SelfHealReinitRequestFailed {
+                node: config.name.clone(),
+                reason: reason.to_string(),
+                attempt,
+                error: e.to_string(),
+            });
+            false
         }
     }
 }
