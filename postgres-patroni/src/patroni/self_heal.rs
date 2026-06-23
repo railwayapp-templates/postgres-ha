@@ -39,17 +39,21 @@
 //!    replica Patroni still considers healthy but frozen behind the leader's
 //!    timeline past a dwell is the silent-divergence variant.
 //!
-//! 2. **Authoritative WAL-too-old ([`confirm_wal_unrecoverable`])** — for the
+//! 2. **WAL-too-old probe ([`confirm_wal_unrecoverable`])** — for the
 //!    manifestation where the replica never becomes healthy at all (so the
 //!    startup-health gate in `monitoring.rs` SIGKILLs the container every
 //!    `max_startup_timeout`, resetting the crash-loop counter before it trips),
-//!    we don't infer from a timer or a stalled cursor. We read the exact fact:
-//!    `pg_controldata` gives the segment the replica must resume from (read
-//!    offline, works while Postgres is down), and a `pg_ls_waldir()` query on
-//!    the leader gives the oldest segment it still retains. If the former
-//!    predates the latter the WAL is provably gone — and standbys here have no
-//!    archive fallback (push-only `archive_command`, no `restore_command`), so
-//!    streaming can never recover. The startup gate calls this before wiping.
+//!    we don't infer from a timer or a stalled cursor. We read two segment
+//!    numbers: `pg_controldata` gives the checkpoint REDO segment — a lower
+//!    bound on what the replica must stream from (read offline, works while
+//!    Postgres is down) — and a `pg_ls_waldir()` query on the leader gives the
+//!    oldest segment it still retains. If the former predates the latter the
+//!    replica is too far behind to stream-catch-up (standbys here have no
+//!    archive fallback: push-only `archive_command`, no `restore_command`).
+//!    Because REDO is a lower bound this never misses a real case (no wedged
+//!    replica left to restart-loop), at the cost of a possible bounded over-fire;
+//!    see the detection section comment for the full argument. The startup gate
+//!    calls this before wiping.
 //!
 //! ## Action
 //! `POST /reinitialize {"force": true}` on the local Patroni REST API.
@@ -512,28 +516,42 @@ fn state_file_path() -> String {
 }
 
 // ====================================================================
-// Authoritative WAL-too-old detection
+// WAL-too-old detection (necessary-condition probe, no false negatives)
 // ====================================================================
 //
-// WAL-too-old is not a guess we infer from a stalled log cursor or a quiet
-// timer — it is a concrete, queryable fact: *the WAL segment this replica must
-// resume from no longer exists on the leader, and standbys here have no archive
-// fallback* (archive_command is push-only; there is no restore_command). Both
-// halves are directly readable:
+// Rather than infer WAL-too-old from a stalled log cursor or a quiet timer, we
+// read two segment numbers directly and compare them. Standbys here have no
+// archive fallback (archive_command is push-only; there is no restore_command),
+// so a replica is unrecoverable-by-streaming exactly when the segment it must
+// resume from is older than everything the leader still retains. We can't read
+// that resume segment while Postgres is down, but we can read a safe LOWER BOUND
+// on it and a hard fact about the leader:
 //
-//   1. What is the OLDEST segment the replica needs? — `pg_controldata`'s
-//      "Latest checkpoint's REDO WAL file". This reads the on-disk control file
-//      *offline*, so it works while the replica's Postgres is dead/crash-looping
-//      — exactly the WAL-too-old state. REDO is a *lower bound* on the resume
-//      point (the segment it actually streams from is >= REDO), which is exactly
-//      what makes the comparison safe: if even REDO is gone from the leader, no
-//      newer segment the node needs can be present either (the leader recycles
-//      oldest-first), so the node can never stream-catch-up. Using the oldest-
-//      needed segment rather than the exact resume segment only ever makes the
-//      verdict MORE conservative — it can miss a recycled-newer-segment case
-//      (a false negative, safe), never invent one.
+//   1. A lower bound on what the replica needs — `pg_controldata`'s "Latest
+//      checkpoint's REDO WAL file". Reads the on-disk control file *offline*, so
+//      it works while the replica's Postgres is dead/crash-looping (exactly the
+//      WAL-too-old state). REDO is the checkpoint floor; the segment the replica
+//      actually streams from is `>= REDO` (it replays local WAL from REDO first,
+//      then requests the next segment from the leader).
 //   2. Does the leader still have it? — one `pg_ls_waldir()` query against the
 //      leader's Postgres for the oldest segment it physically retains.
+//
+// Verdict: reinit when `REDO < leader_oldest`. Because `REDO <= resume_point`,
+// this is a NECESSARY condition for WAL-too-old, not a sufficient one:
+//
+//   * No false negatives. A genuine WAL-too-old has `resume_point < leader_oldest`,
+//     hence `REDO < leader_oldest` too — so the probe ALWAYS fires on a real case.
+//     This is the property that matters: a wedged replica is never left to
+//     restart-loop because we under-detected. (Idle/low-commit clusters don't
+//     change this — a low REDO only makes the probe MORE likely to fire.)
+//   * Possible false positives. `REDO < leader_oldest` can also hold while the
+//     true resume_point is still on the leader — a checkpoint floor lagging a
+//     busy primary. So a node stalled for some *non-WAL* reason that is merely
+//     behind can trip it. We accept that: the trigger is gated by 30s+ of zero
+//     progress, a reachable leader, non-leader role, and the per-hour cap, and a
+//     fresh clone from a healthy leader is a safe recovery regardless of why the
+//     node was stuck. We deliberately bias toward this (a bounded, safe re-clone)
+//     over the alternative (under-detect → permanent restart loop).
 //
 // We compare the two by `(logid, segid)` — the byte-position half of the WAL
 // filename, ignoring the 8-hex timeline prefix. That ordering matches WAL
@@ -569,10 +587,11 @@ fn parse_controldata_redo_segment(output: &str) -> Option<(u64, u64)> {
         .and_then(wal_segment_key)
 }
 
-/// Read this node's required resume segment from its on-disk control file via
-/// `pg_controldata`. Works while Postgres is down/crash-looping (reads the
-/// control file directly). `None` on any failure — callers treat that as
-/// "cannot prove unrecoverable" and never wipe on it.
+/// Read the checkpoint REDO segment from this node's on-disk control file via
+/// `pg_controldata` — a LOWER BOUND on the segment it must resume streaming from
+/// (the actual resume point is `>= REDO`). Works while Postgres is down/crash-
+/// looping (reads the control file directly). `None` on any failure — callers
+/// treat that as "cannot prove unrecoverable" and never wipe on it.
 async fn local_required_segment(data_dir: &str) -> Option<(u64, u64)> {
     let read = Command::new("pg_controldata")
         .arg(data_dir)
@@ -664,16 +683,20 @@ fn wal_segment_recycled(needed: Option<(u64, u64)>, leader_oldest: Option<(u64, 
     matches!((needed, leader_oldest), (Some(n), Some(o)) if n < o)
 }
 
-/// Authoritative WAL-too-old check: `true` ONLY when we positively established
-/// that the WAL segment this replica must resume from has been recycled off the
-/// leader. Any uncertainty — control file unreadable, no leader endpoint, leader
-/// query failed, or the segment is still present — returns `false`, so we never
-/// wipe a replica on a maybe. This replaces every heuristic (stalled cursor,
-/// stderr scraping, dwell timers) for the "replica never becomes healthy"
-/// manifestation: instead of timing out, we ask the leader whether it still
-/// retains the oldest WAL segment this replica needs — a conservative lower
-/// bound on the segment Postgres itself fails to stream (see the section
-/// comment above), so a positive verdict is always genuinely unrecoverable.
+/// WAL-too-old probe: `true` when the replica's checkpoint REDO segment predates
+/// the oldest WAL the leader still retains. REDO is a LOWER BOUND on the segment
+/// the replica must stream from, so this is a NECESSARY condition for WAL-too-old
+/// — it never misses a genuine case (a wedged replica is never left to restart-
+/// loop), but it can over-fire for a node stalled for a non-WAL reason whose
+/// checkpoint floor merely lags a busy primary. We accept that bounded over-fire
+/// (the caller gates on 30s+ no-progress, reachable leader, non-leader, per-hour
+/// cap; a fresh clone is a safe recovery either way) rather than risk a missed
+/// detection that loops forever — see the section comment above for the full
+/// argument. Any uncertainty — control file unreadable, no leader endpoint,
+/// leader query failed, or the segment is still present — returns `false`, so we
+/// never wipe a replica on a maybe. Replaces every prior heuristic (stalled
+/// cursor, stderr scraping, dwell timers) for the "replica never becomes healthy"
+/// manifestation.
 pub async fn confirm_wal_unrecoverable(client: &reqwest::Client, config: &Config) -> bool {
     let needed = local_required_segment(&config.data_dir).await;
     let Some((host, port)) = leader_pg_endpoint(client).await else {
@@ -686,7 +709,7 @@ pub async fn confirm_wal_unrecoverable(client: &reqwest::Client, config: &Config
             needed = ?needed,
             leader_oldest = ?leader_oldest,
             leader_host = %host,
-            "self-heal: WAL segment the replica must resume from is gone from the leader (no archive fallback) — unrecoverable by streaming"
+            "self-heal: replica's checkpoint REDO segment predates the leader's oldest retained WAL (no archive fallback) — unrecoverable by streaming"
         );
     }
     recycled
@@ -1155,7 +1178,7 @@ struct ClusterMember {
     api_url: Option<String>,
     timeline: Option<i64>,
     /// Postgres connect host/port from `/cluster`. Used to query the leader's
-    /// physical WAL retention directly (the authoritative WAL-too-old check).
+    /// physical WAL retention directly (the WAL-too-old probe).
     host: Option<String>,
     port: Option<i64>,
 }

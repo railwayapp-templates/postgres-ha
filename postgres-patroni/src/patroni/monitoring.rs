@@ -77,7 +77,7 @@ pub async fn run_monitoring_loop(
     // restarting into the same wall; if it doesn't take, the next boot re-decides
     // against the persistent per-hour cap rather than re-wiping a half-laid clone.
     let mut reinit_attempted = false;
-    // Backoff schedule for the authoritative WAL-availability probe (see the
+    // Backoff schedule for the WAL-availability probe (see the
     // `Waiting` branch). The WAL-too-old fact is already true at the first
     // probe, so we front-load: probe at the grace mark, then double the gap
     // each time. A node stalled for some *other* reason (WAL still present)
@@ -173,14 +173,14 @@ pub async fn run_monitoring_loop(
                         // pgdata on a stall we can't explain — a full re-clone of a
                         // large volume is expensive, and most stalls a restart can
                         // resolve. The destructive reinitialize fires only on the
-                        // same authoritative fact the Waiting probe uses: the WAL
-                        // the replica must resume from is provably gone from the
-                        // leader (no archive fallback), so streaming can never
-                        // recover. This is the last-chance check for the narrow
-                        // window where the leader was unreachable during every
-                        // backed-off Waiting probe but is reachable now; any other
-                        // stall falls through to the recovery exit and the next
-                        // boot re-probes from scratch.
+                        // same WAL-too-old probe the Waiting branch uses: the
+                        // replica's checkpoint REDO floor predates the oldest WAL
+                        // the leader retains, so it is too far behind to stream-
+                        // catch-up (no archive fallback). This is the last-chance
+                        // check for the narrow window where the leader was
+                        // unreachable during every backed-off Waiting probe but is
+                        // reachable now; any other stall falls through to the
+                        // recovery exit and the next boot re-probes from scratch.
                         let unrecoverable = match patroni_client.as_ref() {
                             Some(c) => self_heal::confirm_wal_unrecoverable(c, config).await,
                             None => false,
@@ -216,18 +216,21 @@ pub async fn run_monitoring_loop(
                     }
                     StartupTick::Waiting => {
                         startup_elapsed += 5;
-                        // Authoritative WAL-too-old check. Once we've gone
-                        // WAL_PROBE_GRACE_SECS with no progress at all (so a
-                        // healthy clone/catch-up is never probed) we ask the
-                        // leader the exact question Postgres itself fails on:
-                        // "do you still have the WAL segment this replica must
-                        // resume from?" If it's been recycled (and standbys have
-                        // no archive fallback), the node can never stream-catch-up
-                        // — reinitialize now instead of waiting out the full
-                        // max_startup_timeout. Probing backs off exponentially
-                        // (see the schedule vars) so an already-struggling leader
-                        // isn't queried every cycle; the *decision* is the
-                        // WAL-availability fact, not a timer.
+                        // WAL-too-old probe. Once we've gone WAL_PROBE_GRACE_SECS
+                        // with no progress at all (so a healthy clone/catch-up is
+                        // never probed) we ask the leader whether it still retains
+                        // WAL as old as this replica's checkpoint REDO floor — a
+                        // lower bound on the segment it must stream from. If even
+                        // that is gone (and standbys have no archive fallback), the
+                        // node can never stream-catch-up, so reinitialize now
+                        // instead of waiting out the full max_startup_timeout.
+                        // Because REDO is a lower bound the probe never MISSES a
+                        // real WAL-too-old (no risk of leaving a wedged replica to
+                        // restart-loop); it can occasionally over-fire on a node
+                        // stalled for another reason, which is a bounded, safe
+                        // re-clone — see `confirm_wal_unrecoverable`. Probing backs
+                        // off exponentially (see the schedule vars) so an already-
+                        // struggling leader isn't queried every cycle.
                         // `confirm_wal_unrecoverable` returns false on any
                         // uncertainty, so we never wipe on a maybe.
                         if !reinit_attempted && startup_elapsed >= next_wal_probe_at {
