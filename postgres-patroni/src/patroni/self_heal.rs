@@ -521,13 +521,17 @@ fn state_file_path() -> String {
 // fallback* (archive_command is push-only; there is no restore_command). Both
 // halves are directly readable:
 //
-//   1. What segment must the replica resume from? — `pg_controldata`'s
+//   1. What is the OLDEST segment the replica needs? — `pg_controldata`'s
 //      "Latest checkpoint's REDO WAL file". This reads the on-disk control file
 //      *offline*, so it works while the replica's Postgres is dead/crash-looping
-//      — exactly the WAL-too-old state. The REDO segment is the OLDEST WAL the
-//      node needs; if even that is gone from the leader, no newer segment it
-//      needs can be present either (the leader recycles oldest-first), so the
-//      node can never stream-catch-up.
+//      — exactly the WAL-too-old state. REDO is a *lower bound* on the resume
+//      point (the segment it actually streams from is >= REDO), which is exactly
+//      what makes the comparison safe: if even REDO is gone from the leader, no
+//      newer segment the node needs can be present either (the leader recycles
+//      oldest-first), so the node can never stream-catch-up. Using the oldest-
+//      needed segment rather than the exact resume segment only ever makes the
+//      verdict MORE conservative — it can miss a recycled-newer-segment case
+//      (a false negative, safe), never invent one.
 //   2. Does the leader still have it? — one `pg_ls_waldir()` query against the
 //      leader's Postgres for the oldest segment it physically retains.
 //
@@ -570,13 +574,17 @@ fn parse_controldata_redo_segment(output: &str) -> Option<(u64, u64)> {
 /// control file directly). `None` on any failure — callers treat that as
 /// "cannot prove unrecoverable" and never wipe on it.
 async fn local_required_segment(data_dir: &str) -> Option<(u64, u64)> {
-    let out = Command::new("pg_controldata")
+    let read = Command::new("pg_controldata")
         .arg(data_dir)
         // Stable, locale-independent field labels.
         .env("LC_ALL", "C")
-        .output()
-        .await
-        .ok()?;
+        .output();
+    // Reads a local file and should return instantly; bound it anyway so a wedged
+    // pg_controldata can't stall the monitoring loop.
+    let out = match tokio::time::timeout(Duration::from_secs(5), read).await {
+        Ok(Ok(out)) => out,
+        _ => return None,
+    };
     if !out.status.success() {
         return None;
     }
@@ -604,7 +612,7 @@ async fn leader_pg_endpoint(client: &reqwest::Client) -> Option<(String, i64)> {
 /// higher-timeline-prefixed segment around a switchpoint can't mask an older
 /// byte position.
 async fn leader_oldest_segment(host: &str, port: i64, config: &Config) -> Option<(u64, u64)> {
-    let out = Command::new("psql")
+    let query = Command::new("psql")
         .args([
             "-U",
             &config.superuser,
@@ -623,9 +631,19 @@ async fn leader_oldest_segment(host: &str, port: i64, config: &Config) -> Option
         .env_remove("PGHOST")
         .env_remove("PGPORT")
         .env_remove("PGDATABASE")
-        .output()
-        .await
-        .ok()?;
+        .output();
+    // PGCONNECT_TIMEOUT only bounds connection setup. Wrap the whole call so a
+    // post-connect hang (a leader busy/in-recovery during a failover wave) can't
+    // block the startup monitoring loop indefinitely — treat a timeout as "can't
+    // prove unrecoverable" like any other query failure.
+    let out = match tokio::time::timeout(Duration::from_secs(10), query).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) => return None,
+        Err(_) => {
+            warn!(host, "self-heal: leader pg_ls_waldir query timed out");
+            return None;
+        }
+    };
     if !out.status.success() {
         warn!(
             host,
@@ -652,8 +670,10 @@ fn wal_segment_recycled(needed: Option<(u64, u64)>, leader_oldest: Option<(u64, 
 /// query failed, or the segment is still present — returns `false`, so we never
 /// wipe a replica on a maybe. This replaces every heuristic (stalled cursor,
 /// stderr scraping, dwell timers) for the "replica never becomes healthy"
-/// manifestation: instead of timing out, we ask the leader the exact question
-/// Postgres itself would fail on.
+/// manifestation: instead of timing out, we ask the leader whether it still
+/// retains the oldest WAL segment this replica needs — a conservative lower
+/// bound on the segment Postgres itself fails to stream (see the section
+/// comment above), so a positive verdict is always genuinely unrecoverable.
 pub async fn confirm_wal_unrecoverable(client: &reqwest::Client, config: &Config) -> bool {
     let needed = local_required_segment(&config.data_dir).await;
     let Some((host, port)) = leader_pg_endpoint(client).await else {
