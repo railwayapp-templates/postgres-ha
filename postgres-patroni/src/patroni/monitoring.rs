@@ -63,6 +63,12 @@ pub async fn run_monitoring_loop(
     let mut startup_elapsed = 0u64;
     let mut last_volume_used = volume_used_bytes(&config.data_dir);
     let mut last_xlog_pos: Option<i64> = None;
+    // One forced reinitialize per container start. A replica that stalls before
+    // ever becoming healthy is usually wedged in a way a restart can't fix — see
+    // [`try_reinitialize_stalled_replica`]. We try a reinitialize once instead of
+    // restarting into the same wall; if it doesn't take, the next boot re-decides
+    // against the persistent per-hour cap rather than re-wiping a half-laid clone.
+    let mut reinit_attempted = false;
     // Short-timeout client for polling Patroni's local REST API for WAL
     // progress. Best-effort: if it can't be built we fall back to the
     // volume-usage signal alone.
@@ -140,6 +146,31 @@ pub async fn run_monitoring_loop(
                         startup_elapsed = 0;
                     }
                     StartupTick::Stalled => {
+                        // A replica that made zero progress for the whole timeout
+                        // is typically wedged in a way a plain restart can't fix —
+                        // classically WAL-too-old: it can't catch up via streaming
+                        // because the leader rotated WAL past its restart LSN, and
+                        // its on-disk pgdata is valid (same timeline, intact
+                        // pg_control) so nothing ever re-clones it. Force a
+                        // reinitialize (fresh pg_basebackup) instead of restarting
+                        // into the same wall; the clone then grows the volume,
+                        // which the progress gate above reads as Progressing and
+                        // protects until it completes. Falls through to the
+                        // recovery exit when we're the leader, the leader is
+                        // unreachable, or the per-hour reinit cap is exhausted.
+                        if !reinit_attempted
+                            && try_reinitialize_stalled_replica(config, telemetry).await
+                        {
+                            reinit_attempted = true;
+                            startup_elapsed = 0;
+                            // Rebaseline progress signals: the reinit wipes pgdata
+                            // (volume shrinks, WAL cursor disappears) before the
+                            // fresh clone starts laying bytes down.
+                            last_volume_used = volume_used_bytes(&config.data_dir);
+                            last_xlog_pos = None;
+                            continue;
+                        }
+
                         error!(
                             elapsed_without_progress = startup_elapsed,
                             max = config.max_startup_timeout,
@@ -225,6 +256,76 @@ pub async fn run_monitoring_loop(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Force a Patroni reinitialize on a replica whose startup stalled before it
+/// ever became healthy — the case the in-process self-heal watcher misses
+/// because this gate keeps restarting the container before the watcher's
+/// crash-loop signal can accrue, and the node never reaches the healthy state
+/// its timeline-divergence path requires (see [`super::self_heal`]). Returns
+/// true when a reinitialize was issued — the caller then keeps the container
+/// alive and lets the fresh clone proceed (the progress gate above protects
+/// it). Returns false to fall back to the recovery exit: we're the leader, the
+/// leader is unreachable, the per-hour reinit cap is exhausted, or the local
+/// Patroni REST didn't answer.
+async fn try_reinitialize_stalled_replica(config: &Config, telemetry: &Telemetry) -> bool {
+    use super::self_heal;
+
+    let Some(client) = self_heal::http_client() else {
+        return false;
+    };
+    // Only act on a role we can positively confirm as non-leader from Patroni;
+    // never wipe a leader.
+    let Some(role) = self_heal::local_role(&client).await else {
+        warn!("startup self-heal: local Patroni role unknown, deferring to restart");
+        return false;
+    };
+    let leader_reachable = self_heal::is_leader_reachable(&client, 3).await;
+    let cap = self_heal::reinit_attempt_cap();
+    let attempts = self_heal::recent_reinit_attempts();
+    if !self_heal::should_reinit_stalled(role, leader_reachable, attempts, cap) {
+        warn!(
+            ?role,
+            leader_reachable,
+            attempts,
+            cap,
+            "startup self-heal: conditions not met (leader, unreachable leader, or cap reached); restarting for recovery"
+        );
+        return false;
+    }
+
+    // Count before issuing — shared per-hour budget with the watcher — so a
+    // wedged Patroni REST can't drive unbounded reinitializes.
+    self_heal::record_reinit_attempt();
+    let attempt = attempts + 1;
+    match self_heal::force_reinitialize(&client).await {
+        Ok(()) => {
+            warn!(
+                attempt,
+                "startup self-heal: forced reinitialize on stalled replica (likely WAL-too-old)"
+            );
+            telemetry.send(TelemetryEvent::SelfHealReinitTriggered {
+                node: config.name.clone(),
+                reason: "stalled_startup".to_string(),
+                attempt,
+            });
+            true
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                attempt,
+                "startup self-heal: reinitialize request failed; restarting for recovery"
+            );
+            telemetry.send(TelemetryEvent::SelfHealReinitRequestFailed {
+                node: config.name.clone(),
+                reason: "stalled_startup".to_string(),
+                attempt,
+                error: e.to_string(),
+            });
+            false
         }
     }
 }

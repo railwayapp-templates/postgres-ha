@@ -396,6 +396,97 @@ fn accrue_divergence_window(
 }
 
 // ====================================================================
+// Shared helpers for the startup-gate self-heal path (monitoring.rs)
+// ====================================================================
+//
+// This watcher catches the manifestation where Patroni considers the node
+// healthy: Postgres flapping underneath it (postmaster_start_time advances
+// ≥3x in a minute) or a replica silently stuck behind the leader's timeline.
+// It cannot catch the *other* manifestation — a replica that never becomes
+// healthy at all, so the patroni-runner startup-health gate (monitoring.rs)
+// SIGKILLs the whole container every `max_startup_timeout`. That kill resets
+// this in-process watcher's state on every restart (the postmaster only
+// starts once per ~5-minute boot, never ≥3x/60s) and the node never reaches
+// the `running`/`streaming` state the divergence path requires. The canonical
+// case is WAL-too-old: the leader rotated WAL past the replica's restart LSN,
+// its on-disk pgdata is valid (same timeline, intact pg_control) so neither
+// Patroni's built-in recovery nor a plain restart ever re-clones it.
+//
+// The startup gate reaches into these helpers to issue the same forced
+// reinitialize, and shares the per-hour attempt accounting below so the two
+// self-heal paths can't jointly exceed the reinitialize budget.
+
+/// Build the same short-timeout HTTP client the watcher uses. Best-effort.
+pub fn http_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()
+}
+
+/// This node's Patroni role, or None if the local REST API didn't answer.
+pub async fn local_role(client: &reqwest::Client) -> Option<Role> {
+    let local = fetch_local_patroni(client).await.ok()?;
+    Some(parse_role(local.role.as_deref()))
+}
+
+/// True if the cluster leader is reachable — a reinitialize clones from it, so
+/// acting without one would wipe pgdata with no source to refill it.
+pub async fn is_leader_reachable(client: &reqwest::Client, timeout_secs: u64) -> bool {
+    probe_leader(client, timeout_secs).await.reachable
+}
+
+/// POST `/reinitialize {"force": true}` to the local Patroni REST API.
+pub async fn force_reinitialize(client: &reqwest::Client) -> Result<()> {
+    issue_reinitialize(client).await
+}
+
+/// Per-hour reinitialize cap, env-overridable, shared by both self-heal paths.
+pub fn reinit_attempt_cap() -> u32 {
+    env_u32(
+        "SELF_HEAL_MAX_ATTEMPTS_PER_HOUR",
+        DEFAULT_MAX_ATTEMPTS_PER_HOUR,
+    )
+}
+
+/// Reinitialize attempts recorded in the trailing hour. Persistent (the state
+/// file lives at the volume root, not in pgdata) so the count survives the
+/// container restarts the startup gate triggers between attempts.
+pub fn recent_reinit_attempts() -> u32 {
+    recent_action_count(&state_file_path(), now_epoch())
+}
+
+/// Record a reinitialize attempt against the shared per-hour budget. Mirrors
+/// the watcher: persist before issuing the call so a wedged Patroni REST can't
+/// drive unbounded re-issues.
+pub fn record_reinit_attempt() {
+    let now = now_epoch();
+    let path = state_file_path();
+    let _ = write_state_field(&path, "last_action_at", &now.to_string());
+    append_attempt(&path, now);
+}
+
+/// Pure decision for the startup-gate path: reinitialize a stalled node only
+/// when it is NOT a leader (wiping a primary is catastrophic), the leader is
+/// reachable (a clone source exists), and we are under the per-hour cap. Kept
+/// pure and zero-I/O so it is unit-testable.
+pub fn should_reinit_stalled(
+    role: Role,
+    leader_reachable: bool,
+    recent_attempts: u32,
+    cap: u32,
+) -> bool {
+    !matches!(role, Role::Leader) && leader_reachable && recent_attempts < cap
+}
+
+/// Path to the persistent self-heal state file. At the volume root (NOT pgdata)
+/// so it survives the reinitialize wipe — the same path the watcher derives
+/// from the volume root it is spawned with, so both paths share one budget.
+fn state_file_path() -> String {
+    format!("{}/{}", crate::volume_root(), STATE_FILENAME)
+}
+
+// ====================================================================
 // Supervisor (spawn + respawn loop)
 // ====================================================================
 
@@ -1392,6 +1483,23 @@ mod tests {
     fn not_diverged_clears_window() {
         let w0 = accrue_divergence_window(obs(3, Some(100)), None, 1_000).unwrap();
         assert!(accrue_divergence_window(None, Some(w0), 1_060).is_none());
+    }
+
+    #[test]
+    fn should_reinit_stalled_guards() {
+        let cap = 5;
+        // Replica, leader reachable, under cap → act.
+        assert!(should_reinit_stalled(Role::Replica, true, 0, cap));
+        // Unknown role (joining/uninitialized but genuinely stalled with a
+        // reachable leader) → act: a fresh clone is the right recovery.
+        assert!(should_reinit_stalled(Role::Unknown, true, 4, cap));
+        // Never wipe a leader.
+        assert!(!should_reinit_stalled(Role::Leader, true, 0, cap));
+        // No clone source.
+        assert!(!should_reinit_stalled(Role::Replica, false, 0, cap));
+        // Cap reached → leave for manual intervention.
+        assert!(!should_reinit_stalled(Role::Replica, true, cap, cap));
+        assert!(!should_reinit_stalled(Role::Replica, true, cap + 1, cap));
     }
 
     #[test]
