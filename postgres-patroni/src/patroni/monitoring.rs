@@ -9,6 +9,7 @@ use nix::unistd::Pid;
 use std::time::Duration;
 use tokio::process::Child;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -23,6 +24,7 @@ pub async fn run_monitoring_loop(
     config: &Config,
     mut child: Child,
     telemetry: &Telemetry,
+    wal_stream_error: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let patroni_pid = child
         .id()
@@ -146,20 +148,14 @@ pub async fn run_monitoring_loop(
                         startup_elapsed = 0;
                     }
                     StartupTick::Stalled => {
-                        // A replica that made zero progress for the whole timeout
-                        // is typically wedged in a way a plain restart can't fix —
-                        // classically WAL-too-old: it can't catch up via streaming
-                        // because the leader rotated WAL past its restart LSN, and
-                        // its on-disk pgdata is valid (same timeline, intact
-                        // pg_control) so nothing ever re-clones it. Force a
-                        // reinitialize (fresh pg_basebackup) instead of restarting
-                        // into the same wall; the clone then grows the volume,
-                        // which the progress gate above reads as Progressing and
-                        // protects until it completes. Falls through to the
-                        // recovery exit when we're the leader, the leader is
-                        // unreachable, or the per-hour reinit cap is exhausted.
+                        // No progress for the full stall timeout. A plain restart
+                        // can't fix this — force a reinitialize so a fresh
+                        // pg_basebackup gives the volume something to grow again,
+                        // which the progress gate above protects to completion.
+                        // Falls through to the recovery exit when we're the leader,
+                        // the leader is unreachable, or the per-hour cap is exhausted.
                         if !reinit_attempted
-                            && try_reinitialize_stalled_replica(config, telemetry).await
+                            && try_reinitialize_stalled_replica(config, telemetry, "stalled_startup").await
                         {
                             reinit_attempted = true;
                             startup_elapsed = 0;
@@ -188,6 +184,23 @@ pub async fn run_monitoring_loop(
                     }
                     StartupTick::Waiting => {
                         startup_elapsed += 5;
+                        // WAL-too-old detected in Patroni's log output: the replica
+                        // can't stream-catch-up because the leader already recycled
+                        // the WAL segment it needs. A plain restart hits the same
+                        // wall immediately. Reinitialize now rather than waiting
+                        // out the remaining stall budget — the fresh pg_basebackup
+                        // clone then grows the volume, which the progress gate above
+                        // reads as Progressing and protects to completion.
+                        if *wal_stream_error.borrow()
+                            && !reinit_attempted
+                            && try_reinitialize_stalled_replica(config, telemetry, "wal_too_old").await
+                        {
+                            reinit_attempted = true;
+                            startup_elapsed = 0;
+                            last_volume_used = volume_used_bytes(&config.data_dir);
+                            last_xlog_pos = None;
+                            continue;
+                        }
                         if startup_elapsed >= config.startup_grace_period && startup_elapsed % 30 == 0 {
                             warn!(
                                 elapsed_without_progress = startup_elapsed,
@@ -270,7 +283,11 @@ pub async fn run_monitoring_loop(
 /// it). Returns false to fall back to the recovery exit: we're the leader, the
 /// leader is unreachable, the per-hour reinit cap is exhausted, or the local
 /// Patroni REST didn't answer.
-async fn try_reinitialize_stalled_replica(config: &Config, telemetry: &Telemetry) -> bool {
+async fn try_reinitialize_stalled_replica(
+    config: &Config,
+    telemetry: &Telemetry,
+    reason: &str,
+) -> bool {
     use super::self_heal;
 
     let Some(client) = self_heal::http_client() else {
@@ -303,25 +320,27 @@ async fn try_reinitialize_stalled_replica(config: &Config, telemetry: &Telemetry
     match self_heal::force_reinitialize(&client).await {
         Ok(()) => {
             warn!(
+                reason,
                 attempt,
-                "startup self-heal: forced reinitialize on stalled replica (likely WAL-too-old)"
+                "startup self-heal: forced reinitialize on stalled replica"
             );
             telemetry.send(TelemetryEvent::SelfHealReinitTriggered {
                 node: config.name.clone(),
-                reason: "stalled_startup".to_string(),
+                reason: reason.to_string(),
                 attempt,
             });
             true
         }
         Err(e) => {
             warn!(
+                reason,
                 error = %e,
                 attempt,
                 "startup self-heal: reinitialize request failed; restarting for recovery"
             );
             telemetry.send(TelemetryEvent::SelfHealReinitRequestFailed {
                 node: config.name.clone(),
-                reason: "stalled_startup".to_string(),
+                reason: reason.to_string(),
                 attempt,
                 error: e.to_string(),
             });

@@ -21,7 +21,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 /// Translate the tool-agnostic `WAL_ARCHIVE_*` env contract into
@@ -503,7 +505,7 @@ async fn start_patroni() -> Result<tokio::process::Child> {
         .arg("/etc/patroni/patroni.yml")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start patroni")?;
 
@@ -1347,7 +1349,24 @@ async fn main() -> Result<()> {
     let _health_handle = health_server::start(health_config).await?;
 
     // Start Patroni and run monitoring loop
-    let child = start_patroni().await?;
+    let mut child = start_patroni().await?;
+
+    // Scan Patroni's stderr for the WAL-too-old error so the monitoring loop
+    // can reinitialize immediately rather than waiting out the full stall
+    // timeout. Each line is forwarded to the container's own stderr so logs
+    // are unaffected by the pipe.
+    let (wal_too_old_tx, wal_too_old_rx) = watch::channel(false);
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("{line}");
+                if line.contains("has already been removed") {
+                    let _ = wal_too_old_tx.send(true);
+                }
+            }
+        });
+    }
 
     // Spawn a DCS reconcile task that retries indefinitely with exponential
     // backoff until it succeeds. This waits for Patroni's REST API to come up,
@@ -1401,7 +1420,7 @@ async fn main() -> Result<()> {
     // on leaders. Honors SELF_HEAL_DISABLED=1 as a kill switch.
     spawn_self_heal_watcher(volume_root.clone(), telemetry.clone());
 
-    run_monitoring_loop(&config, child, &telemetry).await
+    run_monitoring_loop(&config, child, &telemetry, wal_too_old_rx).await
 }
 
 #[cfg(test)]
