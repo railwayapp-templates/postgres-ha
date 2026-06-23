@@ -16,9 +16,9 @@ use tracing::{error, info, warn};
 /// the WAL the replica needs still exists. Below this we assume a normal
 /// clone/catch-up is in flight and don't probe.
 const WAL_PROBE_GRACE_SECS: u64 = 30;
-/// Cadence of the authoritative WAL-availability probe while stalled. Only
-/// rate-limits the leader query — the reinit decision is the probe's verdict.
-const WAL_PROBE_INTERVAL_SECS: u64 = 30;
+/// Upper bound on the (exponentially backing-off) gap between WAL-availability
+/// probes, so a long stall keeps the query rate on the leader bounded.
+const WAL_PROBE_MAX_INTERVAL_SECS: u64 = 240;
 
 /// Run the main monitoring loop for Patroni
 ///
@@ -77,6 +77,16 @@ pub async fn run_monitoring_loop(
     // restarting into the same wall; if it doesn't take, the next boot re-decides
     // against the persistent per-hour cap rather than re-wiping a half-laid clone.
     let mut reinit_attempted = false;
+    // Backoff schedule for the authoritative WAL-availability probe (see the
+    // `Waiting` branch). The WAL-too-old fact is already true at the first
+    // probe, so we front-load: probe at the grace mark, then double the gap
+    // each time. A node stalled for some *other* reason (WAL still present)
+    // is probed only a few times before the `max_startup_timeout` exit takes
+    // over — so we never hammer an already-busy leader with a query every 30s
+    // for the full timeout. Both reset whenever `startup_elapsed` does (a new
+    // stall episode earns fresh, prompt detection).
+    let mut wal_probe_interval = WAL_PROBE_GRACE_SECS;
+    let mut next_wal_probe_at = WAL_PROBE_GRACE_SECS;
     // Short-timeout client for polling Patroni's local REST API for WAL
     // progress. Best-effort: if it can't be built we fall back to the
     // volume-usage signal alone.
@@ -152,6 +162,11 @@ pub async fn run_monitoring_loop(
                             );
                         }
                         startup_elapsed = 0;
+                        // New stall episode (if one follows) earns a fresh,
+                        // prompt probe schedule rather than the backed-off gap
+                        // left over from the previous stall.
+                        wal_probe_interval = WAL_PROBE_GRACE_SECS;
+                        next_wal_probe_at = WAL_PROBE_GRACE_SECS;
                     }
                     StartupTick::Stalled => {
                         // No progress for the full stall timeout. A plain restart
@@ -198,14 +213,21 @@ pub async fn run_monitoring_loop(
                         // resume from?" If it's been recycled (and standbys have
                         // no archive fallback), the node can never stream-catch-up
                         // — reinitialize now instead of waiting out the full
-                        // max_startup_timeout. The grace/interval only rate-limit
-                        // the leader query; the *decision* is the WAL-availability
-                        // fact, not a timer. `confirm_wal_unrecoverable` returns
-                        // false on any uncertainty, so we never wipe on a maybe.
-                        if !reinit_attempted
-                            && startup_elapsed >= WAL_PROBE_GRACE_SECS
-                            && startup_elapsed % WAL_PROBE_INTERVAL_SECS == 0
-                        {
+                        // max_startup_timeout. Probing backs off exponentially
+                        // (see the schedule vars) so an already-struggling leader
+                        // isn't queried every cycle; the *decision* is the
+                        // WAL-availability fact, not a timer.
+                        // `confirm_wal_unrecoverable` returns false on any
+                        // uncertainty, so we never wipe on a maybe.
+                        if !reinit_attempted && startup_elapsed >= next_wal_probe_at {
+                            // Schedule the next probe before running this one,
+                            // doubling the gap up to the cap — so even a slow
+                            // query can't re-enter early, and a long stall keeps
+                            // the leader's query load bounded.
+                            wal_probe_interval =
+                                (wal_probe_interval * 2).min(WAL_PROBE_MAX_INTERVAL_SECS);
+                            next_wal_probe_at = startup_elapsed + wal_probe_interval;
+
                             let unrecoverable = match patroni_client.as_ref() {
                                 Some(c) => self_heal::confirm_wal_unrecoverable(c, config).await,
                                 None => false,
