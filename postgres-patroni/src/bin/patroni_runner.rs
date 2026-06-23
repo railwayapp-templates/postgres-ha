@@ -1354,37 +1354,57 @@ async fn main() -> Result<()> {
 
     // Scan Patroni's stderr for the WAL-too-old error so the monitoring loop
     // can reinitialize immediately rather than waiting out the full stall
-    // timeout. Every line is forwarded verbatim to the container's own stderr so
-    // logs are unaffected by the pipe. We read raw bytes and decode lossily for
-    // the scan only: Postgres can emit non-UTF-8 on stderr (SQL_ASCII/LATIN1
-    // databases, error text echoing arbitrary client bytes), and a line-based
-    // UTF-8 reader would error out on the first such byte, leaving the pipe with
-    // no reader — Patroni's next stderr write then gets EPIPE/SIGPIPE and all
-    // logs are lost for the life of the container. So we never stop draining on a
-    // decode error; we only stop at EOF or a broken pipe.
+    // timeout. Every chunk is forwarded verbatim to the container's own stderr.
+    // We use fill_buf rather than read_until so we drain as many bytes as are
+    // buffered in one syscall — potentially many lines at once — instead of
+    // stalling after every newline. This prevents the 64 KiB OS pipe buffer
+    // from filling when Patroni floods stderr with repeated WAL-too-old FATALs.
+    // We read raw bytes and decode lossily for the scan only: Postgres can emit
+    // non-UTF-8 on stderr (SQL_ASCII/LATIN1 databases, error text echoing
+    // arbitrary client bytes).
     let (wal_too_old_tx, wal_too_old_rx) = watch::channel(false);
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
+    let drain_handle = if let Some(stderr) = child.stderr.take() {
+        Some(tokio::spawn(async move {
+            let mut reader = BufReader::with_capacity(65536, stderr);
             let mut out = tokio::io::stderr();
-            let mut buf = Vec::new();
+            // Accumulates bytes to reconstruct complete lines for WAL scanning.
+            // Cleared once the flag is set; capped at 8 KiB to bound memory on
+            // a pathological log stream with no newlines.
+            let mut line_buf: Vec<u8> = Vec::new();
             loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf).await {
-                    // EOF: Patroni's stderr closed (it's exiting).
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let _ = out.write_all(&buf).await;
-                        if is_wal_too_old_line(&String::from_utf8_lossy(&buf)) {
-                            let _ = wal_too_old_tx.send(true);
-                        }
-                    }
-                    // Broken pipe / transport error — nothing left to drain.
+                // Drain whatever is buffered — waits only when truly empty.
+                let chunk = match reader.fill_buf().await {
+                    Ok(b) if b.is_empty() => break, // EOF
+                    Ok(b) => b.to_vec(),
                     Err(_) => break,
+                };
+                let n = chunk.len();
+                reader.consume(n);
+
+                // Forward the whole batch in one write.
+                let _ = out.write_all(&chunk).await;
+
+                // Scan for WAL-too-old only until the flag is set.
+                if !*wal_too_old_tx.borrow() {
+                    line_buf.extend_from_slice(&chunk);
+                    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                        if is_wal_too_old_line(&String::from_utf8_lossy(&line_buf[..=pos])) {
+                            let _ = wal_too_old_tx.send(true);
+                            line_buf.clear();
+                            break;
+                        }
+                        line_buf.drain(..=pos);
+                    }
+                    if line_buf.len() > 8192 {
+                        line_buf.clear();
+                    }
                 }
             }
-        });
-    }
+        }))
+    } else {
+        warn!("startup self-heal: stderr pipe unavailable; WAL-too-old detection disabled");
+        None
+    };
 
     // Spawn a DCS reconcile task that retries indefinitely with exponential
     // backoff until it succeeds. This waits for Patroni's REST API to come up,
@@ -1438,7 +1458,13 @@ async fn main() -> Result<()> {
     // on leaders. Honors SELF_HEAL_DISABLED=1 as a kill switch.
     spawn_self_heal_watcher(volume_root.clone(), telemetry.clone());
 
-    run_monitoring_loop(&config, child, &telemetry, wal_too_old_rx).await
+    let result = run_monitoring_loop(&config, child, &telemetry, wal_too_old_rx).await;
+    // Patroni has exited; give the drain task up to 2s to flush any stderr
+    // bytes that arrived between child.wait() returning and pipe EOF.
+    if let Some(h) = drain_handle {
+        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+    }
+    result
 }
 
 #[cfg(test)]
