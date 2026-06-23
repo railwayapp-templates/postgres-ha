@@ -516,50 +516,55 @@ fn state_file_path() -> String {
 }
 
 // ====================================================================
-// WAL-too-old detection (necessary-condition probe, no false negatives)
+// WAL-too-old detection (sufficient-condition probe, no false positives)
 // ====================================================================
 //
 // Rather than infer WAL-too-old from a stalled log cursor or a quiet timer, we
-// read two segment numbers directly and compare them. Standbys here have no
+// read WAL segment numbers directly and compare them. Standbys here have no
 // archive fallback (archive_command is push-only; there is no restore_command),
 // so a replica is unrecoverable-by-streaming exactly when the segment it must
-// resume from is older than everything the leader still retains. We can't read
-// that resume segment while Postgres is down, but we can read a safe LOWER BOUND
-// on it and a hard fact about the leader:
+// resume streaming from is older than everything the leader still retains.
 //
-//   1. A lower bound on what the replica needs — `pg_controldata`'s "Latest
-//      checkpoint's REDO WAL file". Reads the on-disk control file *offline*, so
-//      it works while the replica's Postgres is dead/crash-looping (exactly the
-//      WAL-too-old state). REDO is the checkpoint floor; the segment the replica
-//      actually streams from is `>= REDO` (it replays local WAL from REDO first,
-//      then requests the next segment from the leader).
-//   2. Does the leader still have it? — one `pg_ls_waldir()` query against the
-//      leader's Postgres for the oldest segment it physically retains.
+// A reinitialize WIPES pgdata and forces a full re-clone, so the verdict MUST be
+// a SUFFICIENT condition: fire only when the replica is *provably* unable to
+// stream-catch-up. We never read the exact resume point offline, but we can
+// bound it from ABOVE and compare that upper bound against a hard fact about the
+// leader:
 //
-// Verdict: reinit when `REDO < leader_oldest`. Because `REDO <= resume_point`,
-// this is a NECESSARY condition for WAL-too-old, not a sufficient one:
+//   1. An UPPER BOUND on the segment the replica will request from the leader.
+//      On restart the replica replays its local WAL and then streams from the
+//      end of it, so the segment it needs is at most one past the newest segment
+//      already in its own pg_wal:  resume_point <= newest_local + 1. We read the
+//      newest local segment by listing pg_wal *offline* (works while Postgres is
+//      down/crash-looping — exactly the WAL-too-old state) and take its
+//      successor. Preallocated/recycled future segment files only inflate
+//      `newest_local`, which makes the bound LARGER and the verdict STRICTER —
+//      never wrong, only more conservative.
+//   2. The oldest segment the leader still physically retains — one
+//      `pg_ls_waldir()` query against the leader's Postgres.
 //
-//   * No false negatives. A genuine WAL-too-old has `resume_point < leader_oldest`,
-//     hence `REDO < leader_oldest` too — so the probe ALWAYS fires on a real case.
-//     This is the property that matters: a wedged replica is never left to
-//     restart-loop because we under-detected. (Idle/low-commit clusters don't
-//     change this — a low REDO only makes the probe MORE likely to fire.)
-//   * Possible false positives. `REDO < leader_oldest` can also hold while the
-//     true resume_point is still on the leader — a checkpoint floor lagging a
-//     busy primary. So a node stalled for some *non-WAL* reason that is merely
-//     behind can trip it. We accept that: the trigger is gated by 30s+ of zero
-//     progress, a reachable leader, non-leader role, and the per-hour cap, and a
-//     fresh clone from a healthy leader is a safe recovery regardless of why the
-//     node was stuck. We deliberately bias toward this (a bounded, safe re-clone)
-//     over the alternative (under-detect → permanent restart loop).
+// Verdict: reinit only when `successor(newest_local) < leader_oldest`. Because
+// `resume_point <= successor(newest_local)`, this is a SUFFICIENT condition:
 //
-// We compare the two by `(logid, segid)` — the byte-position half of the WAL
-// filename, ignoring the 8-hex timeline prefix. That ordering matches WAL
-// byte-position ordering for any fixed segment size, so the comparison is
-// timeline-independent: a pg_rewind'd replica (which ends up on the leader's
-// timeline but needs WAL from before its slot floor) shares segment numbering
-// with the leader even when the prefixes differ. No LSN arithmetic, no segment
-// size needed.
+//   * No false positives. The trigger guarantees `resume_point < leader_oldest`,
+//     i.e. the segment the replica must stream from is genuinely gone from the
+//     leader. We never wipe a replica a plain restart could have recovered — the
+//     property that matters for a destructive op.
+//   * Possible false negatives. We may MISS a genuine WAL-too-old in the narrow
+//     boundary band where the true resume point is just below the leader's floor
+//     but `newest_local + 1 >= leader_oldest`. Such a node keeps restart-looping
+//     exactly as it does today — no worse than the status quo, and backboard's
+//     monitor / a human still handle it. We deliberately accept that over the
+//     alternative (a destructive re-clone of a replica that was actually fine).
+//
+// Comparisons use `(logid, segid)` — the byte-position half of the WAL filename,
+// ignoring the 8-hex timeline prefix. That ordering matches WAL byte-position
+// ordering for any fixed segment size, so the comparison is timeline-independent:
+// a pg_rewind'd replica (which ends up on the leader's timeline but needs WAL
+// from before its slot floor) shares segment numbering with the leader even when
+// the prefixes differ. The successor step is the one place we need the WAL
+// segment size; we read it from the same control file (`Bytes per WAL segment`),
+// and both nodes share it (initdb-fixed, inherited by the clone).
 
 /// The byte-position key `(logid, segid)` of a 24-hex WAL filename, ignoring
 /// the timeline prefix (first 8 hex). Ordering this tuple matches WAL
@@ -577,22 +582,52 @@ fn wal_segment_key(name: &str) -> Option<(u64, u64)> {
     Some((logid, segid))
 }
 
-/// Extract the "Latest checkpoint's REDO WAL file" segment key from
-/// `pg_controldata` text — the oldest WAL segment the node must replay from on
-/// its next start. `None` if the field is absent or unparseable.
-fn parse_controldata_redo_segment(output: &str) -> Option<(u64, u64)> {
-    output
-        .lines()
-        .find_map(|l| l.split_once("REDO WAL file:").map(|(_, v)| v))
-        .and_then(wal_segment_key)
+/// Number of WAL segments per logid for a given segment size — the value the low
+/// 8 hex of a WAL filename wraps at (`0x1_0000_0000 / wal_segment_size`, e.g. 256
+/// for the default 16 MiB). `None` for a zero/garbage size.
+fn segments_per_logid(wal_segment_size: u64) -> Option<u64> {
+    (wal_segment_size != 0).then(|| 0x1_0000_0000u64 / wal_segment_size)
 }
 
-/// Read the checkpoint REDO segment from this node's on-disk control file via
-/// `pg_controldata` — a LOWER BOUND on the segment it must resume streaming from
-/// (the actual resume point is `>= REDO`). Works while Postgres is down/crash-
-/// looping (reads the control file directly). `None` on any failure — callers
-/// treat that as "cannot prove unrecoverable" and never wipe on it.
-async fn local_required_segment(data_dir: &str) -> Option<(u64, u64)> {
+/// The next WAL segment key after `key` in byte-position order, carrying into the
+/// logid when `segid` reaches `segs_per_logid`.
+fn wal_segment_successor((logid, segid): (u64, u64), segs_per_logid: u64) -> (u64, u64) {
+    if segid + 1 >= segs_per_logid {
+        (logid + 1, 0)
+    } else {
+        (logid, segid + 1)
+    }
+}
+
+/// Parse "Bytes per WAL segment" from `pg_controldata` text — needed to take the
+/// successor of a segment key. `None` if absent or unparseable.
+fn parse_controldata_wal_segsize(output: &str) -> Option<u64> {
+    output
+        .lines()
+        .find_map(|l| l.split_once("Bytes per WAL segment:").map(|(_, v)| v))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Newest WAL segment key present in this node's `pg_wal`, read offline (works
+/// while Postgres is down/crash-looping). `None` when the directory is unreadable
+/// or holds no segment file. Recycled/preallocated future segments may inflate
+/// this — that is safe: it only makes the resume upper bound larger and the
+/// verdict more conservative (see the section comment).
+fn local_newest_wal_segment(data_dir: &str) -> Option<(u64, u64)> {
+    fs::read_dir(format!("{data_dir}/pg_wal"))
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| wal_segment_key(e.file_name().to_str()?))
+        .max()
+}
+
+/// An UPPER BOUND on the segment the replica will request from the leader on its
+/// next start: `successor(newest local segment)`. Reads `pg_wal` offline for the
+/// newest segment and `pg_controldata` for the WAL segment size needed to take
+/// the successor. `None` on any failure — callers treat that as "cannot prove
+/// unrecoverable" and never wipe on it.
+async fn local_resume_upper_bound(data_dir: &str) -> Option<(u64, u64)> {
+    let newest = local_newest_wal_segment(data_dir)?;
     let read = Command::new("pg_controldata")
         .arg(data_dir)
         // Stable, locale-independent field labels.
@@ -601,28 +636,46 @@ async fn local_required_segment(data_dir: &str) -> Option<(u64, u64)> {
     // Reads a local file and should return instantly; bound it anyway so a wedged
     // pg_controldata can't stall the monitoring loop.
     let out = match tokio::time::timeout(Duration::from_secs(5), read).await {
-        Ok(Ok(out)) => out,
+        Ok(Ok(out)) if out.status.success() => out,
         _ => return None,
     };
-    if !out.status.success() {
-        return None;
-    }
-    parse_controldata_redo_segment(&String::from_utf8_lossy(&out.stdout))
+    let segsize = parse_controldata_wal_segsize(&String::from_utf8_lossy(&out.stdout))?;
+    let per_logid = segments_per_logid(segsize)?;
+    Some(wal_segment_successor(newest, per_logid))
 }
 
 /// Postgres `(host, port)` of the current leader, from `/cluster`. `None` when
-/// there is no leader or it advertises no connect host.
+/// the query fails, there is no leader, or the leader advertises no connect host.
+/// Each `None` path logs: the host/port branch in particular is the one external
+/// assumption this whole mechanism rests on (that Patroni's `/cluster` member
+/// objects carry `host`/`port`). If that ever stops holding the WAL probe silently
+/// can't fire, so we surface it loudly rather than degrade to an invisible no-op.
 async fn leader_pg_endpoint(client: &reqwest::Client) -> Option<(String, i64)> {
-    let cluster: ClusterResponse = client
-        .get(PATRONI_CLUSTER_URL)
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    let leader = cluster.members.iter().find(|m| m.role == "leader")?;
-    Some((leader.host.clone()?, leader.port.unwrap_or(5432)))
+    let cluster: ClusterResponse = match client.get(PATRONI_CLUSTER_URL).send().await {
+        Ok(resp) => match resp.json().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "self-heal: /cluster JSON parse failed — cannot locate leader for WAL probe");
+                return None;
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "self-heal: /cluster request failed — cannot locate leader for WAL probe");
+            return None;
+        }
+    };
+    let Some(leader) = cluster.members.iter().find(|m| m.role == "leader") else {
+        warn!("self-heal: no leader member in /cluster — cannot run WAL-availability probe");
+        return None;
+    };
+    let Some(host) = leader.host.clone() else {
+        warn!(
+            leader = %leader.name,
+            "self-heal: leader member in /cluster advertises no host — WAL-availability probe disabled, the startup-gate re-clone cannot fire (check Patroni /cluster member schema)"
+        );
+        return None;
+    };
+    Some((host, leader.port.unwrap_or(5432)))
 }
 
 /// The oldest WAL segment key the leader still physically retains, via
@@ -677,42 +730,46 @@ async fn leader_oldest_segment(host: &str, port: i64, config: &Config) -> Option
         .min()
 }
 
-/// Pure verdict: is the replica's required segment older than everything the
-/// leader retains? `true` only when both keys are known and `needed < oldest`.
-fn wal_segment_recycled(needed: Option<(u64, u64)>, leader_oldest: Option<(u64, u64)>) -> bool {
-    matches!((needed, leader_oldest), (Some(n), Some(o)) if n < o)
+/// Pure verdict: is the segment the replica must resume from (its UPPER BOUND,
+/// `successor(newest_local)`) older than everything the leader retains? `true`
+/// only when both keys are known and `resume_upper_bound < leader_oldest` — a
+/// SUFFICIENT condition for WAL-too-old (no false positives). Any unknown →
+/// `false` (never wipe on a maybe).
+fn streaming_unrecoverable(
+    resume_upper_bound: Option<(u64, u64)>,
+    leader_oldest: Option<(u64, u64)>,
+) -> bool {
+    matches!((resume_upper_bound, leader_oldest), (Some(r), Some(o)) if r < o)
 }
 
-/// WAL-too-old probe: `true` when the replica's checkpoint REDO segment predates
-/// the oldest WAL the leader still retains. REDO is a LOWER BOUND on the segment
-/// the replica must stream from, so this is a NECESSARY condition for WAL-too-old
-/// — it never misses a genuine case (a wedged replica is never left to restart-
-/// loop), but it can over-fire for a node stalled for a non-WAL reason whose
-/// checkpoint floor merely lags a busy primary. We accept that bounded over-fire
-/// (the caller gates on 30s+ no-progress, reachable leader, non-leader, per-hour
-/// cap; a fresh clone is a safe recovery either way) rather than risk a missed
-/// detection that loops forever — see the section comment above for the full
-/// argument. Any uncertainty — control file unreadable, no leader endpoint,
-/// leader query failed, or the segment is still present — returns `false`, so we
-/// never wipe a replica on a maybe. Replaces every prior heuristic (stalled
-/// cursor, stderr scraping, dwell timers) for the "replica never becomes healthy"
-/// manifestation.
+/// WAL-too-old probe: `true` when the replica is PROVABLY unable to stream-catch-
+/// up — an UPPER BOUND on the segment it must resume from (the successor of its
+/// newest local WAL segment) is older than the oldest WAL the leader still
+/// retains, and standbys here have no archive fallback. This is a SUFFICIENT
+/// condition: it never wipes a replica a restart could recover (no false
+/// positives), at the cost of possibly missing a genuine case in a narrow
+/// boundary band (a safe false negative — the node keeps restart-looping as it
+/// does today). Any uncertainty — pg_wal/control file unreadable, no leader
+/// endpoint, leader query failed, or the needed segment is still present —
+/// returns `false`. See the section comment for the full argument. Replaces every
+/// prior heuristic (stalled cursor, stderr scraping, dwell timers, REDO lower-
+/// bound) for the "replica never becomes healthy" manifestation.
 pub async fn confirm_wal_unrecoverable(client: &reqwest::Client, config: &Config) -> bool {
-    let needed = local_required_segment(&config.data_dir).await;
+    let resume_upper_bound = local_resume_upper_bound(&config.data_dir).await;
     let Some((host, port)) = leader_pg_endpoint(client).await else {
         return false;
     };
     let leader_oldest = leader_oldest_segment(&host, port, config).await;
-    let recycled = wal_segment_recycled(needed, leader_oldest);
-    if recycled {
+    let unrecoverable = streaming_unrecoverable(resume_upper_bound, leader_oldest);
+    if unrecoverable {
         warn!(
-            needed = ?needed,
+            resume_upper_bound = ?resume_upper_bound,
             leader_oldest = ?leader_oldest,
             leader_host = %host,
-            "self-heal: replica's checkpoint REDO segment predates the leader's oldest retained WAL (no archive fallback) — unrecoverable by streaming"
+            "self-heal: the segment this replica must resume from is older than the leader's oldest retained WAL (no archive fallback) — provably unrecoverable by streaming"
         );
     }
-    recycled
+    unrecoverable
 }
 
 // ====================================================================
@@ -1850,7 +1907,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Authoritative WAL-too-old detection
+    // WAL-too-old detection (sufficient-condition, no false positives)
     // ----------------------------------------------------------------
 
     #[test]
@@ -1888,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_controldata_extracts_redo_segment() {
+    fn parse_controldata_extracts_wal_segsize() {
         let sample = "\
 pg_control version number:            1300
 Latest checkpoint location:           0/4000060
@@ -1898,28 +1955,80 @@ Latest checkpoint's TimeLineID:       1
 Minimum recovery ending location:     0/0
 Bytes per WAL segment:                16777216
 ";
-        assert_eq!(parse_controldata_redo_segment(sample), Some((0, 4)));
+        assert_eq!(parse_controldata_wal_segsize(sample), Some(16777216));
     }
 
     #[test]
-    fn parse_controldata_missing_field_is_none() {
+    fn parse_controldata_missing_segsize_is_none() {
         let sample = "Latest checkpoint location:           0/4000060\n";
-        assert_eq!(parse_controldata_redo_segment(sample), None);
+        assert_eq!(parse_controldata_wal_segsize(sample), None);
     }
 
     #[test]
-    fn wal_recycled_only_when_needed_predates_leader_oldest() {
-        // Replica needs an older segment than the leader retains → recycled.
-        assert!(wal_segment_recycled(Some((0, 3)), Some((0, 5))));
-        // Replica needs exactly the leader's oldest → present, recoverable.
-        assert!(!wal_segment_recycled(Some((0, 5)), Some((0, 5))));
-        // Replica needs newer than the oldest → present.
-        assert!(!wal_segment_recycled(Some((0, 9)), Some((0, 5))));
+    fn segments_per_logid_for_known_sizes() {
+        // Default 16 MiB → 256 segments per logid (the 0xFF wrap point).
+        assert_eq!(segments_per_logid(16 * 1024 * 1024), Some(256));
+        // 1 MiB → 4096; a non-default size still maps cleanly.
+        assert_eq!(segments_per_logid(1024 * 1024), Some(4096));
+        // Garbage size → None (caller treats as "cannot prove unrecoverable").
+        assert_eq!(segments_per_logid(0), None);
+    }
+
+    #[test]
+    fn wal_segment_successor_increments_and_carries() {
+        // Plain increment within a logid.
+        assert_eq!(wal_segment_successor((0, 3), 256), (0, 4));
+        // Carry at the segs-per-logid boundary (0xFF + 1 → next logid, seg 0).
+        assert_eq!(wal_segment_successor((0, 0xFF), 256), (1, 0));
+        // Non-default segment size carries at its own boundary, not 0xFF.
+        assert_eq!(wal_segment_successor((5, 4095), 4096), (6, 0));
+        assert_eq!(wal_segment_successor((5, 4094), 4096), (5, 4095));
+    }
+
+    #[test]
+    fn streaming_unrecoverable_only_when_resume_predates_leader_oldest() {
+        // Resume upper bound older than the leader's oldest → provably gone.
+        assert!(streaming_unrecoverable(Some((0, 3)), Some((0, 5))));
+        // Upper bound == leader's oldest → the leader still has it → recoverable.
+        assert!(!streaming_unrecoverable(Some((0, 5)), Some((0, 5))));
+        // Upper bound newer than the oldest → present.
+        assert!(!streaming_unrecoverable(Some((0, 9)), Some((0, 5))));
         // Crosses logid boundary correctly.
-        assert!(wal_segment_recycled(Some((0, 0xFF)), Some((1, 0))));
-        // Any unknown → never recycled (never wipe on a maybe).
-        assert!(!wal_segment_recycled(None, Some((0, 5))));
-        assert!(!wal_segment_recycled(Some((0, 3)), None));
-        assert!(!wal_segment_recycled(None, None));
+        assert!(streaming_unrecoverable(Some((0, 0xFF)), Some((1, 0))));
+        // Any unknown → never (never wipe on a maybe).
+        assert!(!streaming_unrecoverable(None, Some((0, 5))));
+        assert!(!streaming_unrecoverable(Some((0, 3)), None));
+        assert!(!streaming_unrecoverable(None, None));
+    }
+
+    #[test]
+    fn local_newest_wal_segment_picks_max_ignoring_non_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("pg_wal");
+        fs::create_dir(&wal).unwrap();
+        // Two real segments, plus noise that must be ignored.
+        for name in [
+            "000000010000000000000003",
+            "000000010000000000000007", // newest by byte position
+            "00000002.history",
+            "000000010000000000000007.partial",
+        ] {
+            fs::write(wal.join(name), b"").unwrap();
+        }
+        fs::create_dir(wal.join("archive_status")).unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        assert_eq!(local_newest_wal_segment(data_dir), Some((0, 7)));
+    }
+
+    #[test]
+    fn local_newest_wal_segment_empty_or_missing_is_none() {
+        // Missing pg_wal entirely.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(local_newest_wal_segment(dir.path().to_str().unwrap()), None);
+        // Present but holds no segment file.
+        let wal = dir.path().join("pg_wal");
+        fs::create_dir(&wal).unwrap();
+        fs::write(wal.join("00000002.history"), b"").unwrap();
+        assert_eq!(local_newest_wal_segment(dir.path().to_str().unwrap()), None);
     }
 }
