@@ -158,6 +158,9 @@ pub enum TelemetryEvent {
     /// Defragmentation of the local etcd node failed
     EtcdDefragFailed { node: String, error: String },
 
+    /// Corrupt etcd data directory wiped so the member re-clones from the cluster
+    EtcdDataDirWiped { node: String, reason: String },
+
     // === HAProxy Events ===
     /// HAProxy started successfully
     HaproxyStarted { node_count: usize, single_node_mode: bool },
@@ -205,6 +208,7 @@ impl TelemetryEvent {
             Self::EtcdStartupFailed { .. } => "ETCD_STARTUP_FAILED",
             Self::EtcdPromotionFailed { .. } => "ETCD_PROMOTION_FAILED",
             Self::EtcdDefragFailed { .. } => "ETCD_DEFRAG_FAILED",
+            Self::EtcdDataDirWiped { .. } => "ETCD_DATA_DIR_WIPED",
             Self::HaproxyStarted { .. } => "HAPROXY_STARTED",
             Self::HaproxyConfigGenerating { .. } => "HAPROXY_CONFIG_GENERATING",
             Self::ComponentStarted { .. } => "COMPONENT_STARTED",
@@ -351,6 +355,9 @@ impl TelemetryEvent {
             }
             Self::EtcdDefragFailed { node, error } => {
                 format!("etcd {} defrag failed: {}", node, error)
+            }
+            Self::EtcdDataDirWiped { node, reason } => {
+                format!("etcd {} data dir wiped: {}", node, reason)
             }
             Self::HaproxyStarted {
                 node_count,

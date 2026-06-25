@@ -382,12 +382,15 @@ pub async fn start_etcd(
     apply_default_flag(&mut cmd, "--snapshot-count", "ETCD_SNAPSHOT_COUNT", "1000");
     apply_default_flag(&mut cmd, "--max-learners", "ETCD_MAX_LEARNERS", "2");
 
+    // stderr is piped (not inherited) so the supervisor can watch etcd's log
+    // stream for the unrecoverable raft-log corruption panic; the caller tees it
+    // back to its own stderr so container logs are unaffected.
     let child = cmd
         .env("ETCD_INITIAL_CLUSTER", initial_cluster)
         .env("ETCD_INITIAL_CLUSTER_STATE", initial_cluster_state)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start etcd")?;
 
