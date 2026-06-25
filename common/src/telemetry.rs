@@ -161,6 +161,10 @@ pub enum TelemetryEvent {
     /// Corrupt etcd data directory wiped so the member re-clones from the cluster
     EtcdDataDirWiped { node: String, reason: String },
 
+    /// Local etcd was unhealthy for too long while running — exiting so the
+    /// platform restarts the node (it was a zombie reporting deployment SUCCESS).
+    EtcdLocalUnhealthy { node: String, unhealthy_secs: u64 },
+
     // === HAProxy Events ===
     /// HAProxy started successfully
     HaproxyStarted { node_count: usize, single_node_mode: bool },
@@ -209,6 +213,7 @@ impl TelemetryEvent {
             Self::EtcdPromotionFailed { .. } => "ETCD_PROMOTION_FAILED",
             Self::EtcdDefragFailed { .. } => "ETCD_DEFRAG_FAILED",
             Self::EtcdDataDirWiped { .. } => "ETCD_DATA_DIR_WIPED",
+            Self::EtcdLocalUnhealthy { .. } => "ETCD_LOCAL_UNHEALTHY",
             Self::HaproxyStarted { .. } => "HAPROXY_STARTED",
             Self::HaproxyConfigGenerating { .. } => "HAPROXY_CONFIG_GENERATING",
             Self::ComponentStarted { .. } => "COMPONENT_STARTED",
@@ -358,6 +363,15 @@ impl TelemetryEvent {
             }
             Self::EtcdDataDirWiped { node, reason } => {
                 format!("etcd {} data dir wiped: {}", node, reason)
+            }
+            Self::EtcdLocalUnhealthy {
+                node,
+                unhealthy_secs,
+            } => {
+                format!(
+                    "etcd {} local node unhealthy for {}s while running - exiting for restart",
+                    node, unhealthy_secs
+                )
             }
             Self::HaproxyStarted {
                 node_count,

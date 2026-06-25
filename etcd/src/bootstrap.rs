@@ -10,7 +10,7 @@ use crate::config::{get_leader_endpoint, parse_initial_cluster, peer_to_client_u
 use anyhow::{anyhow, Result};
 use common::{etcdctl, etcdctl_probe, Telemetry, TelemetryEvent};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -464,5 +464,73 @@ pub async fn defrag_loop(config: Config, telemetry: Telemetry) {
             Err(e) => warn!(error = %e, "Health check error, skipping defrag"),
         }
         sleep(DEFRAG_INTERVAL).await;
+    }
+}
+
+// ---- Local liveness watchdog ----
+// monitor_and_mark_bootstrap stops once bootstrap completes, and check_cluster_health
+// treats a healthy *peer* as proof the cluster is up — so after bootstrap nothing
+// watches whether THIS node's etcd is actually serving. A wedged-but-running etcd
+// (process up, not answering) therefore sits forever as a healthy SUCCESS deployment
+// while its peers carry quorum: a zombie member that reduces real fault tolerance
+// without surfacing as a crash. This watchdog closes that gap by checking the LOCAL
+// endpoint only and crashing the container if it stays unhealthy — flipping the
+// deployment to CRASHED so the platform (and the postgres-ha monitor's crashed-node
+// self-heal) restarts it, which clears the wedge (or, if the data dir is corrupt,
+// triggers the wipe-and-re-clone recovery).
+
+const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+// Grace before we treat a non-serving local etcd as wedged. Generous enough to ride
+// out the brief unavailability of a blocking defrag, compaction, snapshot install, or
+// leader election (these etcd DBs are tiny — only Patroni keys), short enough to
+// recover a genuinely dead node in ~1.5min instead of leaving a silent zombie.
+const LIVENESS_UNHEALTHY_GRACE: Duration = Duration::from_secs(90);
+
+/// Long-lived watchdog over the LOCAL etcd endpoint (127.0.0.1:2379). Runs for the
+/// lifetime of the etcd process (aborted by main when the child exits). Only arms
+/// after the local node has served at least once, so it never kills a node still
+/// doing its initial clone/bootstrap.
+pub async fn local_liveness_watchdog(config: Config, telemetry: Telemetry) {
+    let mut healthy_once = false;
+    let mut unhealthy_since: Option<Instant> = None;
+
+    loop {
+        sleep(LIVENESS_CHECK_INTERVAL).await;
+
+        let local_ok = etcdctl_probe(&["endpoint", "health", "--endpoints=127.0.0.1:2379"])
+            .await
+            .unwrap_or(false);
+
+        if local_ok {
+            healthy_once = true;
+            unhealthy_since = None;
+            continue;
+        }
+
+        // Don't arm until the node has served once — a node still cloning/bootstrapping
+        // is legitimately unhealthy and must not be killed.
+        if !healthy_once {
+            continue;
+        }
+
+        let since = *unhealthy_since.get_or_insert_with(Instant::now);
+        let elapsed = since.elapsed();
+        if elapsed >= LIVENESS_UNHEALTHY_GRACE {
+            telemetry.send(TelemetryEvent::EtcdLocalUnhealthy {
+                node: config.etcd_name.clone(),
+                unhealthy_secs: elapsed.as_secs(),
+            });
+            tracing::error!(
+                unhealthy_secs = elapsed.as_secs(),
+                "Local etcd unhealthy while running - exiting so the platform restarts this node"
+            );
+            std::process::exit(1);
+        }
+        warn!(
+            unhealthy_secs = elapsed.as_secs(),
+            grace_secs = LIVENESS_UNHEALTHY_GRACE.as_secs(),
+            "Local etcd not serving; will exit for restart if it does not recover"
+        );
     }
 }
