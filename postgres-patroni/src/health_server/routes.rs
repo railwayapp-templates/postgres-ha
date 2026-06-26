@@ -30,7 +30,7 @@ async fn primary_handler(State(config): State<HealthServerConfig>) -> impl IntoR
             (StatusCode::SERVICE_UNAVAILABLE, "replica")
         }
         Err(e) => {
-            info!(error = %e, "Primary check: PostgreSQL unreachable, falling back to Patroni");
+            debug!(error = %e, "Primary check: PostgreSQL unreachable, falling back to Patroni");
             match check_patroni_role(&config, "primary").await {
                 Ok(true) => {
                     info!("Primary check: OK (via Patroni fallback)");
@@ -65,7 +65,7 @@ async fn replica_handler(State(config): State<HealthServerConfig>) -> impl IntoR
             (StatusCode::SERVICE_UNAVAILABLE, "primary")
         }
         Err(e) => {
-            info!(error = %e, "Replica check: PostgreSQL unreachable, falling back to Patroni");
+            debug!(error = %e, "Replica check: PostgreSQL unreachable, falling back to Patroni");
             match check_patroni_role(&config, "replica").await {
                 Ok(true) => {
                     info!("Replica check: OK (via Patroni fallback)");
