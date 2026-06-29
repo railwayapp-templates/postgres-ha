@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -113,14 +113,14 @@ async fn main() -> Result<()> {
         let stderr_reader = child.stderr.take().map(|stderr| {
             let flag = Arc::clone(&corruption_detected);
             tokio::spawn(async move {
-                use std::io::Write;
+                let mut stderr_out = tokio::io::stderr();
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if is_raft_corruption_line(&line) {
                         flag.store(true, Ordering::Relaxed);
                     }
                     // Tee to our stderr so etcd's logs still reach the container.
-                    let _ = writeln!(std::io::stderr(), "{}", line);
+                    let _ = stderr_out.write_all(format!("{}\n", line).as_bytes()).await;
                 }
             })
         });
@@ -203,9 +203,13 @@ async fn main() -> Result<()> {
             match check_existing_cluster(&config.initial_cluster, &config.etcd_name).await {
                 Ok(Some(_)) => {
                     warn!("etcd raft log corruption with a healthy peer cluster - wiping data dir to re-clone as a fresh member");
-                    let _ = fs::remove_file(&config.bootstrap_marker()).await;
+                    // Clear data FIRST; remove marker only on success. If clear fails,
+                    // marker + data are preserved and we retry detection next cycle. If
+                    // clear succeeds but remove fails, the stale marker is left with an
+                    // empty data dir — handle that on the next startup.
                     match clear_directory(Path::new(&config.data_dir)).await {
                         Ok(()) => {
+                            let _ = fs::remove_file(&config.bootstrap_marker()).await;
                             telemetry.send(TelemetryEvent::EtcdDataDirWiped {
                                 node: config.etcd_name.clone(),
                                 reason: "raft log corrupted/truncated; quorum intact on peers".to_string(),
