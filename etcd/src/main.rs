@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 
 use bootstrap::{
     bootstrap_as_follower, bootstrap_as_leader, check_existing_cluster, clean_stale_data,
-    defrag_loop, monitor_and_mark_bootstrap,
+    defrag_loop, local_liveness_watchdog, monitor_and_mark_bootstrap,
 };
 use cluster::{clear_directory, has_local_data, start_etcd};
 use config::{get_bootstrap_leader, Config};
@@ -143,9 +143,20 @@ async fn main() -> Result<()> {
             defrag_loop(defrag_config, defrag_telemetry).await
         });
 
+        // Long-lived watchdog over the LOCAL etcd endpoint: crashes the container if
+        // this node's etcd stops serving while still running, so a wedged "zombie"
+        // member (deployment SUCCESS, process not answering) becomes a CRASHED deploy
+        // the platform restarts instead of a silent reduction in fault tolerance.
+        let watchdog_config = Config::from_env()?;
+        let watchdog_telemetry = telemetry.clone();
+        let watchdog_handle = tokio::spawn(async move {
+            local_liveness_watchdog(watchdog_config, watchdog_telemetry).await
+        });
+
         let status = child.wait().await?;
         monitor_handle.abort();
         defrag_handle.abort();
+        watchdog_handle.abort();
         // Drain the rest of etcd's stderr (the reader ends at pipe EOF on exit) so
         // the corruption flag reflects the whole run before we read it.
         if let Some(reader) = stderr_reader {
