@@ -17,7 +17,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Async runtime
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "process", "time", "fs", "io-util", "signal", "net"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "process", "time", "fs", "io-util", "io-std", "signal", "net"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "blocking"] }

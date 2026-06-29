@@ -956,15 +956,30 @@ t_watcher_gap_recovery_full() {
   # AFTER catalog advance is observed. Loop the WAL switch because the
   # state machine needs to see the catalog actually move; a single
   # switch may race the next iteration.
-  local deadline=$(($(date +%s) + 60)) hit=0
+  #
+  # Poll for "gap-recovery state cleared" directly rather than the diff
+  # backup log: clear_gap_recovery_state is called AFTER run_backup returns,
+  # which itself logs "backup completed" before emit_pitr_anchor and
+  # refresh_archiver_stats (two psql round-trips). Polling the diff count
+  # and then immediately grepping for the second log races that async gap.
+  local deadline=$(($(date +%s) + 90)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null 2>&1
-    local now_diff_count
-    now_diff_count=$(count_watcher_backup_logs "$leader" diff)
-    if [ "$now_diff_count" -gt "$before_diff_count" ]; then hit=1; break; fi
+    if docker logs "$leader" 2>&1 | grep -q "gap-recovery state cleared"; then hit=1; break; fi
     sleep 3
   done
   if [ "$hit" != "1" ]; then
+    ko t_watcher_gap_recovery_full "expected 'gap-recovery state cleared' log line"
+    fail_dump t_watcher_gap_recovery_full "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Verify the diff backup actually ran (clear_gap_recovery_state is only
+  # reached after a successful run_backup, so this is a secondary check).
+  local now_diff_count
+  now_diff_count=$(count_watcher_backup_logs "$leader" diff)
+  if [ "$now_diff_count" -le "$before_diff_count" ]; then
     ko t_watcher_gap_recovery_full "no gap-recovery diff"
     fail_dump t_watcher_gap_recovery_full "$leader"
     teardown_scope "$scope"
@@ -973,13 +988,6 @@ t_watcher_gap_recovery_full() {
 
   if docker exec "$leader" test -f /var/lib/postgresql/data/pgdata/.pgbackrest_gap_pending; then
     ko t_watcher_gap_recovery_full "gap marker not cleared"
-    teardown_scope "$scope"
-    return
-  fi
-  # The Rust clear_gap_recovery_state emits "gap-recovery state cleared"
-  # with the reason as a structured tracing field.
-  if ! docker logs "$leader" 2>&1 | grep -q "gap-recovery state cleared"; then
-    ko t_watcher_gap_recovery_full "expected 'gap-recovery state cleared' log line"
     teardown_scope "$scope"
     return
   fi
