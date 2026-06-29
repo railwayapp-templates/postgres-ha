@@ -35,7 +35,7 @@ use config::{get_bootstrap_leader, Config};
 /// non-zero and re-reads the same corrupt WAL on every restart, so retrying the
 /// same data dir loops forever; the only recovery is to wipe and re-clone.
 fn is_raft_corruption_line(line: &str) -> bool {
-    (line.contains("tocommit(") && line.contains("out of range"))
+    (line.contains("tocommit(") && line.contains("is out of range [lastIndex("))
         || line.contains("Was the raft log corrupted, truncated, or lost?")
 }
 
