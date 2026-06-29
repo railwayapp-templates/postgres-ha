@@ -36,7 +36,7 @@ use config::{get_bootstrap_leader, Config};
 /// same data dir loops forever; the only recovery is to wipe and re-clone.
 fn is_raft_corruption_line(line: &str) -> bool {
     (line.contains("tocommit(") && line.contains("out of range"))
-        || line.contains("raft log corrupted, truncated, or lost")
+        || line.contains("Was the raft log corrupted, truncated, or lost?")
 }
 
 #[tokio::main]
@@ -264,6 +264,11 @@ mod tests {
     fn matches_corrupted_log_phrase_alone() {
         assert!(is_raft_corruption_line(
             "Was the raft log corrupted, truncated, or lost?"
+        ));
+        // Without the interrogative prefix the substring does NOT match — guards
+        // against a hypothetical diagnostic like "checking if raft log corrupted...".
+        assert!(!is_raft_corruption_line(
+            "checking if raft log corrupted, truncated, or lost"
         ));
     }
 
