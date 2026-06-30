@@ -29,7 +29,10 @@ pub struct Config {
     pub startup_grace_period: u64,
     /// Maximum time to wait for Patroni to become healthy during startup.
     /// If exceeded, we exit(1) to trigger container restart and recovery.
-    /// Must be >= startup_grace_period. Default: 300 seconds (5 minutes).
+    /// Must be >= startup_grace_period. Default: 1800 seconds (30 minutes).
+    /// The startup loop is progress-gated (stall timer only advances while the
+    /// volume shows zero growth), so this only fires on 30 min of genuine zero
+    /// progress — not on a large clone that is making steady forward progress.
     pub max_startup_timeout: u64,
     pub adopt_existing_data: bool,
     /// If true and node has no existing data, wait for cluster leader in etcd
@@ -117,7 +120,7 @@ impl Config {
             health_check_timeout: u64::env_parse("PATRONI_HEALTH_CHECK_TIMEOUT", 5),
             max_failures: u32::env_parse("PATRONI_MAX_HEALTH_FAILURES", 3),
             startup_grace_period: u64::env_parse("PATRONI_STARTUP_GRACE_PERIOD", 60),
-            max_startup_timeout: u64::env_parse("PATRONI_MAX_STARTUP_TIMEOUT", 300),
+            max_startup_timeout: u64::env_parse("PATRONI_MAX_STARTUP_TIMEOUT", 1800),
             adopt_existing_data: bool::env_parse("PATRONI_ADOPT_EXISTING_DATA", false),
             wait_for_leader: bool::env_parse("PATRONI_WAIT_FOR_LEADER", false),
             synchronous_mode: bool::env_parse("PATRONI_SYNCHRONOUS_MODE", false),

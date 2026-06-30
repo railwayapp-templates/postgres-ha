@@ -116,6 +116,16 @@ const DEFAULT_DIVERGENCE_DWELL_SECONDS: u64 = 300;
 // can never trip a destructive wipe. This is a false-positive guard, not a
 // correctness one — raise it to be stricter, never below 1.
 const DEFAULT_DIVERGENCE_MIN_GAP: i64 = 2;
+// How long Patroni must continuously report "start failed" before we issue a
+// reinitialize. A transient "start failed" poll is expected during a live
+// pg_basebackup clone (PR #61 wipes a partial pgdata on start, then the new
+// clone is in progress while Patroni's startup loop observes "start failed").
+// Without this dwell, the watcher immediately re-wipes a node that is already
+// cloning, compounding the loop: wipe → clone → "start failed" → wipe again.
+// 180 s is long enough that a healthy clone (even on a large primary) would
+// have advanced far enough for Patroni to report "creating replica" or better,
+// while short enough to act promptly on a genuinely wedged node.
+const DEFAULT_START_FAILED_DWELL_SECONDS: u64 = 180;
 
 // ====================================================================
 // Public types
@@ -136,6 +146,9 @@ pub struct Thresholds {
     pub max_attempts_per_hour: u32,
     pub divergence_dwell_secs: u64,
     pub divergence_min_gap: i64,
+    /// Seconds Patroni must continuously report "start failed" before a
+    /// reinitialize fires. Prevents re-wiping a node that is already cloning.
+    pub start_failed_dwell_secs: u64,
 }
 
 impl Default for Thresholds {
@@ -147,6 +160,7 @@ impl Default for Thresholds {
             max_attempts_per_hour: DEFAULT_MAX_ATTEMPTS_PER_HOUR,
             divergence_dwell_secs: DEFAULT_DIVERGENCE_DWELL_SECONDS,
             divergence_min_gap: DEFAULT_DIVERGENCE_MIN_GAP,
+            start_failed_dwell_secs: DEFAULT_START_FAILED_DWELL_SECONDS,
         }
     }
 }
@@ -172,6 +186,12 @@ pub struct SelfHealInputs {
     /// state, *or makes any forward progress* (timeline switch or WAL cursor
     /// advance), so only a true stall ever accrues.
     pub diverged_for_secs: u64,
+    /// Seconds Patroni has continuously reported this node's state as
+    /// "start failed". Resets to `0` the instant the state changes. The
+    /// dwell gate prevents a single transient "start failed" observation
+    /// during an active pg_basebackup clone from triggering an immediate
+    /// re-wipe that would abort the in-progress clone.
+    pub start_failed_for_secs: u64,
     pub last_action_at: Option<i64>,
     pub action_attempts_in_window: u32,
     pub recovery_seen_after_action: bool,
@@ -254,7 +274,8 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
         return SelfHealAction::Wait;
     }
 
-    let patroni_says_failed = s.patroni_state == "start failed";
+    let patroni_says_failed = s.patroni_state == "start failed"
+        && s.start_failed_for_secs >= s.thresholds.start_failed_dwell_secs;
     let is_crash_loop = s.pg_starts_in_window >= s.thresholds.crash_loop_threshold;
     let stalled_divergence = stalled_timeline_divergence(s);
 
@@ -804,6 +825,7 @@ pub fn spawn(volume_root: String, telemetry: Telemetry) {
         max_attempts_per_hour = cfg.thresholds.max_attempts_per_hour,
         divergence_dwell_secs = cfg.thresholds.divergence_dwell_secs,
         divergence_min_gap = cfg.thresholds.divergence_min_gap,
+        start_failed_dwell_secs = cfg.thresholds.start_failed_dwell_secs,
         volume_root = %volume_root,
         "self-heal: starting watcher"
     );
@@ -868,6 +890,10 @@ impl WatcherConfig {
                     DEFAULT_DIVERGENCE_MIN_GAP,
                 )
                 .max(1),
+                start_failed_dwell_secs: env_u64(
+                    "SELF_HEAL_START_FAILED_DWELL_SECONDS",
+                    DEFAULT_START_FAILED_DWELL_SECONDS,
+                ),
             },
         }
     }
@@ -921,6 +947,12 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
     // In-memory like `starts_seen` — a container restart re-arms Patroni's own
     // startup divergence check anyway.
     let mut divergence_window: Option<DivergenceWindow> = None;
+    // Epoch when Patroni first reported "start failed" in the current
+    // continuous run. Resets to None the instant the state changes.
+    // In-memory: a container restart implies Patroni restarted too, so the
+    // "start failed" observation is fresh and the dwell clock correctly
+    // restarts from zero.
+    let mut start_failed_since: Option<i64> = None;
 
     loop {
         if let Err(e) = iteration(
@@ -931,6 +963,7 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
             &mut action_pending_recovery,
             &mut gave_up_emitted,
             &mut divergence_window,
+            &mut start_failed_since,
             &telemetry,
         )
         .await
@@ -949,6 +982,7 @@ async fn iteration(
     action_pending_recovery: &mut Option<i64>,
     gave_up_emitted: &mut bool,
     divergence_window: &mut Option<DivergenceWindow>,
+    start_failed_since: &mut Option<i64>,
     telemetry: &Telemetry,
 ) -> Result<()> {
     let now = now_epoch();
@@ -1007,6 +1041,20 @@ async fn iteration(
     // fast-forwards within a poll or two and so never reaches the dwell; a
     // silently stuck one, frozen on a stale timeline, does.
     let patroni_state = local.state.clone().unwrap_or_default();
+
+    // Track how long Patroni has continuously reported "start failed". Reset
+    // the clock the instant the state changes — only an unbroken run accrues.
+    if patroni_state == "start failed" {
+        if start_failed_since.is_none() {
+            *start_failed_since = Some(now);
+        }
+    } else {
+        *start_failed_since = None;
+    }
+    let start_failed_for_secs = start_failed_since
+        .map(|t| now.saturating_sub(t).max(0) as u64)
+        .unwrap_or(0);
+
     // Highest WAL position Patroni reports for this node — the axis (besides the
     // timeline) on which a catching-up replica makes visible progress.
     let local_progress = local.xlog.and_then(|x| x.highest_location());
@@ -1064,6 +1112,7 @@ async fn iteration(
         local_timeline,
         leader_timeline,
         diverged_for_secs,
+        start_failed_for_secs,
         last_action_at,
         action_attempts_in_window,
         recovery_seen_after_action,
@@ -1458,6 +1507,7 @@ mod tests {
             local_timeline: None,
             leader_timeline: None,
             diverged_for_secs: 0,
+            start_failed_for_secs: 0,
             last_action_at: None,
             action_attempts_in_window: 0,
             recovery_seen_after_action: false,
@@ -1521,9 +1571,10 @@ mod tests {
     }
 
     #[test]
-    fn patroni_start_failed_triggers_reinit() {
+    fn patroni_start_failed_triggers_reinit_after_dwell() {
         let mut s = base();
         s.patroni_state = "start failed".into();
+        s.start_failed_for_secs = s.thresholds.start_failed_dwell_secs;
         match decide_self_heal(&s) {
             SelfHealAction::Reinitialize {
                 reason,
@@ -1534,6 +1585,32 @@ mod tests {
                 assert_eq!(trigger, ReinitTrigger::StartFailed);
             }
             other => panic!("expected Reinitialize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_failed_below_dwell_is_noop() {
+        // "start failed" observed but dwell not yet reached — a normal
+        // pg_basebackup clone is in progress and must not be interrupted.
+        let mut s = base();
+        s.patroni_state = "start failed".into();
+        s.start_failed_for_secs = s.thresholds.start_failed_dwell_secs - 1;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn start_failed_at_zero_dwell_acts_immediately() {
+        // When the operator sets the dwell to 0, revert to the old eager behaviour.
+        let mut s = base();
+        s.patroni_state = "start failed".into();
+        s.start_failed_for_secs = 0;
+        s.thresholds.start_failed_dwell_secs = 0;
+        match decide_self_heal(&s) {
+            SelfHealAction::Reinitialize {
+                trigger: ReinitTrigger::StartFailed,
+                ..
+            } => {}
+            other => panic!("expected Reinitialize(StartFailed), got {other:?}"),
         }
     }
 
