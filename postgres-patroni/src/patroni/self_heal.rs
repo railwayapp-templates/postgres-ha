@@ -332,51 +332,44 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
     let stalled_divergence = stalled_timeline_divergence(s);
     let stalled_replay = stalled_same_timeline_replay(s);
 
-    if patroni_says_failed
-        || is_crash_loop
-        || stalled_divergence.is_some()
-        || stalled_replay.is_some()
-    {
-        let (trigger, reason) = if patroni_says_failed {
-            (
-                ReinitTrigger::StartFailed,
-                "patroni_start_failed".to_string(),
-            )
-        } else if is_crash_loop {
-            (
-                ReinitTrigger::CrashLoop,
-                format!(
-                    "postgres_crash_loop:{}_restarts_in_{}s",
-                    s.pg_starts_in_window, s.thresholds.recent_window_secs
-                ),
-            )
-        } else if let Some((local, leader)) = stalled_divergence {
-            (
-                ReinitTrigger::TimelineDivergence,
-                format!(
-                    "timeline_diverged:tl{local}_behind_leader_tl{leader}_for_{}s",
-                    s.diverged_for_secs
-                ),
-            )
-        } else {
-            // Only reachable when stalled_replay is Some.
-            let tl = stalled_replay.expect("checked is_some above");
-            (
-                ReinitTrigger::WalReplayStalled,
-                format!(
-                    "wal_replay_stalled:tl{tl}_frozen_for_{}s",
-                    s.diverged_for_secs
-                ),
-            )
-        };
-        return SelfHealAction::Reinitialize {
-            reason,
-            attempt: s.action_attempts_in_window + 1,
-            trigger,
-        };
-    }
+    let (trigger, reason) = if patroni_says_failed {
+        (
+            ReinitTrigger::StartFailed,
+            "patroni_start_failed".to_string(),
+        )
+    } else if is_crash_loop {
+        (
+            ReinitTrigger::CrashLoop,
+            format!(
+                "postgres_crash_loop:{}_restarts_in_{}s",
+                s.pg_starts_in_window, s.thresholds.recent_window_secs
+            ),
+        )
+    } else if let Some((local, leader)) = stalled_divergence {
+        (
+            ReinitTrigger::TimelineDivergence,
+            format!(
+                "timeline_diverged:tl{local}_behind_leader_tl{leader}_for_{}s",
+                s.diverged_for_secs
+            ),
+        )
+    } else if let Some(tl) = stalled_replay {
+        (
+            ReinitTrigger::WalReplayStalled,
+            format!(
+                "wal_replay_stalled:tl{tl}_frozen_for_{}s",
+                s.diverged_for_secs
+            ),
+        )
+    } else {
+        return SelfHealAction::NoOp;
+    };
 
-    SelfHealAction::NoOp
+    SelfHealAction::Reinitialize {
+        reason,
+        attempt: s.action_attempts_in_window + 1,
+        trigger,
+    }
 }
 
 /// The structural guards shared by both the cross-timeline-divergence and
