@@ -253,19 +253,23 @@ fn env_or_clamp(var: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// pg_wal drop ceiling (MiB) and pgBackRest archive-push spool ceiling (MiB),
-/// both scaled DOWN from absolute defaults (500 / 5120) on small volumes —
-/// never up. Hobby's 1 GiB volume can't carry a 5 GiB spool, and 500 MiB of
-/// pg_wal is half that disk; on volumes ≥25 GiB the absolutes hold.
+/// pg_wal drop ceiling (MiB) and pgBackRest archive-push spool ceiling (MiB).
+/// Both scale DOWN from the absolute default (5120) on small volumes — never
+/// up. On volumes ≥10 GiB the absolute holds.
 ///
-/// Ratios: wal-drop ~10% of volume (hard-failure pg_wal hostage), queue-max
-/// ~50% of volume (transient-stall spool absorption). The ~10× spread between
-/// the two budgets is preserved across all volume sizes — hard failures still
-/// bail fast, transient stalls still absorb generously.
+/// wal-drop == queue-max, deliberately symmetric (was ~10% of volume / 500
+/// MiB cap, a ~10x smaller budget than queue-max — see 2026-07-01 Tigris
+/// "sjc" incident: transient S3 500s/connection-resets are exactly the
+/// failure pgBackRest's spool is designed to absorb generously, but the
+/// wrapper's own smaller pg_wal check tripped first, silently dropping WAL
+/// far short of the 5 GiB spool budget that should have covered the whole
+/// outage). Only the two explicit no-recovery-possible errors (NoSuchBucket,
+/// InvalidAccessKeyId, checked in pgbackrest-archive-push-wrapper.sh) bypass
+/// this and drop immediately — everything else, hard failure or transient,
+/// gets the full budget before we give up on it.
 ///
-/// Floors: 64 MiB wal-drop (~4 WAL segments — one short stall), 128 MiB
-/// queue-max (~8 segments). Below these archiving is effectively off and the
-/// dashboard surfaces it via pg_stat_archiver.
+/// Floor: 128 MiB (~8 WAL segments). Below this archiving is effectively off
+/// and the dashboard surfaces it via pg_stat_archiver.
 fn compute_volume_thresholds(volume_path: &str) -> (u32, u32) {
     use nix::sys::statvfs::statvfs;
 
@@ -278,12 +282,12 @@ fn compute_volume_thresholds(volume_path: &str) -> (u32, u32) {
         .unwrap_or(0);
 
     if total_mib == 0 {
-        info!("pgbackrest: volume size unknown; using absolute thresholds wal-drop=500 MiB queue-max=5 GiB");
-        return (500, 5 * 1024);
+        info!("pgbackrest: volume size unknown; using absolute threshold wal-drop=queue-max=5 GiB");
+        return (5 * 1024, 5 * 1024);
     }
 
-    let wal_drop = (total_mib / 10).clamp(64, 500);
     let queue_max = (total_mib / 2).clamp(128, 5 * 1024);
+    let wal_drop = queue_max;
 
     info!(
         volume_mib = total_mib,
@@ -522,8 +526,8 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 /// other is `pgbackrest-archive-push-wrapper.sh`'s `WAL_DROP_THRESHOLD_MB`
 /// on `pg_wal/`. Either tripping drops WAL and keeps the DB up at the cost
 /// of a truncated PITR window. Both ceilings come from
-/// `compute_volume_thresholds` (≤500 MiB pg_wal, ≤5 GiB spool on volumes
-/// ≥25 GiB; scaled down proportionally below that).
+/// `compute_volume_thresholds` and are now symmetric (≤5 GiB on volumes
+/// ≥10 GiB; scaled down proportionally below that).
 ///
 /// Spool lives under `$PGDATA/pgbackrest-spool` so segments staged but not
 /// yet pushed to S3 survive container restarts on the Railway volume.
@@ -1271,8 +1275,8 @@ async fn main() -> Result<()> {
     clear_pgbackrest_state_if_disabled(&config.data_dir);
 
     // Size archive-push-queue-max and pg_wal drop ceiling against the
-    // mounted volume. Both scale DOWN from absolute defaults (500 MiB /
-    // 5 GiB) on small volumes — never up. WAL_DROP_THRESHOLD_MB is exported
+    // mounted volume. Both scale DOWN from the same absolute default
+    // (5 GiB) on small volumes — never up. WAL_DROP_THRESHOLD_MB is exported
     // here because the bash archive_command wrapper reads it from env;
     // patroni → postgres → archive_command inherits.
     let (wal_drop_mib, queue_max_mib) = compute_volume_thresholds(&volume_root);

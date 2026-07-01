@@ -26,14 +26,14 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // (60s) plus failover-detection time.
     //
     // archive_command points at the never-halt wrapper rather than calling
-    // pgbackrest directly. The wrapper measures pg_wal/ on hard failures
-    // (bad creds, deleted bucket, expired keys) and drops segments past
-    // PGBACKREST_DROP_THRESHOLD_MB (default 500 MiB) to keep Postgres
-    // running. pgBackRest itself is configured async with
-    // archive-push-queue-max=5GiB (in /etc/pgbackrest/pgbackrest.conf,
-    // rendered by patroni-runner) so transient S3 stalls absorb in the
-    // spool. PITR window truncates on either path; DB stays up. This is
-    // the explicit architectural reason we picked pgBackRest over wal-g.
+    // pgbackrest directly. The wrapper measures pg_wal/ on archive failures
+    // and drops segments past WAL_DROP_THRESHOLD_MB (default 5GiB, matching
+    // pgBackRest's own archive-push-queue-max=5GiB in
+    // /etc/pgbackrest/pgbackrest.conf, rendered by patroni-runner) to keep
+    // Postgres running; only the two known no-recovery-possible errors
+    // (bad creds, deleted bucket) bypass the threshold and drop immediately.
+    // PITR window truncates on either path; DB stays up. This is the
+    // explicit architectural reason we picked pgBackRest over wal-g.
     // track_commit_timestamp lets pg_last_committed_xact() return the
     // wall-clock time of the last commit. The PITR picker uses that as its
     // upper bound: `recovery_target_time` only matches commit record
