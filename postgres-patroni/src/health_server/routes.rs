@@ -33,15 +33,15 @@ async fn primary_handler(State(config): State<HealthServerConfig>) -> impl IntoR
             debug!(error = %e, "Primary check: PostgreSQL unreachable, falling back to Patroni");
             match check_patroni_role(&config, "primary").await {
                 Ok(true) => {
-                    info!("Primary check: OK (via Patroni fallback)");
+                    debug!("Primary check: OK (via Patroni fallback)");
                     (StatusCode::OK, "primary")
                 }
                 Ok(false) => {
-                    info!("Primary check: FAIL (via Patroni fallback)");
+                    debug!("Primary check: FAIL (via Patroni fallback)");
                     (StatusCode::SERVICE_UNAVAILABLE, "replica")
                 }
                 Err(e) => {
-                    info!(error = %e, "Primary check: FAIL (Patroni also unreachable)");
+                    debug!(error = %e, "Primary check: FAIL (Patroni also unreachable)");
                     (StatusCode::SERVICE_UNAVAILABLE, "error")
                 }
             }
