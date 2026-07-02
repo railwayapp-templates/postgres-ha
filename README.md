@@ -93,7 +93,7 @@ Image-level tuning knobs (pgBackRest-native, internal):
 
 | Env var | Purpose |
 |---|---|
-| `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `500`). Outside the `PGBACKREST_*` namespace because pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
+| `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `5120`, matching `archive-push-queue-max`). Outside the `PGBACKREST_*` namespace because pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
 | `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
 | `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default `1` (WAL replay is serial). |
 | `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 16)`. |
@@ -117,17 +117,24 @@ archiving with no config re-push. Residual failover RPO is `archive_timeout`
 pending `archive_status/.ready` markers on the new leader to close most of
 that gap on planned switchover.
 
-**The never-halt guarantee** comes from two orthogonal thresholds:
+**The never-halt guarantee** comes from two thresholds, sized identically
+and checked as one combined budget:
 
 - `archive-push-queue-max=5GiB` (image-baked) governs the **spool**.
-  Trips on transient S3 stalls — async worker keeps retrying and most
-  segments eventually land. Generous buffer to absorb multi-hour outages.
-- `WAL_DROP_THRESHOLD_MB=500` (default) governs **`pg_wal/`**
-  when pgbackrest's foreground returns non-zero. Trips on hard failures
-  (bad creds, deleted bucket) where retrying without operator
-  intervention has zero chance of success. The `archive_command` is the
-  wrapper script (not pgbackrest directly), which measures `pg_wal/`
-  on failure and drops segments past the threshold to keep Postgres up.
+  Trips when the async worker can't keep up. Generous buffer to absorb
+  multi-hour outages — most segments eventually land once it clears.
+- `WAL_DROP_THRESHOLD_MB=5120` (default) governs **`pg_wal/` + the spool,
+  combined**, when pgbackrest's foreground returns non-zero. The
+  `archive_command` is the wrapper script (not pgbackrest directly), which
+  sums `pg_wal/` and spool directory sizes on failure and drops segments
+  past the threshold to keep Postgres up. Checking the sum — not `pg_wal/`
+  alone — matters because the two can each fill for different reasons at
+  once (foreground copy-to-spool failing vs. background upload stalled);
+  identical-but-independent caps would let a single outage hold up to ~2x
+  the intended budget on disk. Only two known no-recovery-possible errors
+  (bad creds, deleted bucket) bypass this and drop immediately regardless
+  of size — every other failure, including transient S3-side errors, gets
+  the same generous combined budget before anything is dropped.
 
 Either threshold tripping truncates the PITR window; the database keeps
 running. This is the explicit reason this image uses pgBackRest instead
