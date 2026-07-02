@@ -257,7 +257,7 @@ fn env_or_clamp(var: &str, default: u32) -> u32 {
 /// Both scale DOWN from the absolute default (5120) on small volumes — never
 /// up. On volumes ≥10 GiB the absolute holds.
 ///
-/// wal-drop == queue-max, deliberately symmetric (was ~10% of volume / 500
+/// wal-drop == queue-max, deliberately identical (was ~10% of volume / 500
 /// MiB cap, a ~10x smaller budget than queue-max — see 2026-07-01 Tigris
 /// "sjc" incident: transient S3 500s/connection-resets are exactly the
 /// failure pgBackRest's spool is designed to absorb generously, but the
@@ -267,6 +267,10 @@ fn env_or_clamp(var: &str, default: u32) -> u32 {
 /// InvalidAccessKeyId, checked in pgbackrest-archive-push-wrapper.sh) bypass
 /// this and drop immediately — everything else, hard failure or transient,
 /// gets the full budget before we give up on it.
+///
+/// The wrapper checks pg_wal + spool against this value as ONE combined sum,
+/// not pg_wal alone — identical caps on two independently-checked
+/// directories would let a single outage hold up to ~2x this budget on disk.
 ///
 /// Floor: 128 MiB (~8 WAL segments). Below this archiving is effectively off
 /// and the dashboard surfaces it via pg_stat_archiver.

@@ -2,16 +2,17 @@
 # pgbackrest-archive-push-wrapper.sh — invoked by Postgres as archive_command.
 #
 # Wraps `pgbackrest archive-push` so that any kind of archive failure (hard
-# repo error, stuck async worker, anything else) cannot fill pg_wal/ and halt
-# Postgres. When pgbackrest fails AND pg_wal/ has grown past a threshold
-# (WAL_DROP_THRESHOLD_MB; sized by patroni_runner's compute_volume_thresholds
-# to min(5 GiB, ~50% of volume) with operator override via this env var
-# or the legacy PGBACKREST_DROP_THRESHOLD_MB), the wrapper returns success
-# to Postgres anyway. Postgres recycles the WAL segment as if archiving were
-# disabled. The PITR window gets a coverage gap from this segment forward;
-# the dashboard reads pg_stat_archiver to surface "PITR broken — fix
-# archiving config" so the underlying issue (bad creds, deleted bucket,
-# expired keys, …) gets fixed.
+# repo error, stuck async worker, anything else) cannot fill disk and halt
+# Postgres. When pgbackrest fails AND pg_wal/ + pgbackrest-spool/ combined
+# have grown past a threshold (WAL_DROP_THRESHOLD_MB; sized by
+# patroni_runner's compute_volume_thresholds to min(5 GiB, ~50% of volume)
+# with operator override via this env var or the legacy
+# PGBACKREST_DROP_THRESHOLD_MB), the wrapper returns success to Postgres
+# anyway. Postgres recycles the WAL segment as if archiving were disabled.
+# The PITR window gets a coverage gap from this segment forward; the
+# dashboard reads pg_stat_archiver to surface "PITR broken — fix archiving
+# config" so the underlying issue (bad creds, deleted bucket, expired
+# keys, …) gets fixed.
 #
 # Special case: if the bucket actively does not exist (S3 NoSuchBucket error)
 # or its credentials were revoked (InvalidAccessKeyId), there is no recovery
@@ -20,20 +21,27 @@
 # (returns 0) regardless of pg_wal size.
 #
 # WAL_DROP_THRESHOLD_MB matches pgBackRest's own archive-push-queue-max
-# (also ≤5 GiB, same volume-proportional sizing) rather than using a smaller
-# cap. Before 2026-07-01 this threshold was ~10x smaller (≤500 MiB) on the
-# theory that anything reaching this wrapper's non-zero-exit path was a
-# hard, unrecoverable failure (bad creds, deleted bucket) not worth holding
-# disk for — but that's wrong for transient S3-side errors (500s, timeouts,
-# connection resets), which is exactly what pgBackRest's own
-# archive-push-queue-max spool is designed to absorb generously, "most
-# segments eventually get pushed" once the outage clears. Those errors also
-# return non-zero from pgbackrest's foreground and used to trip this
-# threshold 10x sooner than the spool's own budget, silently truncating the
-# PITR window during an outage the spool could otherwise have ridden out.
-# Only the two explicit no-recovery-possible errors above bypass the
-# threshold and drop immediately; every other failure — hard or transient —
-# now gets the same budget as the spool before we give up on it.
+# (also ≤5 GiB, same volume-proportional sizing), and the two are checked as
+# ONE combined budget (pg_wal + spool, not each independently), rather than
+# the pre-2026-07-01 design of two INDEPENDENT thresholds. Before that date
+# this threshold was ~10x smaller (≤500 MiB) on the theory that anything
+# reaching this wrapper's non-zero-exit path was a hard, unrecoverable
+# failure (bad creds, deleted bucket) not worth holding disk for — but
+# that's wrong for transient S3-side errors (500s, timeouts, connection
+# resets), which is exactly what pgBackRest's own archive-push-queue-max
+# spool is designed to absorb generously, "most segments eventually get
+# pushed" once the outage clears. Those errors also return non-zero from
+# pgbackrest's foreground and used to trip this threshold 10x sooner than
+# the spool's own budget, silently truncating the PITR window during an
+# outage the spool could otherwise have ridden out. Simply raising this
+# threshold to match the spool's without combining them would have let the
+# two accumulate independently — up to ~2x the intended on-disk budget when
+# both pg_wal (foreground copy-to-spool failing) and the spool (foreground
+# succeeding, background upload stalled) fill up at once. Summing them
+# means the combined WAL-related footprint during any outage — transient
+# or hard — never exceeds the single configured budget. Only the two
+# explicit no-recovery-possible errors above bypass it and drop
+# immediately.
 #
 # Below the threshold the wrapper surfaces pgbackrest's failure to Postgres
 # normally, so transient errors retry on the next archive_timeout instead
@@ -120,9 +128,20 @@ if [ -z "${PGWAL_BYTES:-}" ]; then
   exit "$PGB_RC"
 fi
 
-if [ "$PGWAL_BYTES" -ge "$PGWAL_THRESHOLD_BYTES" ]; then
+# Shared budget: pg_wal/ and pgbackrest-spool/ are two separate directories
+# both holding WAL bytes that haven't reached S3, so they must count against
+# the SAME threshold, not each get their own. Without this, a stall could
+# hold WAL_DROP_THRESHOLD_MB in pg_wal (foreground copy-to-spool failing)
+# AND archive-push-queue-max in the spool (foreground succeeding, background
+# upload stalled) at the same time — up to ~2x the intended budget on disk.
+SPOOL_BYTES=$(du -sb "$PGDATA/pgbackrest-spool" 2>/dev/null | awk '{print $1}')
+: "${SPOOL_BYTES:=0}"
+TOTAL_BYTES=$(( PGWAL_BYTES + SPOOL_BYTES ))
+
+if [ "$TOTAL_BYTES" -ge "$PGWAL_THRESHOLD_BYTES" ]; then
   PGWAL_MB=$(( PGWAL_BYTES / 1024 / 1024 ))
-  echo "pgbackrest-wrapper: pg_wal at ${PGWAL_MB} MiB (threshold ${PGWAL_THRESHOLD_MB} MiB) and archive-push failing; dropping ${WAL_FILE} to keep Postgres up" >&2
+  SPOOL_MB=$(( SPOOL_BYTES / 1024 / 1024 ))
+  echo "pgbackrest-wrapper: pg_wal+spool at ${PGWAL_MB}+${SPOOL_MB} MiB (threshold ${PGWAL_THRESHOLD_MB} MiB combined) and archive-push failing; dropping ${WAL_FILE} to keep Postgres up" >&2
   # Mark the gap so the backup watcher takes a fresh full once archiving
   # recovers. Without this, gap detection collapses to single-signal
   # (failed_count growth from foreground archive_command failures), but the

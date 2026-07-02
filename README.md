@@ -117,20 +117,24 @@ archiving with no config re-push. Residual failover RPO is `archive_timeout`
 pending `archive_status/.ready` markers on the new leader to close most of
 that gap on planned switchover.
 
-**The never-halt guarantee** comes from two thresholds, now sized
-symmetrically:
+**The never-halt guarantee** comes from two thresholds, sized identically
+and checked as one combined budget:
 
 - `archive-push-queue-max=5GiB` (image-baked) governs the **spool**.
   Trips when the async worker can't keep up. Generous buffer to absorb
   multi-hour outages — most segments eventually land once it clears.
-- `WAL_DROP_THRESHOLD_MB=5120` (default) governs **`pg_wal/`**
-  when pgbackrest's foreground returns non-zero. The `archive_command` is
-  the wrapper script (not pgbackrest directly), which measures `pg_wal/`
-  on failure and drops segments past the threshold to keep Postgres up.
-  Only two known no-recovery-possible errors (bad creds, deleted bucket)
-  bypass this and drop immediately regardless of size — every other
-  failure, including transient S3-side errors, gets the same generous
-  budget as the spool before anything is dropped.
+- `WAL_DROP_THRESHOLD_MB=5120` (default) governs **`pg_wal/` + the spool,
+  combined**, when pgbackrest's foreground returns non-zero. The
+  `archive_command` is the wrapper script (not pgbackrest directly), which
+  sums `pg_wal/` and spool directory sizes on failure and drops segments
+  past the threshold to keep Postgres up. Checking the sum — not `pg_wal/`
+  alone — matters because the two can each fill for different reasons at
+  once (foreground copy-to-spool failing vs. background upload stalled);
+  identical-but-independent caps would let a single outage hold up to ~2x
+  the intended budget on disk. Only two known no-recovery-possible errors
+  (bad creds, deleted bucket) bypass this and drop immediately regardless
+  of size — every other failure, including transient S3-side errors, gets
+  the same generous combined budget before anything is dropped.
 
 Either threshold tripping truncates the PITR window; the database keeps
 running. This is the explicit reason this image uses pgBackRest instead
