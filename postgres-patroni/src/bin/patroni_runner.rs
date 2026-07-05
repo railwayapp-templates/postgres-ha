@@ -13,7 +13,8 @@ use nix::unistd::{ForkResult, Pid};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
-    spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
+    spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, wal_corruption,
+    Config,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
@@ -518,12 +519,17 @@ fn wipe_pgdata_contents(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Piped rather than inherited: `wal_corruption::spawn_stdio_forwarder` reads
+/// both streams to detect the WAL-corruption self-heal signal, then forwards
+/// every line straight through to this process's own stdout/stderr — so
+/// Patroni/Postgres's output remains as visible in the container's logs as
+/// `Stdio::inherit()` made it, this just adds a tap on the way out.
 async fn start_patroni() -> Result<tokio::process::Child> {
     let child = Command::new("patroni")
         .arg("/etc/patroni/patroni.yml")
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start patroni")?;
 
@@ -1582,7 +1588,13 @@ async fn async_main() -> Result<()> {
     let _health_handle = health_server::start(health_config).await?;
 
     // Start Patroni and run monitoring loop
-    let child = start_patroni().await?;
+    let mut child = start_patroni().await?;
+
+    // Tap the now-piped stdio for the WAL-corruption self-heal signal, then
+    // forward every line straight through to our own stdout/stderr — must be
+    // spawned immediately after start_patroni() so nothing blocks on a full
+    // pipe buffer before a reader is attached.
+    let corruption_tracker = wal_corruption::spawn_stdio_forwarder(&mut child);
 
     // Spawn a DCS reconcile task that retries indefinitely with exponential
     // backoff until it succeeds. This waits for Patroni's REST API to come up,
@@ -1635,9 +1647,10 @@ async fn async_main() -> Result<()> {
     // Spawn the replica-only self-heal watcher. Polls Patroni REST for
     // postmaster_start_time and POSTs /reinitialize when a replica is
     // crash-looping in a state Patroni's built-in recovery doesn't
-    // catch (notably WAL-too-old after demoted-leader pg_rewind). No-op
+    // catch (notably WAL-too-old after demoted-leader pg_rewind, or a
+    // same-timeline WAL-corruption stall caught via corruption_tracker). No-op
     // on leaders. Honors SELF_HEAL_DISABLED=1 as a kill switch.
-    spawn_self_heal_watcher(volume_root.clone(), telemetry.clone());
+    spawn_self_heal_watcher(volume_root.clone(), telemetry.clone(), corruption_tracker);
 
     run_monitoring_loop(&config, child, &telemetry).await
 }
