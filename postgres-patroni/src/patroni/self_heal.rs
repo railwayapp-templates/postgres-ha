@@ -55,6 +55,28 @@
 //!    see the detection section comment for the full argument. The startup gate
 //!    calls this before wiping.
 //!
+//! 3. **WAL-corruption log watch ([`wal_corruption`] submodule)** — a third
+//!    manifestation none of the above two catch: a replica whose *local* WAL
+//!    replay hits a corrupt record on the *same* timeline the leader is on (no
+//!    gap for `timeline_divergence_present` to see), with `postmaster_start_time`
+//!    never changing (no restart, so no crash-loop signal either) and Patroni
+//!    still polling `running`/`streaming` (it only checks connectivity, not
+//!    replay progress). Postgres logs a small, fixed set of WAL-reader error
+//!    strings when this happens (`record with incorrect prev-link`, `invalid
+//!    resource manager ID`, etc. — the handful of corruption messages
+//!    `xlogreader.c` emits) and retries the same LSN every few seconds forever.
+//!    Unlike the other two signals this one genuinely requires reading
+//!    Postgres's own log output rather than a REST poll — there is no
+//!    catalog/API that exposes "redo is stuck on a bad record". `patroni-runner`
+//!    already owns the child's stdio (it must forward it to the container's
+//!    own stdout/stderr either way), so the watcher taps that same stream: see
+//!    [`wal_corruption::spawn_stdio_forwarder`] for the forwarding+matching
+//!    side and [`wal_corruption::CorruptionTracker`] for what feeds
+//!    `SelfHealInputs::wal_corruption_for_secs` below. The specific strings
+//!    matched are corruption-only (Postgres does not emit them for a merely
+//!    slow or idle replica), so a short dwell is enough to rule out a single
+//!    transient log line without risking a false trigger.
+//!
 //! ## Action
 //! `POST /reinitialize {"force": true}` on the local Patroni REST API.
 //! Patroni wipes pgdata and runs a full pg_basebackup from the leader.
@@ -126,6 +148,19 @@ const DEFAULT_DIVERGENCE_MIN_GAP: i64 = 2;
 // have advanced far enough for Patroni to report "creating replica" or better,
 // while short enough to act promptly on a genuinely wedged node.
 const DEFAULT_START_FAILED_DWELL_SECONDS: u64 = 180;
+// How long the WAL-corruption pattern must have been recurring, continuously,
+// before we reinitialize. The signature repeats every ~5s once a replica is
+// truly stuck on a bad record, so this only needs to be long enough to rule
+// out a single transient log line — nowhere near the multi-minute dwells used
+// for divergence/start-failed, which guard against much slower-moving,
+// ambiguous signals.
+const DEFAULT_WAL_CORRUPTION_DWELL_SECONDS: u64 = 60;
+// How long without a fresh matching log line before we consider a previously
+// -seen corruption signature cleared (replica reinitialized some other way,
+// or — extremely unlikely given the messages are corruption-only — genuinely
+// resolved). Generous relative to the ~5s repeat cadence so a single missed
+// poll can't reset the dwell early.
+const DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS: u64 = 30;
 
 // ====================================================================
 // Public types
@@ -149,6 +184,9 @@ pub struct Thresholds {
     /// Seconds Patroni must continuously report "start failed" before a
     /// reinitialize fires. Prevents re-wiping a node that is already cloning.
     pub start_failed_dwell_secs: u64,
+    /// Seconds the WAL-corruption log signature must have been recurring,
+    /// continuously, before a reinitialize fires.
+    pub wal_corruption_dwell_secs: u64,
 }
 
 impl Default for Thresholds {
@@ -161,6 +199,7 @@ impl Default for Thresholds {
             divergence_dwell_secs: DEFAULT_DIVERGENCE_DWELL_SECONDS,
             divergence_min_gap: DEFAULT_DIVERGENCE_MIN_GAP,
             start_failed_dwell_secs: DEFAULT_START_FAILED_DWELL_SECONDS,
+            wal_corruption_dwell_secs: DEFAULT_WAL_CORRUPTION_DWELL_SECONDS,
         }
     }
 }
@@ -192,6 +231,12 @@ pub struct SelfHealInputs {
     /// during an active pg_basebackup clone from triggering an immediate
     /// re-wipe that would abort the in-progress clone.
     pub start_failed_for_secs: u64,
+    /// Seconds the WAL-corruption log signature (see [`wal_corruption`]) has
+    /// been recurring continuously in this node's Postgres output. `0` when
+    /// no matching line has been seen recently. Unlike the timeline/start-
+    /// failed dwells this tracks a recurring *event*, not a polled state, but
+    /// composes the same way: only a sustained run triggers a reinit.
+    pub wal_corruption_for_secs: u64,
     pub last_action_at: Option<i64>,
     pub action_attempts_in_window: u32,
     pub recovery_seen_after_action: bool,
@@ -207,6 +252,7 @@ pub enum ReinitTrigger {
     StartFailed,
     CrashLoop,
     TimelineDivergence,
+    WalCorruption,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -278,8 +324,13 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
         && s.start_failed_for_secs >= s.thresholds.start_failed_dwell_secs;
     let is_crash_loop = s.pg_starts_in_window >= s.thresholds.crash_loop_threshold;
     let stalled_divergence = stalled_timeline_divergence(s);
+    let stalled_wal_corruption = wal_corruption_stalled(s);
 
-    if patroni_says_failed || is_crash_loop || stalled_divergence.is_some() {
+    if patroni_says_failed
+        || is_crash_loop
+        || stalled_divergence.is_some()
+        || stalled_wal_corruption
+    {
         let (trigger, reason) = if patroni_says_failed {
             (
                 ReinitTrigger::StartFailed,
@@ -293,15 +344,19 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
                     s.pg_starts_in_window, s.thresholds.recent_window_secs
                 ),
             )
-        } else {
-            // Only reachable when stalled_divergence is Some.
-            let (local, leader) = stalled_divergence.expect("checked is_some above");
+        } else if let Some((local, leader)) = stalled_divergence {
             (
                 ReinitTrigger::TimelineDivergence,
                 format!(
                     "timeline_diverged:tl{local}_behind_leader_tl{leader}_for_{}s",
                     s.diverged_for_secs
                 ),
+            )
+        } else {
+            // Only reachable when stalled_wal_corruption is true.
+            (
+                ReinitTrigger::WalCorruption,
+                format!("wal_corruption_detected_for_{}s", s.wal_corruption_for_secs),
             )
         };
         return SelfHealAction::Reinitialize {
@@ -312,6 +367,25 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
     }
 
     SelfHealAction::NoOp
+}
+
+/// The WAL-corruption case: a replica Patroni still considers healthy
+/// (`running`/`streaming`) whose Postgres output has been repeating one of
+/// the [`wal_corruption`] signature strings continuously past the dwell.
+/// Gated on the same role/state guard as [`timeline_divergence_present`] —
+/// never a leader (destructive), never mid-clone (a fresh clone's early log
+/// lines are not this signature anyway, but the state check keeps the two
+/// paths structurally consistent). Unlike divergence this does not require a
+/// timeline gap: the whole point is to catch the *same-timeline* stall that
+/// gap-based detection cannot see.
+fn wal_corruption_stalled(s: &SelfHealInputs) -> bool {
+    if !matches!(s.role, Role::Replica) {
+        return false;
+    }
+    if s.patroni_state != "running" && s.patroni_state != "streaming" {
+        return false;
+    }
+    s.wal_corruption_for_secs >= s.thresholds.wal_corruption_dwell_secs
 }
 
 /// Pure predicate for "this looks like a stuck-behind replica right now",
@@ -800,17 +874,259 @@ pub async fn confirm_wal_unrecoverable(client: &reqwest::Client, config: &Config
 }
 
 // ====================================================================
+// WAL-corruption log watch (third self-heal signal — see module doc)
+// ====================================================================
+
+pub mod wal_corruption {
+    //! Watches Postgres's own log output (via the stdio patroni-runner already
+    //! owns for `patroni`'s child process) for the fixed set of WAL-redo
+    //! corruption error strings, and exposes a dwell counter the self-heal
+    //! watcher polls each iteration. See the parent module doc, signal 3, for
+    //! why this is the one self-heal signal that has to read logs at all.
+
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+    use tokio::process::Child;
+    use tracing::warn;
+
+    /// The fixed set of Postgres WAL-reader error strings emitted only when
+    /// redo/replay hits a corrupt or truncated record (see `xlogreader.c`'s
+    /// `report_invalid_record` call sites). None of these fire for a merely
+    /// idle or slow-but-healthy replica — they are corruption-only — so a
+    /// short recurrence dwell is sufficient to act on without risking a false
+    /// positive on a legitimately quiet database.
+    const CORRUPTION_PATTERNS: &[&str] = &[
+        "record with incorrect prev-link",
+        "invalid record length",
+        "invalid resource manager ID",
+        "invalid magic number in log segment",
+        "incorrect resource manager data checksum",
+        "unexpected pageaddr",
+        "record with incorrect crc",
+        "invalid contrecord length",
+    ];
+
+    fn matches_corruption_pattern(line: &str) -> bool {
+        CORRUPTION_PATTERNS.iter().any(|p| line.contains(p))
+    }
+
+    fn now_epoch() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct Observation {
+        first_seen: i64,
+        last_seen: i64,
+    }
+
+    /// Shared, cheaply-cloneable handle: the stdio forwarder task(s) call
+    /// [`CorruptionTracker::observe`] on every matching line; the self-heal
+    /// watcher calls [`CorruptionTracker::dwell_secs`] once per poll to build
+    /// `SelfHealInputs::wal_corruption_for_secs`. A plain `std::sync::Mutex`
+    /// is fine here — every critical section is a handful of integer
+    /// comparisons, never held across an `.await`.
+    #[derive(Clone, Default)]
+    pub struct CorruptionTracker(Arc<Mutex<Option<Observation>>>);
+
+    impl CorruptionTracker {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Record a matching line observed at `now`. If the previous match was
+        /// more than `DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS` ago, the prior
+        /// run is treated as cleared and a fresh window opens — otherwise this
+        /// extends the existing window without moving `first_seen`, which is
+        /// what lets the dwell in `dwell_secs` accrue across polls.
+        fn observe(&self, now: i64) {
+            let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let stale = matches!(*guard, Some(o)
+                if (now.saturating_sub(o.last_seen) as u64) > super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS);
+            *guard = Some(match *guard {
+                Some(o) if !stale => Observation {
+                    first_seen: o.first_seen,
+                    last_seen: now,
+                },
+                _ => Observation {
+                    first_seen: now,
+                    last_seen: now,
+                },
+            });
+        }
+
+        /// Seconds the corruption signature has been recurring continuously,
+        /// as of `now`. `0` when nothing has ever matched, or when the most
+        /// recent match is older than the reset gap (recurrence stopped —
+        /// treated as cleared rather than an ever-growing stale dwell). Pure
+        /// read: does not mutate, so the next [`Self::observe`] decides
+        /// whether to reset the window, not this call.
+        pub fn dwell_secs(&self, now: i64) -> u64 {
+            let guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            match *guard {
+                Some(o)
+                    if (now.saturating_sub(o.last_seen) as u64)
+                        <= super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS =>
+                {
+                    now.saturating_sub(o.first_seen).max(0) as u64
+                }
+                _ => 0,
+            }
+        }
+    }
+
+    /// Forward one line to this process's own stdout/stderr — preserving the
+    /// external log visibility `Stdio::inherit()` used to provide directly —
+    /// and record it against the tracker if it matches. A write failure here
+    /// must never stop the reader loop: losing one duplicated log line is far
+    /// cheaper than losing the ability to detect the next occurrence.
+    async fn forward_and_observe<W: AsyncWrite + Unpin>(
+        mut out: W,
+        line: &str,
+        tracker: &CorruptionTracker,
+    ) {
+        let _ = out.write_all(line.as_bytes()).await;
+        let _ = out.write_all(b"\n").await;
+        let _ = out.flush().await;
+        if matches_corruption_pattern(line) {
+            tracker.observe(now_epoch());
+        }
+    }
+
+    async fn pump<R: AsyncRead + Unpin>(reader: R, tracker: CorruptionTracker, to_stdout: bool) {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if to_stdout {
+                        forward_and_observe(tokio::io::stdout(), &line, &tracker).await;
+                    } else {
+                        forward_and_observe(tokio::io::stderr(), &line, &tracker).await;
+                    }
+                }
+                Ok(None) => return, // EOF: child closed this stream (process exited).
+                Err(e) => {
+                    warn!(error = %e, "self-heal: wal-corruption stdio pump read error, stopping");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Take `child`'s stdout/stderr — it must have been spawned with
+    /// `Stdio::piped()` on both — spawn a forwarding+matching task for each,
+    /// and return the shared tracker the self-heal watcher polls. This
+    /// replaces `Stdio::inherit()` at the call site; it does not reduce
+    /// visibility of Patroni/Postgres's own logs, it only routes them through
+    /// this process first so the corruption signal can be observed too.
+    pub fn spawn_stdio_forwarder(child: &mut Child) -> CorruptionTracker {
+        let tracker = CorruptionTracker::new();
+        match child.stdout.take() {
+            Some(stdout) => {
+                tokio::spawn(pump(stdout, tracker.clone(), true));
+            }
+            None => warn!(
+                "self-heal: patroni child has no piped stdout — WAL-corruption watch disabled for stdout"
+            ),
+        }
+        match child.stderr.take() {
+            Some(stderr) => {
+                tokio::spawn(pump(stderr, tracker.clone(), false));
+            }
+            None => warn!(
+                "self-heal: patroni child has no piped stderr — WAL-corruption watch disabled for stderr"
+            ),
+        }
+        tracker
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn matches_known_corruption_strings() {
+            assert!(matches_corruption_pattern(
+                "2026-07-05 16:48:48.476 UTC [122] LOG:  record with incorrect prev-link 0/863 at 1/300000A0"
+            ));
+            assert!(matches_corruption_pattern(
+                "2026-07-05 16:48:49.828 UTC [120] LOG:  invalid resource manager ID 127 at 0/7B0000A0"
+            ));
+        }
+
+        #[test]
+        fn does_not_match_unrelated_wal_lines() {
+            assert!(!matches_corruption_pattern(
+                "LOG:  waiting for WAL to become available at 1/300000B8"
+            ));
+            assert!(!matches_corruption_pattern(
+                "INFO: no action. I am (postgres-2), a secondary, and following a leader (postgres-3)"
+            ));
+        }
+
+        #[test]
+        fn tracker_accrues_while_recurring() {
+            // Each successive observe() lands within the reset gap (30s) of
+            // the last, so first_seen must hold across all three even though
+            // no single gap is zero.
+            let t = CorruptionTracker::new();
+            t.observe(1_000);
+            assert_eq!(t.dwell_secs(1_000), 0);
+            t.observe(1_010);
+            assert_eq!(t.dwell_secs(1_010), 10);
+            t.observe(1_030);
+            assert_eq!(
+                t.dwell_secs(1_030),
+                30,
+                "first_seen must not reset while recurrence continues within the gap"
+            );
+        }
+
+        #[test]
+        fn tracker_clears_after_reset_gap() {
+            let t = CorruptionTracker::new();
+            t.observe(1_000);
+            // No further observation; asking well past the reset gap reads as cleared.
+            assert_eq!(t.dwell_secs(1_100), 0);
+            // A later observe() starts a fresh window rather than resuming the old one.
+            t.observe(1_200);
+            assert_eq!(t.dwell_secs(1_200), 0);
+            assert_eq!(t.dwell_secs(1_210), 10);
+        }
+
+        #[test]
+        fn never_observed_is_zero_dwell() {
+            let t = CorruptionTracker::new();
+            assert_eq!(t.dwell_secs(9_999), 0);
+        }
+    }
+}
+
+// ====================================================================
 // Supervisor (spawn + respawn loop)
 // ====================================================================
 
 /// Spawn the self-heal watcher as a long-running background task.
 /// Honors `SELF_HEAL_DISABLED=1` as an operator kill switch.
 ///
+/// `corruption_tracker` is the shared handle from
+/// [`wal_corruption::spawn_stdio_forwarder`] — the caller spawns that
+/// forwarder against the `patroni` child's piped stdio and passes the
+/// returned tracker straight through here so this watcher can poll it.
+///
 /// Same shape as [`backup_watcher::spawn`]: an outer respawn loop wraps
 /// the main loop in `tokio::task::spawn` so a panic surfaces as
 /// `JoinError::is_panic()` instead of aborting patroni-runner. 5s sleep
 /// between respawns prevents CPU burn on rapid failures.
-pub fn spawn(volume_root: String, telemetry: Telemetry) {
+pub fn spawn(
+    volume_root: String,
+    telemetry: Telemetry,
+    corruption_tracker: wal_corruption::CorruptionTracker,
+) {
     if disabled() {
         info!("self-heal: SELF_HEAL_DISABLED=1, watcher inactive");
         return;
@@ -826,6 +1142,7 @@ pub fn spawn(volume_root: String, telemetry: Telemetry) {
         divergence_dwell_secs = cfg.thresholds.divergence_dwell_secs,
         divergence_min_gap = cfg.thresholds.divergence_min_gap,
         start_failed_dwell_secs = cfg.thresholds.start_failed_dwell_secs,
+        wal_corruption_dwell_secs = cfg.thresholds.wal_corruption_dwell_secs,
         volume_root = %volume_root,
         "self-heal: starting watcher"
     );
@@ -835,7 +1152,8 @@ pub fn spawn(volume_root: String, telemetry: Telemetry) {
             let vr = volume_root.clone();
             let t = telemetry.clone();
             let c = cfg.clone();
-            let h = tokio::task::spawn(async move { run(vr, t, c).await });
+            let ct = corruption_tracker.clone();
+            let h = tokio::task::spawn(async move { run(vr, t, c, ct).await });
             match h.await {
                 Ok(Ok(())) => warn!("self-heal: run loop returned cleanly — respawning in 5s"),
                 Ok(Err(e)) => warn!(error = %e, "self-heal: run loop errored — respawning in 5s"),
@@ -894,6 +1212,10 @@ impl WatcherConfig {
                     "SELF_HEAL_START_FAILED_DWELL_SECONDS",
                     DEFAULT_START_FAILED_DWELL_SECONDS,
                 ),
+                wal_corruption_dwell_secs: env_u64(
+                    "SELF_HEAL_WAL_CORRUPTION_DWELL_SECONDS",
+                    DEFAULT_WAL_CORRUPTION_DWELL_SECONDS,
+                ),
             },
         }
     }
@@ -924,7 +1246,12 @@ fn env_i64(k: &str, default: i64) -> i64 {
 // Run loop (orchestrator)
 // ====================================================================
 
-async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> Result<()> {
+async fn run(
+    volume_root: String,
+    telemetry: Telemetry,
+    cfg: WatcherConfig,
+    corruption_tracker: wal_corruption::CorruptionTracker,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
@@ -964,6 +1291,7 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
             &mut gave_up_emitted,
             &mut divergence_window,
             &mut start_failed_since,
+            &corruption_tracker,
             &telemetry,
         )
         .await
@@ -983,6 +1311,7 @@ async fn iteration(
     gave_up_emitted: &mut bool,
     divergence_window: &mut Option<DivergenceWindow>,
     start_failed_since: &mut Option<i64>,
+    corruption_tracker: &wal_corruption::CorruptionTracker,
     telemetry: &Telemetry,
 ) -> Result<()> {
     let now = now_epoch();
@@ -1102,6 +1431,11 @@ async fn iteration(
         _ => false,
     };
 
+    // The corruption tracker is updated asynchronously by the stdio-forwarder
+    // task(s) tapping Patroni/Postgres's own output — read its current dwell
+    // rather than maintain any duplicate state here.
+    let wal_corruption_for_secs = corruption_tracker.dwell_secs(now);
+
     // 6. Build snapshot, decide, dispatch.
     let snapshot = SelfHealInputs {
         now,
@@ -1113,6 +1447,7 @@ async fn iteration(
         leader_timeline,
         diverged_for_secs,
         start_failed_for_secs,
+        wal_corruption_for_secs,
         last_action_at,
         action_attempts_in_window,
         recovery_seen_after_action,
@@ -1508,6 +1843,7 @@ mod tests {
             leader_timeline: None,
             diverged_for_secs: 0,
             start_failed_for_secs: 0,
+            wal_corruption_for_secs: 0,
             last_action_at: None,
             action_attempts_in_window: 0,
             recovery_seen_after_action: false,
@@ -1805,6 +2141,83 @@ mod tests {
         let mut s = diverged();
         s.role = Role::Leader;
         assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    // ---- WAL-corruption signal ----
+
+    #[test]
+    fn wal_corruption_past_dwell_triggers_reinit() {
+        let mut s = base();
+        s.wal_corruption_for_secs = s.thresholds.wal_corruption_dwell_secs;
+        match decide_self_heal(&s) {
+            SelfHealAction::Reinitialize {
+                reason,
+                attempt: 1,
+                trigger,
+            } => {
+                assert!(
+                    reason.starts_with("wal_corruption_detected_for"),
+                    "got {reason}"
+                );
+                assert_eq!(trigger, ReinitTrigger::WalCorruption);
+            }
+            other => panic!("expected Reinitialize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wal_corruption_below_dwell_is_noop() {
+        let mut s = base();
+        s.wal_corruption_for_secs = s.thresholds.wal_corruption_dwell_secs - 1;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn wal_corruption_ignored_on_leader() {
+        // Safety #1 wins even with a long-recurring corruption signature —
+        // this can't happen in practice (the signal only fires on replica
+        // stdio) but the guard must hold regardless.
+        let mut s = base();
+        s.role = Role::Leader;
+        s.wal_corruption_for_secs = s.thresholds.wal_corruption_dwell_secs * 10;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn wal_corruption_ignored_outside_healthy_patroni_states() {
+        // If Patroni already considers the node "start failed"/"stopped", the
+        // other signals own the reinit; this path only exists to catch the
+        // same-timeline stall Patroni thinks is fine.
+        let mut s = base();
+        s.patroni_state = "creating replica".into();
+        s.wal_corruption_for_secs = s.thresholds.wal_corruption_dwell_secs;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+    }
+
+    #[test]
+    fn wal_corruption_respects_leader_unreachable_and_backoff() {
+        let mut s = base();
+        s.wal_corruption_for_secs = s.thresholds.wal_corruption_dwell_secs;
+        s.leader_reachable = false;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::Wait);
+
+        let mut s = base();
+        s.wal_corruption_for_secs = s.thresholds.wal_corruption_dwell_secs;
+        s.last_action_at = Some(s.now - 30);
+        s.thresholds.action_backoff_secs = 600;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::Wait);
+    }
+
+    #[test]
+    fn wal_corruption_respects_attempt_cap() {
+        let mut s = base();
+        s.wal_corruption_for_secs = s.thresholds.wal_corruption_dwell_secs;
+        s.action_attempts_in_window = 5;
+        s.thresholds.max_attempts_per_hour = 5;
+        match decide_self_heal(&s) {
+            SelfHealAction::EmitGaveUp { attempts: 5, .. } => {}
+            other => panic!("expected EmitGaveUp, got {other:?}"),
+        }
     }
 
     fn obs(local_tl: i64, progress: Option<i64>) -> Option<DivergenceObs> {
