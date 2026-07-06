@@ -145,11 +145,21 @@ const DEFAULT_LEADER_HEALTH_TIMEOUT_SECONDS: u64 = 3;
 const DEFAULT_DIVERGENCE_DWELL_SECONDS: u64 = 300;
 // Minimum number of timelines the leader must be ahead before a divergence
 // reinit is even considered. A healthy streaming replica is on the *same*
-// timeline as the leader; being behind at all is abnormal, but we require a
-// clear margin (missed ≥2 promotions) so a single borderline/in-flight switch
-// can never trip a destructive wipe. This is a false-positive guard, not a
-// correctness one — raise it to be stricter, never below 1.
-const DEFAULT_DIVERGENCE_MIN_GAP: i64 = 2;
+// timeline as the leader; being behind at all is abnormal. Originally set to
+// 2 ("missed ≥2 promotions") as an extra false-positive guard layered on top
+// of `divergence_dwell_secs`, on the theory that a single-timeline gap might
+// just be a borderline in-flight switch — but the dwell (five continuous
+// minutes of Patroni still reporting the replica healthy) already rules that
+// out on its own: a real in-flight switch resolves in seconds, not minutes.
+// Confirmed live: a replica stuck exactly 1 timeline behind (the leader
+// rotated WAL past the segment it needed mid-switch) sat unrecovered for
+// days, because gap=1 never met the old floor of 2 — and it was equally
+// invisible to the same-timeline stall path (`stalled_same_timeline_replay`),
+// which requires the timelines to match exactly. Gap=1 was double-uncovered.
+// Lowered to the floor of 1 to close that band for good: gap=0 → the
+// same-timeline stall path, gap>=1 → this path. This is a false-positive
+// guard, not a correctness one — raise it to be stricter, never below 1.
+const DEFAULT_DIVERGENCE_MIN_GAP: i64 = 1;
 // How long a replica's WAL cursor must sit continuously frozen on the SAME
 // timeline as the leader, while Patroni still considers it healthy, before we
 // treat it as a same-timeline replay stall and reinitialize. Longer than
@@ -483,8 +493,9 @@ fn stalled_timeline_divergence(s: &SelfHealInputs) -> Option<(i64, i64)> {
 ///
 /// Returns `local_timeline` when it applies, else `None`. Mutually exclusive
 /// with `stalled_timeline_divergence`: fires only when the timelines are
-/// exactly equal, leaving the small-nonzero-gap band (less than `min_gap`)
-/// deliberately uncovered by either, same as today.
+/// exactly equal. With `divergence_min_gap` at its floor of 1, every nonzero
+/// gap is covered by the cross-timeline path instead, so no band is left
+/// uncovered between the two.
 ///
 /// Requires `leader_advanced_during_stall` in addition to the dwell: an idle
 /// primary freezes its own WAL position exactly like a healthy replica
@@ -2020,20 +2031,41 @@ mod tests {
     }
 
     #[test]
-    fn divergence_below_min_gap_is_noop() {
-        // One timeline behind is not "clearly ahead" — could be a single
-        // in-flight switch. Require the configured margin.
+    fn divergence_at_gap_zero_is_noop_for_divergence_path() {
+        // Gap 0 (timelines equal) is never "behind" — that shape belongs to
+        // the same-timeline stall path (`stalled_same_timeline_replay`), not
+        // this one.
         let mut s = diverged();
-        s.local_timeline = Some(6);
-        s.leader_timeline = Some(7); // gap 1 < default min_gap 2
+        s.local_timeline = Some(7);
+        s.leader_timeline = Some(7); // gap 0 < default min_gap 1
         assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
     }
 
     #[test]
-    fn divergence_at_exactly_min_gap_acts() {
+    fn divergence_at_new_min_gap_of_one_acts() {
+        // Regression pin for the exact bug this closes: a replica stuck
+        // exactly 1 timeline behind the leader (WAL segment recycled before
+        // it could complete the switch) sat unrecovered for days in
+        // production because the old min_gap of 2 ignored gap=1 entirely —
+        // and the same-timeline stall path requires gap=0, so it was
+        // double-uncovered. Confirms gap=1 now acts at the lowered floor.
+        let mut s = diverged();
+        s.local_timeline = Some(6);
+        s.leader_timeline = Some(7); // gap 1 == new default min_gap
+        match decide_self_heal(&s) {
+            SelfHealAction::Reinitialize {
+                trigger: ReinitTrigger::TimelineDivergence,
+                ..
+            } => {}
+            other => panic!("expected divergence Reinitialize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn divergence_above_min_gap_acts() {
         let mut s = diverged();
         s.local_timeline = Some(5);
-        s.leader_timeline = Some(7); // gap 2 == default min_gap
+        s.leader_timeline = Some(7); // gap 2 > default min_gap 1
         match decide_self_heal(&s) {
             SelfHealAction::Reinitialize {
                 trigger: ReinitTrigger::TimelineDivergence,
