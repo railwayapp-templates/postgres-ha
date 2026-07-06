@@ -774,6 +774,72 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Checkpoint tuning appended to postgresql.auto.conf ONLY for the duration
+/// of a PITR replay boot, stripped again the moment promote is detected (see
+/// the `.pitr_staging` && !recovery.signal branch in `configure_pitr_recovery`
+/// and `strip_pitr_diskcap_overrides`). Without this, pg_wal can accumulate
+/// WAL segments fetched by `restore_command` until the next restartpoint,
+/// whose cadence depends on whatever checkpoint_timeout/max_wal_size is
+/// already on disk (vanilla defaults, a customer's own prod tuning, or — on
+/// a volume cloned from the source at the block level — the source's
+/// tuning). On a volume provisioned at ~the source's current size, that
+/// buffer risks ENOSPC before recovery ever reaches the target. Mirrors
+/// postgres-ssl PR #106, adapted for Patroni: postgres-ssl passes these as
+/// `-c` flags on a one-shot process invocation (self-reverting, no cleanup
+/// needed); Patroni owns the postgres process lifecycle here, so instead we
+/// append to auto.conf on stage-in and explicitly strip once promote
+/// completes — unlike restore_command/recovery_target_*, which Postgres
+/// simply ignores outside recovery, checkpoint_timeout/max_wal_size apply in
+/// every mode and would otherwise cap checkpoint frequency for the fork's
+/// entire post-promote production lifetime.
+const PITR_RECOVERY_CHECKPOINT_TIMEOUT: &str = "30s";
+const PITR_RECOVERY_MAX_WAL_SIZE: &str = "512MB";
+const PITR_RECOVERY_DISKCAP_MARKER: &str =
+    "# pgbackrest-recovery disk-cap (patroni-runner) — stripped once PITR completes";
+
+/// Remove the checkpoint_timeout/max_wal_size lines `configure_pitr_recovery`
+/// appends to postgresql.auto.conf for a replay boot. Matches only the exact
+/// contiguous 3-line block we ourselves appended (marker, checkpoint_timeout,
+/// max_wal_size, in that order) rather than either GUC line independently, so
+/// an operator who happens to set `checkpoint_timeout = '30s'` for their own
+/// reasons post-promote is never touched — the caller only runs this once,
+/// on the boot immediately after promote is detected.
+fn strip_pitr_diskcap_overrides(auto_conf_path: &str) -> Result<()> {
+    let contents = match fs::read_to_string(auto_conf_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("Failed to read postgresql.auto.conf"),
+    };
+    let checkpoint_line = format!("checkpoint_timeout = '{PITR_RECOVERY_CHECKPOINT_TIMEOUT}'");
+    let max_wal_line = format!("max_wal_size = '{PITR_RECOVERY_MAX_WAL_SIZE}'");
+
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut removed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let is_block_start = lines[i].trim() == PITR_RECOVERY_DISKCAP_MARKER
+            && lines.get(i + 1).map(|l| l.trim()) == Some(checkpoint_line.as_str())
+            && lines.get(i + 2).map(|l| l.trim()) == Some(max_wal_line.as_str());
+        if is_block_start {
+            removed = true;
+            i += 3;
+        } else {
+            kept.push(lines[i]);
+            i += 1;
+        }
+    }
+
+    if removed {
+        let mut filtered = kept.join("\n");
+        filtered.push('\n');
+        fs::write(auto_conf_path, filtered)
+            .context("Failed to strip PITR disk-cap overrides from postgresql.auto.conf")?;
+        info!("pgbackrest: stripped PITR disk-cap checkpoint overrides post-promote");
+    }
+    Ok(())
+}
+
 /// Stage PITR replay before Patroni starts Postgres.
 ///
 /// When `POSTGRES_RECOVERY_TARGET_TIME` (or `_XID`) is set, writes
@@ -866,6 +932,7 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
     // we just need to stamp the done marker.
     if Path::new(&staging).exists() && !Path::new(&signal).exists() {
         let _ = fs::remove_file(&staging);
+        strip_pitr_diskcap_overrides(&format!("{data_dir}/postgresql.auto.conf"))?;
         fs::write(&done, "").context("Failed to write PITR done marker")?;
         info!("pgbackrest: previous PITR replay completed; marker written");
         return Ok(());
@@ -885,7 +952,10 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
         "\n# managed by pgbackrest-recovery (patroni-runner)\n\
          restore_command = '{escaped_restore}'\n\
          {target_param} = '{escaped_target}'\n\
-         recovery_target_action = 'promote'\n",
+         recovery_target_action = 'promote'\n\
+         {PITR_RECOVERY_DISKCAP_MARKER}\n\
+         checkpoint_timeout = '{PITR_RECOVERY_CHECKPOINT_TIMEOUT}'\n\
+         max_wal_size = '{PITR_RECOVERY_MAX_WAL_SIZE}'\n",
     );
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -1415,8 +1485,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        data_dir_nonempty, is_uuid_shape, pgdata_is_dedicated_subdir, should_wipe_incomplete_clone,
-        wipe_pgdata_contents,
+        configure_pitr_recovery, data_dir_nonempty, is_uuid_shape, pgdata_is_dedicated_subdir,
+        should_wipe_incomplete_clone, strip_pitr_diskcap_overrides, wipe_pgdata_contents, Config,
     };
 
     #[test]
@@ -1587,5 +1657,156 @@ mod tests {
         assert!(!is_uuid_shape("my-bucket-with-dashes"));
         // Looks UUID-ish but isn't 8-4-4-4-12.
         assert!(!is_uuid_shape("121ccc45-0912-457e-8dc0"));
+    }
+
+    #[test]
+    fn strip_pitr_diskcap_overrides_removes_only_the_marked_lines() {
+        let path = std::env::temp_dir().join(format!("diskcap_test_{}.conf", std::process::id()));
+        std::fs::write(
+            &path,
+            "# managed by pgbackrest-recovery (patroni-runner)\n\
+             restore_command = 'pgbackrest archive-get %f %p'\n\
+             recovery_target_time = '2026-01-01 00:00:00+00'\n\
+             recovery_target_action = 'promote'\n\
+             # pgbackrest-recovery disk-cap (patroni-runner) — stripped once PITR completes\n\
+             checkpoint_timeout = '30s'\n\
+             max_wal_size = '512MB'\n",
+        )
+        .unwrap();
+
+        strip_pitr_diskcap_overrides(path.to_str().unwrap()).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        // The disk-cap lines are gone...
+        assert!(!after.contains("checkpoint_timeout"));
+        assert!(!after.contains("max_wal_size"));
+        assert!(!after.contains("disk-cap"));
+        // ...but the recovery settings they were appended alongside survive,
+        // since Postgres ignores those outside recovery and this function
+        // only ever targets the two disk-cap GUCs.
+        assert!(after.contains("restore_command"));
+        assert!(after.contains("recovery_target_time"));
+        assert!(after.contains("recovery_target_action"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strip_pitr_diskcap_overrides_is_a_noop_without_our_marker() {
+        let path = std::env::temp_dir().join(format!("diskcap_noop_{}.conf", std::process::id()));
+        // An operator's own tuning, using the same GUC names but a
+        // different value / no marker comment — must survive untouched.
+        let original = "checkpoint_timeout = '10min'\nmax_wal_size = '4GB'\n";
+        std::fs::write(&path, original).unwrap();
+
+        strip_pitr_diskcap_overrides(path.to_str().unwrap()).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(after, original);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strip_pitr_diskcap_overrides_missing_file_is_ok() {
+        strip_pitr_diskcap_overrides("/nonexistent/postgresql.auto.conf").unwrap();
+    }
+
+    fn test_config(data_dir: String, wal_recover_from_bucket: Option<String>) -> Config {
+        Config {
+            scope: "test".into(),
+            name: "test-1".into(),
+            connect_address: "test-1".into(),
+            etcd_hosts: "localhost:2379".into(),
+            superuser: "postgres".into(),
+            superuser_pass: String::new(),
+            repl_user: "replicator".into(),
+            repl_pass: String::new(),
+            app_user: "postgres".into(),
+            app_pass: String::new(),
+            app_db: "railway".into(),
+            data_dir,
+            certs_dir: "/tmp/certs".into(),
+            ttl: "45".into(),
+            loop_wait: "10".into(),
+            retry_timeout: "17".into(),
+            health_check_interval: 5,
+            health_check_timeout: 5,
+            max_failures: 3,
+            startup_grace_period: 60,
+            max_startup_timeout: 1800,
+            adopt_existing_data: false,
+            wait_for_leader: false,
+            synchronous_mode: false,
+            wal_archive_bucket: None,
+            wal_recover_from_bucket,
+            pitr_target_time: Some("2026-01-01 00:00:00+00".into()),
+            pitr_target_xid: None,
+            archive_timeout_secs: 60,
+        }
+    }
+
+    /// End-to-end (no docker) coverage of both halves of the disk-cap
+    /// feature: staged on the replay boot, stripped on the boot after
+    /// promote — without needing a live Patroni/Postgres process, since
+    /// `configure_pitr_recovery` only touches the filesystem.
+    #[test]
+    fn configure_pitr_recovery_writes_then_strips_diskcap_overrides_after_promote() {
+        let data_dir =
+            std::env::temp_dir().join(format!("pitr_recovery_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let data_dir_str = data_dir.to_str().unwrap().to_string();
+        let config = test_config(data_dir_str.clone(), Some("source-bucket".into()));
+
+        let auto_conf_path = format!("{data_dir_str}/postgresql.auto.conf");
+        let signal_path = format!("{data_dir_str}/recovery.signal");
+        let staging_path = format!("{data_dir_str}/.pitr_staging");
+        let done_path = format!("{data_dir_str}/.pitr_configured");
+
+        // First boot: stage the replay.
+        configure_pitr_recovery(&config).unwrap();
+
+        let auto_conf = std::fs::read_to_string(&auto_conf_path).unwrap();
+        assert!(auto_conf.contains("checkpoint_timeout = '30s'"));
+        assert!(auto_conf.contains("max_wal_size = '512MB'"));
+        assert!(auto_conf.contains("restore_command"));
+        assert!(std::path::Path::new(&signal_path).exists());
+        assert!(std::path::Path::new(&staging_path).exists());
+        assert!(!std::path::Path::new(&done_path).exists());
+
+        // Simulate Postgres consuming recovery.signal on successful promote.
+        std::fs::remove_file(&signal_path).unwrap();
+
+        // Second boot: promote-completed branch fires.
+        configure_pitr_recovery(&config).unwrap();
+
+        assert!(std::path::Path::new(&done_path).exists());
+        assert!(!std::path::Path::new(&staging_path).exists());
+        let auto_conf_after = std::fs::read_to_string(&auto_conf_path).unwrap();
+        assert!(!auto_conf_after.contains("checkpoint_timeout"));
+        assert!(!auto_conf_after.contains("max_wal_size"));
+        assert!(auto_conf_after.contains("restore_command"));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn strip_pitr_diskcap_overrides_requires_the_exact_contiguous_block() {
+        let path =
+            std::env::temp_dir().join(format!("diskcap_partial_{}.conf", std::process::id()));
+        // Marker present, but something (an operator edit) split the block —
+        // must not partially match and delete just one line.
+        let original =
+            "# pgbackrest-recovery disk-cap (patroni-runner) — stripped once PITR completes\n\
+             checkpoint_timeout = '30s'\n\
+             shared_buffers = '256MB'\n\
+             max_wal_size = '512MB'\n";
+        std::fs::write(&path, original).unwrap();
+
+        strip_pitr_diskcap_overrides(path.to_str().unwrap()).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(after, original);
+        let _ = std::fs::remove_file(&path);
     }
 }
