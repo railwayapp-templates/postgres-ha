@@ -41,6 +41,13 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // WAL while the latest reachable target stays pinned at the last commit.
     // Without this GUC the picker falls back to lastArchivedAt and the user
     // can pick an unreachable target. Mirrors postgres-ssl PRs #52 + #58.
+    // lc_messages pinned to C: self_heal's WAL-corruption watch (self_heal.rs
+    // wal_corruption submodule) matches fixed English Postgres error strings
+    // against this server's own log output. lc_messages is context=superuser
+    // (reload-only, not PGC_POSTMASTER), so a single bootstrap.dcs entry is
+    // enough — no local-parameters fallback needed the way archive_mode
+    // below requires one. Only takes effect for clusters bootstrapped after
+    // this change; bootstrap.dcs seeds DCS once at first init.
     let pgbackrest_archive_params = if config.wal_archive_bucket.is_some() {
         format!(
             "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n",
@@ -97,6 +104,7 @@ bootstrap:
         max_connections: 500
         password_encryption: scram-sha-256
         shared_preload_libraries: pg_stat_statements
+        lc_messages: "C"
 {pgbackrest_archive_params}
   initdb:
     - encoding: UTF8

@@ -886,16 +886,26 @@ pub mod wal_corruption {
 
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio::process::Child;
     use tracing::warn;
 
-    /// The fixed set of Postgres WAL-reader error strings emitted only when
-    /// redo/replay hits a corrupt or truncated record (see `xlogreader.c`'s
-    /// `report_invalid_record` call sites). None of these fire for a merely
-    /// idle or slow-but-healthy replica — they are corruption-only — so a
-    /// short recurrence dwell is sufficient to act on without risking a false
-    /// positive on a legitimately quiet database.
+    /// The fixed set of Postgres WAL-reader error strings emitted when
+    /// redo/replay hits a record it can't parse (see `xlogreader.c`'s
+    /// `report_invalid_record` call sites). Two of these — `"invalid record
+    /// length"` and `"invalid contrecord length"` — are NOT corruption-only:
+    /// Postgres also logs them as the normal, expected way of detecting the
+    /// leading edge of available WAL (crash-recovery catch-up, or a streaming
+    /// replica repeatedly reaching a primary's moving end-of-WAL boundary).
+    /// A healthy replica trailing an intermittent primary can log one of
+    /// these every few seconds indefinitely without ever being stuck. The
+    /// pattern match alone therefore cannot tell "stuck" from "healthy and
+    /// still advancing" — [`extract_lsn`] + [`CorruptionTracker`]'s
+    /// same-LSN requirement below is what actually enforces the module's
+    /// documented invariant (signal 3: "retries the same LSN every few
+    /// seconds forever"): only a match recurring at the SAME position counts,
+    /// so an advancing replica never accrues a dwell no matter how often it
+    /// logs one of these strings.
     const CORRUPTION_PATTERNS: &[&str] = &[
         "record with incorrect prev-link",
         "invalid record length",
@@ -911,6 +921,24 @@ pub mod wal_corruption {
         CORRUPTION_PATTERNS.iter().any(|p| line.contains(p))
     }
 
+    /// Extract the LSN Postgres reports the error against, e.g. `"invalid
+    /// resource manager ID 127 at 0/7B0000A0"` -> `Some("0/7B0000A0")`. Every
+    /// `report_invalid_record` call site logs `"... at %X/%X"` with the
+    /// position being read, so this is a stable extraction point across all
+    /// [`CORRUPTION_PATTERNS`] entries without needing a per-pattern parser.
+    /// `None` when the line doesn't have the expected trailing `"at
+    /// <hex>/<hex>"` — callers must treat that as "can't prove same-LSN
+    /// recurrence" (see [`CorruptionTracker::observe`]), never as a match.
+    fn extract_lsn(line: &str) -> Option<&str> {
+        let (_, after) = line.rsplit_once(" at ")?;
+        let token = after
+            .split(|c: char| c.is_whitespace() || c == ':')
+            .next()?;
+        let (hi, lo) = token.split_once('/')?;
+        let is_hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+        (is_hex(hi) && is_hex(lo)).then_some(token)
+    }
+
     fn now_epoch() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -918,17 +946,24 @@ pub mod wal_corruption {
             .unwrap_or(0)
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     struct Observation {
         first_seen: i64,
         last_seen: i64,
+        /// The LSN of the match that opened this window. `dwell_secs` only
+        /// ever reports a nonzero value while every match since has repeated
+        /// this exact LSN — seeing a *different* LSN, or one we couldn't
+        /// parse, means the replica made progress (or we can't prove it
+        /// didn't), so [`CorruptionTracker::observe`] opens a fresh window
+        /// instead of extending this one.
+        lsn: String,
     }
 
     /// Shared, cheaply-cloneable handle: the stdio forwarder task(s) call
     /// [`CorruptionTracker::observe`] on every matching line; the self-heal
     /// watcher calls [`CorruptionTracker::dwell_secs`] once per poll to build
     /// `SelfHealInputs::wal_corruption_for_secs`. A plain `std::sync::Mutex`
-    /// is fine here — every critical section is a handful of integer
+    /// is fine here — every critical section is a handful of integer/string
     /// comparisons, never held across an `.await`.
     #[derive(Clone, Default)]
     pub struct CorruptionTracker(Arc<Mutex<Option<Observation>>>);
@@ -938,39 +973,54 @@ pub mod wal_corruption {
             Self::default()
         }
 
-        /// Record a matching line observed at `now`. If the previous match was
-        /// more than `DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS` ago, the prior
-        /// run is treated as cleared and a fresh window opens — otherwise this
-        /// extends the existing window without moving `first_seen`, which is
-        /// what lets the dwell in `dwell_secs` accrue across polls.
-        fn observe(&self, now: i64) {
+        /// Record a matching line observed at `now`, reporting the LSN
+        /// [`extract_lsn`] found (`None` if it couldn't parse one). Extends
+        /// the existing window only when ALL of: the previous match was
+        /// within `DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS`, AND this LSN
+        /// was successfully parsed, AND it's identical to the window's LSN —
+        /// i.e. only a replica provably stuck replaying the exact same
+        /// record accrues dwell. A parse failure or a differing LSN always
+        /// opens a fresh window rather than extend, so a replica that is
+        /// merely advancing through a series of *different* end-of-WAL
+        /// boundary hits (see the [`CORRUPTION_PATTERNS`] doc) can never
+        /// accrue past a single observation.
+        fn observe(&self, now: i64, lsn: Option<&str>) {
             let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            let stale = matches!(*guard, Some(o)
-                if (now.saturating_sub(o.last_seen) as u64) > super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS);
-            *guard = Some(match *guard {
-                Some(o) if !stale => Observation {
+            let extends = matches!(
+                (&*guard, lsn),
+                (Some(o), Some(l))
+                    if l == o.lsn
+                    && (now.saturating_sub(o.last_seen) as u64)
+                        <= super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS
+            );
+            *guard = Some(match (&*guard, lsn) {
+                (Some(o), _) if extends => Observation {
                     first_seen: o.first_seen,
                     last_seen: now,
+                    lsn: o.lsn.clone(),
                 },
                 _ => Observation {
                     first_seen: now,
                     last_seen: now,
+                    lsn: lsn.unwrap_or_default().to_string(),
                 },
             });
         }
 
-        /// Seconds the corruption signature has been recurring continuously,
-        /// as of `now`. `0` when nothing has ever matched, or when the most
-        /// recent match is older than the reset gap (recurrence stopped —
-        /// treated as cleared rather than an ever-growing stale dwell). Pure
-        /// read: does not mutate, so the next [`Self::observe`] decides
-        /// whether to reset the window, not this call.
+        /// Seconds the corruption signature has been recurring continuously
+        /// at the SAME LSN, as of `now`. `0` when nothing has ever matched,
+        /// when the most recent match is older than the reset gap, or when
+        /// the current window's LSN is empty (an unparseable match opened
+        /// it — never treated as evidence of a stall). Pure read: does not
+        /// mutate, so the next [`Self::observe`] decides whether to reset
+        /// the window, not this call.
         pub fn dwell_secs(&self, now: i64) -> u64 {
             let guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
             match *guard {
-                Some(o)
-                    if (now.saturating_sub(o.last_seen) as u64)
-                        <= super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS =>
+                Some(ref o)
+                    if !o.lsn.is_empty()
+                        && (now.saturating_sub(o.last_seen) as u64)
+                            <= super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS =>
                 {
                     now.saturating_sub(o.first_seen).max(0) as u64
                 }
@@ -979,37 +1029,87 @@ pub mod wal_corruption {
         }
     }
 
-    /// Forward one line to this process's own stdout/stderr — preserving the
-    /// external log visibility `Stdio::inherit()` used to provide directly —
-    /// and record it against the tracker if it matches. A write failure here
-    /// must never stop the reader loop: losing one duplicated log line is far
-    /// cheaper than losing the ability to detect the next occurrence.
+    /// Caps a single buffered "line" so one pathological no-newline chunk of
+    /// output (e.g. a huge single-line logged statement) can't grow this
+    /// process's memory without bound — a failure mode `Stdio::inherit()`
+    /// never had, since that data used to go straight to the container's log
+    /// driver without passing through this process at all. Once the cap is
+    /// hit without finding a `\n`, the buffered prefix is forwarded/matched
+    /// as-is and reading resumes for the remainder as a fresh chunk.
+    const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+    /// Read one physical chunk into `buf` (which callers clear first):
+    /// everything up to and including the next `\n`, or up to
+    /// `MAX_LINE_BYTES`, whichever comes first — operating on raw bytes, not
+    /// `String`, so invalid UTF-8 in the child's output can never make this
+    /// return `Err` (unlike `AsyncBufReadExt::lines()`/`next_line()`, which
+    /// requires valid UTF-8 and errors out permanently on the first bad
+    /// byte). Returns the number of bytes read; `0` means clean EOF with
+    /// nothing buffered.
+    async fn read_chunk_capped<R: AsyncBufRead + Unpin>(
+        reader: &mut R,
+        buf: &mut Vec<u8>,
+        max_len: usize,
+    ) -> std::io::Result<usize> {
+        use tokio::io::AsyncBufReadExt;
+        loop {
+            if buf.len() >= max_len {
+                return Ok(buf.len());
+            }
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(buf.len()); // EOF
+            }
+            let newline_at = available.iter().position(|&b| b == b'\n');
+            let want = newline_at.map_or(available.len(), |p| p + 1);
+            let take = want.min(max_len - buf.len());
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            if newline_at.is_some() && take == want {
+                return Ok(buf.len());
+            }
+        }
+    }
+
+    /// Forward one chunk's raw bytes to this process's own stdout/stderr —
+    /// preserving the external log visibility `Stdio::inherit()` used to
+    /// provide directly, byte-for-byte — and record it against the tracker
+    /// if it matches. Pattern matching uses a lossy UTF-8 view purely for the
+    /// `contains()` scan; the bytes written above are the untouched
+    /// originals, so non-UTF-8 output is forwarded faithfully even though it
+    /// can never itself satisfy a corruption match. A write failure here must
+    /// never stop the reader loop: losing one duplicated chunk is far cheaper
+    /// than losing the ability to detect the next occurrence.
     async fn forward_and_observe<W: AsyncWrite + Unpin>(
         mut out: W,
-        line: &str,
+        chunk: &[u8],
         tracker: &CorruptionTracker,
     ) {
-        let _ = out.write_all(line.as_bytes()).await;
-        let _ = out.write_all(b"\n").await;
+        let _ = out.write_all(chunk).await;
         let _ = out.flush().await;
-        if matches_corruption_pattern(line) {
-            tracker.observe(now_epoch());
+        let text = String::from_utf8_lossy(chunk);
+        if matches_corruption_pattern(&text) {
+            tracker.observe(now_epoch(), extract_lsn(&text));
         }
     }
 
     async fn pump<R: AsyncRead + Unpin>(reader: R, tracker: CorruptionTracker, to_stdout: bool) {
-        let mut lines = BufReader::new(reader).lines();
+        let mut reader = BufReader::new(reader);
+        let mut buf: Vec<u8> = Vec::new();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
+            buf.clear();
+            match read_chunk_capped(&mut reader, &mut buf, MAX_LINE_BYTES).await {
+                Ok(0) => return, // EOF: child closed this stream (process exited).
+                Ok(_) => {
                     if to_stdout {
-                        forward_and_observe(tokio::io::stdout(), &line, &tracker).await;
+                        forward_and_observe(tokio::io::stdout(), &buf, &tracker).await;
                     } else {
-                        forward_and_observe(tokio::io::stderr(), &line, &tracker).await;
+                        forward_and_observe(tokio::io::stderr(), &buf, &tracker).await;
                     }
                 }
-                Ok(None) => return, // EOF: child closed this stream (process exited).
                 Err(e) => {
+                    // A genuine I/O error on the underlying pipe (not a UTF-8
+                    // issue — read_chunk_capped never validates encoding).
                     warn!(error = %e, "self-heal: wal-corruption stdio pump read error, stopping");
                     return;
                 }
@@ -1069,31 +1169,89 @@ pub mod wal_corruption {
         }
 
         #[test]
-        fn tracker_accrues_while_recurring() {
+        fn extract_lsn_from_real_messages() {
+            assert_eq!(
+                extract_lsn(
+                    "2026-07-05 16:48:48.476 UTC [122] LOG:  record with incorrect prev-link 0/863 at 1/300000A0"
+                ),
+                Some("1/300000A0")
+            );
+            assert_eq!(
+                extract_lsn(
+                    "2026-07-05 16:48:49.828 UTC [120] LOG:  invalid resource manager ID 127 at 0/7B0000A0"
+                ),
+                Some("0/7B0000A0")
+            );
+            // Trailing punctuation after the LSN token is excluded.
+            assert_eq!(
+                extract_lsn("LOG:  invalid record length at 1/300000A0: wanted 24, got 0"),
+                Some("1/300000A0")
+            );
+        }
+
+        #[test]
+        fn extract_lsn_none_when_unparseable() {
+            assert_eq!(extract_lsn("no ' at ' marker here"), None);
+            assert_eq!(extract_lsn("something at not-hex/also-not-hex"), None);
+            assert_eq!(extract_lsn("something at 0/"), None);
+        }
+
+        #[test]
+        fn tracker_accrues_while_recurring_at_the_same_lsn() {
             // Each successive observe() lands within the reset gap (30s) of
-            // the last, so first_seen must hold across all three even though
-            // no single gap is zero.
+            // the last AND reports the same LSN, so first_seen must hold
+            // across all three even though no single gap is zero — this is
+            // the "stuck replaying the same record forever" case.
             let t = CorruptionTracker::new();
-            t.observe(1_000);
+            t.observe(1_000, Some("0/7B0000A0"));
             assert_eq!(t.dwell_secs(1_000), 0);
-            t.observe(1_010);
+            t.observe(1_010, Some("0/7B0000A0"));
             assert_eq!(t.dwell_secs(1_010), 10);
-            t.observe(1_030);
+            t.observe(1_030, Some("0/7B0000A0"));
             assert_eq!(
                 t.dwell_secs(1_030),
                 30,
-                "first_seen must not reset while recurrence continues within the gap"
+                "first_seen must not reset while recurrence continues at the same LSN"
             );
+        }
+
+        #[test]
+        fn tracker_never_accrues_when_lsn_advances() {
+            // The false-positive case this fix targets: a healthy replica
+            // repeatedly hitting a normal, moving end-of-WAL boundary logs a
+            // matching pattern every few seconds, but at a DIFFERENT LSN each
+            // time — dwell must never build past a single observation.
+            let t = CorruptionTracker::new();
+            t.observe(1_000, Some("0/1000"));
+            t.observe(1_005, Some("0/2000"));
+            t.observe(1_010, Some("0/3000"));
+            t.observe(1_015, Some("0/4000"));
+            assert_eq!(
+                t.dwell_secs(1_015),
+                0,
+                "an advancing LSN must never accrue dwell, however often it recurs"
+            );
+        }
+
+        #[test]
+        fn tracker_never_accrues_when_lsn_unparseable() {
+            // A match we couldn't extract an LSN from can't prove a stall —
+            // fail safe and never let it accrue, even across many polls.
+            let t = CorruptionTracker::new();
+            t.observe(1_000, None);
+            t.observe(1_010, None);
+            t.observe(1_030, None);
+            assert_eq!(t.dwell_secs(1_030), 0);
         }
 
         #[test]
         fn tracker_clears_after_reset_gap() {
             let t = CorruptionTracker::new();
-            t.observe(1_000);
+            t.observe(1_000, Some("0/7B0000A0"));
             // No further observation; asking well past the reset gap reads as cleared.
             assert_eq!(t.dwell_secs(1_100), 0);
             // A later observe() starts a fresh window rather than resuming the old one.
-            t.observe(1_200);
+            t.observe(1_200, Some("0/7B0000A0"));
             assert_eq!(t.dwell_secs(1_200), 0);
             assert_eq!(t.dwell_secs(1_210), 10);
         }
@@ -1102,6 +1260,54 @@ pub mod wal_corruption {
         fn never_observed_is_zero_dwell() {
             let t = CorruptionTracker::new();
             assert_eq!(t.dwell_secs(9_999), 0);
+        }
+
+        // ---- byte-based capped reader (non-UTF-8 safety, memory bound) ----
+
+        async fn read_all_chunks(bytes: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+            let mut reader = BufReader::new(bytes);
+            let mut chunks = Vec::new();
+            loop {
+                let mut buf = Vec::new();
+                match read_chunk_capped(&mut reader, &mut buf, max_len)
+                    .await
+                    .unwrap()
+                {
+                    0 => return chunks,
+                    _ => chunks.push(buf),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn read_chunk_capped_splits_on_newlines() {
+            let chunks = read_all_chunks(b"first\nsecond\nthird", 1024).await;
+            assert_eq!(
+                chunks,
+                vec![b"first\n".to_vec(), b"second\n".to_vec(), b"third".to_vec()]
+            );
+        }
+
+        #[tokio::test]
+        async fn read_chunk_capped_never_errors_on_invalid_utf8() {
+            // A lone continuation byte (0x80) is invalid UTF-8 on its own —
+            // AsyncBufReadExt::lines() would return Err here and the old pump
+            // would exit permanently. The byte-based reader must not care.
+            let input = [b'a', b'b', 0x80, b'c', b'\n', b'd'];
+            let chunks = read_all_chunks(&input, 1024).await;
+            assert_eq!(
+                chunks,
+                vec![vec![b'a', b'b', 0x80, b'c', b'\n'], vec![b'd']]
+            );
+        }
+
+        #[tokio::test]
+        async fn read_chunk_capped_bounds_a_line_with_no_newline() {
+            let input = vec![b'x'; 100];
+            let chunks = read_all_chunks(&input, 10).await;
+            // 100 bytes with no '\n', capped at 10 per chunk -> 10 chunks.
+            assert_eq!(chunks.len(), 10);
+            assert!(chunks.iter().all(|c| c.len() == 10));
         }
     }
 }
