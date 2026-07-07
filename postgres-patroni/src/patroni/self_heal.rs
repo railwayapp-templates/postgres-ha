@@ -592,12 +592,23 @@ fn accrue_divergence_window(
             _ => false,
         };
         if timeline_frozen && progress_frozen {
+            // Late-bind the leader-progress baseline: if the leader was
+            // unmeasurable on the poll this window opened, the first later poll
+            // that CAN measure it becomes the baseline. A cleanly-frozen stall
+            // never resets the window (measurable, frozen cursor every poll),
+            // so this accrual branch is the only place the baseline is ever
+            // read after open — leaving it `None` here would permanently blind
+            // the same-timeline stall check for the whole episode. Adopting the
+            // first measurable value costs at most one extra poll before an
+            // advance can latch and never resets the accrued dwell.
+            let leader_progress_at_open = w.leader_progress_at_open.or(obs.leader_progress);
             let leader_advanced = w.leader_advanced
                 || matches!(
-                    (w.leader_progress_at_open, obs.leader_progress),
+                    (leader_progress_at_open, obs.leader_progress),
                     (Some(opened_at), Some(cur)) if cur > opened_at
                 );
             return Some(DivergenceWindow {
+                leader_progress_at_open,
                 leader_advanced,
                 ..w
             });
@@ -2375,6 +2386,53 @@ mod tests {
         assert!(
             !w2.leader_advanced,
             "a fresh window must start with a fresh leader_advanced baseline"
+        );
+    }
+
+    #[test]
+    fn leader_progress_baseline_late_binds_when_unmeasurable_at_open() {
+        // The window opens on a poll where the leader's WAL position couldn't
+        // be measured (a transient blip). A cleanly-frozen stall never resets
+        // the window, so if the baseline stayed `None` forever the leader
+        // could never be proven to advance and the stall would go undetected
+        // for the whole episode. Instead, the first later poll that CAN
+        // measure the leader adopts the baseline — without resetting the dwell
+        // — and a subsequent advance past it still latches.
+        let w0 =
+            accrue_divergence_window(obs_with_leader(3, Some(100), None), None, 1_000).unwrap();
+        assert_eq!(
+            w0.leader_progress_at_open, None,
+            "no leader baseline is captured when the leader is unmeasurable at open"
+        );
+        assert!(!w0.leader_advanced);
+
+        // Leader now measurable at 500 → adopt as the baseline. Not itself an
+        // advance (this IS the baseline), and the dwell clock must not reset.
+        let w1 =
+            accrue_divergence_window(obs_with_leader(3, Some(100), Some(500)), Some(w0), 1_060)
+                .unwrap();
+        assert_eq!(
+            w1.leader_progress_at_open,
+            Some(500),
+            "first measurable leader progress must become the baseline"
+        );
+        assert!(
+            !w1.leader_advanced,
+            "adopting the baseline is not itself an advance"
+        );
+        assert_eq!(
+            w1.since, 1_000,
+            "adopting a late baseline must NOT reset the accrued dwell"
+        );
+
+        // Leader past the adopted baseline → latch, proving the primary is
+        // writing while the replica stays frozen.
+        let w2 =
+            accrue_divergence_window(obs_with_leader(3, Some(100), Some(600)), Some(w1), 1_120)
+                .unwrap();
+        assert!(
+            w2.leader_advanced,
+            "an advance past the adopted baseline must latch"
         );
     }
 
