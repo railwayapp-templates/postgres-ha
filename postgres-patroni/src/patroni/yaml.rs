@@ -50,9 +50,11 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // recovery section it writes for standbys (_adjust_recovery_parameters →
     // build_recovery_params), so this reaches every standby and never the
     // primary. It goes through the archive-get wrapper because repo1-path
-    // must be resolved at call time from the volume marker: the env
-    // Postgres inherits from Patroni still holds the pre-derivation base
-    // path, and pgBackRest prefers env over pgbackrest.conf.
+    // must be resolved at call time — volume marker first, Patroni DCS on a
+    // miss (the marker can go stale on standbys after a leader-side path
+    // migration): the env Postgres inherits from Patroni still holds the
+    // pre-derivation base path, and pgBackRest prefers env over
+    // pgbackrest.conf.
     let pgbackrest_archive_params = if config.wal_archive_bucket.is_some() {
         format!(
             "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n        restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n",

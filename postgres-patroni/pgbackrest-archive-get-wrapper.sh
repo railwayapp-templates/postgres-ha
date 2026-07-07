@@ -11,8 +11,23 @@
 # holds the pre-derivation base path. pgBackRest gives environment variables
 # precedence over pgbackrest.conf, so calling pgbackrest directly from
 # restore_command would silently point archive-get at the bucket root and
-# never find a segment. Re-reading the marker here mirrors
-# pgbackrest-archive-push-wrapper.sh.
+# never find a segment.
+#
+# Resolution is marker-first, DCS-on-miss — the inverse of the replica
+# restore wrapper's DCS-first order, because the cost profile is inverted:
+# restore runs once per re-seed (one curl is nothing) and its headline
+# scenario has no marker at all, while restore_command runs once per WAL
+# segment with a marker that is almost always right. The marker can still
+# go stale: the backup watcher's DCS converge runs on the LEADER only, so a
+# standby that lived through a leader-side WAL-regression path migration
+# keeps the old path — and that standby is exactly the one that needs the
+# archive fallback. So on an archive-get miss, ask Patroni DCS
+# (`pgbackrest_repo1_path`, published by the leader's backup watcher) for
+# the authoritative path; if it differs, retry there and rewrite the marker
+# on success so subsequent calls resolve correctly without the extra hop.
+# A genuine miss (segment not yet archived — the normal end-of-catch-up
+# signal to switch to streaming) finds DCS agreeing with the marker and
+# adds only one localhost curl, no second S3 round-trip.
 #
 # Exit codes follow restore_command semantics: non-zero means "segment not
 # available here" and standby recovery falls back to streaming; only death
@@ -29,6 +44,7 @@ if [ -z "$WAL_FILE" ] || [ -z "$WAL_DEST" ]; then
 fi
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
+MARKER="$PGDATA/.pgbackrest_repo_path"
 
 # Defensive gate, mirroring the push wrapper: if WAL_ARCHIVE_BUCKET is unset
 # at call time there is no repo to fetch from — the setting leaked via a
@@ -38,9 +54,26 @@ if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
   exit 1
 fi
 
-if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
-  PGBACKREST_REPO1_PATH=$(cat "$PGDATA/.pgbackrest_repo_path")
-  export PGBACKREST_REPO1_PATH
+USED_PATH="${PGBACKREST_REPO1_PATH:-}"
+if [ -f "$MARKER" ]; then
+  USED_PATH=$(tr -d '\n\r' <"$MARKER")
+fi
+if [ -n "$USED_PATH" ]; then
+  export PGBACKREST_REPO1_PATH="$USED_PATH"
 fi
 
-exec pgbackrest --stanza=main archive-get "$WAL_FILE" "$WAL_DEST"
+pgbackrest --stanza=main archive-get "$WAL_FILE" "$WAL_DEST"
+rc=$?
+[ "$rc" -eq 0 ] && exit 0
+
+DCS_PATH=$(curl -sf --max-time 2 http://localhost:8008/config 2>/dev/null \
+  | python3 -c 'import json,sys; v = json.load(sys.stdin).get("pgbackrest_repo1_path") or ""; print(v if isinstance(v, str) else "")' 2>/dev/null)
+if [ -n "$DCS_PATH" ] && [ "$DCS_PATH" != "$USED_PATH" ]; then
+  if PGBACKREST_REPO1_PATH="$DCS_PATH" pgbackrest --stanza=main archive-get "$WAL_FILE" "$WAL_DEST"; then
+    echo "pgbackrest-archive-get-wrapper: repo path '${USED_PATH:-<unset>}' is stale; ${WAL_FILE} found at DCS path '${DCS_PATH}' — rewriting marker" >&2
+    { printf '%s\n' "$DCS_PATH" >"$MARKER" && chmod 640 "$MARKER"; } 2>/dev/null || true
+    exit 0
+  fi
+fi
+
+exit "$rc"

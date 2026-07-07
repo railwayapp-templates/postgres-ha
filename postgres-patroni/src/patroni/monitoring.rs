@@ -19,6 +19,19 @@ const WAL_PROBE_GRACE_SECS: u64 = 30;
 /// Upper bound on the (exponentially backing-off) gap between WAL-availability
 /// probes, so a long stall keeps the query rate on the leader bounded.
 const WAL_PROBE_MAX_INTERVAL_SECS: u64 = 240;
+/// Extra zero-progress dwell demanded, past the first positive WAL-too-old
+/// verdict, before the startup gate wipes a replica on a cluster WITH a WAL
+/// archive. There standbys have an archive fallback (`restore_command`, seeded
+/// alongside the archive params in yaml.rs): leader-recycled WAL alone no
+/// longer proves the replica is stuck, because recovery normally pulls the gap
+/// from the S3 archive on its own — which registers as progress and resets the
+/// gate before any probe fires. A verdict that survives this dwell with still
+/// zero progress means the archive path is stalled too (a WAL gap in the
+/// archive, a stale repo path, or an object-store outage that has outlasted
+/// the dwell), and the wipe-and-reseed is the remaining move. Without an
+/// archive the verdict is already final and fires immediately, exactly as
+/// before.
+const WAL_ARCHIVE_STALL_CONFIRM_SECS: u64 = 300;
 
 /// Run the main monitoring loop for Patroni
 ///
@@ -87,6 +100,12 @@ pub async fn run_monitoring_loop(
     // stall episode earns fresh, prompt detection).
     let mut wal_probe_interval = WAL_PROBE_GRACE_SECS;
     let mut next_wal_probe_at = WAL_PROBE_GRACE_SECS;
+    // `startup_elapsed` at the FIRST positive WAL-too-old verdict of the
+    // current stall episode. On archiving clusters the destructive reinit is
+    // deferred until the stall outlives WAL_ARCHIVE_STALL_CONFIRM_SECS past
+    // this point (see `wal_reinit_confirmed`); resets with the other episode
+    // state whenever progress lands.
+    let mut wal_unrecoverable_since: Option<u64> = None;
     // Short-timeout client for polling Patroni's local REST API for WAL
     // progress. Best-effort: if it can't be built we fall back to the
     // volume-usage signal alone.
@@ -167,6 +186,10 @@ pub async fn run_monitoring_loop(
                         // left over from the previous stall.
                         wal_probe_interval = WAL_PROBE_GRACE_SECS;
                         next_wal_probe_at = WAL_PROBE_GRACE_SECS;
+                        // Progress also disarms the archive-stall confirmation:
+                        // on archiving clusters it usually IS the archive
+                        // fallback quietly fixing the WAL-too-old state.
+                        wal_unrecoverable_since = None;
                     }
                     StartupTick::Stalled => {
                         // No progress for the full stall timeout. We do NOT wipe
@@ -177,11 +200,17 @@ pub async fn run_monitoring_loop(
                         // SUFFICIENT condition: an upper bound on the segment the
                         // replica must resume from is older than the oldest WAL the
                         // leader retains, so it is *provably* too far behind to
-                        // stream-catch-up (no archive fallback). This is the last-
-                        // chance check for the narrow window where the leader was
-                        // unreachable during every backed-off Waiting probe but is
-                        // reachable now; any other stall falls through to the
-                        // recovery exit and the next boot re-probes from scratch.
+                        // stream-catch-up. This is the last-chance check for the
+                        // narrow window where the leader was unreachable during
+                        // every backed-off Waiting probe but is reachable now; any
+                        // other stall falls through to the recovery exit and the
+                        // next boot re-probes from scratch. Unlike the Waiting
+                        // branch, a positive verdict fires immediately even on
+                        // archiving clusters: reaching Stalled means zero progress
+                        // for the full max_startup_timeout, so the archive
+                        // fallback has already had far longer than
+                        // WAL_ARCHIVE_STALL_CONFIRM_SECS to produce a single byte
+                        // and didn't — the verdict is final here too.
                         let unrecoverable = match patroni_client.as_ref() {
                             Some(c) => self_heal::confirm_wal_unrecoverable(c, config).await,
                             None => false,
@@ -222,15 +251,21 @@ pub async fn run_monitoring_loop(
                         // never probed) we ask the leader whether it still retains
                         // WAL as old as an UPPER BOUND on the segment this replica
                         // must stream from (the successor of its newest local WAL
-                        // segment). If even that is gone (and standbys have no
-                        // archive fallback), the node can never stream-catch-up, so
-                        // reinitialize now instead of waiting out the full
-                        // max_startup_timeout. Because we compare an upper bound the
-                        // probe is a SUFFICIENT condition: it only fires when the
-                        // replica is provably unrecoverable, so it never wipes a
-                        // node a restart could have fixed (it may instead MISS a
-                        // genuine case in a narrow boundary band — a safe false
-                        // negative that just restart-loops as today). See
+                        // segment). If even that is gone the node can never
+                        // stream-catch-up, so reinitialize instead of waiting out
+                        // the full max_startup_timeout — immediately on clusters
+                        // without a WAL archive (streaming was the only source),
+                        // and only after WAL_ARCHIVE_STALL_CONFIRM_SECS more of
+                        // zero progress on archiving clusters, where standbys
+                        // normally self-serve the gap from S3 via restore_command
+                        // and a short object-store blip must not cost a full
+                        // re-seed (see `wal_reinit_confirmed`). Because we compare
+                        // an upper bound the probe is a SUFFICIENT condition: it
+                        // only fires when the replica is provably unrecoverable
+                        // by streaming, so it never wipes a node a restart could
+                        // have fixed (it may instead MISS a genuine case in a
+                        // narrow boundary band — a safe false negative that just
+                        // restart-loops as today). See
                         // `confirm_wal_unrecoverable`. Probing backs off
                         // exponentially (see the schedule vars) so an already-
                         // struggling leader isn't queried every cycle.
@@ -249,13 +284,28 @@ pub async fn run_monitoring_loop(
                                 Some(c) => self_heal::confirm_wal_unrecoverable(c, config).await,
                                 None => false,
                             };
+                            if unrecoverable && wal_unrecoverable_since.is_none() {
+                                wal_unrecoverable_since = Some(startup_elapsed);
+                                if config.wal_archive_bucket.is_some() {
+                                    warn!(
+                                        confirm_dwell_secs = WAL_ARCHIVE_STALL_CONFIRM_SECS,
+                                        "WAL-too-old confirmed for streaming, but this cluster archives WAL and standbys self-serve missed segments via restore_command — deferring reinitialize until the zero-progress stall outlives the dwell"
+                                    );
+                                }
+                            }
                             if unrecoverable
+                                && wal_reinit_confirmed(
+                                    config.wal_archive_bucket.is_some(),
+                                    wal_unrecoverable_since,
+                                    startup_elapsed,
+                                )
                                 && try_reinitialize_stalled_replica(config, telemetry, "wal_unrecoverable").await
                             {
                                 reinit_attempted = true;
                                 startup_elapsed = 0;
                                 last_volume_used = volume_used_bytes(&config.data_dir);
                                 last_xlog_pos = None;
+                                wal_unrecoverable_since = None;
                                 continue;
                             }
                         }
@@ -450,6 +500,31 @@ fn classify_startup_tick(
     }
 }
 
+/// Gate for acting on a positive WAL-too-old verdict in the `Waiting` branch.
+/// Without a WAL archive the verdict is final — streaming was the standby's
+/// only WAL source — so fire immediately. With one, standbys also have
+/// `restore_command`, and a *working* archive fallback surfaces as replay
+/// progress that resets the whole stall episode before this gate is ever
+/// consulted — so a positive verdict here still doesn't prove the node is
+/// stuck until the zero-progress stall has also outlived
+/// WAL_ARCHIVE_STALL_CONFIRM_SECS past the first positive verdict
+/// (`pending_since`, in startup-elapsed seconds). Both clocks reset together
+/// on any progress, so the subtraction never spans stall episodes. Pure and
+/// unit-tested.
+fn wal_reinit_confirmed(
+    has_archive_fallback: bool,
+    pending_since: Option<u64>,
+    startup_elapsed: u64,
+) -> bool {
+    if !has_archive_fallback {
+        return true;
+    }
+    match pending_since {
+        Some(t) => startup_elapsed.saturating_sub(t) >= WAL_ARCHIVE_STALL_CONFIRM_SECS,
+        None => false,
+    }
+}
+
 /// Used bytes on the filesystem holding `path` (O(1) `statvfs`, no tree walk).
 /// The startup progress signal for the pg_basebackup phase: a clone in flight
 /// grows the volume as data files land, and it costs one syscall instead of
@@ -508,6 +583,38 @@ async fn fetch_patroni_xlog_position(client: &reqwest::Client) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_reinit_fires_immediately_without_archive() {
+        // Pre-archive behavior unchanged: streaming was the only WAL source,
+        // so a positive verdict is final on its own.
+        assert!(wal_reinit_confirmed(false, None, 30));
+        assert!(wal_reinit_confirmed(false, Some(30), 30));
+    }
+
+    #[test]
+    fn wal_reinit_waits_out_archive_stall_dwell() {
+        // First positive verdict arms at t=30; on an archiving cluster the
+        // wipe waits until the zero-progress stall outlives the dwell.
+        assert!(!wal_reinit_confirmed(true, Some(30), 30));
+        assert!(!wal_reinit_confirmed(
+            true,
+            Some(30),
+            30 + WAL_ARCHIVE_STALL_CONFIRM_SECS - 1
+        ));
+        assert!(wal_reinit_confirmed(
+            true,
+            Some(30),
+            30 + WAL_ARCHIVE_STALL_CONFIRM_SECS
+        ));
+    }
+
+    #[test]
+    fn wal_reinit_never_fires_unarmed_on_archiving_cluster() {
+        // Defensive: however long the stall, a verdict that was never armed
+        // (progress reset the episode) doesn't wipe.
+        assert!(!wal_reinit_confirmed(true, None, 9_999));
+    }
 
     #[test]
     fn healthy_breaks_regardless_of_progress_or_elapsed() {

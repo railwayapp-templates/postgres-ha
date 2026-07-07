@@ -25,8 +25,9 @@
 # postgresql.auto.conf or creating recovery.signal — Patroni owns the
 # standby recovery config (and would sanitize those away regardless).
 #
-# On success the marker is rewritten with the path actually used: the
-# restored backup carries the leader's marker from backup time, which a
+# On success the marker is rewritten with the path actually used — including
+# the env-default case, where success proves the inherited path was right:
+# the restored backup carries the leader's marker from backup time, which a
 # later path migration may have staled; restore_command (the archive-get
 # wrapper) reads the marker on every call.
 #
@@ -64,8 +65,8 @@ mkdir -p "$PGDATA" && chmod 700 "$PGDATA"
 pgbackrest --stanza=main --delta --type=none restore
 rc=$?
 
-if [ "$rc" -eq 0 ] && [ -n "$REPO_PATH" ]; then
-  { printf '%s\n' "$REPO_PATH" >"$MARKER" && chmod 640 "$MARKER"; } 2>/dev/null || true
+if [ "$rc" -eq 0 ] && [ -n "${PGBACKREST_REPO1_PATH:-}" ]; then
+  { printf '%s\n' "$PGBACKREST_REPO1_PATH" >"$MARKER" && chmod 640 "$MARKER"; } 2>/dev/null || true
 fi
 
 exit "$rc"
