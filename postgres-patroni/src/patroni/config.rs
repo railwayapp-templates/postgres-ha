@@ -100,11 +100,13 @@ pub struct Config {
 /// ~1000x unit footgun on a knob that is only ever hand-set mid-incident.
 /// Anything invalid falls back to the default with a warning — the throttled
 /// basebackup is the bootstrap path of last resort and must never be broken
-/// by a typo. Any set override logs its outcome (applied or rejected) so the
-/// operator can confirm from runtime logs which rate is actually in effect.
+/// by a typo. Every resolution logs the rate in effect (default, applied
+/// override, or rejected override) so the operator can confirm from runtime
+/// logs which rate a re-seed will actually run at.
 fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
     const DEFAULT: &str = "20M";
     let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        info!(max_rate = DEFAULT, "basebackup throttle using default (POSTGRES_BASEBACKUP_MAX_RATE unset)");
         return DEFAULT.to_string();
     };
     let kb = v
