@@ -4,7 +4,7 @@ use crate::{pgdata, ssl_dir};
 use anyhow::Result;
 use common::ConfigExt;
 use std::env;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Configuration for Patroni runner
 pub struct Config {
@@ -100,7 +100,8 @@ pub struct Config {
 /// ~1000x unit footgun on a knob that is only ever hand-set mid-incident.
 /// Anything invalid falls back to the default with a warning — the throttled
 /// basebackup is the bootstrap path of last resort and must never be broken
-/// by a typo.
+/// by a typo. Any set override logs its outcome (applied or rejected) so the
+/// operator can confirm from runtime logs which rate is actually in effect.
 fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
     const DEFAULT: &str = "20M";
     let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
@@ -115,7 +116,10 @@ fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
                 .and_then(|m| m.checked_mul(1024))
         });
     match kb {
-        Some(kb) if (32..=1_048_576).contains(&kb) => v,
+        Some(kb) if (32..=1_048_576).contains(&kb) => {
+            info!(max_rate = %v, "POSTGRES_BASEBACKUP_MAX_RATE override applied");
+            v
+        }
         _ => {
             warn!(
                 value = %v,
