@@ -75,6 +75,8 @@ RUN mkdir -p /home/postgres /var/run/postgresql /etc/patroni /etc/pgbackrest \
 # Copy SSL init script, archive-push wrapper, and Rust binaries
 COPY --chmod=755 postgres-patroni/init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
 COPY --chmod=755 postgres-patroni/pgbackrest-archive-push-wrapper.sh /usr/local/bin/pgbackrest-archive-push-wrapper.sh
+COPY --chmod=755 postgres-patroni/pgbackrest-archive-get-wrapper.sh /usr/local/bin/pgbackrest-archive-get-wrapper.sh
+COPY --chmod=755 postgres-patroni/pgbackrest-replica-restore-wrapper.sh /usr/local/bin/pgbackrest-replica-restore-wrapper.sh
 COPY --from=rust-binaries --chmod=755 /postgres-wrapper /usr/local/bin/postgres-wrapper
 COPY --from=rust-binaries --chmod=755 /post-bootstrap /usr/local/bin/post-bootstrap
 COPY --from=rust-binaries --chmod=755 /patroni-runner /usr/local/bin/patroni-runner

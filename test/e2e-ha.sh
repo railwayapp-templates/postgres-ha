@@ -370,6 +370,31 @@ setup_patroni_cluster() {
   echo "$n1 $n2 $n3"
 }
 
+# (Re)create a single Patroni node with the same flags
+# setup_patroni_cluster uses in its phase-2 run. Used by re-seed tests
+# that kill one member, wipe its volume, and bring it back.
+run_patroni_node() {
+  local scope="$1"; shift
+  local etcd_hosts="$1"; shift
+  local n="$1"; shift
+  local extra_args=("$@")
+  docker rm -f "$n" >/dev/null 2>&1 || true
+  docker run -d --name "$n" --label "$HA_LABEL" --network "$NET" \
+    --hostname "$n" \
+    -e "PATRONI_ENABLED=true" \
+    -e "PATRONI_NAME=${n}" \
+    -e "PATRONI_SCOPE=${scope}" \
+    -e "RAILWAY_PRIVATE_DOMAIN=${n}" \
+    -e "PATRONI_ETCD3_HOSTS=${etcd_hosts}" \
+    -e "POSTGRES_PASSWORD=test" \
+    -e "PATRONI_REPLICATION_PASSWORD=replpass" \
+    -e "PATRONI_SUPERUSER_PASSWORD=test" \
+    -e "PGDATA=/var/lib/postgresql/data/pgdata" \
+    "${extra_args[@]}" \
+    -v "${n}-vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+}
+
 # Wait for one of the 3 nodes to become Patroni leader. Returns the
 # leader container name on stdout, or non-zero if no leader inside the
 # timeout. Uses the local /leader endpoint on each node.
@@ -1519,6 +1544,175 @@ gosu postgres pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/data/pgdat
   teardown_scope "$scope"
 }
 
+# H8. Wiped-replica re-seed via pgbackrest (PR #78). With archiving
+# enabled and a full backup in the bucket, a replica whose volume is
+# lost must re-seed via `pgbackrest restore` from S3
+# (create_replica_methods) instead of pg_basebackup off the live
+# leader. The wiped volume has neither pg_control nor the
+# .pgbackrest_repo_path marker, so the wrapper must discover the
+# per-cluster repo1-path from Patroni DCS (seeded by the leader's
+# backup watcher) — this is exactly the path that a naive
+# `pgbackrest restore` in patroni.yml gets wrong (stale
+# PGBACKREST_REPO1_PATH env pointing at the bucket root).
+t_ha_replica_reseed_pgbackrest() {
+  local scope=t-reseed-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher))
+
+  local leader; leader=$(wait_for_leader "$scope" 240) || { ko t_ha_replica_reseed_pgbackrest "no leader"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_replica_reseed_pgbackrest "replicas didn't stream"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader" 90 || { ko t_ha_replica_reseed_pgbackrest "no stanza-create"; teardown_scope "$scope"; return; }
+
+  psql_leader "$leader" -c "CREATE TABLE reseed(id int, v text); INSERT INTO reseed VALUES (1,'seeded'); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$leader" full 120 || { ko t_ha_replica_reseed_pgbackrest "no initial full backup"; teardown_scope "$scope"; return; }
+
+  # The wiped replica discovers the per-cluster repo path from Patroni
+  # DCS; wait for the leader's watcher to publish it there.
+  local dcs_path="" dcs_deadline=$(($(date +%s) + 90))
+  while [ "$(date +%s)" -lt "$dcs_deadline" ]; do
+    dcs_path=$(docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null \
+      | grep -o '"pgbackrest_repo1_path"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')
+    [ -n "$dcs_path" ] && break
+    sleep 3
+  done
+  if [ -z "$dcs_path" ]; then
+    ko t_ha_replica_reseed_pgbackrest "leader never published pgbackrest_repo1_path to DCS"
+    fail_dump t_ha_replica_reseed_pgbackrest "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Kill a replica and destroy its volume — the production "volume
+  # lost / wiped" scenario.
+  local replica=""
+  for n in "$n1" "$n2" "$n3"; do
+    if [ "$n" != "$leader" ]; then replica="$n"; break; fi
+  done
+  docker rm -f "$replica" >/dev/null 2>&1 || true
+  new_volume "${replica}-vol"
+  # shellcheck disable=SC2046
+  run_patroni_node "$scope" "$etcd_hosts" "$replica" $(archive_env_fast_watcher)
+
+  # Gate on the new node's own creation log line, not the leader's
+  # /cluster view: the destroyed member's etcd key (state=streaming)
+  # lingers for its TTL after `docker rm -f`, so streaming counts
+  # false-positive while the new container is still bootstrapping.
+  local created="" create_deadline=$(($(date +%s) + 300))
+  while [ "$(date +%s)" -lt "$create_deadline" ]; do
+    created=$(docker logs "$replica" 2>&1 | grep -o "replica has been created using [a-z_]*" | tail -1)
+    [ -n "$created" ] && break
+    sleep 5
+  done
+  if [ "$created" != "replica has been created using pgbackrest" ]; then
+    ko t_ha_replica_reseed_pgbackrest "expected pgbackrest re-seed, got: '${created:-no creation logged in 300s}'"
+    fail_dump t_ha_replica_reseed_pgbackrest "$replica" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  wait_for_replication "$scope" 2 300 || {
+    ko t_ha_replica_reseed_pgbackrest "re-seeded replica never started streaming"
+    fail_dump t_ha_replica_reseed_pgbackrest "$replica" "$leader"
+    teardown_scope "$scope"
+    return
+  }
+
+  # Data round-trip: the restored+streaming replica serves the row.
+  local val="" row_deadline=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$row_deadline" ]; do
+    val=$(docker exec "$replica" psql -U postgres -h /var/run/postgresql -At -c "SELECT v FROM reseed WHERE id=1" 2>/dev/null || echo "")
+    [ "$val" = "seeded" ] && break
+    sleep 3
+  done
+  if [ "$val" != "seeded" ]; then
+    ko t_ha_replica_reseed_pgbackrest "re-seeded replica doesn't serve the data (got '$val')"
+    fail_dump t_ha_replica_reseed_pgbackrest "$replica"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # The wrapper rewrites the volume marker with the path it used, so
+  # restore_command (archive-get wrapper) resolves correctly from now on.
+  local marker
+  marker=$(docker exec "$replica" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path 2>/dev/null | tr -d '\n\r')
+  if [ "$marker" != "$dcs_path" ]; then
+    ko t_ha_replica_reseed_pgbackrest "marker '$marker' != DCS path '$dcs_path' after re-seed"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_replica_reseed_pgbackrest
+  note "wiped replica re-seeded via pgbackrest from $dcs_path; data intact; marker rewritten"
+  teardown_scope "$scope"
+}
+
+# H9. pgbackrest re-seed falls back to basebackup when the restore
+# cannot succeed (PR #78). Watcher cadence is pushed out to a day so
+# the stanza exists but holds zero backups; the wiped replica's
+# pgbackrest method must fail without wedging replica creation, and
+# Patroni must fall through to basebackup and still produce a
+# streaming member.
+t_ha_replica_reseed_fallback_basebackup() {
+  local scope=t-reseedfb-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env) \
+    -e WAL_BACKUP_POLL_INTERVAL_SECONDS=86400 -e WAL_BACKUP_INITIAL_POLL_SECONDS=86400)
+
+  local leader; leader=$(wait_for_leader "$scope" 240) || { ko t_ha_replica_reseed_fallback_basebackup "no leader"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_replica_reseed_fallback_basebackup "replicas didn't stream"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader" 90 || { ko t_ha_replica_reseed_fallback_basebackup "no stanza-create"; teardown_scope "$scope"; return; }
+
+  local replica=""
+  for n in "$n1" "$n2" "$n3"; do
+    if [ "$n" != "$leader" ]; then replica="$n"; break; fi
+  done
+  docker rm -f "$replica" >/dev/null 2>&1 || true
+  new_volume "${replica}-vol"
+  # shellcheck disable=SC2046
+  run_patroni_node "$scope" "$etcd_hosts" "$replica" $(archive_env) \
+    -e WAL_BACKUP_POLL_INTERVAL_SECONDS=86400 -e WAL_BACKUP_INITIAL_POLL_SECONDS=86400
+
+  # Same stale-etcd-member caveat as t_ha_replica_reseed_pgbackrest:
+  # gate on the new node's own creation log line.
+  local created="" create_deadline=$(($(date +%s) + 300))
+  while [ "$(date +%s)" -lt "$create_deadline" ]; do
+    created=$(docker logs "$replica" 2>&1 | grep -o "replica has been created using [a-z_]*" | tail -1)
+    [ -n "$created" ] && break
+    sleep 5
+  done
+  if [ "$created" != "replica has been created using basebackup" ]; then
+    ko t_ha_replica_reseed_fallback_basebackup "expected basebackup fallback, got: '${created:-no creation logged in 300s}'"
+    fail_dump t_ha_replica_reseed_fallback_basebackup "$replica" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # The pgbackrest method must have been attempted first (the wrapper
+  # logs its resolved repo path before the restore fails).
+  if ! docker logs "$replica" 2>&1 | grep -q "pgbackrest-replica-restore: restoring from repo1-path"; then
+    ko t_ha_replica_reseed_fallback_basebackup "pgbackrest method never attempted"
+    fail_dump t_ha_replica_reseed_fallback_basebackup "$replica"
+    teardown_scope "$scope"
+    return
+  fi
+
+  wait_for_replication "$scope" 2 300 || {
+    ko t_ha_replica_reseed_fallback_basebackup "fallback replica never started streaming"
+    fail_dump t_ha_replica_reseed_fallback_basebackup "$replica" "$leader"
+    teardown_scope "$scope"
+    return
+  }
+
+  ok t_ha_replica_reseed_fallback_basebackup
+  note "pgbackrest attempt failed cleanly (no backups in stanza); basebackup fallback produced a streaming member"
+  teardown_scope "$scope"
+}
+
 # H5. PGHOST/PGPORT cleared in stanza-create + watcher subshells.
 # Pins port commit caea70a (postgres-ssl PR #51 equivalent). Asserts
 # via a customer-style PGHOST set to a deliberately-broken target —
@@ -2185,6 +2379,9 @@ ALL_TESTS=(
   t_ha_track_commit_timestamp_seeded
   t_ha_per_cluster_path_marker
   t_ha_recovery_source_conf_isolation
+  # PR #78: replica re-seed from the S3 archive instead of the live leader
+  t_ha_replica_reseed_pgbackrest
+  t_ha_replica_reseed_fallback_basebackup
   t_ha_pghost_pgport_unset
   t_ha_restore_gate_logged_on_every_node
   t_ha_failover_watcher_handoff

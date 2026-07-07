@@ -121,6 +121,9 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
     let track_commit_timestamp = params
         .and_then(|m| m.get("track_commit_timestamp"))
         .and_then(|v| v.as_str());
+    let restore_command = params
+        .and_then(|m| m.get("restore_command"))
+        .and_then(|v| v.as_str());
 
     if enabled {
         if archive_mode == Some(EXPECTED_ARCHIVE_MODE)
@@ -154,7 +157,11 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
         send_patch(&client, &patch).await?;
         info!("DCS archive params patched in (PITR enabled)");
     } else {
-        if archive_mode.is_none() && archive_command.is_none() && archive_timeout.is_none() {
+        if archive_mode.is_none()
+            && archive_command.is_none()
+            && archive_timeout.is_none()
+            && restore_command.is_none()
+        {
             info!("DCS archive config already absent (PITR disabled)");
             return Ok(());
         }
@@ -168,12 +175,17 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
         // null in PATCH /config removes the key from the merged DCS config.
         // track_commit_timestamp is left in place: it's harmless when set
         // without archiving, and a no-op cost on inactive clusters.
+        // restore_command is cleared for the same reason as archive_command:
+        // bootstrap.dcs seeds it on archiving-born clusters, and after a
+        // disable the S3 creds are gone — every standby would spam a failing
+        // archive-get on each recovery attempt until someone cleans DCS.
         let patch = json!({
             "postgresql": {
                 "parameters": {
                     "archive_mode": Value::Null,
                     "archive_command": Value::Null,
                     "archive_timeout": Value::Null,
+                    "restore_command": Value::Null,
                 }
             }
         });

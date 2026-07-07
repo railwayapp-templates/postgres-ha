@@ -544,11 +544,14 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 ///
 /// Per-command `process-max` is sized off cgroup-detected vCPU. Each
 /// command has a different bottleneck shape: archive-push is gated by
-/// serial WAL arrival + S3 PUT overhead; archive-get by serial replay
-/// inside Postgres; restore is unbounded (DB is down) up to pgBackRest's
-/// plateau around 32 workers. Backup is capped at 2: volume read
-/// throughput does not scale with vCPU, so extra readers only deepen the
-/// volume's request queue — starving live queries and any member
+/// serial WAL arrival + S3 PUT overhead; archive-get is sized like push —
+/// with `archive-async=y` it prefetches segments into the spool ahead of
+/// replay, and during bulk catch-up (standby archive fallback, staged
+/// replay) per-segment S3 GET latency dominates, so parallel prefetch
+/// directly shortens catch-up; restore is unbounded (DB is down) up to
+/// pgBackRest's plateau around 32 workers. Backup is capped at 2: volume
+/// read throughput does not scale with vCPU, so extra readers only deepen
+/// the volume's request queue — starving live queries and any member
 /// mid-rewind or mid-clone that is reading from this node.
 ///
 /// No-op when neither archive nor recover-from is configured. Otherwise
@@ -641,7 +644,7 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
 
     let cpus = detect_cpus().max(1) as i64;
     let push_max = env_or_clamp("PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX", clamp(cpus / 8, 2, 8));
-    let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", 1);
+    let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", clamp(cpus / 8, 2, 8));
     let backup_max = env_or_clamp("PGBACKREST_BACKUP_PROCESS_MAX", clamp(cpus / 4, 1, 2));
     let restore_max = env_or_clamp("PGBACKREST_RESTORE_PROCESS_MAX", clamp(cpus, 1, 32));
 

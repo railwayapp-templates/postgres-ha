@@ -45,12 +45,17 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // breaks and the leader has already recycled the WAL a standby needs
     // (post-rewind catch-up, long clone, extended disconnect), recovery pulls
     // the missing segments from the stanza's own S3 archive instead of
-    // wedging on "requested WAL segment has already been removed". Staged
-    // PITR restores still win: their restore_command lands in
-    // postgresql.auto.conf, which Postgres reads last.
+    // wedging on "requested WAL segment has already been removed". Patroni
+    // moves recovery parameters out of postgresql.parameters into the
+    // recovery section it writes for standbys (_adjust_recovery_parameters →
+    // build_recovery_params), so this reaches every standby and never the
+    // primary. It goes through the archive-get wrapper because repo1-path
+    // must be resolved at call time from the volume marker: the env
+    // Postgres inherits from Patroni still holds the pre-derivation base
+    // path, and pgBackRest prefers env over pgbackrest.conf.
     let pgbackrest_archive_params = if config.wal_archive_bucket.is_some() {
         format!(
-            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n        restore_command: 'pgbackrest --stanza=main archive-get %f \"%p\"'\n",
+            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n        restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n",
             config.archive_timeout_secs,
         )
     } else {
@@ -63,10 +68,12 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // read load on the leader's volume. pg_basebackup — a single sequential
     // stream read directly off the leader, competing with production
     // queries for the same disk — stays as the fallback for fresh stanzas
-    // (no backup in the catalog yet) and restore failures. --delta reuses
-    // whatever valid files are already on the volume.
+    // (no backup in the catalog yet) and restore failures. The wrapper
+    // resolves the per-cluster repo1-path at call time (DCS → volume
+    // marker → env default): a wiped volume has neither pg_control nor the
+    // marker, and the env Patroni inherited holds only the base path.
     let pgbackrest_replica_method = if config.wal_archive_bucket.is_some() {
-        "  create_replica_methods:\n    - pgbackrest\n    - basebackup\n  pgbackrest:\n    command: \"pgbackrest --stanza=main --delta restore\"\n    keep_data: true\n    no_params: true\n".to_string()
+        "  create_replica_methods:\n    - pgbackrest\n    - basebackup\n  pgbackrest:\n    command: \"/usr/local/bin/pgbackrest-replica-restore-wrapper.sh\"\n    keep_data: true\n    no_params: true\n".to_string()
     } else {
         String::new()
     };
@@ -81,7 +88,7 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // priority when both are present and agree; if DCS is empty at startup
     // the local value fills the gap and avoids the reload→pending_restart trap.
     let pgbackrest_local_params = if config.wal_archive_bucket.is_some() {
-        "    archive_mode: \"on\"\n    track_commit_timestamp: \"on\"\n    restore_command: 'pgbackrest --stanza=main archive-get %f \"%p\"'\n".to_string()
+        "    archive_mode: \"on\"\n    track_commit_timestamp: \"on\"\n    restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n".to_string()
     } else {
         String::new()
     };
@@ -296,5 +303,46 @@ mod tests {
         cfg.basebackup_max_rate = "64M".into();
         let yaml = generate_patroni_config(&cfg, "replica");
         assert!(yaml.contains("  basebackup:\n    max-rate: 64M\n    checkpoint: fast\n"));
+    }
+
+    #[test]
+    fn archiving_enabled_seeds_replica_method_and_restore_command() {
+        let yaml = generate_patroni_config(&test_config(Some("bucket")), "replica");
+
+        // Replica re-seed method ahead of basebackup, via the call-time
+        // repo-path-resolving wrapper.
+        assert!(yaml.contains("  create_replica_methods:\n    - pgbackrest\n    - basebackup\n"));
+        assert!(yaml.contains("command: \"/usr/local/bin/pgbackrest-replica-restore-wrapper.sh\""));
+        assert!(yaml.contains("keep_data: true"));
+        assert!(yaml.contains("no_params: true"));
+
+        // Archive fallback for standbys, in both bootstrap DCS seed (8-space
+        // indent) and local postgresql.parameters (4-space indent).
+        assert!(yaml.contains(
+            "        restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n"
+        ));
+        assert!(yaml.contains(
+            "    restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n"
+        ));
+    }
+
+    #[test]
+    fn archiving_disabled_omits_replica_method_and_restore_command() {
+        let yaml = generate_patroni_config(&test_config(None), "replica");
+
+        assert!(!yaml.contains("create_replica_methods"));
+        assert!(!yaml.contains("restore_command"));
+        assert!(!yaml.contains("pgbackrest"));
+        // The interpolation site must still render valid YAML.
+        assert!(yaml.contains("  data_dir: /var/lib/postgresql/data/pgdata\n  pgpass: /tmp/pgpass\n"));
+    }
+
+    #[test]
+    fn replica_method_block_renders_between_data_dir_and_pgpass() {
+        let yaml = generate_patroni_config(&test_config(Some("bucket")), "replica");
+        assert!(yaml.contains(
+            "  data_dir: /var/lib/postgresql/data/pgdata\n  create_replica_methods:"
+        ));
+        assert!(yaml.contains("    no_params: true\n  pgpass: /tmp/pgpass\n"));
     }
 }
