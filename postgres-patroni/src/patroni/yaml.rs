@@ -65,6 +65,16 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
         String::new()
     };
 
+    // Throttle replica creation so a re-seed can never monopolize the
+    // leader's volume: pg_basebackup is a single sequential stream read
+    // directly off the live leader, and unthrottled it runs at the volume's
+    // throughput ceiling, starving production queries for the entire copy.
+    // The 20M default is well under the observed per-volume read ceiling,
+    // leaving production the dominant share while a re-seed runs.
+    // checkpoint: fast skips the spread-checkpoint wait (up to
+    // checkpoint_timeout of apparent hang before the first byte lands).
+    // config.basebackup_max_rate is the validated POSTGRES_BASEBACKUP_MAX_RATE
+    // override for oversized emergencies, resolved in Config::from_env.
     format!(
         r#"scope: {scope}
 name: {name}
@@ -120,6 +130,9 @@ postgresql:
   listen: "*:5432"
   connect_address: {connect_address}:5432
   data_dir: {data_dir}
+  basebackup:
+    max-rate: {basebackup_max_rate}
+    checkpoint: fast
   pgpass: /tmp/pgpass
   callbacks:
     on_role_change: /usr/local/bin/on-role-change
@@ -161,6 +174,7 @@ postgresql:
         data_dir = config.data_dir,
         certs_dir = config.certs_dir,
         synchronous_mode = config.synchronous_mode,
+        basebackup_max_rate = config.basebackup_max_rate,
         pgbackrest_archive_params = pgbackrest_archive_params,
         pgbackrest_local_params = pgbackrest_local_params,
     )
@@ -204,4 +218,62 @@ host replication {} ::/0 scram-sha-256
 
     info!("pg_hba.conf updated");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(wal_archive_bucket: Option<&str>) -> Config {
+        Config {
+            scope: "test-scope".into(),
+            name: "test-node".into(),
+            connect_address: "test-node".into(),
+            etcd_hosts: "etcd-1:2379".into(),
+            superuser: "postgres".into(),
+            superuser_pass: "pw".into(),
+            repl_user: "repl".into(),
+            repl_pass: "pw".into(),
+            app_user: "app".into(),
+            app_pass: "pw".into(),
+            app_db: "app".into(),
+            data_dir: "/var/lib/postgresql/data/pgdata".into(),
+            certs_dir: "/certs".into(),
+            ttl: "30".into(),
+            loop_wait: "10".into(),
+            retry_timeout: "10".into(),
+            health_check_interval: 5,
+            health_check_timeout: 3,
+            max_failures: 3,
+            startup_grace_period: 30,
+            max_startup_timeout: 1800,
+            adopt_existing_data: false,
+            wait_for_leader: false,
+            synchronous_mode: false,
+            wal_archive_bucket: wal_archive_bucket.map(String::from),
+            wal_recover_from_bucket: None,
+            pitr_target_time: None,
+            pitr_target_xid: None,
+            archive_timeout_secs: 60,
+            basebackup_max_rate: "20M".into(),
+        }
+    }
+
+    #[test]
+    fn basebackup_is_throttled_with_and_without_archiving() {
+        for cfg in [test_config(Some("bucket")), test_config(None)] {
+            let yaml = generate_patroni_config(&cfg, "replica");
+            assert!(yaml.contains(
+                "  data_dir: /var/lib/postgresql/data/pgdata\n  basebackup:\n    max-rate: 20M\n    checkpoint: fast\n  pgpass: /tmp/pgpass\n"
+            ));
+        }
+    }
+
+    #[test]
+    fn basebackup_max_rate_renders_from_config() {
+        let mut cfg = test_config(None);
+        cfg.basebackup_max_rate = "64M".into();
+        let yaml = generate_patroni_config(&cfg, "replica");
+        assert!(yaml.contains("  basebackup:\n    max-rate: 64M\n    checkpoint: fast\n"));
+    }
 }
