@@ -81,7 +81,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const STATE_FILENAME: &str = ".pgbackrest_backup_state";
 const GAP_MARKER_FILENAME: &str = ".pgbackrest_gap_pending";
@@ -294,7 +294,9 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
     sync_repo_path_from_marker(data_dir);
 
     if !pg_isready().await {
-        info!("pgbackrest-watcher: iteration skipped (pg_isready=fail)");
+        // Routine during bootstrap/clone, where this can fire every poll
+        // for minutes at INFO — debug-only to avoid drowning out real signal.
+        debug!("pgbackrest-watcher: iteration skipped (pg_isready=fail)");
         return;
     }
 
