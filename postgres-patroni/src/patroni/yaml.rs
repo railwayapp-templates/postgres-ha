@@ -41,11 +41,32 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // WAL while the latest reachable target stays pinned at the last commit.
     // Without this GUC the picker falls back to lastArchivedAt and the user
     // can pick an unreachable target. Mirrors postgres-ssl PRs #52 + #58.
+    // restore_command gives every standby an archive fallback: when streaming
+    // breaks and the leader has already recycled the WAL a standby needs
+    // (post-rewind catch-up, long clone, extended disconnect), recovery pulls
+    // the missing segments from the stanza's own S3 archive instead of
+    // wedging on "requested WAL segment has already been removed". Staged
+    // PITR restores still win: their restore_command lands in
+    // postgresql.auto.conf, which Postgres reads last.
     let pgbackrest_archive_params = if config.wal_archive_bucket.is_some() {
         format!(
-            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n",
+            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n        restore_command: 'pgbackrest --stanza=main archive-get %f \"%p\"'\n",
             config.archive_timeout_secs,
         )
+    } else {
+        String::new()
+    };
+
+    // Re-seed replicas from the S3 archive instead of the live leader:
+    // pgbackrest restore downloads the base backup from object storage in
+    // parallel and replays archived WAL via restore_command, placing zero
+    // read load on the leader's volume. pg_basebackup — a single sequential
+    // stream read directly off the leader, competing with production
+    // queries for the same disk — stays as the fallback for fresh stanzas
+    // (no backup in the catalog yet) and restore failures. --delta reuses
+    // whatever valid files are already on the volume.
+    let pgbackrest_replica_method = if config.wal_archive_bucket.is_some() {
+        "  create_replica_methods:\n    - pgbackrest\n    - basebackup\n  pgbackrest:\n    command: \"pgbackrest --stanza=main --delta restore\"\n    keep_data: true\n    no_params: true\n".to_string()
     } else {
         String::new()
     };
@@ -60,7 +81,7 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // priority when both are present and agree; if DCS is empty at startup
     // the local value fills the gap and avoids the reload→pending_restart trap.
     let pgbackrest_local_params = if config.wal_archive_bucket.is_some() {
-        "    archive_mode: \"on\"\n    track_commit_timestamp: \"on\"\n".to_string()
+        "    archive_mode: \"on\"\n    track_commit_timestamp: \"on\"\n    restore_command: 'pgbackrest --stanza=main archive-get %f \"%p\"'\n".to_string()
     } else {
         String::new()
     };
@@ -130,7 +151,7 @@ postgresql:
   listen: "*:5432"
   connect_address: {connect_address}:5432
   data_dir: {data_dir}
-  basebackup:
+{pgbackrest_replica_method}  basebackup:
     max-rate: {basebackup_max_rate}
     checkpoint: fast
   pgpass: /tmp/pgpass
