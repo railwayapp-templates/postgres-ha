@@ -892,28 +892,41 @@ pub mod wal_corruption {
 
     /// The fixed set of Postgres WAL-reader error strings emitted when
     /// redo/replay hits a record it can't parse (see `xlogreader.c`'s
-    /// `report_invalid_record` call sites). Two of these — `"invalid record
-    /// length"` and `"invalid contrecord length"` — are NOT corruption-only:
-    /// Postgres also logs them as the normal, expected way of detecting the
-    /// leading edge of available WAL (crash-recovery catch-up, or a streaming
-    /// replica repeatedly reaching a primary's moving end-of-WAL boundary).
-    /// A healthy replica trailing an intermittent primary can log one of
-    /// these every few seconds indefinitely without ever being stuck. The
-    /// pattern match alone therefore cannot tell "stuck" from "healthy and
-    /// still advancing" — [`extract_lsn`] + [`CorruptionTracker`]'s
+    /// `report_invalid_record` call sites). Each entry is the leading,
+    /// format-argument-free prefix of one message so a single `contains`
+    /// scan matches across the supported majors (PG 14–18) despite the `%`
+    /// placeholders and the wording changes between them (e.g. PG 16 reworded
+    /// `"invalid record length ... wanted %u"` to `"... expected at least
+    /// %u"`, and `"in log segment"` to `"in WAL segment ..., LSN %X/%X"`).
+    ///
+    /// Two of these — `"invalid record length"` and `"invalid contrecord
+    /// length"` — are NOT corruption-only: Postgres also logs them as the
+    /// normal, expected way of detecting the leading edge of available WAL
+    /// (crash-recovery catch-up, or a streaming replica repeatedly reaching a
+    /// primary's moving end-of-WAL boundary). A healthy replica trailing an
+    /// intermittent primary can log one every few seconds indefinitely without
+    /// ever being stuck. The pattern match alone therefore cannot tell "stuck"
+    /// from "healthy and still advancing" — [`extract_lsn`] + [`CorruptionTracker`]'s
     /// same-LSN requirement below is what actually enforces the module's
     /// documented invariant (signal 3: "retries the same LSN every few
     /// seconds forever"): only a match recurring at the SAME position counts,
     /// so an advancing replica never accrues a dwell no matter how often it
     /// logs one of these strings.
+    ///
+    /// The last two — `"invalid magic number"` and `"unexpected pageaddr"` —
+    /// are page-header errors whose LSN is reported as `"..., LSN %X/%X"`,
+    /// which only exists on PG 16+ (PG 14/15 log `"in log segment %s, offset
+    /// %u"` with no LSN at all). [`extract_lsn`] reads that `LSN` form too, so
+    /// these are same-LSN-gated on 16+ and harmlessly inert on 14/15 (no LSN
+    /// to key on ⇒ never accrues a dwell). Prefix-only so the `%04X`/`%X/%X`
+    /// arguments that follow the matched words don't break the scan.
     const CORRUPTION_PATTERNS: &[&str] = &[
         "record with incorrect prev-link",
         "invalid record length",
         "invalid resource manager ID",
-        "invalid magic number in log segment",
+        "invalid magic number",
         "incorrect resource manager data checksum",
         "unexpected pageaddr",
-        "record with incorrect crc",
         "invalid contrecord length",
     ];
 
@@ -922,17 +935,28 @@ pub mod wal_corruption {
     }
 
     /// Extract the LSN Postgres reports the error against, e.g. `"invalid
-    /// resource manager ID 127 at 0/7B0000A0"` -> `Some("0/7B0000A0")`. Every
-    /// `report_invalid_record` call site logs `"... at %X/%X"` with the
-    /// position being read, so this is a stable extraction point across all
-    /// [`CORRUPTION_PATTERNS`] entries without needing a per-pattern parser.
-    /// `None` when the line doesn't have the expected trailing `"at
-    /// <hex>/<hex>"` — callers must treat that as "can't prove same-LSN
-    /// recurrence" (see [`CorruptionTracker::observe`]), never as a match.
+    /// resource manager ID 127 at 0/7B0000A0"` -> `Some("0/7B0000A0")`.
+    /// Record-level errors report it as `"... at %X/%X"`; page-header errors
+    /// (magic number, pageaddr) report it as `"..., LSN %X/%X, offset %u"` on
+    /// PG 16+ — we read either form, taking the token right after the marker.
+    ///
+    /// Anchored on the FIRST `" at "`, not the last: PG 16+'s `"invalid record
+    /// length at %X/%X: expected at least %u, got %u"` embeds a SECOND `" at "`
+    /// inside "expected at least", so an `rsplit` would parse "least" and fail.
+    /// The first `" at "` after the message is always the read position for
+    /// every record-level [`CORRUPTION_PATTERNS`] entry (`prev-link`'s leading
+    /// `%X/%X` value is not preceded by `" at "`).
+    ///
+    /// `None` when the line carries neither marker followed by a `<hex>/<hex>`
+    /// token — e.g. a page-header error on PG 14/15, which logs no LSN at all.
+    /// Callers must treat `None` as "can't prove same-LSN recurrence" (see
+    /// [`CorruptionTracker::observe`]), never as a match.
     fn extract_lsn(line: &str) -> Option<&str> {
-        let (_, after) = line.rsplit_once(" at ")?;
+        let (_, after) = line
+            .split_once(" at ")
+            .or_else(|| line.split_once(" LSN "))?;
         let token = after
-            .split(|c: char| c.is_whitespace() || c == ':')
+            .split(|c: char| c.is_whitespace() || c == ':' || c == ',')
             .next()?;
         let (hi, lo) = token.split_once('/')?;
         let is_hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
@@ -1156,6 +1180,16 @@ pub mod wal_corruption {
             assert!(matches_corruption_pattern(
                 "2026-07-05 16:48:49.828 UTC [120] LOG:  invalid resource manager ID 127 at 0/7B0000A0"
             ));
+            // Page-header errors: the prefix must match despite the `%04X` magic
+            // value and the "log segment"→"WAL segment" rewording on PG 16+
+            // (the pre-fix pattern "invalid magic number in log segment" matched
+            // neither, because %04X sits between "number" and "in").
+            assert!(matches_corruption_pattern(
+                "LOG:  invalid magic number D07E in WAL segment 000000010000000100000030, LSN 1/300000A0, offset 0"
+            ));
+            assert!(matches_corruption_pattern(
+                "LOG:  unexpected pageaddr 1/2000 in WAL segment 000000010000000100000030, LSN 1/300000A0, offset 40"
+            ));
         }
 
         #[test]
@@ -1190,10 +1224,53 @@ pub mod wal_corruption {
         }
 
         #[test]
+        fn extract_lsn_handles_both_record_length_wordings() {
+            // PG 14/15 wording ("wanted %u") and PG 16+ wording ("expected at
+            // least %u") must resolve to the SAME read position. The latter
+            // embeds a second " at " ("expected AT least") that a naive rsplit
+            // would parse instead — this is the regression that silently
+            // disabled the signal on PG 16/17/18 (the default and CI versions).
+            assert_eq!(
+                extract_lsn("LOG:  invalid record length at 1/300000A0: wanted 24, got 0"),
+                Some("1/300000A0")
+            );
+            assert_eq!(
+                extract_lsn(
+                    "LOG:  invalid record length at 1/300000A0: expected at least 24, got 0"
+                ),
+                Some("1/300000A0")
+            );
+        }
+
+        #[test]
+        fn extract_lsn_from_page_header_lsn_form() {
+            // Page-header errors (PG 16+) report position as ", LSN %X/%X,
+            // offset %u" rather than "at %X/%X"; extract_lsn reads that too.
+            assert_eq!(
+                extract_lsn(
+                    "LOG:  invalid magic number D07E in WAL segment 000000010000000100000030, LSN 1/300000A0, offset 0"
+                ),
+                Some("1/300000A0")
+            );
+            assert_eq!(
+                extract_lsn(
+                    "LOG:  unexpected pageaddr 1/2000 in WAL segment 000000010000000100000030, LSN 1/300000A0, offset 40"
+                ),
+                Some("1/300000A0")
+            );
+        }
+
+        #[test]
         fn extract_lsn_none_when_unparseable() {
             assert_eq!(extract_lsn("no ' at ' marker here"), None);
             assert_eq!(extract_lsn("something at not-hex/also-not-hex"), None);
             assert_eq!(extract_lsn("something at 0/"), None);
+            // PG 14/15 page-header errors carry no LSN ("in log segment %s,
+            // offset %u"); no marker ⇒ None ⇒ never accrues a dwell there.
+            assert_eq!(
+                extract_lsn("LOG:  invalid magic number D07E in log segment 000000010000000100000030, offset 0"),
+                None
+            );
         }
 
         #[test]
