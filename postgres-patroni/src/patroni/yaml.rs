@@ -2,10 +2,31 @@
 
 use super::Config;
 use anyhow::Result;
+use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tracing::info;
+
+/// Validate an operator-supplied pg_basebackup --max-rate value: digits with
+/// an optional k/M suffix (pg_basebackup accepts 32kB..1024MB). Anything else
+/// falls back to the default so a typo can't break replica creation — the
+/// throttled basebackup is the bootstrap path of last resort.
+fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
+    const DEFAULT: &str = "32M";
+    let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return DEFAULT.to_string();
+    };
+    let digits = v
+        .strip_suffix('k')
+        .or_else(|| v.strip_suffix('M'))
+        .unwrap_or(&v);
+    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+        v
+    } else {
+        DEFAULT.to_string()
+    }
+}
 
 /// Generate Patroni YAML configuration.
 ///
@@ -65,6 +86,17 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
         String::new()
     };
 
+    // Throttle replica creation so a re-seed can never monopolize the
+    // leader's volume: pg_basebackup is a single sequential stream read
+    // directly off the live leader, and unthrottled it runs at the volume's
+    // throughput ceiling, starving production queries for the entire copy.
+    // The 32M default is roughly half the observed per-volume read ceiling,
+    // leaving production the larger share while a re-seed runs.
+    // checkpoint: fast skips the spread-checkpoint wait (up to
+    // checkpoint_timeout of apparent hang before the first byte lands).
+    // PG_BASEBACKUP_MAX_RATE overrides the rate for oversized emergencies.
+    let basebackup_max_rate = resolve_basebackup_max_rate(env::var("PG_BASEBACKUP_MAX_RATE").ok());
+
     format!(
         r#"scope: {scope}
 name: {name}
@@ -120,6 +152,9 @@ postgresql:
   listen: "*:5432"
   connect_address: {connect_address}:5432
   data_dir: {data_dir}
+  basebackup:
+    max-rate: {basebackup_max_rate}
+    checkpoint: fast
   pgpass: /tmp/pgpass
   callbacks:
     on_role_change: /usr/local/bin/on-role-change
@@ -204,4 +239,71 @@ host replication {} ::/0 scram-sha-256
 
     info!("pg_hba.conf updated");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(wal_archive_bucket: Option<&str>) -> Config {
+        Config {
+            scope: "test-scope".into(),
+            name: "test-node".into(),
+            connect_address: "test-node".into(),
+            etcd_hosts: "etcd-1:2379".into(),
+            superuser: "postgres".into(),
+            superuser_pass: "pw".into(),
+            repl_user: "repl".into(),
+            repl_pass: "pw".into(),
+            app_user: "app".into(),
+            app_pass: "pw".into(),
+            app_db: "app".into(),
+            data_dir: "/var/lib/postgresql/data/pgdata".into(),
+            certs_dir: "/certs".into(),
+            ttl: "30".into(),
+            loop_wait: "10".into(),
+            retry_timeout: "10".into(),
+            health_check_interval: 5,
+            health_check_timeout: 3,
+            max_failures: 3,
+            startup_grace_period: 30,
+            max_startup_timeout: 1800,
+            adopt_existing_data: false,
+            wait_for_leader: false,
+            synchronous_mode: false,
+            wal_archive_bucket: wal_archive_bucket.map(String::from),
+            wal_recover_from_bucket: None,
+            pitr_target_time: None,
+            pitr_target_xid: None,
+            archive_timeout_secs: 60,
+        }
+    }
+
+    #[test]
+    fn basebackup_is_throttled_with_and_without_archiving() {
+        for cfg in [test_config(Some("bucket")), test_config(None)] {
+            let yaml = generate_patroni_config(&cfg, "replica");
+            assert!(yaml.contains(
+                "  data_dir: /var/lib/postgresql/data/pgdata\n  basebackup:\n    max-rate: 32M\n    checkpoint: fast\n  pgpass: /tmp/pgpass\n"
+            ));
+        }
+    }
+
+    #[test]
+    fn resolve_basebackup_max_rate_accepts_valid_values() {
+        assert_eq!(resolve_basebackup_max_rate(Some("64M".into())), "64M");
+        assert_eq!(resolve_basebackup_max_rate(Some("512k".into())), "512k");
+        assert_eq!(resolve_basebackup_max_rate(Some("100".into())), "100");
+        assert_eq!(resolve_basebackup_max_rate(Some(" 48M ".into())), "48M");
+    }
+
+    #[test]
+    fn resolve_basebackup_max_rate_falls_back_on_garbage() {
+        assert_eq!(resolve_basebackup_max_rate(None), "32M");
+        assert_eq!(resolve_basebackup_max_rate(Some(String::new())), "32M");
+        assert_eq!(resolve_basebackup_max_rate(Some("fast".into())), "32M");
+        assert_eq!(resolve_basebackup_max_rate(Some("M".into())), "32M");
+        assert_eq!(resolve_basebackup_max_rate(Some("32MB".into())), "32M");
+        assert_eq!(resolve_basebackup_max_rate(Some("-5M".into())), "32M");
+    }
 }
