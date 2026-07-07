@@ -31,6 +31,13 @@ const WAL_PROBE_MAX_INTERVAL_SECS: u64 = 240;
 /// the dwell), and the wipe-and-reseed is the remaining move. Without an
 /// archive the verdict is already final and fires immediately, exactly as
 /// before.
+///
+/// The Stalled branch's immediate fire assumes `max_startup_timeout` (default
+/// 1800, operator-overridable) is comfortably larger than this dwell — that's
+/// what makes "reached Stalled" imply "the archive had longer than the dwell".
+/// An operator setting max_startup_timeout below ~this value would let the
+/// Stalled path wipe an archiving replica with less zero-progress time than
+/// the Waiting path demands; nothing enforces the relationship today.
 const WAL_ARCHIVE_STALL_CONFIRM_SECS: u64 = 300;
 
 /// Run the main monitoring loop for Patroni

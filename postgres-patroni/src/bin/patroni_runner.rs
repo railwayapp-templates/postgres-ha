@@ -546,9 +546,10 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 /// command has a different bottleneck shape: archive-push is gated by
 /// serial WAL arrival + S3 PUT overhead; archive-get is sized like push —
 /// with `archive-async=y` it prefetches segments into the spool ahead of
-/// replay, and during bulk catch-up (standby archive fallback, staged
-/// replay) per-segment S3 GET latency dominates, so parallel prefetch
-/// directly shortens catch-up; restore is unbounded (DB is down) up to
+/// replay, and during bulk catch-up per-segment S3 GET latency dominates,
+/// so parallel prefetch directly shortens catch-up (this conf serves the
+/// standby archive fallback; staged replay reads the recovery-source
+/// conf, which mirrors these settings); restore is unbounded (DB is down) up to
 /// pgBackRest's plateau around 32 workers. Backup is capped at 2: volume
 /// read throughput does not scale with vCPU, so extra readers only deepen
 /// the volume's request queue — starving live queries and any member
@@ -722,6 +723,12 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
 /// bucket as repo1 (numbering is per-config) so post-promote
 /// archive-push from the fork's main pgbackrest.conf can never fan out
 /// to source's read-only bucket and 403. Mirrors postgres-ssl PR #49.
+///
+/// `--config` REPLACES the main pgbackrest.conf, so the async parallel
+/// archive-get settings must be repeated here or staged replay silently
+/// runs sync with process-max=1 — bulk WAL replay to a PITR target is
+/// exactly the workload where per-segment S3 GET latency dominates.
+/// Sizing and env override mirror `render_pgbackrest_conf`.
 fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
     let bucket = match env::var("WAL_RECOVER_FROM_BUCKET") {
         Ok(b) if !b.is_empty() => b,
@@ -751,11 +758,16 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/pgbackrest".to_string());
 
+    let cpus = detect_cpus().max(1) as i64;
+    let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", clamp(cpus / 8, 2, 8));
+
     let spool_dir = format!("{data_dir}/pgbackrest-spool");
     let conf = format!(
         "[global]\n\
          log-level-console=info\n\
          log-level-file=off\n\
+         archive-async=y\n\
+         archive-get-queue-max=1GiB\n\
          spool-path={spool_dir}\n\
          repo1-type=s3\n\
          repo1-s3-bucket={bucket}\n\
@@ -765,6 +777,9 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
          repo1-s3-endpoint={endpoint}\n\
          repo1-s3-uri-style={uri_style}\n\
          repo1-path={path}\n\
+         \n\
+         [global:archive-get]\n\
+         process-max={get_max}\n\
          \n\
          [main]\n\
          pg1-path={data_dir}\n\
@@ -900,6 +915,16 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
         .context("Failed to open postgresql.auto.conf")?;
     f.write_all(addition.as_bytes())
         .context("Failed to append recovery settings")?;
+
+    // The recovery-source conf runs archive-get in async mode, which needs
+    // the spool dir. `spawn_bootstrap_stanza_create` only mkdirs it after
+    // pg_isready — too late for replay, whose archive-gets start first.
+    // Safe here: pgdata is populated (postgresql.auto.conf was just written
+    // into it), so Patroni's empty-dir bootstrap gate is not in play.
+    let spool_dir = format!("{data_dir}/pgbackrest-spool");
+    fs::create_dir_all(&spool_dir).context("Failed to create pgbackrest spool dir")?;
+    fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o750))
+        .context("Failed to set pgbackrest spool dir permissions")?;
 
     fs::File::create(&signal).context("Failed to create recovery.signal")?;
     fs::write(&staging, "").context("Failed to write PITR staging marker")?;

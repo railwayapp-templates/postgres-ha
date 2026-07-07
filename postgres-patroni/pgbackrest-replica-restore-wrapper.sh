@@ -21,6 +21,12 @@
 #      restore fails and Patroni falls back to the next method (basebackup).
 #
 # `--delta` reuses valid files already on the volume (checksum-verified).
+# Don't expect it to engage often: Patroni's reinitialize and its
+# invalid-system-ID path both wipe pgdata BEFORE running replica methods,
+# so delta usually lands on an empty dir and auto-disables (pgBackRest
+# warns and does a full restore — harmless). It genuinely resumes only
+# when a failed pgbackrest restore is retried before the basebackup
+# fallback runs (whose pre-wipe destroys the partial).
 # `--type=none` keeps pgBackRest from writing restore_command into
 # postgresql.auto.conf or creating recovery.signal — Patroni owns the
 # standby recovery config (and would sanitize those away regardless).
@@ -66,7 +72,12 @@ pgbackrest --stanza=main --delta --type=none restore
 rc=$?
 
 if [ "$rc" -eq 0 ] && [ -n "${PGBACKREST_REPO1_PATH:-}" ]; then
-  { printf '%s\n' "$PGBACKREST_REPO1_PATH" >"$MARKER" && chmod 640 "$MARKER"; } 2>/dev/null || true
+  # tmp + rename so concurrent readers (archive-push/archive-get read this
+  # file per call) never see a truncated marker; mirrors the backup
+  # watcher's apply_active_path.
+  MARKER_TMP="$MARKER.tmp.$$"
+  { printf '%s\n' "$PGBACKREST_REPO1_PATH" >"$MARKER_TMP" && chmod 640 "$MARKER_TMP" && mv "$MARKER_TMP" "$MARKER"; } 2>/dev/null \
+    || rm -f "$MARKER_TMP" 2>/dev/null || true
 fi
 
 exit "$rc"

@@ -54,9 +54,13 @@ if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
   exit 1
 fi
 
+# Marker wins only when it actually holds a path: an empty read (truncated
+# write, fresh file) falls back to the inherited env so USED_PATH always
+# names the path the first attempt really runs with.
 USED_PATH="${PGBACKREST_REPO1_PATH:-}"
 if [ -f "$MARKER" ]; then
-  USED_PATH=$(tr -d '\n\r' <"$MARKER")
+  MARKER_PATH=$(tr -d '\n\r' <"$MARKER")
+  [ -n "$MARKER_PATH" ] && USED_PATH="$MARKER_PATH"
 fi
 if [ -n "$USED_PATH" ]; then
   export PGBACKREST_REPO1_PATH="$USED_PATH"
@@ -71,7 +75,12 @@ DCS_PATH=$(curl -sf --max-time 2 http://localhost:8008/config 2>/dev/null \
 if [ -n "$DCS_PATH" ] && [ "$DCS_PATH" != "$USED_PATH" ]; then
   if PGBACKREST_REPO1_PATH="$DCS_PATH" pgbackrest --stanza=main archive-get "$WAL_FILE" "$WAL_DEST"; then
     echo "pgbackrest-archive-get-wrapper: repo path '${USED_PATH:-<unset>}' is stale; ${WAL_FILE} found at DCS path '${DCS_PATH}' — rewriting marker" >&2
-    { printf '%s\n' "$DCS_PATH" >"$MARKER" && chmod 640 "$MARKER"; } 2>/dev/null || true
+    # tmp + rename so concurrent readers (archive-push cats this file on
+    # every WAL segment) never see a truncated marker; mirrors the backup
+    # watcher's apply_active_path.
+    MARKER_TMP="$MARKER.tmp.$$"
+    { printf '%s\n' "$DCS_PATH" >"$MARKER_TMP" && chmod 640 "$MARKER_TMP" && mv "$MARKER_TMP" "$MARKER"; } 2>/dev/null \
+      || rm -f "$MARKER_TMP" 2>/dev/null || true
     exit 0
   fi
 fi
