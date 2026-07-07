@@ -6,12 +6,15 @@
 //! plus the cadence-override branch).
 //!
 //! Triggers (any of):
-//!   1. NEEDS_INITIAL_BACKUP — no full on record. Take the first full
-//!      immediately so PITR is restorable from this LSN forward.
-//!      pgbackrest brackets the base in pg_backup_start/stop and waits
-//!      for the closing WAL to archive before declaring success, so a
-//!      broken archive_command fails the backup loudly instead of
-//!      producing an unrestorable base.
+//!   1. NEEDS_INITIAL_BACKUP — no full on record locally AND none in the
+//!      S3 catalog. Take the first full immediately so PITR is restorable
+//!      from this LSN forward. pgbackrest brackets the base in
+//!      pg_backup_start/stop and waits for the closing WAL to archive
+//!      before declaring success, so a broken archive_command fails the
+//!      backup loudly instead of producing an unrestorable base. A node
+//!      with empty local state whose catalog already has a full (a
+//!      lifelong replica winning its first election) adopts the catalog
+//!      history instead of re-taking a full at the moment of promotion.
 //!   2. Gap recovery — a state machine that fires whenever WAL coverage is
 //!      diverging from the S3 catalog, regardless of cause. Entry conditions
 //!      (any of):
@@ -355,6 +358,8 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
     // poll rather than waiting up to catalog_verify_interval (default 3600 s).
     stanza_create_step().await;
 
+    adopt_backup_history_from_catalog(data_dir).await;
+
     // Gap-recovery state machine — detects WAL/catalog divergence and
     // drives the kick-and-diff sequence. Runs every iteration;
     // pgbackrest info is cheap enough that throttling isn't worth the
@@ -676,8 +681,10 @@ fn parse_has_full(info_json: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// Probe the S3 catalog for repo1 and classify into the three states above.
-async fn catalog_check_backup() -> CatalogBackupState {
+/// Run `pgbackrest info --output=json` against repo1 and return stdout.
+/// `None` on timeout, spawn failure, non-zero exit, or empty output —
+/// callers treat all of those as inconclusive.
+async fn pgbackrest_info_json() -> Option<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(60),
         Command::new("pgbackrest")
@@ -689,20 +696,106 @@ async fn catalog_check_backup() -> CatalogBackupState {
     .await;
     let out = match out {
         Ok(Ok(o)) => o,
-        _ => return CatalogBackupState::Inconclusive,
+        _ => return None,
     };
     if !out.status.success() {
-        return CatalogBackupState::Inconclusive;
+        return None;
     }
-    let info_json = String::from_utf8_lossy(&out.stdout);
+    let info_json = String::from_utf8_lossy(&out.stdout).into_owned();
     if info_json.trim().is_empty() {
-        return CatalogBackupState::Inconclusive;
+        return None;
     }
+    Some(info_json)
+}
+
+/// Probe the S3 catalog for repo1 and classify into the three states above.
+async fn catalog_check_backup() -> CatalogBackupState {
+    let Some(info_json) = pgbackrest_info_json().await else {
+        return CatalogBackupState::Inconclusive;
+    };
     match parse_has_full(&info_json) {
         Ok(true) => CatalogBackupState::FullPresent,
         Ok(false) => CatalogBackupState::NoFull,
         Err(_) => CatalogBackupState::Inconclusive,
     }
+}
+
+/// Newest full / diff backup stop times (epoch seconds) across all stanzas
+/// in `pgbackrest info --output=json`. Bubbles up serde_json errors so the
+/// caller can treat a parse failure as inconclusive.
+fn parse_latest_backup_stops(info_json: &str) -> Result<(Option<i64>, Option<i64>)> {
+    let v: serde_json::Value = serde_json::from_str(info_json)?;
+    let stanzas = v
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("pgbackrest info JSON top-level not an array"))?;
+    let mut full: Option<i64> = None;
+    let mut diff: Option<i64> = None;
+    for stanza in stanzas {
+        let Some(backups) = stanza.get("backup").and_then(|b| b.as_array()) else {
+            continue;
+        };
+        for backup in backups {
+            let Some(stop) = backup
+                .get("timestamp")
+                .and_then(|t| t.get("stop"))
+                .and_then(|s| s.as_i64())
+            else {
+                continue;
+            };
+            match backup.get("type").and_then(|t| t.as_str()) {
+                Some("full") => full = full.max(Some(stop)),
+                Some("diff") => diff = diff.max(Some(stop)),
+                _ => {}
+            }
+        }
+    }
+    Ok((full, diff))
+}
+
+/// A node that has never run a backup (a lifelong replica winning its first
+/// election) has an empty local state file even when the stanza already
+/// holds backups taken by previous leaders. Left alone, its first leader
+/// iteration reads `last_full_at` as absent and fires NEEDS_INITIAL_BACKUP —
+/// a full-volume read at the exact moment of promotion, competing with
+/// production queries and any member mid-rewind/mid-clone against this
+/// node. Instead, seed `last_full_at`/`last_diff_at` from the catalog's
+/// newest full/diff stop times so the periodic cadence continues where the
+/// previous leader left off. A genuinely fresh stanza (no full in the
+/// catalog) still takes the initial full.
+async fn adopt_backup_history_from_catalog(data_dir: &str) {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    if read_state_field(&state_path, "last_full_at").is_some() {
+        return;
+    }
+    // Mirror decide_action's migration guard: mid WAL_REGRESSION archive-path
+    // migration, `last_full_at` was deliberately cleared to force a full on
+    // the NEW repo path. Until finalization flips the conf, `pgbackrest info`
+    // may still read the OLD path, whose stale fulls must not be adopted.
+    if read_state_field(&state_path, "wal_regression_pending_new_path").is_some() {
+        return;
+    }
+    let Some(info_json) = pgbackrest_info_json().await else {
+        return;
+    };
+    let Ok((full_stop, diff_stop)) = parse_latest_backup_stops(&info_json) else {
+        return;
+    };
+    let Some(full_stop) = full_stop else {
+        return;
+    };
+    if let Err(e) = write_state_field(&state_path, "last_full_at", &full_stop.to_string()) {
+        warn!(error = %e, "pgbackrest-watcher: failed to adopt last_full_at from catalog");
+        return;
+    }
+    let adopted_diff = diff_stop.filter(|d| *d > full_stop);
+    if let Some(diff) = adopted_diff {
+        let _ = write_state_field(&state_path, "last_diff_at", &diff.to_string());
+    }
+    info!(
+        last_full_at = full_stop,
+        last_diff_at = ?adopted_diff,
+        "pgbackrest-watcher: adopted backup history from S3 catalog (no local state)"
+    );
 }
 
 /// Re-run the catalog probe with stderr captured and log the exit code + a
@@ -2052,8 +2145,8 @@ fn now_epoch() -> i64 {
 mod tests {
     use super::{
         decide_gap_recovery, full_retry_ready, parse_catalog_max, parse_has_full,
-        probe_async_duplicate_error, segment_to_number, wal_has_async_archive_duplicate_error,
-        GapRecoveryAction, GapRecoveryInputs,
+        parse_latest_backup_stops, probe_async_duplicate_error, segment_to_number,
+        wal_has_async_archive_duplicate_error, GapRecoveryAction, GapRecoveryInputs,
     };
     use std::fs;
 
@@ -2263,6 +2356,46 @@ mod tests {
         // inconclusive — never as a false "no full" that would wrongly clear
         // last_full_at on a transient unparseable response.
         assert!(parse_has_full("not json").is_err());
+    }
+
+    // ---- parse_latest_backup_stops: catalog adoption ----
+
+    #[test]
+    fn parse_latest_backup_stops_picks_newest_of_each_type() {
+        let info = r#"[{"backup":[
+            {"type":"full","timestamp":{"start":100,"stop":200}},
+            {"type":"diff","timestamp":{"start":300,"stop":400}},
+            {"type":"full","timestamp":{"start":150,"stop":250}},
+            {"type":"incr","timestamp":{"start":500,"stop":600}}
+        ]}]"#;
+        assert_eq!(
+            parse_latest_backup_stops(info).unwrap(),
+            (Some(250), Some(400))
+        );
+    }
+
+    #[test]
+    fn parse_latest_backup_stops_none_when_no_backups() {
+        let info = r#"[{"archive":[{"id":"18-1"}],"backup":[]}]"#;
+        assert_eq!(parse_latest_backup_stops(info).unwrap(), (None, None));
+    }
+
+    #[test]
+    fn parse_latest_backup_stops_skips_entries_without_timestamp() {
+        // Older catalog entries or partial JSON: an entry missing
+        // timestamp.stop must not panic or poison the others.
+        let info = r#"[{"backup":[
+            {"type":"full"},
+            {"type":"full","timestamp":{"start":100,"stop":200}}
+        ]}]"#;
+        assert_eq!(parse_latest_backup_stops(info).unwrap(), (Some(200), None));
+    }
+
+    #[test]
+    fn parse_latest_backup_stops_errors_on_malformed_json() {
+        // Err (not (None, None)) so the adopt step skips this iteration
+        // instead of concluding "fresh stanza" from a transient bad read.
+        assert!(parse_latest_backup_stops("not json").is_err());
     }
 
     // ---- decide_gap_recovery: state-machine transitions ----
