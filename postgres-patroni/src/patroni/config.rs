@@ -4,6 +4,7 @@ use crate::{pgdata, ssl_dir};
 use anyhow::Result;
 use common::ConfigExt;
 use std::env;
+use tracing::warn;
 
 /// Configuration for Patroni runner
 pub struct Config {
@@ -86,6 +87,44 @@ pub struct Config {
     /// the DCS reconciler when archiving is enabled. Default 60s. Operators
     /// raise it on idle DBs to cut S3 cost or lower it for tighter RPO.
     pub archive_timeout_secs: i64,
+    /// `--max-rate` for pg_basebackup during replica creation, so a re-seed
+    /// can never monopolize the leader's volume. Validated
+    /// `POSTGRES_BASEBACKUP_MAX_RATE` override or the `20M` default.
+    pub basebackup_max_rate: String,
+}
+
+/// Validate an operator-supplied pg_basebackup --max-rate override. Requires
+/// an explicit `k` or `M` suffix (matching pg_basebackup's case-sensitive
+/// units) within pg_basebackup's accepted range of 32kB..1024MB. Bare digits
+/// are rejected even though pg_basebackup accepts them: they mean kB/s, a
+/// ~1000x unit footgun on a knob that is only ever hand-set mid-incident.
+/// Anything invalid falls back to the default with a warning — the throttled
+/// basebackup is the bootstrap path of last resort and must never be broken
+/// by a typo.
+fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
+    const DEFAULT: &str = "20M";
+    let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return DEFAULT.to_string();
+    };
+    let kb = v
+        .strip_suffix('k')
+        .and_then(|d| d.parse::<u64>().ok())
+        .or_else(|| {
+            v.strip_suffix('M')
+                .and_then(|d| d.parse::<u64>().ok())
+                .and_then(|m| m.checked_mul(1024))
+        });
+    match kb {
+        Some(kb) if (32..=1_048_576).contains(&kb) => v,
+        _ => {
+            warn!(
+                value = %v,
+                default = DEFAULT,
+                "invalid POSTGRES_BASEBACKUP_MAX_RATE (need 32k..1024M, explicit k/M suffix); using default"
+            );
+            DEFAULT.to_string()
+        }
+    }
 }
 
 impl Config {
@@ -141,6 +180,54 @@ impl Config {
                 .and_then(|s| s.parse::<i64>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(60),
+            basebackup_max_rate: resolve_basebackup_max_rate(
+                env::var("POSTGRES_BASEBACKUP_MAX_RATE").ok(),
+            ),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_basebackup_max_rate;
+
+    #[test]
+    fn max_rate_accepts_suffixed_values_in_range() {
+        assert_eq!(resolve_basebackup_max_rate(Some("64M".into())), "64M");
+        assert_eq!(resolve_basebackup_max_rate(Some("512k".into())), "512k");
+        assert_eq!(resolve_basebackup_max_rate(Some("32k".into())), "32k");
+        assert_eq!(resolve_basebackup_max_rate(Some("1024M".into())), "1024M");
+        assert_eq!(resolve_basebackup_max_rate(Some(" 48M ".into())), "48M");
+    }
+
+    #[test]
+    fn max_rate_falls_back_on_missing_or_malformed() {
+        assert_eq!(resolve_basebackup_max_rate(None), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some(String::new())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("fast".into())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("M".into())), "20M");
+        // pg_basebackup's units are case-sensitive: only k and M.
+        assert_eq!(resolve_basebackup_max_rate(Some("64m".into())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("32MB".into())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("-5M".into())), "20M");
+    }
+
+    #[test]
+    fn max_rate_rejects_bare_digits_unit_footgun() {
+        // 100 would mean 100 kB/s to pg_basebackup — ~200x slower than the
+        // default, silently. Require the explicit suffix.
+        assert_eq!(resolve_basebackup_max_rate(Some("100".into())), "20M");
+    }
+
+    #[test]
+    fn max_rate_enforces_pg_basebackup_range() {
+        assert_eq!(resolve_basebackup_max_rate(Some("31k".into())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("1025M".into())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("0M".into())), "20M");
+        // Overflow-sized digit strings must not panic or pass.
+        assert_eq!(
+            resolve_basebackup_max_rate(Some("99999999999999999999M".into())),
+            "20M"
+        );
     }
 }

@@ -2,31 +2,10 @@
 
 use super::Config;
 use anyhow::Result;
-use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tracing::info;
-
-/// Validate an operator-supplied pg_basebackup --max-rate value: digits with
-/// an optional k/M suffix (pg_basebackup accepts 32kB..1024MB). Anything else
-/// falls back to the default so a typo can't break replica creation — the
-/// throttled basebackup is the bootstrap path of last resort.
-fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
-    const DEFAULT: &str = "20M";
-    let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
-        return DEFAULT.to_string();
-    };
-    let digits = v
-        .strip_suffix('k')
-        .or_else(|| v.strip_suffix('M'))
-        .unwrap_or(&v);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        v
-    } else {
-        DEFAULT.to_string()
-    }
-}
 
 /// Generate Patroni YAML configuration.
 ///
@@ -94,9 +73,8 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // leaving production the dominant share while a re-seed runs.
     // checkpoint: fast skips the spread-checkpoint wait (up to
     // checkpoint_timeout of apparent hang before the first byte lands).
-    // PG_BASEBACKUP_MAX_RATE overrides the rate for oversized emergencies.
-    let basebackup_max_rate = resolve_basebackup_max_rate(env::var("PG_BASEBACKUP_MAX_RATE").ok());
-
+    // config.basebackup_max_rate is the validated POSTGRES_BASEBACKUP_MAX_RATE
+    // override for oversized emergencies, resolved in Config::from_env.
     format!(
         r#"scope: {scope}
 name: {name}
@@ -196,6 +174,7 @@ postgresql:
         data_dir = config.data_dir,
         certs_dir = config.certs_dir,
         synchronous_mode = config.synchronous_mode,
+        basebackup_max_rate = config.basebackup_max_rate,
         pgbackrest_archive_params = pgbackrest_archive_params,
         pgbackrest_local_params = pgbackrest_local_params,
     )
@@ -276,6 +255,7 @@ mod tests {
             pitr_target_time: None,
             pitr_target_xid: None,
             archive_timeout_secs: 60,
+            basebackup_max_rate: "20M".into(),
         }
     }
 
@@ -290,20 +270,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_basebackup_max_rate_accepts_valid_values() {
-        assert_eq!(resolve_basebackup_max_rate(Some("64M".into())), "64M");
-        assert_eq!(resolve_basebackup_max_rate(Some("512k".into())), "512k");
-        assert_eq!(resolve_basebackup_max_rate(Some("100".into())), "100");
-        assert_eq!(resolve_basebackup_max_rate(Some(" 48M ".into())), "48M");
-    }
-
-    #[test]
-    fn resolve_basebackup_max_rate_falls_back_on_garbage() {
-        assert_eq!(resolve_basebackup_max_rate(None), "20M");
-        assert_eq!(resolve_basebackup_max_rate(Some(String::new())), "20M");
-        assert_eq!(resolve_basebackup_max_rate(Some("fast".into())), "20M");
-        assert_eq!(resolve_basebackup_max_rate(Some("M".into())), "20M");
-        assert_eq!(resolve_basebackup_max_rate(Some("32MB".into())), "20M");
-        assert_eq!(resolve_basebackup_max_rate(Some("-5M".into())), "20M");
+    fn basebackup_max_rate_renders_from_config() {
+        let mut cfg = test_config(None);
+        cfg.basebackup_max_rate = "64M".into();
+        let yaml = generate_patroni_config(&cfg, "replica");
+        assert!(yaml.contains("  basebackup:\n    max-rate: 64M\n    checkpoint: fast\n"));
     }
 }

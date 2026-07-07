@@ -83,6 +83,7 @@ Operator-facing env contract:
 | `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored cluster; `archive-get` reads source WAL from here during replay. Set by backboard on restore; not normally a manual knob. |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 | `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
+| `POSTGRES_BASEBACKUP_MAX_RATE` | `--max-rate` for pg_basebackup replica creation (default `20M`; explicit `k`/`M` suffix required, `32k`..`1024M`; invalid values fall back to the default). Raise for an emergency fast re-seed at the cost of leader disk contention. |
 | `WAL_BACKUP_FULL_INTERVAL_HOURS` | image-owned full base-backup cadence (default `168` = weekly; `0` disables periodic fulls). Initial / gap-recovery fulls fire regardless. |
 | `WAL_BACKUP_DIFF_INTERVAL_HOURS` | image-owned differential base-backup cadence (default `24`; `0` disables) |
 | `WAL_BACKUP_RETENTION_FULL` | full backups kept by `pgbackrest expire` (default `4`) |
