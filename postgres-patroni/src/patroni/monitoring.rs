@@ -2,6 +2,7 @@
 //!
 //! Handles the monitoring loop, signal handling, and health check management.
 
+use super::self_heal::wal_corruption;
 use super::{check_health, self_heal, Config};
 use common::{ConfigExt, Telemetry, TelemetryEvent};
 use nix::sys::signal::{kill, Signal};
@@ -10,6 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::process::Child;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -86,6 +88,7 @@ pub async fn run_monitoring_loop(
     config: &Config,
     mut child: Child,
     telemetry: &Telemetry,
+    mut stdio_pumps: Vec<JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let patroni_pid = child
         .id()
@@ -183,12 +186,14 @@ pub async fn run_monitoring_loop(
                 info!("Received SIGTERM during startup");
                 let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
                 let _ = child.wait().await;
+                wal_corruption::drain(std::mem::take(&mut stdio_pumps)).await;
                 return Ok(());
             }
             _ = sigint.recv() => {
                 info!("Received SIGINT during startup");
                 let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
                 let _ = child.wait().await;
+                wal_corruption::drain(std::mem::take(&mut stdio_pumps)).await;
                 return Ok(());
             }
             status = child.wait() => {
@@ -198,6 +203,7 @@ pub async fn run_monitoring_loop(
                     process: "patroni".to_string(),
                     exit_code: status.ok().and_then(|s| s.code()),
                 });
+                wal_corruption::drain(std::mem::take(&mut stdio_pumps)).await;
                 std::process::exit(1);
             }
             _ = sleep(Duration::from_secs(5)) => {
@@ -305,6 +311,7 @@ pub async fn run_monitoring_loop(
                         let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
                         sleep(Duration::from_secs(2)).await;
                         let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGKILL);
+                        wal_corruption::drain(std::mem::take(&mut stdio_pumps)).await;
                         std::process::exit(1);
                     }
                     StartupTick::Waiting => {
@@ -400,12 +407,14 @@ pub async fn run_monitoring_loop(
                 info!("Received SIGTERM");
                 let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
                 let _ = child.wait().await;
+                wal_corruption::drain(std::mem::take(&mut stdio_pumps)).await;
                 return Ok(());
             }
             _ = sigint.recv() => {
                 info!("Received SIGINT");
                 let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
                 let _ = child.wait().await;
+                wal_corruption::drain(std::mem::take(&mut stdio_pumps)).await;
                 return Ok(());
             }
             status = child.wait() => {
@@ -415,6 +424,7 @@ pub async fn run_monitoring_loop(
                     process: "patroni".to_string(),
                     exit_code: status.ok().and_then(|s| s.code()),
                 });
+                wal_corruption::drain(std::mem::take(&mut stdio_pumps)).await;
                 std::process::exit(1);
             }
             _ = sleep(Duration::from_secs(config.health_check_interval)) => {
@@ -437,6 +447,7 @@ pub async fn run_monitoring_loop(
                         let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
                         sleep(Duration::from_secs(2)).await;
                         let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGKILL);
+                        wal_corruption::drain(std::mem::take(&mut stdio_pumps)).await;
                         std::process::exit(1);
                     }
                 }

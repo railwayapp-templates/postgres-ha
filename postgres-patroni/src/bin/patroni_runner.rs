@@ -1593,8 +1593,11 @@ async fn async_main() -> Result<()> {
     // Tap the now-piped stdio for the WAL-corruption self-heal signal, then
     // forward every line straight through to our own stdout/stderr — must be
     // spawned immediately after start_patroni() so nothing blocks on a full
-    // pipe buffer before a reader is attached.
-    let corruption_tracker = wal_corruption::spawn_stdio_forwarder(&mut child);
+    // pipe buffer before a reader is attached. `forwarder.pumps` is handed to
+    // run_monitoring_loop below so it can drain them before every exit path —
+    // without that, `std::process::exit` can race an in-flight pump and drop
+    // patroni/postgres's last few log lines.
+    let forwarder = wal_corruption::spawn_stdio_forwarder(&mut child);
 
     // Spawn a DCS reconcile task that retries indefinitely with exponential
     // backoff until it succeeds. This waits for Patroni's REST API to come up,
@@ -1648,11 +1651,11 @@ async fn async_main() -> Result<()> {
     // postmaster_start_time and POSTs /reinitialize when a replica is
     // crash-looping in a state Patroni's built-in recovery doesn't
     // catch (notably WAL-too-old after demoted-leader pg_rewind, or a
-    // same-timeline WAL-corruption stall caught via corruption_tracker). No-op
+    // same-timeline WAL-corruption stall caught via forwarder.tracker). No-op
     // on leaders. Honors SELF_HEAL_DISABLED=1 as a kill switch.
-    spawn_self_heal_watcher(volume_root.clone(), telemetry.clone(), corruption_tracker);
+    spawn_self_heal_watcher(volume_root.clone(), telemetry.clone(), forwarder.tracker);
 
-    run_monitoring_loop(&config, child, &telemetry).await
+    run_monitoring_loop(&config, child, &telemetry, forwarder.pumps).await
 }
 
 #[cfg(test)]

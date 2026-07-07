@@ -163,7 +163,11 @@ const DEFAULT_WAL_CORRUPTION_DWELL_SECONDS: u64 = 60;
 // -seen corruption signature cleared (replica reinitialized some other way,
 // or — extremely unlikely given the messages are corruption-only — genuinely
 // resolved). Generous relative to the ~5s repeat cadence so a single missed
-// poll can't reset the dwell early.
+// poll can't reset the dwell early. Unlike the other thresholds this default
+// is captured once into the `CorruptionTracker` at construction (see
+// `wal_corruption::spawn_stdio_forwarder`'s `SELF_HEAL_WAL_CORRUPTION_RESET_GAP_SECONDS`
+// env read) rather than re-read from a `Thresholds` snapshot every poll — the
+// tracker is driven by stdio-pump tasks with no access to `WatcherConfig`.
 const DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS: u64 = 30;
 
 // ====================================================================
@@ -373,23 +377,27 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
     SelfHealAction::NoOp
 }
 
-/// The WAL-corruption case: a replica Patroni still considers healthy
-/// (`running`/`streaming`) whose Postgres output has been repeating one of
-/// the [`wal_corruption`] signature strings continuously past the dwell.
-/// Gated on the same role/state guard as [`timeline_divergence_present`] —
-/// never a leader (destructive), never mid-clone (a fresh clone's early log
-/// lines are not this signature anyway, but the state check keeps the two
-/// paths structurally consistent). Unlike divergence this does not require a
+/// Structural guard for the WAL-corruption case, independent of the dwell:
+/// a replica Patroni still considers healthy (`running`/`streaming`). Gated
+/// on the same role/state guard as [`timeline_divergence_present`] — never a
+/// leader (destructive), never mid-clone (a fresh clone's early log lines
+/// are not this signature anyway, but the state check keeps the two paths
+/// structurally consistent). Shared by [`wal_corruption_stalled`] and
+/// [`confirm_wal_corruption`] so both judge the structural shape by exactly
+/// the same rule, mirroring [`timeline_divergence_present`]'s role.
+fn wal_corruption_present(role: Role, patroni_state: &str) -> bool {
+    matches!(role, Role::Replica) && (patroni_state == "running" || patroni_state == "streaming")
+}
+
+/// The WAL-corruption case: [`wal_corruption_present`] holds AND the
+/// [`wal_corruption`] signature has been recurring, continuously, in a
+/// provably replay-stuck window (see [`wal_corruption::CorruptionTracker::dwell_secs`])
+/// past the dwell threshold. Unlike divergence this does not require a
 /// timeline gap: the whole point is to catch the *same-timeline* stall that
 /// gap-based detection cannot see.
 fn wal_corruption_stalled(s: &SelfHealInputs) -> bool {
-    if !matches!(s.role, Role::Replica) {
-        return false;
-    }
-    if s.patroni_state != "running" && s.patroni_state != "streaming" {
-        return false;
-    }
-    s.wal_corruption_for_secs >= s.thresholds.wal_corruption_dwell_secs
+    wal_corruption_present(s.role, &s.patroni_state)
+        && s.wal_corruption_for_secs >= s.thresholds.wal_corruption_dwell_secs
 }
 
 /// Pure predicate for "this looks like a stuck-behind replica right now",
@@ -905,10 +913,12 @@ pub mod wal_corruption {
     //! watcher polls each iteration. See the parent module doc, signal 3, for
     //! why this is the one self-heal signal that has to read logs at all.
 
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio::process::Child;
+    use tokio::task::JoinHandle;
     use tracing::warn;
 
     /// The fixed set of Postgres WAL-reader error strings emitted when
@@ -920,26 +930,42 @@ pub mod wal_corruption {
     /// `"invalid record length ... wanted %u"` to `"... expected at least
     /// %u"`, and `"in log segment"` to `"in WAL segment ..., LSN %X/%X"`).
     ///
-    /// Two of these — `"invalid record length"` and `"invalid contrecord
-    /// length"` — are NOT corruption-only: Postgres also logs them as the
-    /// normal, expected way of detecting the leading edge of available WAL
+    /// None of these seven are corruption-only in isolation. `"invalid record
+    /// length"` and `"invalid contrecord length"` are also the normal,
+    /// expected way Postgres detects the leading edge of available WAL
     /// (crash-recovery catch-up, or a streaming replica repeatedly reaching a
-    /// primary's moving end-of-WAL boundary). A healthy replica trailing an
-    /// intermittent primary can log one every few seconds indefinitely without
-    /// ever being stuck. The pattern match alone therefore cannot tell "stuck"
-    /// from "healthy and still advancing" — [`extract_lsn`] + [`CorruptionTracker`]'s
-    /// same-LSN requirement below is what actually enforces the module's
+    /// primary's moving end-of-WAL boundary); `"invalid magic number"` and
+    /// `"unexpected pageaddr"` are also what a recycled/zero-filled future
+    /// WAL segment logs as its preallocated space is reached. A healthy
+    /// replica can log any of these every few seconds indefinitely without
+    /// ever being stuck. The pattern match alone therefore cannot tell
+    /// "stuck" from "healthy and still advancing" — two further gates in
+    /// [`CorruptionTracker`] are what actually enforce the module's
     /// documented invariant (signal 3: "retries the same LSN every few
-    /// seconds forever"): only a match recurring at the SAME position counts,
-    /// so an advancing replica never accrues a dwell no matter how often it
-    /// logs one of these strings.
+    /// seconds forever"):
     ///
-    /// The last two — `"invalid magic number"` and `"unexpected pageaddr"` —
-    /// are page-header errors whose LSN is reported as `"..., LSN %X/%X"`,
-    /// which only exists on PG 16+ (PG 14/15 log `"in log segment %s, offset
-    /// %u"` with no LSN at all). [`extract_lsn`] reads that `LSN` form too, so
-    /// these are same-LSN-gated on 16+ and harmlessly inert on 14/15 (no LSN
-    /// to key on ⇒ never accrues a dwell). Prefix-only so the `%04X`/`%X/%X`
+    /// 1. **Same-LSN recurrence** ([`extract_lsn`]): only a match recurring
+    ///    at the SAME position counts, so an advancing replica never accrues
+    ///    a dwell no matter how often it logs one of these strings.
+    /// 2. **Received-ahead** ([`CorruptionTracker::note_received_location`]):
+    ///    same-LSN recurrence alone is also what a replica whose *fetch*
+    ///    path is broken looks like (dead/misconfigured replication link —
+    ///    nothing new ever arrives, so it retries the same stuck LSN
+    ///    forever too) — and reinitializing that replica is actively
+    ///    harmful: a `pg_basebackup` clone crosses the exact same broken
+    ///    link and just fails again, so the wipe destroys a data directory
+    ///    the operator could otherwise have kept while fixing connectivity.
+    ///    A genuine corruption stall is different: the walreceiver keeps
+    ///    streaming new WAL past the bad record even though local replay is
+    ///    stuck on it, so `received_location` keeps climbing while
+    ///    `replayed_location` (and this log signature) does not. Only a
+    ///    window that has observed that ordering ever contributes to
+    ///    [`CorruptionTracker::dwell_secs`].
+    ///
+    /// The last two patterns' LSN is reported as `"..., LSN %X/%X"`, which
+    /// only exists on PG 16+ (PG 14/15 log `"in log segment %s, offset %u"`
+    /// with no LSN at all, so [`extract_lsn`] returns `None` there and they
+    /// stay harmlessly inert on 14/15). Prefix-only so the `%04X`/`%X/%X`
     /// arguments that follow the matched words don't break the scan.
     const CORRUPTION_PATTERNS: &[&str] = &[
         "record with incorrect prev-link",
@@ -951,8 +977,24 @@ pub mod wal_corruption {
         "invalid contrecord length",
     ];
 
+    /// The severity marker `report_invalid_record`'s `ereport(LOG, ...)`
+    /// renders these messages with once `lc_messages: "C"` fixes the
+    /// wording (we deliberately only match `LOG`, never a lower severity:
+    /// Postgres demotes a same-LSN repeat to `DEBUG1` only when reading from
+    /// its own already-written `pg_wal` file, not while streaming from the
+    /// primary — the case this signal targets — so every retry of a genuine
+    /// stall stays at `LOG`). Anchoring to right after this marker — rather
+    /// than a bare substring scan of the whole line — means text a client
+    /// controls elsewhere on the line (e.g. a `STATEMENT:` continuation
+    /// echoing a query) cannot spoof a match merely by containing the same
+    /// words; it would have to fabricate this exact marker immediately
+    /// before them too.
+    const LOG_MARKER: &str = "LOG:  ";
+
     fn matches_corruption_pattern(line: &str) -> bool {
-        CORRUPTION_PATTERNS.iter().any(|p| line.contains(p))
+        line.find(LOG_MARKER)
+            .map(|i| &line[i + LOG_MARKER.len()..])
+            .is_some_and(|msg| CORRUPTION_PATTERNS.iter().any(|p| msg.starts_with(p)))
     }
 
     /// Extract the LSN Postgres reports the error against, e.g. `"invalid
@@ -991,87 +1033,191 @@ pub mod wal_corruption {
             .unwrap_or(0)
     }
 
+    /// One in-progress "same LSN keeps recurring" window, keyed externally
+    /// by that LSN string in [`CorruptionTracker`]'s map — see there for why
+    /// each distinct LSN gets its own independent window instead of one
+    /// global slot.
     #[derive(Debug, Clone)]
     struct Observation {
         first_seen: i64,
         last_seen: i64,
-        /// The LSN of the match that opened this window. `dwell_secs` only
-        /// ever reports a nonzero value while every match since has repeated
-        /// this exact LSN — seeing a *different* LSN, or one we couldn't
-        /// parse, means the replica made progress (or we can't prove it
-        /// didn't), so [`CorruptionTracker::observe`] opens a fresh window
-        /// instead of extending this one.
-        lsn: String,
+        /// Latched `true` once a `received_location` strictly beyond this
+        /// window's LSN has been observed via
+        /// [`CorruptionTracker::note_received_location`] — proof the
+        /// walreceiver is still pulling in new WAL even though local replay
+        /// is stuck on this record, i.e. this is a genuine corruption stall
+        /// rather than a broken fetch path. Sticky for the life of the
+        /// window: a later walreceiver restart (which can report a lower
+        /// `received_location` for a while) must not un-latch it. See the
+        /// [`CORRUPTION_PATTERNS`] doc, gate 2.
+        received_ahead: bool,
     }
 
+    /// Cap on distinct in-flight LSN windows. A genuinely stuck replica logs
+    /// at most a couple of distinct LSNs (the stuck record, and possibly one
+    /// more across a brief flap before it settles); this is purely a memory
+    /// bound against a pathological flood of distinct unparseable-looking-
+    /// parseable LSNs, not a value expected to matter in practice.
+    const MAX_TRACKED_LSNS: usize = 8;
+
     /// Shared, cheaply-cloneable handle: the stdio forwarder task(s) call
-    /// [`CorruptionTracker::observe`] on every matching line; the self-heal
-    /// watcher calls [`CorruptionTracker::dwell_secs`] once per poll to build
+    /// [`CorruptionTracker::observe`] on every matching line and
+    /// [`CorruptionTracker::note_received_location`] on every `/patroni`
+    /// poll's WAL position; the self-heal watcher calls
+    /// [`CorruptionTracker::dwell_secs`] once per poll to build
     /// `SelfHealInputs::wal_corruption_for_secs`. A plain `std::sync::Mutex`
-    /// is fine here — every critical section is a handful of integer/string
-    /// comparisons, never held across an `.await`.
-    #[derive(Clone, Default)]
-    pub struct CorruptionTracker(Arc<Mutex<Option<Observation>>>);
+    /// is fine here — every critical section is a handful of map operations,
+    /// never held across an `.await`.
+    ///
+    /// Keyed by LSN string rather than a single `Option<Observation>` slot:
+    /// a replica can legitimately hit two *different* corruption-pattern
+    /// strings at two different LSNs in quick succession (e.g. a
+    /// page-header error immediately followed by a record-level error once
+    /// replay resumes one segment later) — with one global slot, the second
+    /// LSN's observation would silently discard the first LSN's
+    /// already-accruing dwell, resetting real progress toward detection back
+    /// to zero on every alternation. Independent per-LSN windows mean an
+    /// unrelated or unparseable match can never clobber a window that is
+    /// genuinely accruing.
+    #[derive(Clone)]
+    pub struct CorruptionTracker {
+        windows: Arc<Mutex<HashMap<String, Observation>>>,
+        /// How long without a fresh match before a window is considered
+        /// cleared. Stored per-tracker (rather than a bare module constant)
+        /// so [`spawn_stdio_forwarder`] can honor
+        /// `SELF_HEAL_WAL_CORRUPTION_RESET_GAP_SECONDS` — this tracker is
+        /// constructed once, well before the watcher loads `WatcherConfig`
+        /// from env, and is driven by stdio-pump tasks that have no access
+        /// to that config, so the value is captured once at construction
+        /// instead of threaded through every call.
+        reset_gap_secs: u64,
+    }
+
+    impl Default for CorruptionTracker {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     impl CorruptionTracker {
         pub fn new() -> Self {
-            Self::default()
+            Self::with_reset_gap_secs(super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS)
+        }
+
+        /// Same as [`Self::new`] but with an explicit reset-gap override —
+        /// used by [`spawn_stdio_forwarder`] to honor the env var; test code
+        /// uses [`Self::new`]'s fixed default so tests stay deterministic
+        /// regardless of the process environment.
+        pub fn with_reset_gap_secs(reset_gap_secs: u64) -> Self {
+            Self {
+                windows: Arc::new(Mutex::new(HashMap::new())),
+                reset_gap_secs,
+            }
         }
 
         /// Record a matching line observed at `now`, reporting the LSN
-        /// [`extract_lsn`] found (`None` if it couldn't parse one). Extends
-        /// the existing window only when ALL of: the previous match was
-        /// within `DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS`, AND this LSN
-        /// was successfully parsed, AND it's identical to the window's LSN —
-        /// i.e. only a replica provably stuck replaying the exact same
-        /// record accrues dwell. A parse failure or a differing LSN always
-        /// opens a fresh window rather than extend, so a replica that is
-        /// merely advancing through a series of *different* end-of-WAL
-        /// boundary hits (see the [`CORRUPTION_PATTERNS`] doc) can never
-        /// accrue past a single observation.
+        /// [`extract_lsn`] found. A `None` LSN can't prove same-LSN
+        /// recurrence (see [`extract_lsn`]'s contract) and is dropped
+        /// entirely rather than stored — it must never displace or reset an
+        /// existing, provably-recurring window.
+        ///
+        /// For a parsed LSN: extends that LSN's own window (keeping its
+        /// `first_seen` and `received_ahead` latch) when the previous match
+        /// on it was within `self.reset_gap_secs`; otherwise starts a fresh
+        /// window for it. Windows for *other* LSNs are untouched either way.
+        /// Evicts the stalest window when the map would exceed
+        /// [`MAX_TRACKED_LSNS`].
         fn observe(&self, now: i64, lsn: Option<&str>) {
-            let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(lsn) = lsn else {
+                return;
+            };
+            let mut guard = self.windows.lock().unwrap_or_else(|e| e.into_inner());
             let extends = matches!(
-                (&*guard, lsn),
-                (Some(o), Some(l))
-                    if l == o.lsn
-                    && (now.saturating_sub(o.last_seen) as u64)
-                        <= super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS
+                guard.get(lsn),
+                Some(o) if (now.saturating_sub(o.last_seen) as u64) <= self.reset_gap_secs
             );
-            *guard = Some(match (&*guard, lsn) {
-                (Some(o), _) if extends => Observation {
-                    first_seen: o.first_seen,
-                    last_seen: now,
-                    lsn: o.lsn.clone(),
-                },
-                _ => Observation {
-                    first_seen: now,
-                    last_seen: now,
-                    lsn: lsn.unwrap_or_default().to_string(),
-                },
-            });
-        }
-
-        /// Seconds the corruption signature has been recurring continuously
-        /// at the SAME LSN, as of `now`. `0` when nothing has ever matched,
-        /// when the most recent match is older than the reset gap, or when
-        /// the current window's LSN is empty (an unparseable match opened
-        /// it — never treated as evidence of a stall). Pure read: does not
-        /// mutate, so the next [`Self::observe`] decides whether to reset
-        /// the window, not this call.
-        pub fn dwell_secs(&self, now: i64) -> u64 {
-            let guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            match *guard {
-                Some(ref o)
-                    if !o.lsn.is_empty()
-                        && (now.saturating_sub(o.last_seen) as u64)
-                            <= super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS =>
+            if extends {
+                guard.get_mut(lsn).unwrap().last_seen = now;
+            } else {
+                guard.insert(
+                    lsn.to_string(),
+                    Observation {
+                        first_seen: now,
+                        last_seen: now,
+                        received_ahead: false,
+                    },
+                );
+            }
+            if guard.len() > MAX_TRACKED_LSNS {
+                if let Some(stalest) = guard
+                    .iter()
+                    .min_by_key(|(_, o)| o.last_seen)
+                    .map(|(k, _)| k.clone())
                 {
-                    now.saturating_sub(o.first_seen).max(0) as u64
+                    guard.remove(&stalest);
                 }
-                _ => 0,
             }
         }
+
+        /// Latch [`Observation::received_ahead`] on every live window whose
+        /// LSN is strictly behind `received` (Patroni's
+        /// `xlog.received_location`, in the same byte-position space as a
+        /// parsed WAL LSN — see [`lsn_to_u64`]). Called once per poll from
+        /// the watcher's regular `/patroni` read; a window whose LSN doesn't
+        /// parse as a comparable position is left alone (never latched, so
+        /// it can never contribute to [`Self::dwell_secs`] either — same
+        /// fail-safe direction as an unparseable [`extract_lsn`] result).
+        pub fn note_received_location(&self, received: i64) {
+            // A WAL position is never negative; an unexpected negative
+            // reading can't be compared meaningfully, so skip rather than
+            // reinterpret its bits as a huge u64.
+            let Ok(received) = u64::try_from(received) else {
+                return;
+            };
+            let mut guard = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+            for (lsn, o) in guard.iter_mut() {
+                if o.received_ahead {
+                    continue;
+                }
+                if let Some(pos) = lsn_to_u64(lsn) {
+                    if received > pos {
+                        o.received_ahead = true;
+                    }
+                }
+            }
+        }
+
+        /// Seconds the LONGEST-lived *replay-stuck* window has been
+        /// recurring continuously, as of `now`. A window counts only when
+        /// BOTH: it has a match within `self.reset_gap_secs` of `now` (still
+        /// "live"), AND `received_ahead` is latched (proven stuck-in-replay,
+        /// not stuck-in-fetch — see the [`CORRUPTION_PATTERNS`] doc, gate 2).
+        /// `0` when no window qualifies. Pure read: does not mutate, so
+        /// [`Self::observe`]/[`Self::note_received_location`] alone decide
+        /// window lifetime.
+        pub fn dwell_secs(&self, now: i64) -> u64 {
+            let guard = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .values()
+                .filter(|o| {
+                    o.received_ahead
+                        && (now.saturating_sub(o.last_seen) as u64) <= self.reset_gap_secs
+                })
+                .map(|o| now.saturating_sub(o.first_seen).max(0) as u64)
+                .max()
+                .unwrap_or(0)
+        }
+    }
+
+    /// Parse a `"%X/%X"` WAL LSN string into the same byte-position `u64`
+    /// space as Patroni's `xlog.received_location`/`replayed_location`
+    /// (`(hi << 32) | lo`). `None` on any non-hex or malformed input —
+    /// callers treat that as "can't compare", never as evidence either way.
+    fn lsn_to_u64(lsn: &str) -> Option<u64> {
+        let (hi, lo) = lsn.split_once('/')?;
+        let hi = u32::from_str_radix(hi, 16).ok()?;
+        let lo = u32::from_str_radix(lo, 16).ok()?;
+        Some(((hi as u64) << 32) | lo as u64)
     }
 
     /// Caps a single buffered "line" so one pathological no-newline chunk of
@@ -1162,31 +1308,60 @@ pub mod wal_corruption {
         }
     }
 
+    /// Returned by [`spawn_stdio_forwarder`]: the shared tracker the
+    /// self-heal watcher polls, plus the pump tasks' join handles so the
+    /// caller can [`drain`] them right before the process exits. Without
+    /// draining, `std::process::exit` (called on every exit path in
+    /// `monitoring.rs`) can race an in-flight pump and silently drop the
+    /// last chunk of patroni/postgres's own output — exactly the lines most
+    /// useful for diagnosing why the process is exiting, and a regression
+    /// `Stdio::inherit()` never had (that output went straight to the
+    /// container's log driver, outside this process entirely).
+    pub struct StdioForwarder {
+        pub tracker: CorruptionTracker,
+        pub pumps: Vec<JoinHandle<()>>,
+    }
+
     /// Take `child`'s stdout/stderr — it must have been spawned with
     /// `Stdio::piped()` on both — spawn a forwarding+matching task for each,
-    /// and return the shared tracker the self-heal watcher polls. This
-    /// replaces `Stdio::inherit()` at the call site; it does not reduce
-    /// visibility of Patroni/Postgres's own logs, it only routes them through
-    /// this process first so the corruption signal can be observed too.
-    pub fn spawn_stdio_forwarder(child: &mut Child) -> CorruptionTracker {
-        let tracker = CorruptionTracker::new();
+    /// and return the shared tracker the self-heal watcher polls plus their
+    /// join handles for [`drain`]. This replaces `Stdio::inherit()` at the
+    /// call site; it does not reduce visibility of Patroni/Postgres's own
+    /// logs, it only routes them through this process first so the
+    /// corruption signal can be observed too.
+    pub fn spawn_stdio_forwarder(child: &mut Child) -> StdioForwarder {
+        let tracker = CorruptionTracker::with_reset_gap_secs(super::env_u64(
+            "SELF_HEAL_WAL_CORRUPTION_RESET_GAP_SECONDS",
+            super::DEFAULT_WAL_CORRUPTION_RESET_GAP_SECONDS,
+        ));
+        let mut pumps = Vec::with_capacity(2);
         match child.stdout.take() {
-            Some(stdout) => {
-                tokio::spawn(pump(stdout, tracker.clone(), true));
-            }
+            Some(stdout) => pumps.push(tokio::spawn(pump(stdout, tracker.clone(), true))),
             None => warn!(
                 "self-heal: patroni child has no piped stdout — WAL-corruption watch disabled for stdout"
             ),
         }
         match child.stderr.take() {
-            Some(stderr) => {
-                tokio::spawn(pump(stderr, tracker.clone(), false));
-            }
+            Some(stderr) => pumps.push(tokio::spawn(pump(stderr, tracker.clone(), false))),
             None => warn!(
                 "self-heal: patroni child has no piped stderr — WAL-corruption watch disabled for stderr"
             ),
         }
-        tracker
+        StdioForwarder { tracker, pumps }
+    }
+
+    /// Await every pump task with a short bound before the caller exits, so
+    /// patroni/postgres's final log lines are flushed to this process's own
+    /// stdout/stderr first. The child's pipes hit EOF the instant it dies,
+    /// so in the common case both pumps return almost immediately; the
+    /// timeout only guards a pump wedged on a slow or full downstream write.
+    /// Best-effort by design: this runs right before an unconditional
+    /// process exit, so there is nothing better to do with a timed-out pump
+    /// than proceed anyway.
+    pub async fn drain(pumps: Vec<JoinHandle<()>>) {
+        for h in pumps {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
     }
 
     #[cfg(test)]
@@ -1220,6 +1395,19 @@ pub mod wal_corruption {
             ));
             assert!(!matches_corruption_pattern(
                 "INFO: no action. I am (postgres-2), a secondary, and following a leader (postgres-3)"
+            ));
+        }
+
+        #[test]
+        fn does_not_match_pattern_text_embedded_elsewhere_on_the_line() {
+            // Before anchoring to the severity marker, a bare `contains()` scan
+            // matched this line purely because the pattern words appear
+            // somewhere in it — even though they're not the actual `LOG:`
+            // message. This is the residual client-log-injection surface the
+            // anchor closes: text a client controls (e.g. an echoed statement)
+            // can no longer spoof a match just by containing the same words.
+            assert!(!matches_corruption_pattern(
+                "STATEMENT:  SELECT 'record with incorrect prev-link 0/863 at 1/300000A0'"
             ));
         }
 
@@ -1295,16 +1483,37 @@ pub mod wal_corruption {
         }
 
         #[test]
-        fn tracker_accrues_while_recurring_at_the_same_lsn() {
+        fn tracker_same_lsn_recurrence_alone_never_accrues() {
+            // The fetch-stuck false-positive case this gate targets: a replica
+            // whose replication link is broken retries the exact same LSN
+            // forever too (nothing new ever arrives), so same-LSN recurrence
+            // by itself must NOT be enough to accrue dwell — only
+            // `note_received_location` proving new WAL arrived past this LSN
+            // (see the next test) unlocks it.
+            let t = CorruptionTracker::new();
+            t.observe(1_000, Some("0/7B0000A0"));
+            t.observe(1_010, Some("0/7B0000A0"));
+            t.observe(1_030, Some("0/7B0000A0"));
+            assert_eq!(t.dwell_secs(1_030), 0);
+        }
+
+        #[test]
+        fn tracker_accrues_once_received_ahead_is_latched() {
             // Each successive observe() lands within the reset gap (30s) of
             // the last AND reports the same LSN, so first_seen must hold
             // across all three even though no single gap is zero — this is
-            // the "stuck replaying the same record forever" case.
+            // the "stuck replaying the same record forever" case. Once the
+            // walreceiver is seen pulling in WAL past this LSN, the window
+            // counts from its ORIGINAL first_seen, not from the latch point.
             let t = CorruptionTracker::new();
             t.observe(1_000, Some("0/7B0000A0"));
-            assert_eq!(t.dwell_secs(1_000), 0);
             t.observe(1_010, Some("0/7B0000A0"));
-            assert_eq!(t.dwell_secs(1_010), 10);
+            t.note_received_location(0x7B0000A1); // one byte past the stuck LSN
+            assert_eq!(
+                t.dwell_secs(1_010),
+                10,
+                "dwell counts from first_seen even though the latch arrived later"
+            );
             t.observe(1_030, Some("0/7B0000A0"));
             assert_eq!(
                 t.dwell_secs(1_030),
@@ -1314,50 +1523,112 @@ pub mod wal_corruption {
         }
 
         #[test]
-        fn tracker_never_accrues_when_lsn_advances() {
-            // The false-positive case this fix targets: a healthy replica
-            // repeatedly hitting a normal, moving end-of-WAL boundary logs a
-            // matching pattern every few seconds, but at a DIFFERENT LSN each
-            // time — dwell must never build past a single observation.
+        fn tracker_received_ahead_latch_is_sticky_across_a_lower_reading() {
+            // A walreceiver restart can briefly report a LOWER
+            // received_location than before. The latch must not un-set once
+            // proven, or a single such blip would silently disable an
+            // already-justified detection.
             let t = CorruptionTracker::new();
             t.observe(1_000, Some("0/1000"));
-            t.observe(1_005, Some("0/2000"));
-            t.observe(1_010, Some("0/3000"));
-            t.observe(1_015, Some("0/4000"));
+            t.note_received_location(0x1001);
+            t.observe(1_010, Some("0/1000"));
+            t.note_received_location(0x500); // walreceiver restarted, position regressed
+            assert_eq!(t.dwell_secs(1_010), 10, "the earlier latch must persist");
+        }
+
+        #[test]
+        fn tracker_note_received_location_ignores_a_negative_reading() {
+            let t = CorruptionTracker::new();
+            t.observe(1_000, Some("0/1000"));
+            t.note_received_location(-1);
             assert_eq!(
-                t.dwell_secs(1_015),
+                t.dwell_secs(1_000),
                 0,
-                "an advancing LSN must never accrue dwell, however often it recurs"
+                "a negative reading can't be compared meaningfully and must not latch"
             );
         }
 
         #[test]
-        fn tracker_never_accrues_when_lsn_unparseable() {
-            // A match we couldn't extract an LSN from can't prove a stall —
-            // fail safe and never let it accrue, even across many polls.
+        fn tracker_different_lsns_do_not_clobber_each_others_windows() {
+            // Regression coverage for the single-slot design this replaced:
+            // a match at LSN B must never reset or discard LSN A's
+            // already-accruing window.
             let t = CorruptionTracker::new();
-            t.observe(1_000, None);
+            t.observe(1_000, Some("0/A000"));
+            t.note_received_location(0xA001);
+            t.observe(1_010, Some("0/A000"));
+            // An unrelated, single, never-latched match at a different LSN.
+            t.observe(1_015, Some("0/B000"));
+            assert_eq!(
+                t.dwell_secs(1_015),
+                15,
+                "LSN A's window must be unaffected by LSN B's observation"
+            );
+        }
+
+        #[test]
+        fn tracker_unparseable_lsn_is_dropped_not_stored() {
+            // A match we couldn't extract an LSN from can't prove same-LSN
+            // recurrence — it must be dropped entirely, never occupying a
+            // window (and never disturbing one that already exists).
+            let t = CorruptionTracker::new();
+            t.observe(1_000, Some("0/7B0000A0"));
+            t.note_received_location(0x7B0000A1);
             t.observe(1_010, None);
-            t.observe(1_030, None);
-            assert_eq!(t.dwell_secs(1_030), 0);
+            t.observe(1_020, None);
+            assert_eq!(
+                t.dwell_secs(1_020),
+                20,
+                "unparseable observations must not clear the real window"
+            );
         }
 
         #[test]
         fn tracker_clears_after_reset_gap() {
             let t = CorruptionTracker::new();
             t.observe(1_000, Some("0/7B0000A0"));
+            t.note_received_location(0x7B0000A1);
             // No further observation; asking well past the reset gap reads as cleared.
             assert_eq!(t.dwell_secs(1_100), 0);
-            // A later observe() starts a fresh window rather than resuming the old one.
+            // A later observe() starts a fresh window rather than resuming the
+            // old one — and the fresh window starts unlatched again.
             t.observe(1_200, Some("0/7B0000A0"));
-            assert_eq!(t.dwell_secs(1_200), 0);
+            assert_eq!(t.dwell_secs(1_210), 0, "fresh window needs its own latch");
+            t.note_received_location(0x7B0000A1);
             assert_eq!(t.dwell_secs(1_210), 10);
+        }
+
+        #[test]
+        fn tracker_evicts_stalest_window_when_over_cap() {
+            let t = CorruptionTracker::new();
+            for i in 0..(MAX_TRACKED_LSNS + 3) {
+                t.observe(1_000 + i as i64, Some(&format!("0/{i:X}")));
+            }
+            assert!(
+                t.windows.lock().unwrap().len() <= MAX_TRACKED_LSNS,
+                "map must never grow past the cap"
+            );
         }
 
         #[test]
         fn never_observed_is_zero_dwell() {
             let t = CorruptionTracker::new();
             assert_eq!(t.dwell_secs(9_999), 0);
+        }
+
+        #[test]
+        fn lsn_to_u64_parses_byte_position() {
+            assert_eq!(lsn_to_u64("0/0"), Some(0));
+            assert_eq!(lsn_to_u64("0/1"), Some(1));
+            assert_eq!(lsn_to_u64("1/0"), Some(0x1_0000_0000));
+            assert_eq!(lsn_to_u64("0/7B0000A0"), Some(0x7B0000A0));
+        }
+
+        #[test]
+        fn lsn_to_u64_none_when_unparseable() {
+            assert_eq!(lsn_to_u64("not-hex/0"), None);
+            assert_eq!(lsn_to_u64("0"), None);
+            assert_eq!(lsn_to_u64(""), None);
         }
 
         // ---- byte-based capped reader (non-UTF-8 safety, memory bound) ----
@@ -1691,6 +1962,16 @@ async fn iteration(
     // Highest WAL position Patroni reports for this node — the axis (besides the
     // timeline) on which a catching-up replica makes visible progress.
     let local_progress = local.xlog.and_then(|x| x.highest_location());
+
+    // Feed the corruption tracker this poll's furthest-received WAL position —
+    // the discriminator between "stuck in replay" (WAL keeps arriving past the
+    // bad record; corruption, safe to wipe) and "stuck in fetch" (nothing new
+    // ever arrives — a broken replication link, which a reinitialize's
+    // pg_basebackup would cross too and just fail again). See
+    // `wal_corruption::CorruptionTracker::note_received_location`.
+    if let Some(received) = local.xlog.and_then(|x| x.received_location) {
+        corruption_tracker.note_received_location(received);
+    }
     let current_obs = timeline_divergence_present(
         role,
         &patroni_state,
@@ -1787,6 +2068,17 @@ async fn iteration(
                 info!(
                     reason = %reason,
                     "self-heal: timeline-divergence re-check did not confirm on fresh read, skipping reinit"
+                );
+                return Ok(());
+            }
+            // Same re-confirmation, for the same reason, on the other
+            // single-log-source destructive trigger.
+            if trigger == ReinitTrigger::WalCorruption
+                && !confirm_wal_corruption(client, cfg, corruption_tracker).await
+            {
+                info!(
+                    reason = %reason,
+                    "self-heal: wal-corruption re-check did not confirm on fresh read, skipping reinit"
                 );
                 return Ok(());
             }
@@ -2018,6 +2310,31 @@ async fn confirm_timeline_divergence(client: &reqwest::Client, cfg: &WatcherConf
         cfg.thresholds.divergence_min_gap,
     )
     .is_some()
+}
+
+/// Independent re-confirmation of a WAL-corruption stall taken immediately
+/// before the destructive reinit — mirrors [`confirm_timeline_divergence`].
+/// Does its own fresh read of `/patroni` (not the snapshot the decision was
+/// made from), re-applies [`wal_corruption_present`], and re-reads the
+/// tracker's current dwell rather than trusting `SelfHealInputs`'s. Any
+/// disagreement — role/state changed, or the corruption signature cleared
+/// (window aged out past the reset gap) — returns `false` and the caller
+/// backs off without consuming an attempt.
+async fn confirm_wal_corruption(
+    client: &reqwest::Client,
+    cfg: &WatcherConfig,
+    corruption_tracker: &wal_corruption::CorruptionTracker,
+) -> bool {
+    let Ok(local) = fetch_local_patroni(client).await else {
+        return false;
+    };
+    if !wal_corruption_present(
+        parse_role(local.role.as_deref()),
+        &local.state.unwrap_or_default(),
+    ) {
+        return false;
+    }
+    corruption_tracker.dwell_secs(now_epoch()) >= cfg.thresholds.wal_corruption_dwell_secs
 }
 
 async fn issue_reinitialize(client: &reqwest::Client) -> Result<()> {
@@ -2522,6 +2839,26 @@ mod tests {
             SelfHealAction::EmitGaveUp { attempts: 5, .. } => {}
             other => panic!("expected EmitGaveUp, got {other:?}"),
         }
+    }
+
+    // `wal_corruption_present` is the same structural guard `decide_self_heal`
+    // and `confirm_wal_corruption` (the pre-action re-read) both apply — a
+    // fresh unhealthy/leader read must make the pre-action confirm refuse the
+    // reinit even if the tracker's dwell is still (stale-)past threshold, the
+    // same way `timeline_divergence_present` backs `confirm_timeline_divergence`.
+    #[test]
+    fn wal_corruption_present_requires_replica_role() {
+        assert!(!wal_corruption_present(Role::Leader, "streaming"));
+        assert!(!wal_corruption_present(Role::Unknown, "streaming"));
+        assert!(wal_corruption_present(Role::Replica, "streaming"));
+    }
+
+    #[test]
+    fn wal_corruption_present_requires_healthy_state() {
+        assert!(wal_corruption_present(Role::Replica, "running"));
+        assert!(wal_corruption_present(Role::Replica, "streaming"));
+        assert!(!wal_corruption_present(Role::Replica, "start failed"));
+        assert!(!wal_corruption_present(Role::Replica, "creating replica"));
     }
 
     fn obs(local_tl: i64, progress: Option<i64>) -> Option<DivergenceObs> {
