@@ -13,7 +13,7 @@ use tracing::info;
 /// falls back to the default so a typo can't break replica creation — the
 /// throttled basebackup is the bootstrap path of last resort.
 fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
-    const DEFAULT: &str = "32M";
+    const DEFAULT: &str = "20M";
     let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
         return DEFAULT.to_string();
     };
@@ -90,8 +90,8 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // leader's volume: pg_basebackup is a single sequential stream read
     // directly off the live leader, and unthrottled it runs at the volume's
     // throughput ceiling, starving production queries for the entire copy.
-    // The 32M default is roughly half the observed per-volume read ceiling,
-    // leaving production the larger share while a re-seed runs.
+    // The 20M default is well under the observed per-volume read ceiling,
+    // leaving production the dominant share while a re-seed runs.
     // checkpoint: fast skips the spread-checkpoint wait (up to
     // checkpoint_timeout of apparent hang before the first byte lands).
     // PG_BASEBACKUP_MAX_RATE overrides the rate for oversized emergencies.
@@ -284,7 +284,7 @@ mod tests {
         for cfg in [test_config(Some("bucket")), test_config(None)] {
             let yaml = generate_patroni_config(&cfg, "replica");
             assert!(yaml.contains(
-                "  data_dir: /var/lib/postgresql/data/pgdata\n  basebackup:\n    max-rate: 32M\n    checkpoint: fast\n  pgpass: /tmp/pgpass\n"
+                "  data_dir: /var/lib/postgresql/data/pgdata\n  basebackup:\n    max-rate: 20M\n    checkpoint: fast\n  pgpass: /tmp/pgpass\n"
             ));
         }
     }
@@ -299,11 +299,11 @@ mod tests {
 
     #[test]
     fn resolve_basebackup_max_rate_falls_back_on_garbage() {
-        assert_eq!(resolve_basebackup_max_rate(None), "32M");
-        assert_eq!(resolve_basebackup_max_rate(Some(String::new())), "32M");
-        assert_eq!(resolve_basebackup_max_rate(Some("fast".into())), "32M");
-        assert_eq!(resolve_basebackup_max_rate(Some("M".into())), "32M");
-        assert_eq!(resolve_basebackup_max_rate(Some("32MB".into())), "32M");
-        assert_eq!(resolve_basebackup_max_rate(Some("-5M".into())), "32M");
+        assert_eq!(resolve_basebackup_max_rate(None), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some(String::new())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("fast".into())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("M".into())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("32MB".into())), "20M");
+        assert_eq!(resolve_basebackup_max_rate(Some("-5M".into())), "20M");
     }
 }
