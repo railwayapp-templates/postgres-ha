@@ -32,6 +32,17 @@
 //! 3-simultaneous-restart cluster flap. The dashboard PITR enable/disable
 //! flow owns the rolling-restart choreography. This reconcile only ensures
 //! DCS cannot drift from env-var intent.
+//!
+//! Also asserts `lc_messages: "C"` in DCS, independent of archiving — the
+//! self-heal WAL-corruption watch (`self_heal.rs`'s `wal_corruption`
+//! submodule) matches fixed English Postgres log strings, so a non-C locale
+//! silently disables that signal. `bootstrap.dcs` only sets it for clusters
+//! bootstrapped after that change shipped; this reconcile is what brings the
+//! existing fleet's DCS up to date on next restart. `lc_messages` is
+//! `PGC_SUSET` (reload-only, unlike `archive_mode`), so no `pending_restart`
+//! concern here. Only patched in when currently *absent* from DCS — an
+//! operator who has explicitly set a different `lc_messages` is left alone,
+//! at the cost of that cluster's corruption signal staying disabled.
 
 use super::Config;
 use anyhow::{Context, Result};
@@ -45,6 +56,7 @@ use tracing::{info, warn};
 const PATRONI_REST: &str = "http://localhost:8008";
 const EXPECTED_ARCHIVE_MODE: &str = "on";
 const EXPECTED_ARCHIVE_COMMAND: &str = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
+const EXPECTED_LC_MESSAGES: &str = "C";
 // Bounded poll before concluding Patroni's own dynamic-config sync missed
 // this node, rather than just being a loop_wait cycle behind a patch we
 // ourselves may have just issued moments ago. Only SUCCESSFUL reads count
@@ -867,6 +879,9 @@ where
 ///   are per-node — e.g. a leader elected after the disable patch already
 ///   landed can carry a stale `restore_command` with nothing left to
 ///   reconcile in DCS.
+/// - Independent of archiving: also assert `lc_messages="C"` in DCS whenever
+///   it is currently absent there (never overwrites an operator-set value).
+///   See the module doc.
 ///
 /// The DCS decision itself lives in `compute_archive_reconcile_patch`; this
 /// function does the GET/PATCH I/O around it plus the live-GUC follow-ups.
@@ -936,6 +951,39 @@ pub async fn reconcile_pgbackrest_archive_config(
             info!(
                 enabled,
                 "DCS archive config already matches env-driven intent"
+            );
+        }
+    }
+
+    let lc_messages = params
+        .and_then(|m| m.get("lc_messages"))
+        .and_then(|v| v.as_str());
+
+    // Independent of archive_mode/enabled: only ever patches in when DCS has
+    // no lc_messages at all, so an operator's explicit non-C choice is never
+    // clobbered (that cluster's corruption signal just stays disabled).
+    match lc_messages {
+        None => {
+            warn!(
+                "DCS has no lc_messages set — pinning to \"C\" so the WAL-corruption self-heal signal (which matches fixed English log strings) can work on this cluster"
+            );
+            let lc_patch = json!({
+                "postgresql": {
+                    "parameters": {
+                        "lc_messages": EXPECTED_LC_MESSAGES,
+                    }
+                }
+            });
+            send_patch(&client, &lc_patch).await?;
+            info!("DCS lc_messages pinned to \"C\"");
+        }
+        Some(EXPECTED_LC_MESSAGES) => {
+            info!("DCS lc_messages already \"C\"");
+        }
+        Some(other) => {
+            info!(
+                current_lc_messages = other,
+                "DCS lc_messages set to a non-default value — leaving the operator's choice alone (WAL-corruption self-heal signal stays disabled on this cluster)"
             );
         }
     }
