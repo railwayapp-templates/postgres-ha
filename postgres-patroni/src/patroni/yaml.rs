@@ -317,24 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn basebackup_is_throttled_with_and_without_archiving() {
-        for cfg in [test_config(Some("bucket")), test_config(None)] {
-            let yaml = generate_patroni_config(&cfg, "replica");
-            assert!(yaml.contains(
-                "  data_dir: /var/lib/postgresql/data/pgdata\n  basebackup:\n    max-rate: 20M\n    checkpoint: fast\n  pgpass: /tmp/pgpass\n"
-            ));
-        }
-    }
-
-    #[test]
-    fn basebackup_max_rate_renders_from_config() {
-        let mut cfg = test_config(None);
-        cfg.basebackup_max_rate = "64M".into();
-        let yaml = generate_patroni_config(&cfg, "replica");
-        assert!(yaml.contains("  basebackup:\n    max-rate: 64M\n    checkpoint: fast\n"));
-    }
-
-    #[test]
     fn archiving_enabled_seeds_replica_method_and_restore_command() {
         let yaml = generate_patroni_config(&test_config(Some("bucket")), "replica");
 
@@ -362,16 +344,39 @@ mod tests {
         assert!(!yaml.contains("create_replica_methods"));
         assert!(!yaml.contains("restore_command"));
         assert!(!yaml.contains("pgbackrest"));
-        // The interpolation site must still render valid YAML.
-        assert!(yaml.contains("  data_dir: /var/lib/postgresql/data/pgdata\n  pgpass: /tmp/pgpass\n"));
+        // The interpolation site must still render valid YAML: with no
+        // replica-method block, data_dir is directly followed by the
+        // basebackup throttle options.
+        assert!(yaml.contains("  data_dir: /var/lib/postgresql/data/pgdata\n  basebackup:"));
     }
 
     #[test]
-    fn replica_method_block_renders_between_data_dir_and_pgpass() {
+    fn replica_method_block_renders_between_data_dir_and_basebackup_options() {
         let yaml = generate_patroni_config(&test_config(Some("bucket")), "replica");
         assert!(yaml.contains(
             "  data_dir: /var/lib/postgresql/data/pgdata\n  create_replica_methods:"
         ));
-        assert!(yaml.contains("    no_params: true\n  pgpass: /tmp/pgpass\n"));
+        assert!(yaml.contains("    no_params: true\n  basebackup:"));
+    }
+
+    #[test]
+    fn basebackup_is_throttled_with_and_without_archiving() {
+        // No data_dir adjacency here: with archiving enabled the
+        // replica-method block sits between data_dir and this options
+        // block. The throttle itself must render either way.
+        for cfg in [test_config(Some("bucket")), test_config(None)] {
+            let yaml = generate_patroni_config(&cfg, "replica");
+            assert!(yaml.contains(
+                "  basebackup:\n    max-rate: 20M\n    checkpoint: fast\n  pgpass: /tmp/pgpass\n"
+            ));
+        }
+    }
+
+    #[test]
+    fn basebackup_max_rate_renders_from_config() {
+        let mut cfg = test_config(None);
+        cfg.basebackup_max_rate = "64M".into();
+        let yaml = generate_patroni_config(&cfg, "replica");
+        assert!(yaml.contains("  basebackup:\n    max-rate: 64M\n    checkpoint: fast\n"));
     }
 }

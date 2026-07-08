@@ -29,10 +29,29 @@
 # signal to switch to streaming) finds DCS agreeing with the marker and
 # adds only one localhost curl, no second S3 round-trip.
 #
-# Exit codes follow restore_command semantics: non-zero means "segment not
-# available here" and standby recovery falls back to streaming; only death
-# by signal is treated as FATAL by Postgres. No drop/threshold logic is
-# needed on the read path.
+# Exit codes follow restore_command semantics: exit 1 means "segment not
+# available here" and standby recovery falls back to streaming, while any
+# exit >125 (or death by signal) is treated as FATAL by Postgres and ends
+# the startup process.
+#
+# That FATAL semantic carries the connectivity circuit-breaker: pgBackRest
+# exits 0 on a hit and 1 on a genuine miss (repo reachable, file absent) —
+# both PROVE the archive endpoint is reachable and clear the breaker. Any
+# other exit (25–125: HostConnect/RepoInvalid/TLS/timeout classes) means we
+# could not talk to the repo at all; after
+# WAL_ARCHIVE_GET_CONNECTIVITY_TRIP consecutive such invocations the
+# wrapper exits 126 so Postgres FATALs the startup process instead of
+# retrying the dead endpoint forever. Why that is the RIGHT failure mode: a
+# standby that needs archived WAL it cannot fetch keeps its postmaster
+# alive in "starting" for as long as restore_command keeps returning 1,
+# and Patroni parks any force-reinitialize behind that never-finishing
+# start — the WAL-too-old self-heal fires but cannot act. Tripping to
+# FATAL restores crash-loop dynamics: postgres exits, Patroni restarts it
+# (probing the archive afresh each cycle, so a recovered endpoint heals on
+# the next boot), and the self-heal reinitialize can land while postgres
+# is down. The counter lives in PGDATA (wiped with a re-seed) and resets
+# on every trip so each crash-loop cycle re-probes the endpoint a full
+# threshold's worth before tripping again.
 
 set -u
 
@@ -45,6 +64,29 @@ fi
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
 MARKER="$PGDATA/.pgbackrest_repo_path"
+BREAKER="$PGDATA/.pgbackrest_archive_get_conn_failures"
+TRIP_THRESHOLD="${WAL_ARCHIVE_GET_CONNECTIVITY_TRIP:-30}"
+
+# Success (0) and genuine miss (1) both prove the repo answered: clear the
+# breaker and pass the code through. Anything else is a connectivity-class
+# failure: count it, trip to 126 at the threshold. Single writer (recovery
+# invokes restore_command serially), so a plain overwrite is safe.
+finish() {
+  rc="$1"
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; then
+    rm -f "$BREAKER" 2>/dev/null || true
+    exit "$rc"
+  fi
+  fails=$(tr -dc '0-9' <"$BREAKER" 2>/dev/null)
+  fails=$((${fails:-0} + 1))
+  if [ "$fails" -ge "$TRIP_THRESHOLD" ]; then
+    rm -f "$BREAKER" 2>/dev/null || true
+    echo "pgbackrest-archive-get-wrapper: archive endpoint unreachable for ${fails} consecutive invocations (last rc=${rc}) — connectivity breaker tripped, exiting 126 so recovery crash-loops instead of waiting on a dead archive forever" >&2
+    exit 126
+  fi
+  printf '%s\n' "$fails" >"$BREAKER" 2>/dev/null || true
+  exit "$rc"
+}
 
 # Defensive gate, mirroring the push wrapper: if WAL_ARCHIVE_BUCKET is unset
 # at call time there is no repo to fetch from — the setting leaked via a
@@ -68,7 +110,7 @@ fi
 
 pgbackrest --stanza=main archive-get "$WAL_FILE" "$WAL_DEST"
 rc=$?
-[ "$rc" -eq 0 ] && exit 0
+[ "$rc" -eq 0 ] && finish 0
 
 DCS_PATH=$(curl -sf --max-time 2 http://localhost:8008/config 2>/dev/null \
   | python3 -c 'import json,sys; v = json.load(sys.stdin).get("pgbackrest_repo1_path") or ""; print(v if isinstance(v, str) else "")' 2>/dev/null)
@@ -81,8 +123,8 @@ if [ -n "$DCS_PATH" ] && [ "$DCS_PATH" != "$USED_PATH" ]; then
     MARKER_TMP="$MARKER.tmp.$$"
     { printf '%s\n' "$DCS_PATH" >"$MARKER_TMP" && chmod 640 "$MARKER_TMP" && mv "$MARKER_TMP" "$MARKER"; } 2>/dev/null \
       || rm -f "$MARKER_TMP" 2>/dev/null || true
-    exit 0
+    finish 0
   fi
 fi
 
-exit "$rc"
+finish "$rc"

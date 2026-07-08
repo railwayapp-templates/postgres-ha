@@ -312,12 +312,89 @@ t_archive_get_genuine_miss_dcs_agrees_no_second_attempt() {
   setup
   echo "current-path" > "$(marker_path)"
   dcs_json_for "current-path"   # DCS agrees with the marker: a real miss, not staleness
-  echo "3" > "$TMPROOT/control/fail_code"   # no success_path -> always fails
+  echo "1" > "$TMPROOT/control/fail_code"   # pgbackrest miss semantics: exit 1
   WAL_ARCHIVE_BUCKET=bucket run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   local rc; rc=$(exit_code)
-  assert_eq "$rc" "3" "a genuine miss (segment not archived yet) must return pgbackrest's real exit code" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
+  assert_eq "$rc" "1" "a genuine miss (segment not archived yet) must return pgbackrest's miss code" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
   assert_eq "$(pgbackrest_call_count)" "1" "when DCS agrees with the marker there is nothing to retry — must not call pgbackrest a second time" || { ko "$FUNCNAME" "unexpected retry: $(cat "$TMPROOT/control/pgbackrest_calls.log")"; teardown; return; }
   assert_eq "$(marker_content)" "current-path" "marker must be untouched on a genuine miss" || { ko "$FUNCNAME" "marker changed unexpectedly"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+breaker_path() { echo "$TMPROOT/pgdata/.pgbackrest_archive_get_conn_failures"; }
+breaker_content() { tr -dc '0-9' < "$(breaker_path)" 2>/dev/null || echo "<absent>"; }
+
+t_archive_get_connectivity_breaker_trips_at_threshold() {
+  # Consecutive connectivity-class failures (rc>1: HostConnect/RepoInvalid
+  # etc.) must trip to exit 126 — FATAL to Postgres — at the threshold, so
+  # a standby wedged on a dead archive crash-loops (where the WAL-too-old
+  # reinitialize can land) instead of retrying the endpoint forever.
+  setup
+  touch "$TMPROOT/control/dcs_unreachable"
+  echo "103" > "$TMPROOT/control/fail_code"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "103" "failure 1/3 must pass through pgbackrest's code" || { ko "$FUNCNAME" "run1 rc"; teardown; return; }
+  assert_eq "$(breaker_content)" "1" "failure 1/3 must persist a count of 1" || { ko "$FUNCNAME" "run1 counter"; teardown; return; }
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "103" "failure 2/3 must pass through pgbackrest's code" || { ko "$FUNCNAME" "run2 rc"; teardown; return; }
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "126" "failure 3/3 must trip the breaker with exit 126 (>125 = FATAL)" || { ko "$FUNCNAME" "run3 rc"; teardown; return; }
+  if [ -f "$(breaker_path)" ]; then ko "$FUNCNAME" "trip must reset the counter file"; teardown; return; fi
+  grep -q "connectivity breaker tripped" "$TMPROOT/control/output" || { ko "$FUNCNAME" "trip must log its reason"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_get_genuine_miss_resets_breaker() {
+  # rc=1 means the repo ANSWERED and the file is absent — proof of
+  # connectivity, so it must clear the count. Only an unbroken run of
+  # connectivity failures may trip; otherwise the normal end-of-catch-up
+  # miss would inherit stale counts from an earlier blip.
+  setup
+  touch "$TMPROOT/control/dcs_unreachable"
+  echo "103" > "$TMPROOT/control/fail_code"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(breaker_content)" "2" "two connectivity failures must persist a count of 2" || { ko "$FUNCNAME" "pre-miss counter"; teardown; return; }
+  echo "1" > "$TMPROOT/control/fail_code"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "1" "a genuine miss must still exit 1" || { ko "$FUNCNAME" "miss rc"; teardown; return; }
+  if [ -f "$(breaker_path)" ]; then ko "$FUNCNAME" "a genuine miss must clear the breaker"; teardown; return; fi
+  echo "103" > "$TMPROOT/control/fail_code"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "103" "post-reset failure must count from 1 again, not trip" || { ko "$FUNCNAME" "post-reset rc"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_get_success_resets_breaker() {
+  setup
+  touch "$TMPROOT/control/dcs_unreachable"
+  echo "103" > "$TMPROOT/control/fail_code"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  echo "env-path" > "$TMPROOT/control/success_path"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 PGBACKREST_REPO1_PATH=env-path run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "0" "recovered endpoint must serve the segment" || { ko "$FUNCNAME" "success rc"; teardown; return; }
+  if [ -f "$(breaker_path)" ]; then ko "$FUNCNAME" "success must clear the breaker"; teardown; return; fi
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_get_post_trip_run_counts_fresh() {
+  # Each crash-loop cycle must re-probe the endpoint a full threshold's
+  # worth: the run AFTER a trip passes the code through and counts from 1.
+  setup
+  touch "$TMPROOT/control/dcs_unreachable"
+  echo "103" > "$TMPROOT/control/fail_code"
+  for _ in 1 2 3; do
+    WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  done
+  assert_eq "$(exit_code)" "126" "third failure must have tripped" || { ko "$FUNCNAME" "trip rc"; teardown; return; }
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "103" "first post-trip failure must not trip again" || { ko "$FUNCNAME" "post-trip rc"; teardown; return; }
+  assert_eq "$(breaker_content)" "1" "post-trip counting must restart at 1" || { ko "$FUNCNAME" "post-trip counter"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
@@ -373,6 +450,10 @@ ALL_TESTS=(
   t_archive_get_genuine_miss_dcs_agrees_no_second_attempt
   t_archive_get_dcs_unreachable_on_miss_returns_original_failure
   t_archive_get_double_miss_returns_first_attempts_exit_code
+  t_archive_get_connectivity_breaker_trips_at_threshold
+  t_archive_get_genuine_miss_resets_breaker
+  t_archive_get_success_resets_breaker
+  t_archive_get_post_trip_run_counts_fresh
 )
 
 if [ "$#" -gt 0 ]; then

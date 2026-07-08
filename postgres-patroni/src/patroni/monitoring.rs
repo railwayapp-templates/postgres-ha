@@ -6,6 +6,7 @@ use super::{check_health, self_heal, Config};
 use common::{ConfigExt, Telemetry, TelemetryEvent};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use std::path::Path;
 use std::time::Duration;
 use tokio::process::Child;
 use tokio::signal::unix::{signal, SignalKind};
@@ -492,6 +493,7 @@ async fn try_reinitialize_stalled_replica(
                 reason: reason.to_string(),
                 attempt,
             });
+            ensure_reinitialize_unparked(config, &client).await;
             true
         }
         Err(e) => {
@@ -510,6 +512,103 @@ async fn try_reinitialize_stalled_replica(
             false
         }
     }
+}
+
+/// How long an ACCEPTED force-reinitialize may sit with no visible effect
+/// (pg_control still present) before we conclude Patroni has parked it and
+/// preempt Postgres ourselves. Long enough for Patroni's normal
+/// stop→wipe→clone sequencing on a loaded node; far below the
+/// max_startup_timeout cliff this path exists to beat.
+const REINIT_PARK_TIMEOUT_SECS: u64 = 90;
+const REINIT_PARK_POLL_SECS: u64 = 2;
+
+/// Patroni parks an accepted force-reinitialize behind a postgres that never
+/// leaves "starting": the reinitialize must stop postgres before it can wipe,
+/// but the in-flight start action never completes while the startup process
+/// cycles restore_command/streaming retries — observed as "reinitialize in
+/// progress" for 6+ minutes with zero data-wipe progress. The archive-get
+/// wrapper's connectivity breaker usually prevents that state (it FATALs
+/// startup when the archive ENDPOINT is dead), but it cannot help when the
+/// archive answers and simply lacks the WAL this node needs — a gap in
+/// archived history keeps returning honest misses and the eternal start
+/// persists.
+///
+/// Watch for the wipe (pg_control vanishing is its first observable step);
+/// if nothing has happened inside the park timeout, stop Postgres directly.
+/// That is safe by construction at this call site: the WAL-too-old verdict
+/// proved the node cannot stream-catch-up, the archive dwell proved the
+/// fallback is stalled, and Patroni has already ACCEPTED an instruction to
+/// wipe this node — stopping a postgres that is sentenced to wipe-and-reseed
+/// destroys nothing. Afterwards re-issue the reinitialize for the case where
+/// Patroni dropped the parked task instead of resuming it once postgres died.
+async fn ensure_reinitialize_unparked(config: &Config, client: &reqwest::Client) {
+    let pg_control = format!("{}/global/pg_control", config.data_dir);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(REINIT_PARK_TIMEOUT_SECS);
+    while tokio::time::Instant::now() < deadline {
+        if !Path::new(&pg_control).exists() {
+            return;
+        }
+        sleep(Duration::from_secs(REINIT_PARK_POLL_SECS)).await;
+    }
+
+    warn!(
+        park_timeout_secs = REINIT_PARK_TIMEOUT_SECS,
+        "startup self-heal: reinitialize accepted but no data wipe within the park timeout — preempting postgres so Patroni can act"
+    );
+    // Signal the postmaster directly rather than shelling out to pg_ctl:
+    // Debian's postgresql-common wraps psql/pg_controldata onto PATH but
+    // deliberately NOT pg_ctl, so a bare pg_ctl spawn fails instantly in
+    // this process. SIGINT = fast shutdown, SIGQUIT = immediate.
+    stop_postgres_directly(&config.data_dir).await;
+
+    // Re-issue: Patroni cancels the parked task when a new forced
+    // reinitialize arrives, and with postgres now down the fresh task can
+    // actually run its stop→wipe→clone sequence. A client timeout here is
+    // routine — Patroni answers slowly while cancelling — and harmless
+    // either way, so log-and-continue.
+    match self_heal::force_reinitialize(client).await {
+        Ok(()) => info!("startup self-heal: re-issued reinitialize after preempting the wedged postgres"),
+        Err(e) => warn!(
+            error = %e,
+            "startup self-heal: reinitialize re-issue answered slowly or failed — the cancelled-and-recreated task may already be proceeding"
+        ),
+    }
+}
+
+/// Stop the local postmaster by pid-file signal: SIGINT (fast shutdown),
+/// escalating to SIGQUIT (immediate) if it hasn't exited within the fast
+/// window. Returns silently when there is no postmaster to stop — between
+/// crash-loop cycles (e.g. after the archive-get connectivity breaker
+/// FATALs startup) that is the normal case and exactly what the caller
+/// wants. Only invoked on a node already sentenced to wipe-and-reseed.
+async fn stop_postgres_directly(data_dir: &str) {
+    let pidfile = format!("{data_dir}/postmaster.pid");
+    let pid = std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<i32>().ok()));
+    let Some(pid) = pid else {
+        info!("startup self-heal: no postmaster.pid — postgres already down");
+        return;
+    };
+    let pid = Pid::from_raw(pid);
+    let _ = kill(pid, Signal::SIGINT);
+    for _ in 0..15 {
+        if kill(pid, None).is_err() {
+            info!("startup self-heal: postgres stopped after fast-shutdown signal");
+            return;
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+    warn!("startup self-heal: fast shutdown did not complete; escalating to immediate");
+    let _ = kill(pid, Signal::SIGQUIT);
+    for _ in 0..8 {
+        if kill(pid, None).is_err() {
+            info!("startup self-heal: postgres stopped after immediate-shutdown signal");
+            return;
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+    warn!("startup self-heal: postmaster survived both shutdown signals; leaving it to the recovery exit");
 }
 
 /// Outcome of one 5s startup poll. Pure so the progress-gated timeout is

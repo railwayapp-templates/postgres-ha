@@ -2171,9 +2171,15 @@ t_ha_wal_archive_stall_dwell_gates_reinit() {
   # than a race against a fallback that might work anyway.
   docker stop "$MINIO" >/dev/null 2>&1
 
+  # Low connectivity-breaker threshold so the wedge FATALs into a visible
+  # crash loop within the observation window (default 30 would too, just
+  # slower); the dwell/reinit assertions below are unaffected because the
+  # WAL probe reads pg_wal offline and the monitor keeps classifying
+  # Waiting across postgres crash cycles.
   # shellcheck disable=SC2046
   RUN_NODE_VOLUME="${replica}-vol-tmpfs" run_patroni_node "$scope" "$etcd_hosts" "$replica" $(archive_env_fast_watcher) \
-    -e "WAL_ARCHIVE_STALL_CONFIRM_SECONDS=${confirm_secs}"
+    -e "WAL_ARCHIVE_STALL_CONFIRM_SECONDS=${confirm_secs}" \
+    -e "WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=10"
 
   # First positive WAL-too-old verdict arms at ~30s of zero progress
   # (WAL_PROBE_GRACE_SECS). Sample shortly after that — before the dwell
@@ -2194,21 +2200,20 @@ t_ha_wal_archive_stall_dwell_gates_reinit() {
     sleep 5
   done
 
-  # Completion is observed but NOT asserted: with S3 hard-down,
-  # restore_command keeps the startup process alive retrying the archive
-  # every wal_retrieve_retry_interval, postgres never leaves "starting",
-  # and Patroni parks the accepted force-reinitialize behind that state
-  # indefinitely ("reinitialize in progress" for 6+ minutes with no data
-  # wipe, measured locally). Pre-restore_command this scenario
-  # crash-looped, leaving windows where the reinit could land — so the
-  # completion gap is a real follow-up (preempt postgres before
-  # reinitialize, or bound the wrapper's connectivity-failure retries),
-  # tracked separately from the dwell behavior this test pins. H8/H9
-  # prove the create methods themselves whenever postgres isn't wedged
-  # mid-start.
+  # Completion is a hard assert again, carried by two mechanisms added
+  # after the parked-reinitialize finding (Patroni parks an accepted
+  # force-reinitialize behind a postgres that never leaves "starting",
+  # which restore_command's eternal retry loop otherwise guarantees while
+  # S3 is down): the archive-get wrapper's connectivity breaker FATALs the
+  # startup process after N consecutive endpoint-unreachable invocations
+  # (restoring crash-loop dynamics where the reinit can land), and the
+  # monitor's park-watch preempts postgres directly if an accepted
+  # reinitialize shows no data wipe within its park timeout. The re-clone
+  # itself is basebackup at the 20M max-rate throttle (pgbackrest can't
+  # restore from the down S3), so the window is generous.
   local created=""
   if [ "$fired" = "1" ]; then
-    local create_deadline=$(($(date +%s) + 60))
+    local create_deadline=$(($(date +%s) + 360))
     while [ "$(date +%s)" -lt "$create_deadline" ]; do
       created=$(docker logs "$replica" 2>&1 | grep -o "replica has been created using [a-z_]*" | tail -1)
       [ -n "$created" ] && break
@@ -2243,11 +2248,21 @@ t_ha_wal_archive_stall_dwell_gates_reinit() {
     teardown_scope "$scope"
     return
   fi
-  if [ -n "$created" ]; then
-    note "reinit completed during the observation window via '$created'"
-  else
-    note "reinit triggered but parked inside Patroni behind the still-starting postgres (known completion gap — see comment above)"
+  if [ -z "$created" ]; then
+    ko t_ha_wal_archive_stall_dwell_gates_reinit "reinitialize triggered but the replica was never re-created — neither the connectivity breaker nor the park-watch unwedged it"
+    fail_dump t_ha_wal_archive_stall_dwell_gates_reinit "$replica" "$leader"
+    teardown_scope "$scope"
+    return
   fi
+  # The breaker must have fired along the way: with the endpoint dead, the
+  # eternal-starting state is exactly what it exists to break.
+  if ! logs_contain "$replica" "connectivity breaker tripped"; then
+    ko t_ha_wal_archive_stall_dwell_gates_reinit "expected the archive-get connectivity breaker to have tripped at least once with S3 down"
+    fail_dump t_ha_wal_archive_stall_dwell_gates_reinit "$replica"
+    teardown_scope "$scope"
+    return
+  fi
+  note "reinit completed via '$created' with the connectivity breaker tripping during the outage"
   if ! logs_contain "$replica" "deferring reinitialize until the zero-progress stall outlives the dwell"; then
     ko t_ha_wal_archive_stall_dwell_gates_reinit "expected the archive-aware dwell warning to have logged at least once"
     fail_dump t_ha_wal_archive_stall_dwell_gates_reinit "$replica"
