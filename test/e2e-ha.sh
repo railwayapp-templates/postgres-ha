@@ -2487,7 +2487,7 @@ t_ha_failover_watcher_handoff() {
   # the attempt-level ground truth. Match the message text only: tracing
   # wraps the key=value fields that follow it in ANSI codes, so
   # `backup_type=...` is not a contiguous string in raw docker logs.
-  if docker logs "$leader2" 2>&1 | grep -q "pgbackrest-watcher: running backup"; then
+  if logs_contain "$leader2" "pgbackrest-watcher: running backup"; then
     ko t_ha_failover_watcher_handoff "new leader attempted a backup post-promotion (running-backup line in logs)"
     fail_dump t_ha_failover_watcher_handoff "$leader2"
     teardown_scope "$scope"
@@ -2548,7 +2548,7 @@ t_ha_failover_adopts_catalog_history() {
   # definitive signal this code path ran, as opposed to generic liveness.
   local deadline=$(($(date +%s) + 60)) adopted=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$leader2" 2>&1 | grep -q "pgbackrest-watcher: adopted backup history from S3 catalog"; then
+    if logs_contain "$leader2" "pgbackrest-watcher: adopted backup history from S3 catalog"; then
       adopted=1
       break
     fi
@@ -2594,7 +2594,7 @@ t_ha_failover_adopts_catalog_history() {
   # through. The watcher loop is single-threaded — the adoption line having
   # printed proves nothing was in flight at that instant — and this closes
   # the rest of the window: no attempt may have been logged at all.
-  if docker logs "$leader2" 2>&1 | grep -q "pgbackrest-watcher: running backup"; then
+  if logs_contain "$leader2" "pgbackrest-watcher: running backup"; then
     ko t_ha_failover_adopts_catalog_history "new leader attempted a backup despite adopting (running-backup line in logs)"
     fail_dump t_ha_failover_adopts_catalog_history "$leader2"
     teardown_scope "$scope"
