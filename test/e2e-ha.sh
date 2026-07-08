@@ -1645,6 +1645,14 @@ t_ha_failover_watcher_handoff() {
 
   local wal_before; wal_before=$(count_archived_wal_segments)
   local fulls_before; fulls_before=$(count_backups_of_type "$leader1" full)
+  # Pin the precondition: count_backups_of_type greps pgbackrest's text
+  # output, so a format drift would make it return 0 on both sides and the
+  # fulls_after equality check below would pass vacuously.
+  if [ "$fulls_before" != "1" ]; then
+    ko t_ha_failover_watcher_handoff "unexpected pre-failover catalog state; fulls=$fulls_before"
+    teardown_scope "$scope"
+    return
+  fi
 
   log "killing leader $leader1"
   docker stop "$leader1" >/dev/null
@@ -1702,6 +1710,19 @@ t_ha_failover_watcher_handoff() {
   local fulls_after; fulls_after=$(count_backups_of_type "$leader2" full)
   if [ "$fulls_after" != "$fulls_before" ]; then
     ko t_ha_failover_watcher_handoff "new leader took a redundant full on promotion; before=$fulls_before after=$fulls_after"
+    fail_dump t_ha_failover_watcher_handoff "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Catalog counts only see COMPLETED backups — a redundant backup still in
+  # flight (or one that failed) is invisible to the check above. The watcher
+  # logs `running backup` before invoking pgbackrest, so leader2's logs are
+  # the attempt-level ground truth. Match the message text only: tracing
+  # wraps the key=value fields that follow it in ANSI codes, so
+  # `backup_type=...` is not a contiguous string in raw docker logs.
+  if docker logs "$leader2" 2>&1 | grep -q "pgbackrest-watcher: running backup"; then
+    ko t_ha_failover_watcher_handoff "new leader attempted a backup post-promotion (running-backup line in logs)"
     fail_dump t_ha_failover_watcher_handoff "$leader2"
     teardown_scope "$scope"
     return
@@ -1797,6 +1818,32 @@ t_ha_failover_adopts_catalog_history() {
   fi
   if [ "$diffs_after" != "$diffs_before" ]; then
     ko t_ha_failover_adopts_catalog_history "new leader took a redundant diff instead of adopting; before=$diffs_before after=$diffs_after"
+    fail_dump t_ha_failover_adopts_catalog_history "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Attempt-level check: the counts above only see completed backups, so a
+  # redundant backup still in flight (or failing) at count time would slip
+  # through. The watcher loop is single-threaded — the adoption line having
+  # printed proves nothing was in flight at that instant — and this closes
+  # the rest of the window: no attempt may have been logged at all.
+  if docker logs "$leader2" 2>&1 | grep -q "pgbackrest-watcher: running backup"; then
+    ko t_ha_failover_adopts_catalog_history "new leader attempted a backup despite adopting (running-backup line in logs)"
+    fail_dump t_ha_failover_adopts_catalog_history "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Quiescence: hold three more watcher polls and recount. Catches a backup
+  # that fires shortly AFTER adoption (bad cadence anchor, spurious
+  # gap-recovery entry) instead of at the sampled instant.
+  sleep 15
+  local fulls_settled diffs_settled
+  fulls_settled=$(count_backups_of_type "$leader2" full)
+  diffs_settled=$(count_backups_of_type "$leader2" diff)
+  if [ "$fulls_settled" != "$fulls_before" ] || [ "$diffs_settled" != "$diffs_before" ]; then
+    ko t_ha_failover_adopts_catalog_history "backup counts moved during quiescence window; fulls=$fulls_settled diffs=$diffs_settled"
     fail_dump t_ha_failover_adopts_catalog_history "$leader2"
     teardown_scope "$scope"
     return
