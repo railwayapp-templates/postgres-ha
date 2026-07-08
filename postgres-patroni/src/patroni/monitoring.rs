@@ -6,6 +6,7 @@ use super::{check_health, self_heal, Config};
 use common::{Telemetry, TelemetryEvent};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use std::path::Path;
 use std::time::Duration;
 use tokio::process::Child;
 use tokio::signal::unix::{signal, SignalKind};
@@ -398,6 +399,7 @@ async fn try_reinitialize_stalled_replica(
                 reason: reason.to_string(),
                 attempt,
             });
+            ensure_reinitialize_unparked(config).await;
             true
         }
         Err(e) => {
@@ -416,6 +418,164 @@ async fn try_reinitialize_stalled_replica(
             false
         }
     }
+}
+
+/// How long an ACCEPTED force-reinitialize may sit with no visible effect
+/// (pg_control still present) before we conclude Patroni has parked it and
+/// preempt Postgres ourselves. Long enough for Patroni's normal
+/// stop→wipe→clone sequencing on a loaded node; far below the
+/// max_startup_timeout cliff this path exists to beat. The RETRY window is
+/// shorter: after the first preempt+reissue we're confirming that action
+/// worked, not rediscovering the park from scratch.
+const REINIT_PARK_TIMEOUT_SECS: u64 = 90;
+const REINIT_PARK_RETRY_WAIT_SECS: u64 = 30;
+const REINIT_PARK_POLL_SECS: u64 = 2;
+/// Timeout for the re-issued `POST /reinitialize` specifically — NOT the
+/// shared 5s `self_heal::http_client()`. Patroni cancelling the existing
+/// parked task and scheduling a fresh one is itself slow (observed: our 5s
+/// client errored out while Patroni's own log showed "Cancelling long
+/// running task reinitialize" landing several seconds later) — a timeout
+/// here reads as "request failed" when the request actually succeeded.
+const REINIT_REISSUE_TIMEOUT_SECS: u64 = 20;
+/// Total preempt+reissue cycles before giving up and letting the outer
+/// recovery-exit path (container restart, next boot re-decides) take over.
+const REINIT_UNPARK_MAX_ATTEMPTS: u32 = 3;
+
+/// Patroni parks an accepted force-reinitialize behind a postgres that never
+/// leaves "starting": the reinitialize must stop postgres before it can wipe,
+/// but the in-flight start action never completes while the startup process
+/// cycles retries for WAL it can never obtain — observed as "reinitialize in
+/// progress" for 6+ minutes with zero data-wipe progress. Postgres dying on
+/// its own (a crash, an operator kill) does NOT unstick Patroni's side
+/// either — observed directly: the parked task sat idle for 90s+ after
+/// postmaster.pid had already vanished, and only a fresh
+/// `POST /reinitialize` made Patroni log "Cancelling long running task
+/// reinitialize" and move.
+///
+/// Watch for the wipe (pg_control vanishing is its first observable step);
+/// if nothing has happened inside the park timeout, stop Postgres (a no-op
+/// if it already died on its own) and re-issue the reinitialize so Patroni
+/// cancels whatever it had parked and reschedules against the now-stopped
+/// node. Safe by construction at this call site: the WAL-too-old verdict
+/// proved the node cannot stream-catch-up, and Patroni has already ACCEPTED
+/// an instruction to wipe this node — none of that changes across retries.
+/// Repeats up to `REINIT_UNPARK_MAX_ATTEMPTS` times (a single
+/// preempt+reissue is not guaranteed to land the first time) before giving
+/// up loudly.
+async fn ensure_reinitialize_unparked(config: &Config) {
+    let pg_control = format!("{}/global/pg_control", config.data_dir);
+
+    if wait_for_wipe(&pg_control, REINIT_PARK_TIMEOUT_SECS).await {
+        return;
+    }
+
+    for attempt in 1..=REINIT_UNPARK_MAX_ATTEMPTS {
+        warn!(
+            attempt,
+            park_timeout_secs = REINIT_PARK_TIMEOUT_SECS,
+            "startup self-heal: reinitialize accepted but no data wipe within the park timeout — preempting postgres so Patroni can act"
+        );
+        // Signal the postmaster directly rather than shelling out to
+        // pg_ctl: Debian's postgresql-common wraps psql/pg_controldata onto
+        // PATH but deliberately NOT pg_ctl, so a bare pg_ctl spawn fails
+        // instantly in this process. SIGINT = fast shutdown, SIGQUIT =
+        // immediate. A no-op (logged) if postgres already died on its own.
+        stop_postgres_directly(&config.data_dir).await;
+
+        let reissue_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(REINIT_REISSUE_TIMEOUT_SECS))
+            .build();
+        match reissue_client {
+            Ok(c) => match self_heal::force_reinitialize(&c).await {
+                Ok(()) => info!(attempt, "startup self-heal: re-issued reinitialize after preempting the wedged postgres"),
+                Err(e) => warn!(attempt, error = %e, "startup self-heal: reinitialize re-issue failed even with the longer timeout"),
+            },
+            Err(e) => warn!(attempt, error = %e, "startup self-heal: failed to build the re-issue HTTP client"),
+        }
+
+        if wait_for_wipe(&pg_control, REINIT_PARK_RETRY_WAIT_SECS).await {
+            return;
+        }
+    }
+
+    warn!(
+        attempts = REINIT_UNPARK_MAX_ATTEMPTS,
+        "startup self-heal: reinitialize still parked after all unpark attempts — leaving it to the recovery exit"
+    );
+}
+
+/// Poll for `pg_control`'s disappearance (the wipe's first observable step)
+/// for up to `timeout_secs`. Returns `true` once it's gone (unparked —
+/// nothing more to do), `false` if the window elapsed with it still present
+/// (still parked — caller should act).
+async fn wait_for_wipe(pg_control: &str, timeout_secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while tokio::time::Instant::now() < deadline {
+        if !Path::new(pg_control).exists() {
+            return true;
+        }
+        sleep(Duration::from_secs(REINIT_PARK_POLL_SECS)).await;
+    }
+    false
+}
+
+/// True when `pid` is alive AND its `/proc/<pid>/comm` reads `postgres`.
+/// The pidfile pid can go stale in exactly the crash-loop gaps this path
+/// lives in, and a bare `kill(pid, 0)` liveness check would then aim the
+/// shutdown signals at whatever process recycled the pid. comm is the
+/// kernel-side name — the postmaster's is always `postgres` (process
+/// retitling only touches argv) — and callers re-check it on every poll,
+/// so an exit-and-recycle mid-wait reads as "stopped" instead of keeping
+/// the SIGQUIT escalation pointed at an innocent process.
+fn pid_is_live_postmaster(pid: Pid) -> bool {
+    if kill(pid, None).is_err() {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{}/comm", pid.as_raw()))
+        .map(|comm| comm.trim() == "postgres")
+        .unwrap_or(false)
+}
+
+/// Stop the local postmaster by pid-file signal: SIGINT (fast shutdown),
+/// escalating to SIGQUIT (immediate) if it hasn't exited within the fast
+/// window. Returns silently when there is no postmaster to stop — between
+/// crash-loop cycles that is the normal case and exactly what the caller
+/// wants. A stale pidfile counts as "no postmaster": the pid must read as
+/// a live `postgres` process (`pid_is_live_postmaster`) to be signaled at
+/// all, re-verified between signals. Only invoked on a node already
+/// sentenced to wipe-and-reseed.
+async fn stop_postgres_directly(data_dir: &str) {
+    let pidfile = format!("{data_dir}/postmaster.pid");
+    let pid = std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<i32>().ok()));
+    let Some(pid) = pid else {
+        info!("startup self-heal: no postmaster.pid — postgres already down");
+        return;
+    };
+    let pid = Pid::from_raw(pid);
+    if !pid_is_live_postmaster(pid) {
+        info!("startup self-heal: postmaster.pid is stale (pid gone or not a postgres process) — postgres already down");
+        return;
+    }
+    let _ = kill(pid, Signal::SIGINT);
+    for _ in 0..15 {
+        if !pid_is_live_postmaster(pid) {
+            info!("startup self-heal: postgres stopped after fast-shutdown signal");
+            return;
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+    warn!("startup self-heal: fast shutdown did not complete; escalating to immediate");
+    let _ = kill(pid, Signal::SIGQUIT);
+    for _ in 0..8 {
+        if !pid_is_live_postmaster(pid) {
+            info!("startup self-heal: postgres stopped after immediate-shutdown signal");
+            return;
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+    warn!("startup self-heal: postmaster survived both shutdown signals; leaving it to the recovery exit");
 }
 
 /// Outcome of one 5s startup poll. Pure so the progress-gated timeout is
@@ -508,6 +668,32 @@ async fn fetch_patroni_xlog_position(client: &reqwest::Client) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wait_for_wipe_true_when_pg_control_absent() {
+        // Contract pin: TRUE means "wipe under way — nothing to unpark",
+        // and ensure_reinitialize_unparked RETURNS on true. This polarity
+        // was once inverted, which silently disabled the entire park-watch
+        // (no preempt, no warn, reinitialize parked forever) while every
+        // individual log line still looked normal — cost a red CI run and
+        // hours of live-instrumented debugging to find.
+        let missing = format!(
+            "{}/wait_for_wipe_absent_{}/pg_control",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        assert!(wait_for_wipe(&missing, 1).await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_wipe_false_while_pg_control_survives_the_window() {
+        let dir = std::env::temp_dir().join(format!("wait_for_wipe_present_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("pg_control");
+        std::fs::write(&f, "x").unwrap();
+        assert!(!wait_for_wipe(f.to_str().unwrap(), 1).await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn healthy_breaks_regardless_of_progress_or_elapsed() {
