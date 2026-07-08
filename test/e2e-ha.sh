@@ -390,6 +390,26 @@ wait_for_leader() {
   return 1
 }
 
+# Poll the given nodes until one (other than $exclude) reports Patroni
+# leader. Used post-failover, where the survivor set is already known and
+# we're waiting on election rather than initial cluster formation.
+wait_for_new_leader() {
+  local exclude="$1" timeout_secs="$2"; shift 2
+  local deadline=$(($(date +%s) + timeout_secs))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    for n in "$@"; do
+      if [ "$n" = "$exclude" ]; then continue; fi
+      if docker exec "$n" curl -sf -o /dev/null -w '%{http_code}' \
+         http://localhost:8008/leader 2>/dev/null | grep -q "^200$"; then
+        echo "$n"
+        return 0
+      fi
+    done
+    sleep 3
+  done
+  return 1
+}
+
 # Wait for the cluster to have `expected` healthy replicas streaming.
 # Reads the leader's /cluster endpoint.
 wait_for_replication() {
@@ -1624,25 +1644,14 @@ t_ha_failover_watcher_handoff() {
   wait_for_watcher_backup "$leader1" full 120 || { ko t_ha_failover_watcher_handoff "no initial full on leader1"; teardown_scope "$scope"; return; }
 
   local wal_before; wal_before=$(count_archived_wal_segments)
+  local fulls_before; fulls_before=$(count_backups_of_type "$leader1" full)
 
   log "killing leader $leader1"
   docker stop "$leader1" >/dev/null
 
   # Wait for a NEW leader (one of the survivors). Leader election TTL
   # is 45s (PATRONI_TTL default); allow generous margin.
-  local deadline=$(($(date +%s) + 180)) leader2=""
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    for n in "$n1" "$n2" "$n3"; do
-      if [ "$n" = "$leader1" ]; then continue; fi
-      if docker exec "$n" curl -sf -o /dev/null -w '%{http_code}' \
-         http://localhost:8008/leader 2>/dev/null | grep -q "^200$"; then
-        leader2="$n"
-        break
-      fi
-    done
-    [ -n "$leader2" ] && break
-    sleep 3
-  done
+  local leader2; leader2=$(wait_for_new_leader "$leader1" 180 "$n1" "$n2" "$n3")
   if [ -z "$leader2" ]; then
     ko t_ha_failover_watcher_handoff "no new leader elected after killing $leader1"
     fail_dump t_ha_failover_watcher_handoff "$n1" "$n2" "$n3"
@@ -1685,8 +1694,116 @@ t_ha_failover_watcher_handoff() {
     return
   fi
 
+  # The new leader has never run a backup locally but the stanza already
+  # holds one taken by leader1 — its watcher must adopt that history rather
+  # than re-take a redundant full at the moment of promotion (the bug this
+  # harness is here to catch; see t_ha_failover_adopts_catalog_history for a
+  # more targeted version of this same assertion).
+  local fulls_after; fulls_after=$(count_backups_of_type "$leader2" full)
+  if [ "$fulls_after" != "$fulls_before" ]; then
+    ko t_ha_failover_watcher_handoff "new leader took a redundant full on promotion; before=$fulls_before after=$fulls_after"
+    fail_dump t_ha_failover_watcher_handoff "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
   ok t_ha_failover_watcher_handoff
-  note "killed=$leader1; new leader=$leader2; archive grew from $wal_before to $wal_after"
+  note "killed=$leader1; new leader=$leader2; archive grew from $wal_before to $wal_after; fulls stayed at $fulls_after"
+  teardown_scope "$scope"
+}
+
+# H7b. Focused regression test for the catalog-history-adoption fix: a
+# lifelong replica winning its first election has an EMPTY local backup
+# state file even though the S3 catalog already holds a full+diff taken by
+# the previous leader. Assert the new leader (a) logs the adoption message,
+# (b) does NOT re-take a full or diff, and (c) seeds its local state file
+# from the catalog so the periodic cadence continues rather than restarting.
+t_ha_failover_adopts_catalog_history() {
+  local scope=t-adopt-hist-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher))
+
+  local leader1; leader1=$(wait_for_leader "$scope" 180) || { ko t_ha_failover_adopts_catalog_history "no initial leader"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_failover_adopts_catalog_history "replicas didn't stream"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader1" 90 || { ko t_ha_failover_adopts_catalog_history "no stanza-create"; teardown_scope "$scope"; return; }
+
+  psql_leader "$leader1" -c "CREATE TABLE adopt_hist(id int);" >/dev/null
+  psql_leader "$leader1" -c "INSERT INTO adopt_hist VALUES (1); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$leader1" full 120 || { ko t_ha_failover_adopts_catalog_history "no initial full on leader1"; fail_dump t_ha_failover_adopts_catalog_history "$leader1"; teardown_scope "$scope"; return; }
+
+  # Seed a diff too, so adoption of last_diff_at is exercised as well as
+  # last_full_at (not just the fresh-stanza-vs-has-a-full distinction).
+  take_pgbackrest_backup "$leader1" diff || { ko t_ha_failover_adopts_catalog_history "manual diff on leader1 failed"; teardown_scope "$scope"; return; }
+
+  local fulls_before; fulls_before=$(count_backups_of_type "$leader1" full)
+  local diffs_before; diffs_before=$(count_backups_of_type "$leader1" diff)
+  if [ "$fulls_before" != "1" ] || [ "$diffs_before" != "1" ]; then
+    ko t_ha_failover_adopts_catalog_history "unexpected pre-failover catalog state; fulls=$fulls_before diffs=$diffs_before"
+    teardown_scope "$scope"
+    return
+  fi
+
+  log "killing leader $leader1"
+  docker stop "$leader1" >/dev/null
+
+  local leader2; leader2=$(wait_for_new_leader "$leader1" 180 "$n1" "$n2" "$n3")
+  if [ -z "$leader2" ]; then
+    ko t_ha_failover_adopts_catalog_history "no new leader elected after killing $leader1"
+    fail_dump t_ha_failover_adopts_catalog_history "$n1" "$n2" "$n3"
+    teardown_scope "$scope"
+    return
+  fi
+  log "new leader: $leader2"
+
+  # Wait for the new leader's watcher to log the adoption message — the
+  # definitive signal this code path ran, as opposed to generic liveness.
+  local deadline=$(($(date +%s) + 60)) adopted=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$leader2" 2>&1 | grep -q "pgbackrest-watcher: adopted backup history from S3 catalog"; then
+      adopted=1
+      break
+    fi
+    sleep 3
+  done
+  if [ "$adopted" != "1" ]; then
+    ko t_ha_failover_adopts_catalog_history "new leader $leader2 never logged catalog-history adoption"
+    fail_dump t_ha_failover_adopts_catalog_history "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if ! docker exec "$leader2" grep -q "^last_full_at=" /var/lib/postgresql/data/pgdata/.pgbackrest_backup_state; then
+    ko t_ha_failover_adopts_catalog_history "new leader's state file missing last_full_at after adoption"
+    fail_dump t_ha_failover_adopts_catalog_history "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! docker exec "$leader2" grep -q "^last_diff_at=" /var/lib/postgresql/data/pgdata/.pgbackrest_backup_state; then
+    ko t_ha_failover_adopts_catalog_history "new leader's state file missing last_diff_at after adoption"
+    fail_dump t_ha_failover_adopts_catalog_history "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  local fulls_after; fulls_after=$(count_backups_of_type "$leader2" full)
+  local diffs_after; diffs_after=$(count_backups_of_type "$leader2" diff)
+  if [ "$fulls_after" != "$fulls_before" ]; then
+    ko t_ha_failover_adopts_catalog_history "new leader took a redundant full instead of adopting; before=$fulls_before after=$fulls_after"
+    fail_dump t_ha_failover_adopts_catalog_history "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+  if [ "$diffs_after" != "$diffs_before" ]; then
+    ko t_ha_failover_adopts_catalog_history "new leader took a redundant diff instead of adopting; before=$diffs_before after=$diffs_after"
+    fail_dump t_ha_failover_adopts_catalog_history "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_failover_adopts_catalog_history
+  note "killed=$leader1; new leader=$leader2 adopted history; fulls stayed at $fulls_after, diffs stayed at $diffs_after"
   teardown_scope "$scope"
 }
 
@@ -2014,6 +2131,8 @@ ALL_TESTS=(
   t_ha_pghost_pgport_unset
   t_ha_restore_gate_logged_on_every_node
   t_ha_failover_watcher_handoff
+  # catalog-history adoption on promotion (S3 catalog fix)
+  t_ha_failover_adopts_catalog_history
   # audit follow-up (M4 + L7 — see plan ok-fix-all-of-cheerful-wolf.md)
   t_ha_invalid_bucket_validator
   # standalone→HA conversion: wal_level preservation (logical replication)
