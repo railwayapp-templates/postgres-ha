@@ -52,6 +52,18 @@
 # is down. The counter lives in PGDATA (wiped with a re-seed) and resets
 # on every trip so each crash-loop cycle re-probes the endpoint a full
 # threshold's worth before tripping again.
+#
+# The count also DECAYS: the breaker file records the time of its latest
+# failure, and a count whose latest failure is older than
+# WAL_ARCHIVE_GET_CONNECTIVITY_STALE_SECONDS (default 3600) restarts from
+# scratch, so only failures dense in time — one continuous outage — can
+# trip. Without decay, a cluster whose archive ANSWERS but permanently
+# errors (deleted bucket → FileMissing-class codes, which sit in the same
+# 25–125 band and never produce a resetting 0/1) would accumulate counts
+# across unrelated brief streaming hiccups over days and eventually FATAL
+# a healthy streaming standby. Within a genuine outage, invocations arrive
+# every wal_retrieve_retry_interval (5s) plus at most pgBackRest's own
+# network timeouts — minutes apart, nowhere near the window.
 
 set -u
 
@@ -66,10 +78,15 @@ PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
 MARKER="$PGDATA/.pgbackrest_repo_path"
 BREAKER="$PGDATA/.pgbackrest_archive_get_conn_failures"
 TRIP_THRESHOLD="${WAL_ARCHIVE_GET_CONNECTIVITY_TRIP:-30}"
+STALE_SECS="${WAL_ARCHIVE_GET_CONNECTIVITY_STALE_SECONDS:-3600}"
 
 # Success (0) and genuine miss (1) both prove the repo answered: clear the
 # breaker and pass the code through. Anything else is a connectivity-class
-# failure: count it, trip to 126 at the threshold. Single writer (recovery
+# failure: count it, trip to 126 at the threshold. The breaker file holds
+# "<count> <epoch-of-latest-failure>"; a count whose latest failure is
+# older than STALE_SECS is a relic of an unrelated episode and restarts at
+# 1 — as does a file whose timestamp is missing or mangled (freshness
+# unprovable → the slower-to-trip direction). Single writer (recovery
 # invokes restore_command serially), so a plain overwrite is safe.
 finish() {
   rc="$1"
@@ -77,14 +94,24 @@ finish() {
     rm -f "$BREAKER" 2>/dev/null || true
     exit "$rc"
   fi
-  fails=$(tr -dc '0-9' <"$BREAKER" 2>/dev/null)
-  fails=$((${fails:-0} + 1))
+  now=$(date +%s)
+  prev_fails=""
+  prev_ts=""
+  if [ -f "$BREAKER" ]; then
+    read -r prev_fails prev_ts <"$BREAKER" 2>/dev/null || true
+    prev_fails=$(printf '%s' "${prev_fails:-}" | tr -dc '0-9')
+    prev_ts=$(printf '%s' "${prev_ts:-}" | tr -dc '0-9')
+  fi
+  fails=1
+  if [ -n "$prev_fails" ] && [ -n "$prev_ts" ] && [ $((now - prev_ts)) -le "$STALE_SECS" ]; then
+    fails=$((prev_fails + 1))
+  fi
   if [ "$fails" -ge "$TRIP_THRESHOLD" ]; then
     rm -f "$BREAKER" 2>/dev/null || true
     echo "pgbackrest-archive-get-wrapper: archive endpoint unreachable for ${fails} consecutive invocations (last rc=${rc}) — connectivity breaker tripped, exiting 126 so recovery crash-loops instead of waiting on a dead archive forever" >&2
     exit 126
   fi
-  printf '%s\n' "$fails" >"$BREAKER" 2>/dev/null || true
+  printf '%s %s\n' "$fails" "$now" >"$BREAKER" 2>/dev/null || true
   exit "$rc"
 }
 

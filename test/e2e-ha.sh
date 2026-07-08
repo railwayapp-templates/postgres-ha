@@ -1858,9 +1858,12 @@ t_ha_archive_disable_clears_restore_command() {
   # loop polls on a 5s cadence; Patroni applies within a loop_wait), so
   # poll each node's GUC rather than sampling once. A poll iteration only
   # counts as cleared when psql itself succeeded — an unreachable postgres
-  # must read as "not yet", not as an empty GUC.
-  local guc_deadline=$(($(date +%s) + 120))
+  # must read as "not yet", not as an empty GUC. The deadline is per-node:
+  # the clears land independently, so a slow-but-legitimate first node must
+  # not starve the later nodes' observation windows down to a sliver of a
+  # shared budget.
   for n in "$n1" "$n2" "$n3"; do
+    local guc_deadline=$(($(date +%s) + 120))
     local rc_after="unqueried"
     while [ "$(date +%s)" -lt "$guc_deadline" ]; do
       if rc_after=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SHOW restore_command" 2>/dev/null); then

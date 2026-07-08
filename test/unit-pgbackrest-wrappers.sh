@@ -323,7 +323,8 @@ t_archive_get_genuine_miss_dcs_agrees_no_second_attempt() {
 }
 
 breaker_path() { echo "$TMPROOT/pgdata/.pgbackrest_archive_get_conn_failures"; }
-breaker_content() { tr -dc '0-9' < "$(breaker_path)" 2>/dev/null || echo "<absent>"; }
+# First field only: the breaker file is "<count> <epoch-of-latest-failure>".
+breaker_count() { awk '{print $1}' < "$(breaker_path)" 2>/dev/null || echo "<absent>"; }
 
 t_archive_get_connectivity_breaker_trips_at_threshold() {
   # Consecutive connectivity-class failures (rc>1: HostConnect/RepoInvalid
@@ -335,7 +336,7 @@ t_archive_get_connectivity_breaker_trips_at_threshold() {
   echo "103" > "$TMPROOT/control/fail_code"
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   assert_eq "$(exit_code)" "103" "failure 1/3 must pass through pgbackrest's code" || { ko "$FUNCNAME" "run1 rc"; teardown; return; }
-  assert_eq "$(breaker_content)" "1" "failure 1/3 must persist a count of 1" || { ko "$FUNCNAME" "run1 counter"; teardown; return; }
+  assert_eq "$(breaker_count)" "1" "failure 1/3 must persist a count of 1" || { ko "$FUNCNAME" "run1 counter"; teardown; return; }
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   assert_eq "$(exit_code)" "103" "failure 2/3 must pass through pgbackrest's code" || { ko "$FUNCNAME" "run2 rc"; teardown; return; }
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
@@ -356,7 +357,7 @@ t_archive_get_genuine_miss_resets_breaker() {
   echo "103" > "$TMPROOT/control/fail_code"
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
-  assert_eq "$(breaker_content)" "2" "two connectivity failures must persist a count of 2" || { ko "$FUNCNAME" "pre-miss counter"; teardown; return; }
+  assert_eq "$(breaker_count)" "2" "two connectivity failures must persist a count of 2" || { ko "$FUNCNAME" "pre-miss counter"; teardown; return; }
   echo "1" > "$TMPROOT/control/fail_code"
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   assert_eq "$(exit_code)" "1" "a genuine miss must still exit 1" || { ko "$FUNCNAME" "miss rc"; teardown; return; }
@@ -394,7 +395,54 @@ t_archive_get_post_trip_run_counts_fresh() {
   assert_eq "$(exit_code)" "126" "third failure must have tripped" || { ko "$FUNCNAME" "trip rc"; teardown; return; }
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   assert_eq "$(exit_code)" "103" "first post-trip failure must not trip again" || { ko "$FUNCNAME" "post-trip rc"; teardown; return; }
-  assert_eq "$(breaker_content)" "1" "post-trip counting must restart at 1" || { ko "$FUNCNAME" "post-trip counter"; teardown; return; }
+  assert_eq "$(breaker_count)" "1" "post-trip counting must restart at 1" || { ko "$FUNCNAME" "post-trip counter"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_get_stale_breaker_count_restarts() {
+  # Decay: a persisted count whose latest failure is older than the stale
+  # window is a relic of an unrelated episode (e.g. streaming blips days
+  # apart on a cluster whose archive answers but permanently errors — a
+  # deleted bucket never produces a resetting 0/1). The next failure must
+  # restart the count at 1, not push the accumulated total over the trip
+  # threshold and FATAL an otherwise-healthy standby.
+  setup
+  touch "$TMPROOT/control/dcs_unreachable"
+  echo "103" > "$TMPROOT/control/fail_code"
+  printf '%s %s\n' 2 "$(( $(date +%s) - 7200 ))" > "$(breaker_path)"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "103" "a stale count must not trip (this would have been failure 3/3)" || { ko "$FUNCNAME" "rc"; teardown; return; }
+  assert_eq "$(breaker_count)" "1" "a stale count must restart at 1" || { ko "$FUNCNAME" "counter"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_get_fresh_breaker_count_accumulates_to_trip() {
+  # Boundary companion to the stale test: a count whose latest failure is
+  # RECENT is one continuous episode and must keep accumulating — seeded at
+  # 2/3 with a fresh timestamp, the next failure trips.
+  setup
+  touch "$TMPROOT/control/dcs_unreachable"
+  echo "103" > "$TMPROOT/control/fail_code"
+  printf '%s %s\n' 2 "$(date +%s)" > "$(breaker_path)"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "126" "a fresh count must accumulate and trip at the threshold" || { ko "$FUNCNAME" "rc"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_get_legacy_count_only_breaker_restarts() {
+  # Rolling-upgrade safety: a pre-decay breaker file holds a bare count with
+  # no timestamp — freshness is unprovable, so it must restart at 1 (the
+  # slower-to-trip direction), not be trusted as current.
+  setup
+  touch "$TMPROOT/control/dcs_unreachable"
+  echo "103" > "$TMPROOT/control/fail_code"
+  printf '%s\n' 2 > "$(breaker_path)"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "103" "a legacy count-only file must not contribute to a trip" || { ko "$FUNCNAME" "rc"; teardown; return; }
+  assert_eq "$(breaker_count)" "1" "a legacy count-only file must restart at 1" || { ko "$FUNCNAME" "counter"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
@@ -454,6 +502,9 @@ ALL_TESTS=(
   t_archive_get_genuine_miss_resets_breaker
   t_archive_get_success_resets_breaker
   t_archive_get_post_trip_run_counts_fresh
+  t_archive_get_stale_breaker_count_restarts
+  t_archive_get_fresh_breaker_count_accumulates_to_trip
+  t_archive_get_legacy_count_only_breaker_restarts
 )
 
 if [ "$#" -gt 0 ]; then

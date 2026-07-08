@@ -575,12 +575,33 @@ async fn ensure_reinitialize_unparked(config: &Config, client: &reqwest::Client)
     }
 }
 
+/// True when `pid` is alive AND its `/proc/<pid>/comm` reads `postgres`.
+/// The pidfile pid can go stale in exactly the crash-loop gaps this path
+/// lives in (e.g. moments after the archive-get connectivity breaker
+/// FATALs startup), and a bare `kill(pid, 0)` liveness check would then
+/// aim the shutdown signals at whatever process recycled the pid. comm is
+/// the kernel-side name — the postmaster's is always `postgres` (process
+/// retitling only touches argv) — and callers re-check it on every poll,
+/// so an exit-and-recycle mid-wait reads as "stopped" instead of keeping
+/// the SIGQUIT escalation pointed at an innocent process.
+fn pid_is_live_postmaster(pid: Pid) -> bool {
+    if kill(pid, None).is_err() {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{}/comm", pid.as_raw()))
+        .map(|comm| comm.trim() == "postgres")
+        .unwrap_or(false)
+}
+
 /// Stop the local postmaster by pid-file signal: SIGINT (fast shutdown),
 /// escalating to SIGQUIT (immediate) if it hasn't exited within the fast
 /// window. Returns silently when there is no postmaster to stop — between
 /// crash-loop cycles (e.g. after the archive-get connectivity breaker
 /// FATALs startup) that is the normal case and exactly what the caller
-/// wants. Only invoked on a node already sentenced to wipe-and-reseed.
+/// wants. A stale pidfile counts as "no postmaster": the pid must read as
+/// a live `postgres` process (`pid_is_live_postmaster`) to be signaled at
+/// all, re-verified between signals. Only invoked on a node already
+/// sentenced to wipe-and-reseed.
 async fn stop_postgres_directly(data_dir: &str) {
     let pidfile = format!("{data_dir}/postmaster.pid");
     let pid = std::fs::read_to_string(&pidfile)
@@ -591,9 +612,13 @@ async fn stop_postgres_directly(data_dir: &str) {
         return;
     };
     let pid = Pid::from_raw(pid);
+    if !pid_is_live_postmaster(pid) {
+        info!("startup self-heal: postmaster.pid is stale (pid gone or not a postgres process) — postgres already down");
+        return;
+    }
     let _ = kill(pid, Signal::SIGINT);
     for _ in 0..15 {
-        if kill(pid, None).is_err() {
+        if !pid_is_live_postmaster(pid) {
             info!("startup self-heal: postgres stopped after fast-shutdown signal");
             return;
         }
@@ -602,7 +627,7 @@ async fn stop_postgres_directly(data_dir: &str) {
     warn!("startup self-heal: fast shutdown did not complete; escalating to immediate");
     let _ = kill(pid, Signal::SIGQUIT);
     for _ in 0..8 {
-        if kill(pid, None).is_err() {
+        if !pid_is_live_postmaster(pid) {
             info!("startup self-heal: postgres stopped after immediate-shutdown signal");
             return;
         }

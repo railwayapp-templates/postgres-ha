@@ -36,6 +36,7 @@
 use super::Config;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::path::Path;
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -362,6 +363,26 @@ async fn alter_system_clear_restore_command() {
     }
 }
 
+/// True when this node is a recover-from fork whose staged PITR replay has
+/// not yet been stamped complete — the window where the post-disable
+/// `restore_command` clear must NOT run. During staged replay the effective
+/// `restore_command` is the recovery-source invocation patroni-runner itself
+/// appended to postgresql.auto.conf; the clear loop would read it as stale
+/// and, on a node Patroni leader-labels while postgres is still replaying
+/// (the lock is acquired before promote completes), `ALTER SYSTEM` it away
+/// mid-replay — severing the replay's WAL source short of the recovery
+/// target, since the GUC is reloadable. Even on a non-leader the loop would
+/// spend the whole replay cycling observe-stale → deadline → `Err` → retry.
+///
+/// Nothing is lost by skipping: a fork that doesn't itself archive has no
+/// yaml-rendered or DCS-seeded `restore_command` to go stale, Patroni
+/// sanitizes the staged auto.conf value at promote (`_sanitize_auto_conf`),
+/// and the boot after replay stamps `.pitr_configured` so the clear then
+/// verifies normally — instantly, on an already-empty GUC.
+fn pitr_replay_pending(recover_from_configured: bool, replay_done_marker_present: bool) -> bool {
+    recover_from_configured && !replay_done_marker_present
+}
+
 /// Reconcile DCS archive params with env-driven intent.
 ///
 /// - `WAL_ARCHIVE_BUCKET` set: assert `archive_mode=on` /
@@ -372,7 +393,9 @@ async fn alter_system_clear_restore_command() {
 ///   archive_command after disable, then clear a stale `restore_command`
 ///   GUC on the primary and verify it stuck (see
 ///   `ensure_restore_command_cleared` for why the order matters and why a
-///   one-shot clear isn't enough).
+///   one-shot clear isn't enough). The clear is skipped while a staged PITR
+///   replay is pending on a recover-from fork — the staged value IS the
+///   replay's WAL source (see `pitr_replay_pending`).
 /// - Idempotent: no patch issued when DCS already matches intent. The
 ///   disable-path GUC verification still runs on a no-op patch — a leader
 ///   elected after the patch already landed can carry the stale value with
@@ -448,11 +471,23 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
     }
 
     if !enabled {
-        // Strictly after the DCS patch: a GUC clear issued before it loses
-        // the race with Patroni's next config write, which sanitizes the
-        // auto.conf override away while postgresql.conf still renders the
-        // stale line (see `ensure_restore_command_cleared`).
-        ensure_restore_command_cleared(&client).await?;
+        // `.pitr_configured` is stamped by the restore gate on the boot
+        // after a staged replay completes (patroni_runner.rs owns the
+        // marker lifecycle).
+        let replay_done =
+            Path::new(&format!("{}/.pitr_configured", config.data_dir)).exists();
+        if pitr_replay_pending(config.wal_recover_from_bucket.is_some(), replay_done) {
+            info!(
+                "reconcile: staged PITR replay still pending — skipping the restore_command clear; the staged value is the replay's WAL source and Patroni sanitizes it at promote"
+            );
+        } else {
+            // Strictly after the DCS patch: a GUC clear issued before it
+            // loses the race with Patroni's next config write, which
+            // sanitizes the auto.conf override away while postgresql.conf
+            // still renders the stale line (see
+            // `ensure_restore_command_cleared`).
+            ensure_restore_command_cleared(&client).await?;
+        }
     }
 
     Ok(())
@@ -620,5 +655,19 @@ mod tests {
         // eventual leader when all nodes redeployed together.
         assert_eq!(next_clear_step(None, false), ClearStep::AwaitPostgres);
         assert_eq!(next_clear_step(None, true), ClearStep::AwaitPostgres);
+    }
+
+    #[test]
+    fn restore_clear_deferred_only_during_pending_fork_replay() {
+        // The clear must stand down exactly while a recover-from fork's
+        // staged replay is unstamped: the staged restore_command is the
+        // replay's WAL source, and an ALTER on a leader-labeled
+        // still-replaying node would sever it short of the target. A
+        // stamped replay, or any node with no recover-from source at all
+        // (the whole non-fork fleet), clears normally.
+        assert!(pitr_replay_pending(true, false));
+        assert!(!pitr_replay_pending(true, true));
+        assert!(!pitr_replay_pending(false, false));
+        assert!(!pitr_replay_pending(false, true));
     }
 }
