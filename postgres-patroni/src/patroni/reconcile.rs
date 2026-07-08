@@ -146,54 +146,162 @@ fn compute_archive_reconcile_patch(
     }
 }
 
-/// Clear a stale `restore_command` GUC value on the CURRENT PRIMARY when
-/// archiving is disabled.
-///
-/// `archive_mode`/`archive_command`/`archive_timeout` get reconciled on
-/// every role generically once the DCS patch below lands (Patroni's usual
-/// config-diff-and-apply path). `restore_command` doesn't: it belongs to
-/// the recovery-parameter family Patroni only writes/clears via its
-/// standby-specific code path (`_adjust_recovery_parameters` →
-/// `build_recovery_params`), which never runs for a primary. A node that
-/// is (or becomes) leader while carrying an old enabled-archiving config
-/// is left with the wrapper invocation sitting in its live
-/// `postgresql.conf` — confirmed surviving even a full process restart,
-/// since nothing else ever tells Postgres to drop that specific line.
-/// It's functionally inert (a running primary never executes
-/// `restore_command`), but `SHOW restore_command` on it right after a
-/// disable is misleading, and a later scenario that runs recovery on a
-/// still-primary-labeled node (crash restart before promotion settles,
-/// certain rewind paths) would pick it up.
-///
-/// Runs unconditionally whenever archiving is disabled, independent of
-/// whether the DCS patch below was actually needed — a leader that
-/// predates this fix, or was elected after the DCS patch already landed,
-/// can still be carrying the stale value with nothing further to
-/// reconcile in DCS. Bypasses Patroni's config rendering entirely:
-/// `ALTER SYSTEM SET` writes directly into `postgresql.auto.conf`, which
-/// Postgres loads AFTER the main `postgresql.conf` and so wins for the
-/// same key regardless of whatever stale line Patroni left behind. An
-/// explicit empty string (not `RESET`, which only deletes the
-/// `auto.conf` override and would fall back to the still-stale
-/// `postgresql.conf` line) is what actually clears the effective GUC.
-///
-/// Best-effort: errors are logged, never propagated — this is a
-/// hardening pass on top of the DCS reconcile, not a required step, and
-/// must not block reconcile on a standby (`ALTER SYSTEM` fails there:
-/// "cannot execute ALTER SYSTEM SET in a read-only transaction" —
-/// standbys get the correct value via Patroni's normal recovery-param
-/// path anyway, so failing quietly there is exactly right).
-async fn clear_stale_restore_command_if_leader(client: &reqwest::Client) {
-    let is_leader = client
+/// How long `ensure_restore_command_cleared` polls for the effective GUC to
+/// read empty after an archive disable before giving up on this reconcile
+/// pass. Generous relative to what it waits on (leader election settling,
+/// Patroni applying the cleaned DCS config within a couple of loop_waits) but
+/// bounded, because the caller's retry loop re-enters with backoff on failure.
+const CLEAR_VERIFY_DEADLINE_SECS: u64 = 120;
+const CLEAR_POLL_INTERVAL_SECS: u64 = 5;
+
+/// One observation → next move in the post-disable `restore_command` clear
+/// loop. Pure so the decision table is unit-testable without psql/HTTP mocks.
+#[derive(Debug, PartialEq, Eq)]
+enum ClearStep {
+    /// `SHOW restore_command` reads empty — the clear is verified.
+    Verified,
+    /// Non-empty on the current leader: Patroni never reconciles recovery
+    /// params on a primary, so issue the `ALTER SYSTEM` clear ourselves.
+    ClearOnPrimary,
+    /// Non-empty on a standby (or mid-election): Patroni rewrites standby
+    /// recovery config from the now-clean DCS on its own — keep polling
+    /// until verification.
+    AwaitPatroni,
+    /// Postgres isn't answering yet — keep polling.
+    AwaitPostgres,
+}
+
+fn next_clear_step(shown: Option<&str>, is_leader: bool) -> ClearStep {
+    match shown {
+        Some("") => ClearStep::Verified,
+        Some(_) if is_leader => ClearStep::ClearOnPrimary,
+        Some(_) => ClearStep::AwaitPatroni,
+        None => ClearStep::AwaitPostgres,
+    }
+}
+
+/// `SHOW restore_command` via the local socket. `None` when Postgres isn't
+/// answering (still starting, mid-clone); `Some(value)` otherwise, with the
+/// empty string meaning the GUC is clear.
+async fn show_restore_command() -> Option<String> {
+    let out = Command::new("psql")
+        .args([
+            "-U",
+            "postgres",
+            "-h",
+            "/var/run/postgresql",
+            "-tAXq",
+            "-c",
+            "SHOW restore_command",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+async fn local_node_is_leader(client: &reqwest::Client) -> bool {
+    client
         .get(format!("{PATRONI_REST}/leader"))
         .send()
         .await
         .map(|r| r.status() == 200)
-        .unwrap_or(false);
-    if !is_leader {
-        return;
-    }
+        .unwrap_or(false)
+}
 
+/// Clear a stale `restore_command` GUC after archiving is disabled, and keep
+/// at it until `SHOW restore_command` actually reads empty.
+///
+/// Why the primary needs help at all: `archive_mode`/`archive_command`/
+/// `archive_timeout` get reconciled on every role generically once the DCS
+/// disable patch lands (Patroni's usual config-diff-and-apply path).
+/// `restore_command` doesn't: it belongs to the recovery-parameter family
+/// Patroni only writes/clears via its standby-specific code path
+/// (`_adjust_recovery_parameters` → `build_recovery_params`), which never
+/// runs for a primary. A node that is (or becomes) leader while carrying an
+/// old enabled-archiving config keeps the wrapper invocation in its live
+/// `postgresql.conf` — confirmed surviving even a full process restart.
+/// Functionally inert (a running primary never executes `restore_command`),
+/// but `SHOW` on it right after a disable is misleading, and a later scenario
+/// that runs recovery on a still-primary-labeled node (crash restart before
+/// promotion settles, certain rewind paths) would pick it up.
+///
+/// Why a verify loop instead of a one-shot `ALTER SYSTEM`: Patroni sanitizes
+/// recovery parameters out of `postgresql.auto.conf` whenever it writes
+/// postgres config (`ConfigHandler._sanitize_auto_conf`), so an
+/// `ALTER SYSTEM SET restore_command = ''` that races one of Patroni's own
+/// config writes gets deleted and the still-rendered `postgresql.conf` line
+/// becomes effective again — observed in e2e as the GUC flipping back to the
+/// wrapper ~100 ms after a "successful" clear that ran before the DCS patch.
+/// The caller therefore invokes this strictly AFTER the disable patch has
+/// landed (so Patroni's subsequent config rewrites no longer carry the line),
+/// and this loop re-issues the clear until a `SHOW` confirms it stuck.
+///
+/// Role is re-checked every iteration rather than probed once at boot: on an
+/// all-node redeploy (how disables roll out) reconcile typically runs while
+/// the election is still settling, and the eventual leader would slip past a
+/// single boot-time `/leader` probe — every node would report "not leader"
+/// and nobody would clear. Standbys converge without our help (Patroni
+/// rewrites their recovery config from the now-clean DCS), so a non-empty
+/// value on a non-leader just keeps polling toward verification.
+///
+/// Returns `Ok` once verified empty. If Postgres never answers within the
+/// window and no stale value was ever observed (e.g. a replica mid-clone on a
+/// cluster that never archived), also `Ok` — there is nothing observed to
+/// fix, and failing would warn-spam every clone through the caller's retry
+/// loop. A stale value that survives the whole window is an `Err` so the
+/// caller's retry loop keeps pushing with backoff.
+async fn ensure_restore_command_cleared(client: &reqwest::Client) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(CLEAR_VERIFY_DEADLINE_SECS);
+    let mut observed_stale = false;
+    loop {
+        let shown = show_restore_command().await;
+        let is_leader = match shown.as_deref() {
+            Some(v) if !v.is_empty() => local_node_is_leader(client).await,
+            _ => false,
+        };
+        match next_clear_step(shown.as_deref(), is_leader) {
+            ClearStep::Verified => {
+                if observed_stale {
+                    info!("reconcile: restore_command verified empty after archive disable");
+                }
+                return Ok(());
+            }
+            ClearStep::ClearOnPrimary => {
+                observed_stale = true;
+                alter_system_clear_restore_command().await;
+            }
+            ClearStep::AwaitPatroni => {
+                observed_stale = true;
+            }
+            ClearStep::AwaitPostgres => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if observed_stale {
+                anyhow::bail!(
+                    "restore_command still set {CLEAR_VERIFY_DEADLINE_SECS}s after the archive-disable reconcile"
+                );
+            }
+            info!("reconcile: postgres unreachable for the whole restore_command verify window with no stale value observed — skipping");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(CLEAR_POLL_INTERVAL_SECS)).await;
+    }
+}
+
+/// Issue `ALTER SYSTEM SET restore_command = ''` + `pg_reload_conf()` on the
+/// local Postgres. An explicit empty string (not `RESET`, which only deletes
+/// the `auto.conf` override and would fall back to a still-stale
+/// `postgresql.conf` line) is what clears the effective GUC. Best-effort per
+/// call — `ensure_restore_command_cleared` owns verification and retry, so a
+/// role flip mid-flight ("cannot execute ALTER SYSTEM SET in a read-only
+/// transaction") just surfaces as a warn and the next iteration re-decides.
+async fn alter_system_clear_restore_command() {
     let alter = Command::new("psql")
         .args([
             "-U",
@@ -218,9 +326,9 @@ async fn clear_stale_restore_command_if_leader(client: &reqwest::Client) {
         }
     };
     if !alter.status.success() {
-        // Expected on a standby (read-only) — nothing to warn about there;
-        // this check only ran because /leader reported 200, so a failure
-        // here is either a genuine problem or a role change mid-flight.
+        // /leader reported 200 just before this ran, so a failure here is
+        // either a genuine problem or a role change mid-flight — the verify
+        // loop re-decides on its next iteration either way.
         warn!(
             stderr = %String::from_utf8_lossy(&alter.stderr),
             "reconcile: ALTER SYSTEM clearing restore_command on primary failed"
@@ -244,7 +352,7 @@ async fn clear_stale_restore_command_if_leader(client: &reqwest::Client) {
         .await;
     match reload {
         Ok(o) if o.status.success() => {
-            info!("reconcile: cleared stale restore_command via ALTER SYSTEM on primary (Patroni doesn't reconcile it there)");
+            info!("reconcile: issued ALTER SYSTEM clearing restore_command on primary — verification follows");
         }
         Ok(o) => warn!(
             stderr = %String::from_utf8_lossy(&o.stderr),
@@ -261,10 +369,14 @@ async fn clear_stale_restore_command_if_leader(client: &reqwest::Client) {
 ///   `archive_timeout=60` are present in DCS. Patches them in if missing.
 /// - `WAL_ARCHIVE_BUCKET` unset: remove those keys from DCS so leftover
 ///   archive_mode from a previous enable doesn't keep firing
-///   archive_command after disable, and clear a stale `restore_command`
-///   on the primary if this node is currently leader (see
-///   `clear_stale_restore_command_if_leader`).
-/// - Idempotent: no patch issued when DCS already matches intent.
+///   archive_command after disable, then clear a stale `restore_command`
+///   GUC on the primary and verify it stuck (see
+///   `ensure_restore_command_cleared` for why the order matters and why a
+///   one-shot clear isn't enough).
+/// - Idempotent: no patch issued when DCS already matches intent. The
+///   disable-path GUC verification still runs on a no-op patch — a leader
+///   elected after the patch already landed can carry the stale value with
+///   nothing left to reconcile in DCS.
 ///
 /// The decision itself lives in `compute_archive_reconcile_patch`; this
 /// function only does the GET/PATCH I/O around it.
@@ -278,10 +390,6 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
         .context("build reqwest client")?;
 
     wait_for_patroni_rest(&client).await?;
-
-    if !enabled {
-        clear_stale_restore_command_if_leader(&client).await;
-    }
 
     let current: Value = client
         .get(format!("{PATRONI_REST}/config"))
@@ -317,26 +425,35 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
             .and_then(|v| v.as_str()),
     };
 
-    let Some(patch) = compute_archive_reconcile_patch(enabled, expected_archive_timeout, &current_params) else {
-        info!(
-            enabled,
-            "DCS archive config already matches env-driven intent"
-        );
-        return Ok(());
-    };
+    match compute_archive_reconcile_patch(enabled, expected_archive_timeout, &current_params) {
+        Some(patch) => {
+            warn!(
+                enabled,
+                current_mode = ?current_params.archive_mode,
+                current_command = ?current_params.archive_command,
+                current_timeout = ?current_params.archive_timeout,
+                current_track_commit_timestamp = ?current_params.track_commit_timestamp,
+                current_restore_command = ?current_params.restore_command,
+                "DCS archive config drifted from env-driven intent — reconciling"
+            );
+            send_patch(&client, &patch).await?;
+            info!(enabled, "DCS archive params reconciled");
+        }
+        None => {
+            info!(
+                enabled,
+                "DCS archive config already matches env-driven intent"
+            );
+        }
+    }
 
-    warn!(
-        enabled,
-        current_mode = ?current_params.archive_mode,
-        current_command = ?current_params.archive_command,
-        current_timeout = ?current_params.archive_timeout,
-        current_track_commit_timestamp = ?current_params.track_commit_timestamp,
-        current_restore_command = ?current_params.restore_command,
-        "DCS archive config drifted from env-driven intent — reconciling"
-    );
-
-    send_patch(&client, &patch).await?;
-    info!(enabled, "DCS archive params reconciled");
+    if !enabled {
+        // Strictly after the DCS patch: a GUC clear issued before it loses
+        // the race with Patroni's next config write, which sanitizes the
+        // auto.conf override away while postgresql.conf still renders the
+        // stale line (see `ensure_restore_command_cleared`).
+        ensure_restore_command_cleared(&client).await?;
+    }
 
     Ok(())
 }
@@ -476,5 +593,32 @@ mod tests {
         assert!(patch["postgresql"]["parameters"]
             .get("track_commit_timestamp")
             .is_none());
+    }
+
+    const STALE_GUC: &str = "/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p";
+
+    #[test]
+    fn clear_step_verified_on_empty_show_regardless_of_role() {
+        assert_eq!(next_clear_step(Some(""), false), ClearStep::Verified);
+        assert_eq!(next_clear_step(Some(""), true), ClearStep::Verified);
+    }
+
+    #[test]
+    fn clear_step_alters_only_on_the_leader() {
+        // Patroni never reconciles recovery params on a primary, so a stale
+        // value there is ours to clear; the same value on a standby is
+        // Patroni's to rewrite from the now-clean DCS — we only wait.
+        assert_eq!(next_clear_step(Some(STALE_GUC), true), ClearStep::ClearOnPrimary);
+        assert_eq!(next_clear_step(Some(STALE_GUC), false), ClearStep::AwaitPatroni);
+    }
+
+    #[test]
+    fn clear_step_waits_for_postgres_when_show_unanswered() {
+        // Regression guard on the election race: an unanswerable SHOW (still
+        // starting, mid-clone) must poll again — never short-circuit to
+        // Verified, which is how a one-shot boot-time check missed the
+        // eventual leader when all nodes redeployed together.
+        assert_eq!(next_clear_step(None, false), ClearStep::AwaitPostgres);
+        assert_eq!(next_clear_step(None, true), ClearStep::AwaitPostgres);
     }
 }
