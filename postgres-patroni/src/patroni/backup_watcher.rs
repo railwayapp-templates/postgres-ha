@@ -842,9 +842,22 @@ async fn adopt_backup_history_from_catalog(data_dir: &str) {
 /// job; this is purely the state-file side, split out (and clock-injected
 /// via `now`) so it's unit-testable against a real temp file without
 /// shelling out or racing wall-clock resolution.
+///
+/// Every decision that reaches this function logs its outcome, so a
+/// freshly promoted leader's first iterations read as a clear adoption
+/// narrative in the deploy logs. NotApplicable is the exception: it's
+/// short-circuited at the caller before the probe, and decide_action's
+/// per-iteration no-action line already reports both of its causes
+/// (`all gates clean (last_full=…)` / `wal_regression migration pending`).
 fn apply_adopt_decision(state_path: &str, decision: AdoptDecision, now: i64) {
     match decision {
-        AdoptDecision::NotApplicable | AdoptDecision::FreshStanza => {}
+        AdoptDecision::NotApplicable => {}
+        AdoptDecision::FreshStanza => {
+            info!(
+                "pgbackrest-watcher: catalog conclusively holds no full — nothing to adopt; \
+                 initial full will fire via decide_action, honoring any existing retry backoff"
+            );
+        }
         AdoptDecision::Inconclusive => {
             // Stamp the marker only on the FIRST inconclusive probe.
             // Refreshing it on every subsequent inconclusive iteration would
@@ -855,6 +868,15 @@ fn apply_adopt_decision(state_path: &str, decision: AdoptDecision, now: i64) {
             // window from the first hiccup, not a sliding one.
             if read_state_field(state_path, "last_full_failure_at").is_none() {
                 let _ = write_state_field(state_path, "last_full_failure_at", &now.to_string());
+                info!(
+                    "pgbackrest-watcher: adoption probe inconclusive; stamped failure marker \
+                     to hold the initial full for the retry backoff"
+                );
+            } else {
+                info!(
+                    "pgbackrest-watcher: adoption probe inconclusive again; backoff marker \
+                     unchanged"
+                );
             }
         }
         AdoptDecision::Adopt {
