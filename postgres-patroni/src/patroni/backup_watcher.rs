@@ -124,10 +124,13 @@ struct WatcherConfig {
     /// NEEDS_INITIAL_BACKUP and the catalog-verify rc=1 clear both leave
     /// `last_full_at` empty, which makes decide_action want a full every poll —
     /// so a full that keeps failing (S3 down, broken backup.info) would hammer
-    /// S3 with full-sized pushes. run_backup records `last_full_failure_at`
-    /// only on a failed full (cleared on success); decide_action suppresses the
-    /// next full until this elapses. A full after a *deliberate* `last_full_at`
-    /// clear carries no fresh failure marker, so it fires immediately.
+    /// S3 with full-sized pushes. `last_full_failure_at` has two writers:
+    /// run_backup on a failed full (cleared on success), and the
+    /// catalog-adoption step on an inconclusive `pgbackrest info` probe —
+    /// both mean "S3 didn't cooperate just now; hold the full". decide_action
+    /// suppresses the next full until this elapses. A full after a
+    /// *deliberate* `last_full_at` clear carries no fresh failure marker, so
+    /// it fires as soon as the adoption probe reads the catalog conclusively.
     full_retry_backoff: u64,
     /// Like `full_retry_backoff` but for the INITIAL full (none on record yet).
     /// Deliberately much shorter: a cluster with no full at all is completely
@@ -668,7 +671,7 @@ fn parse_has_full(info_json: &str) -> Result<bool> {
 }
 
 /// Run `pgbackrest info --output=json` against repo1 and return stdout.
-/// `None` on timeout, spawn failure, non-zero exit, or empty output —
+/// `None` on timeout (60 s), spawn failure, non-zero exit, or empty output —
 /// callers treat all of those as inconclusive.
 async fn pgbackrest_info_json() -> Option<String> {
     let out = tokio::time::timeout(
@@ -753,8 +756,12 @@ enum AdoptDecision {
     /// rather than treat one bad read as "nothing to adopt".
     Inconclusive,
     /// Probe succeeded and conclusively found no full — a genuinely fresh
-    /// stanza. NEEDS_INITIAL_BACKUP should fire without delay: an empty
-    /// cluster has zero backup protection.
+    /// stanza. NEEDS_INITIAL_BACKUP fires without delay (an empty cluster
+    /// has zero backup protection) unless a failure marker is already on
+    /// record — and FreshStanza must NOT clear that marker: after a failed
+    /// initial full the catalog stays empty, so every iteration reads
+    /// FreshStanza, and clearing here would erase run_backup's retry backoff
+    /// and hot-loop full attempts against a broken S3.
     FreshStanza,
     Adopt {
         last_full_at: i64,
@@ -859,9 +866,11 @@ fn apply_adopt_decision(state_path: &str, decision: AdoptDecision, now: i64) {
                 warn!(error = %e, "pgbackrest-watcher: failed to adopt last_full_at from catalog");
                 return;
             }
-            if let Some(diff) = last_diff_at {
-                let _ = write_state_field(state_path, "last_diff_at", &diff.to_string());
-            }
+            // Mirror the catalog for the whole pair: with no catalog diff
+            // newer than the adopted full, clear any stale local last_diff_at
+            // so the diff cadence anchors on the adopted full.
+            let diff_value = last_diff_at.map(|d| d.to_string()).unwrap_or_default();
+            let _ = write_state_field(state_path, "last_diff_at", &diff_value);
             // Clear any soft-failure marker left by a prior inconclusive
             // probe — mirrors run_backup's success-clears-failure convention.
             let _ = write_state_field(state_path, "last_full_failure_at", "");
@@ -1962,11 +1971,13 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     // Full-retry backoff. NEEDS_INITIAL and the catalog-verify rc=1 clear both
     // leave last_full_at empty, so a full that keeps FAILING (S3 down, broken
     // backup.info) would otherwise be re-attempted every poll, hammering S3
-    // with full-sized pushes. run_backup records last_full_failure_at only when
-    // a full FAILS (and clears it on success), so this gates retries of a
-    // failing full without ever delaying a full that follows a deliberate
-    // last_full_at clear (fresh enable, rc=1 self-heal, WAL_REGRESSION migrate
-    // — none of which leave a fresh failure marker).
+    // with full-sized pushes. last_full_failure_at has two writers: run_backup
+    // when a full FAILS (cleared on success), and the catalog-adoption step
+    // when its pgbackrest info probe is inconclusive — both mean "S3 didn't
+    // cooperate just now; hold the full". A full that follows a deliberate
+    // last_full_at clear (fresh enable, rc=1 self-heal, WAL_REGRESSION
+    // migrate) leaves no marker, so it fires as soon as the adoption probe
+    // reads the catalog conclusively.
     let last_full_failure_at = read_state_field(&state_path, "last_full_failure_at")
         .and_then(|s| s.parse::<i64>().ok());
 
@@ -2647,7 +2658,7 @@ mod tests {
     // covers what decision gets made from a given probe result; this
     // covers what actually happens to the state file for each decision).
 
-    use super::{apply_adopt_decision, read_state_field};
+    use super::{apply_adopt_decision, read_state_field, write_state_field};
 
     fn temp_state_path(name: &str) -> String {
         let dir = std::env::temp_dir().join(format!(
@@ -2684,6 +2695,25 @@ mod tests {
         let state_path = temp_state_path("writes_full_only");
         let decision = decide_adopt_backup_history(false, false, Some(FULL_ONLY_INFO));
         apply_adopt_decision(&state_path, decision, 12345);
+        assert_eq!(
+            read_state_field(&state_path, "last_full_at"),
+            Some("200".to_string())
+        );
+        assert_eq!(read_state_field(&state_path, "last_diff_at"), None);
+    }
+
+    #[test]
+    fn apply_adopt_clears_stale_local_diff_when_catalog_has_none_newer() {
+        // A local last_diff_at with no matching last_full_at must not
+        // survive adoption: the adopted pair mirrors the catalog, and a
+        // stale diff timestamp older than the adopted full would anchor the
+        // diff cadence on it instead of the full.
+        let state_path = temp_state_path("clears_stale_diff");
+        write_state_field(&state_path, "last_diff_at", "50").unwrap();
+
+        let decision = decide_adopt_backup_history(false, false, Some(FULL_ONLY_INFO));
+        apply_adopt_decision(&state_path, decision, 12345);
+
         assert_eq!(
             read_state_field(&state_path, "last_full_at"),
             Some("200".to_string())
