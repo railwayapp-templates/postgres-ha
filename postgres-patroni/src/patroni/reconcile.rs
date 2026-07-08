@@ -37,11 +37,18 @@ use super::Config;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::process::Command;
 use tracing::{info, warn};
 
 const PATRONI_REST: &str = "http://localhost:8008";
 const EXPECTED_ARCHIVE_MODE: &str = "on";
-const EXPECTED_ARCHIVE_COMMAND: &str = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
+pub(crate) const EXPECTED_ARCHIVE_COMMAND: &str =
+    "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
+// Bounded poll before concluding Patroni's own dynamic-config sync missed
+// this node, rather than just being a poll_wait cycle behind a patch we
+// ourselves may have just issued moments ago.
+const LIVE_CHECK_ATTEMPTS: u32 = 5;
+const LIVE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Wait for Patroni's REST API to respond before reconciling. Patroni starts
 /// shortly after `patroni-runner` spawns it, but there's a startup window
@@ -73,11 +80,186 @@ async fn wait_for_patroni_rest(client: &reqwest::Client) -> Result<()> {
     }
 }
 
+/// Live `archive_command` / `archive_timeout` GUC values read directly from
+/// the running Postgres, bypassing Patroni and DCS entirely.
+struct LiveArchiveGucs {
+    archive_command: String,
+    archive_timeout_secs: i64,
+}
+
+/// Query the live `archive_command` / `archive_timeout` GUCs over the unix
+/// socket. `Err` here means "couldn't ask" (postgres not up yet, socket not
+/// ready) — distinct from a successful query that reads back an empty/wrong
+/// value, which is the actual defect this module exists to catch.
+async fn query_live_archive_gucs(superuser: &str) -> Result<LiveArchiveGucs> {
+    let out = Command::new("psql")
+        .args([
+            "-U",
+            superuser,
+            "-h",
+            "/var/run/postgresql",
+            "-tAXq",
+            "-F",
+            "\t",
+            "-c",
+            // pg_settings.setting (not current_setting()/SHOW) for
+            // archive_timeout: current_setting() applies "nice" unit
+            // formatting (e.g. "1min" instead of "60") for GUC_UNIT_S
+            // parameters, which a bare ::int cast rejects. pg_settings.setting
+            // is always the raw value in the GUC's base unit (seconds here),
+            // with no suffix.
+            "SELECT current_setting('archive_command'), \
+             (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'archive_timeout')::int",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output()
+        .await
+        .context("spawn psql")?;
+
+    if !out.status.success() {
+        anyhow::bail!(
+            "live archive GUC query failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // trim_end_matches (not trim()) — the first column is empty exactly
+    // when this function's caller most needs a correct answer (a broken
+    // archive_command), and generic trim() strips the leading tab
+    // separator along with it, silently shifting the second column into
+    // the first field and reporting "missing" instead of "empty".
+    let mut fields = stdout.trim_end_matches('\n').splitn(2, '\t');
+    let archive_command = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing archive_command field in psql output"))?
+        .to_string();
+    let archive_timeout_secs = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing archive_timeout field in psql output"))?
+        .parse::<i64>()
+        .context("parse archive_timeout")?;
+
+    Ok(LiveArchiveGucs {
+        archive_command,
+        archive_timeout_secs,
+    })
+}
+
+/// Force `archive_command` + `archive_timeout` directly via `ALTER SYSTEM`
+/// + `pg_reload_conf()`, bypassing Patroni's own dynamic-config application
+/// entirely. Only called once we've already proven Patroni's own path
+/// silently failed to apply values DCS already agrees on — going back
+/// through Patroni's `/config` PATCH would just re-enter the exact
+/// mechanism that already failed to take effect. Both GUCs are
+/// `PGC_SIGHUP` (reload-only, no restart), and `ALTER SYSTEM` writes to
+/// `postgresql.auto.conf`, which always takes priority over Patroni's
+/// rendered `postgresql.conf` — the correction survives any later
+/// Patroni-driven re-render.
+async fn force_live_archive_gucs(superuser: &str, archive_timeout_secs: i64) -> Result<()> {
+    // ALTER SYSTEM cannot run inside a transaction block, and psql wraps a
+    // single `-c` argument containing multiple `;`-separated statements in
+    // one implicit transaction — each statement needs its own `-c` flag so
+    // it runs as its own simple-query round trip.
+    let alter_command_sql =
+        format!("ALTER SYSTEM SET archive_command = '{EXPECTED_ARCHIVE_COMMAND}';");
+    let alter_timeout_sql = format!("ALTER SYSTEM SET archive_timeout = {archive_timeout_secs};");
+    let out = Command::new("psql")
+        .args([
+            "-U",
+            superuser,
+            "-h",
+            "/var/run/postgresql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            &alter_command_sql,
+            "-c",
+            &alter_timeout_sql,
+            "-c",
+            "SELECT pg_reload_conf();",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output()
+        .await
+        .context("spawn psql")?;
+
+    if !out.status.success() {
+        anyhow::bail!(
+            "failed to force live archive GUCs: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+/// Verify the live Postgres GUCs actually match `expected_archive_timeout`,
+/// self-healing if Patroni's own sync silently missed this node.
+///
+/// DCS being correct is necessary but not sufficient. Patroni's dynamic
+/// config sync has a startup race: a node's first `set_dynamic_configuration`
+/// call can land while its own Postgres isn't yet in the `RUNNING` state
+/// (e.g. mid-basebackup on a freshly-joining replica) — Patroni's config
+/// writer skips the actual `postgresql.conf` write + reload when that
+/// happens, but still marks that DCS config *version* as "seen" internally,
+/// and never revisits an already-seen version even though it was never
+/// truly applied. DCS then reads as correct forever while the live GUC
+/// stays empty. Confirmed happening in practice: a freshly-booted replica
+/// with a provably-correct DCS config and a live `archive_command` of ''.
+/// If that replica is later promoted, WAL archiving silently never starts.
+async fn verify_and_heal_live_archive_config(
+    superuser: &str,
+    expected_archive_timeout: i64,
+) -> Result<()> {
+    let mut last_err = None;
+    for attempt in 1..=LIVE_CHECK_ATTEMPTS {
+        match query_live_archive_gucs(superuser).await {
+            Ok(live)
+                if live.archive_command == EXPECTED_ARCHIVE_COMMAND
+                    && live.archive_timeout_secs == expected_archive_timeout =>
+            {
+                info!("live archive_command/archive_timeout confirmed applied");
+                return Ok(());
+            }
+            Ok(live) => {
+                if attempt < LIVE_CHECK_ATTEMPTS {
+                    tokio::time::sleep(LIVE_CHECK_INTERVAL).await;
+                    continue;
+                }
+                warn!(
+                    live_archive_command = %live.archive_command,
+                    live_archive_timeout = live.archive_timeout_secs,
+                    "live archive config diverged from DCS despite DCS being correct — \
+                     Patroni's dynamic-config sync silently missed this node; forcing directly"
+                );
+                force_live_archive_gucs(superuser, expected_archive_timeout).await?;
+                info!("live archive_command/archive_timeout corrected via ALTER SYSTEM + pg_reload_conf()");
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(LIVE_CHECK_INTERVAL).await;
+            }
+        }
+    }
+    // Every attempt failed to even query (postgres unreachable this whole
+    // window) — propagate so the caller's retry-with-backoff loop tries
+    // again later, same as any other transient failure in this module.
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("live archive GUC query never succeeded")))
+        .context("verify live archive config")
+}
+
 /// Reconcile DCS archive params with env-driven intent.
 ///
 /// - `WAL_ARCHIVE_BUCKET` set: assert `archive_mode=on` /
 ///   `archive_command='/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'` /
 ///   `archive_timeout=60` are present in DCS. Patches them in if missing.
+///   Then verifies the values actually took effect on the live Postgres
+///   (see `verify_and_heal_live_archive_config`) — DCS-correct is not
+///   proof-of-application.
 /// - `WAL_ARCHIVE_BUCKET` unset: remove those keys from DCS so leftover
 ///   archive_mode from a previous enable doesn't keep firing
 ///   archive_command after disable.
@@ -123,36 +305,38 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
         .and_then(|v| v.as_str());
 
     if enabled {
-        if archive_mode == Some(EXPECTED_ARCHIVE_MODE)
+        let dcs_matches = archive_mode == Some(EXPECTED_ARCHIVE_MODE)
             && archive_command == Some(EXPECTED_ARCHIVE_COMMAND)
             && archive_timeout == Some(expected_archive_timeout)
-            && track_commit_timestamp == Some("on")
-        {
+            && track_commit_timestamp == Some("on");
+
+        if dcs_matches {
             info!("DCS archive config matches env-driven intent (PITR enabled)");
-            return Ok(());
+        } else {
+            warn!(
+                current_mode = ?archive_mode,
+                current_command = ?archive_command,
+                current_timeout = ?archive_timeout,
+                current_track_commit_timestamp = ?track_commit_timestamp,
+                "DCS archive config drifted from env-driven intent — re-asserting"
+            );
+
+            let patch = json!({
+                "postgresql": {
+                    "parameters": {
+                        "archive_mode": EXPECTED_ARCHIVE_MODE,
+                        "archive_command": EXPECTED_ARCHIVE_COMMAND,
+                        "archive_timeout": expected_archive_timeout,
+                        "track_commit_timestamp": "on",
+                    }
+                }
+            });
+
+            send_patch(&client, &patch).await?;
+            info!("DCS archive params patched in (PITR enabled)");
         }
 
-        warn!(
-            current_mode = ?archive_mode,
-            current_command = ?archive_command,
-            current_timeout = ?archive_timeout,
-            current_track_commit_timestamp = ?track_commit_timestamp,
-            "DCS archive config drifted from env-driven intent — re-asserting"
-        );
-
-        let patch = json!({
-            "postgresql": {
-                "parameters": {
-                    "archive_mode": EXPECTED_ARCHIVE_MODE,
-                    "archive_command": EXPECTED_ARCHIVE_COMMAND,
-                    "archive_timeout": expected_archive_timeout,
-                    "track_commit_timestamp": "on",
-                }
-            }
-        });
-
-        send_patch(&client, &patch).await?;
-        info!("DCS archive params patched in (PITR enabled)");
+        verify_and_heal_live_archive_config(&config.superuser, expected_archive_timeout).await?;
     } else {
         if archive_mode.is_none() && archive_command.is_none() && archive_timeout.is_none() {
             info!("DCS archive config already absent (PITR disabled)");
