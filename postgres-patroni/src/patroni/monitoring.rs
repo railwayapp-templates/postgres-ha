@@ -37,7 +37,9 @@ const WAL_PROBE_MAX_INTERVAL_SECS: u64 = 240;
 /// what makes "reached Stalled" imply "the archive had longer than the dwell".
 /// An operator setting max_startup_timeout below ~this value would let the
 /// Stalled path wipe an archiving replica with less zero-progress time than
-/// the Waiting path demands; nothing enforces the relationship today.
+/// the Waiting path demands. Not enforced (both are independently
+/// operator-overridable env vars), but `run_monitoring_loop` warns loudly at
+/// startup on an archiving cluster where the relationship doesn't hold.
 ///
 /// `WAL_ARCHIVE_STALL_CONFIRM_SECONDS` env-overrides this default — mirrors
 /// `WAL_BACKUP_FULL_INTERVAL_SECONDS` in `backup_watcher.rs`: this dwell is a
@@ -125,6 +127,21 @@ pub async fn run_monitoring_loop(
     // buys nothing since it can't change under a running process.
     let wal_archive_stall_confirm_secs =
         u64::env_parse("WAL_ARCHIVE_STALL_CONFIRM_SECONDS", WAL_ARCHIVE_STALL_CONFIRM_SECS);
+    // The Stalled branch's immediate-fire assumption (see the const doc comment
+    // above) only holds when max_startup_timeout comfortably exceeds the dwell.
+    // Nothing else enforces that relationship, so surface it loudly rather than
+    // let it silently undercut the dwell the Waiting branch just paid for.
+    if archive_stall_dwell_exceeds_startup_timeout(
+        config.wal_archive_bucket.is_some(),
+        config.max_startup_timeout,
+        wal_archive_stall_confirm_secs,
+    ) {
+        warn!(
+            max_startup_timeout = config.max_startup_timeout,
+            wal_archive_stall_confirm_secs,
+            "max_startup_timeout is shorter than the WAL archive-stall confirmation dwell — the Stalled-branch reinit can fire with less zero-progress time than the Waiting branch requires; raise max_startup_timeout or WAL_ARCHIVE_STALL_CONFIRM_SECONDS to restore the intended margin"
+        );
+    }
     // Short-timeout client for polling Patroni's local REST API for WAL
     // progress. Best-effort: if it can't be built we fall back to the
     // volume-usage signal alone.
@@ -546,6 +563,21 @@ fn wal_reinit_confirmed(
     }
 }
 
+/// True when the Stalled branch's immediate-fire assumption (see
+/// `WAL_ARCHIVE_STALL_CONFIRM_SECS`'s doc comment) doesn't hold: on an
+/// archiving cluster, "reached Stalled" only implies "the archive fallback
+/// had longer than the dwell" if `max_startup_timeout` is at least as large
+/// as the dwell. Pure and unit-tested; the caller logs a warning when this
+/// returns `true` rather than changing behavior — both knobs are legitimate,
+/// independent operator overrides, so this is a footgun warning, not a gate.
+fn archive_stall_dwell_exceeds_startup_timeout(
+    has_archive_fallback: bool,
+    max_startup_timeout: u64,
+    confirm_secs: u64,
+) -> bool {
+    has_archive_fallback && max_startup_timeout < confirm_secs
+}
+
 /// Used bytes on the filesystem holding `path` (O(1) `statvfs`, no tree walk).
 /// The startup progress signal for the pg_basebackup phase: a clone in flight
 /// grows the volume as data files land, and it costs one syscall instead of
@@ -664,6 +696,38 @@ mod tests {
         // 0 rather than underflowing/panicking, so this stays a safe "not
         // confirmed yet" instead of a crash.
         assert!(!wal_reinit_confirmed(true, Some(100), 50, 10));
+    }
+
+    #[test]
+    fn dwell_warning_silent_without_archive_regardless_of_timeout() {
+        // Non-archiving clusters never consult the dwell at all — no
+        // relationship to warn about, even with a tiny max_startup_timeout.
+        assert!(!archive_stall_dwell_exceeds_startup_timeout(false, 0, WAL_ARCHIVE_STALL_CONFIRM_SECS));
+        assert!(!archive_stall_dwell_exceeds_startup_timeout(false, 9_999, WAL_ARCHIVE_STALL_CONFIRM_SECS));
+    }
+
+    #[test]
+    fn dwell_warning_fires_when_archiving_and_timeout_shorter_than_dwell() {
+        assert!(archive_stall_dwell_exceeds_startup_timeout(true, 299, 300));
+        assert!(archive_stall_dwell_exceeds_startup_timeout(true, 0, 300));
+    }
+
+    #[test]
+    fn dwell_warning_silent_when_timeout_meets_or_exceeds_dwell() {
+        // Equal is fine: the Stalled branch's own zero-progress wait then
+        // matches the dwell exactly, so the Waiting path's guarantee still
+        // holds at the boundary.
+        assert!(!archive_stall_dwell_exceeds_startup_timeout(true, 300, 300));
+        assert!(!archive_stall_dwell_exceeds_startup_timeout(true, 1800, 300));
+    }
+
+    #[test]
+    fn dwell_warning_honors_a_shortened_confirm_secs_override() {
+        // Mirrors wal_reinit_honors_a_shortened_confirm_secs: the check must
+        // key off whatever confirm_secs the env override resolved to, not
+        // the WAL_ARCHIVE_STALL_CONFIRM_SECS constant.
+        assert!(!archive_stall_dwell_exceeds_startup_timeout(true, 10, 5));
+        assert!(archive_stall_dwell_exceeds_startup_timeout(true, 4, 5));
     }
 
     #[test]

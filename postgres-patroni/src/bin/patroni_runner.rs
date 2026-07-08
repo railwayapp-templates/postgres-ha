@@ -682,7 +682,7 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
         .filter(|v| *v > 0)
         .unwrap_or(14);
 
-    let conf = build_pgbackrest_conf(
+    let conf = build_pgbackrest_conf(&PgbackrestConfParams {
         data_dir,
         queue_max_mib,
         push_max,
@@ -691,7 +691,7 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
         restore_max,
         retention_full,
         retention_diff,
-    );
+    });
 
     fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
     fs::write(conf_path, conf).context("Failed to write pgbackrest.conf")?;
@@ -702,14 +702,13 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
     Ok(())
 }
 
-/// Pure conf-string builder for the main `pgbackrest.conf`, split out of
-/// `render_pgbackrest_conf` so the process-max sizing (and its regression:
-/// `archive-get` used to default to a flat `1`, now `clamp(cpus/8, 2, 8)`
-/// like `archive-push`) is unit-testable without writing to the real
-/// `/etc/pgbackrest` path.
-#[allow(clippy::too_many_arguments)]
-fn build_pgbackrest_conf(
-    data_dir: &str,
+/// Inputs for [`build_pgbackrest_conf`], bundled so the builder doesn't need
+/// eight positional args (`clippy::too_many_arguments`) — every field maps
+/// 1:1 to a line in the rendered conf, so a struct with named fields also
+/// reads better at the call site than a wall of positional numbers.
+#[derive(Clone, Copy)]
+struct PgbackrestConfParams<'a> {
+    data_dir: &'a str,
     queue_max_mib: u32,
     push_max: u32,
     get_max: u32,
@@ -717,7 +716,24 @@ fn build_pgbackrest_conf(
     restore_max: u32,
     retention_full: u32,
     retention_diff: u32,
-) -> String {
+}
+
+/// Pure conf-string builder for the main `pgbackrest.conf`, split out of
+/// `render_pgbackrest_conf` so the process-max sizing (and its regression:
+/// `archive-get` used to default to a flat `1`, now `clamp(cpus/8, 2, 8)`
+/// like `archive-push`) is unit-testable without writing to the real
+/// `/etc/pgbackrest` path.
+fn build_pgbackrest_conf(params: &PgbackrestConfParams) -> String {
+    let PgbackrestConfParams {
+        data_dir,
+        queue_max_mib,
+        push_max,
+        get_max,
+        backup_max,
+        restore_max,
+        retention_full,
+        retention_diff,
+    } = *params;
     let spool_dir = format!("{data_dir}/pgbackrest-spool");
     format!(
         "[global]\n\
@@ -797,9 +813,17 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
     let cpus = detect_cpus().max(1) as i64;
     let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", clamp(cpus / 8, 2, 8));
 
-    let conf = build_pgbackrest_recovery_source_conf(
-        data_dir, &bucket, &key, &secret, &region, &endpoint, &uri_style, &path, get_max,
-    );
+    let conf = build_pgbackrest_recovery_source_conf(&RecoverySourceConfParams {
+        data_dir,
+        bucket: &bucket,
+        key: &key,
+        secret: &secret,
+        region: &region,
+        endpoint: &endpoint,
+        uri_style: &uri_style,
+        path: &path,
+        get_max,
+    });
 
     fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
     let conf_path = "/etc/pgbackrest/pgbackrest-recovery-source.conf";
@@ -810,6 +834,24 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Inputs for [`build_pgbackrest_recovery_source_conf`], bundled for the same
+/// reason as [`PgbackrestConfParams`] — avoids a nine-positional-argument
+/// signature (`clippy::too_many_arguments`) where several args share the
+/// `&str` type and are easy to transpose by position (`region` vs.
+/// `endpoint` vs. `uri_style`) but not by name.
+#[derive(Clone, Copy)]
+struct RecoverySourceConfParams<'a> {
+    data_dir: &'a str,
+    bucket: &'a str,
+    key: &'a str,
+    secret: &'a str,
+    region: &'a str,
+    endpoint: &'a str,
+    uri_style: &'a str,
+    path: &'a str,
+    get_max: u32,
+}
+
 /// Pure conf-string builder for `pgbackrest-recovery-source.conf`, split out
 /// of `render_pgbackrest_recovery_source_conf` for unit testing. This PR's
 /// regression to guard: `--config` REPLACES the main conf wholesale, so
@@ -817,18 +859,18 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
 /// `[global:archive-get]` process-max block repeated here, staged PITR replay
 /// silently runs sync at process-max=1 even when the main conf is tuned for
 /// parallel prefetch.
-#[allow(clippy::too_many_arguments)]
-fn build_pgbackrest_recovery_source_conf(
-    data_dir: &str,
-    bucket: &str,
-    key: &str,
-    secret: &str,
-    region: &str,
-    endpoint: &str,
-    uri_style: &str,
-    path: &str,
-    get_max: u32,
-) -> String {
+fn build_pgbackrest_recovery_source_conf(params: &RecoverySourceConfParams) -> String {
+    let RecoverySourceConfParams {
+        data_dir,
+        bucket,
+        key,
+        secret,
+        region,
+        endpoint,
+        uri_style,
+        path,
+        get_max,
+    } = *params;
     let spool_dir = format!("{data_dir}/pgbackrest-spool");
     format!(
         "[global]\n\
@@ -1508,7 +1550,8 @@ mod tests {
     use super::{
         build_pgbackrest_conf, build_pgbackrest_recovery_source_conf, configure_pitr_recovery,
         data_dir_nonempty, is_uuid_shape, parse_process_max, pgdata_is_dedicated_subdir,
-        should_wipe_incomplete_clone, wipe_pgdata_contents, Config,
+        should_wipe_incomplete_clone, wipe_pgdata_contents, Config, PgbackrestConfParams,
+        RecoverySourceConfParams,
     };
 
     fn test_config(data_dir: &str) -> Config {
@@ -1569,16 +1612,16 @@ mod tests {
         // bulk catch-up. Exercise the same clamp() the real call site uses
         // across the cpu range operators actually see.
         for (cpus, expected_get_max) in [(1i64, 2u32), (8, 2), (16, 2), (64, 8), (256, 8)] {
-            let conf = build_pgbackrest_conf(
-                "/pgdata",
-                5120,
-                super::clamp(cpus / 8, 2, 8),
-                super::clamp(cpus / 8, 2, 8),
-                1,
-                1,
-                4,
-                14,
-            );
+            let conf = build_pgbackrest_conf(&PgbackrestConfParams {
+                data_dir: "/pgdata",
+                queue_max_mib: 5120,
+                push_max: super::clamp(cpus / 8, 2, 8),
+                get_max: super::clamp(cpus / 8, 2, 8),
+                backup_max: 1,
+                restore_max: 1,
+                retention_full: 4,
+                retention_diff: 14,
+            });
             assert!(
                 conf.contains(&format!("[global:archive-get]\nprocess-max={expected_get_max}\n")),
                 "cpus={cpus}: expected archive-get process-max={expected_get_max} in:\n{conf}"
@@ -1588,7 +1631,16 @@ mod tests {
 
     #[test]
     fn pgbackrest_conf_renders_all_five_process_max_sections() {
-        let conf = build_pgbackrest_conf("/pgdata", 5120, 8, 4, 2, 32, 4, 14);
+        let conf = build_pgbackrest_conf(&PgbackrestConfParams {
+            data_dir: "/pgdata",
+            queue_max_mib: 5120,
+            push_max: 8,
+            get_max: 4,
+            backup_max: 2,
+            restore_max: 32,
+            retention_full: 4,
+            retention_diff: 14,
+        });
         assert!(conf.contains("[global:archive-push]\nprocess-max=8\n"));
         assert!(conf.contains("[global:archive-get]\nprocess-max=4\n"));
         assert!(conf.contains("[global:backup]\nprocess-max=2\n"));
@@ -1604,17 +1656,17 @@ mod tests {
         // sync archive-get at process-max=1 regardless of how the main conf
         // was tuned — exactly the bulk-catch-up workload parallel prefetch
         // targets.
-        let conf = build_pgbackrest_recovery_source_conf(
-            "/pgdata",
-            "source-bucket",
-            "key",
-            "secret",
-            "us-east-1",
-            "fly.storage.tigris.dev",
-            "path",
-            "/pgbackrest",
-            6,
-        );
+        let conf = build_pgbackrest_recovery_source_conf(&RecoverySourceConfParams {
+            data_dir: "/pgdata",
+            bucket: "source-bucket",
+            key: "key",
+            secret: "secret",
+            region: "us-east-1",
+            endpoint: "fly.storage.tigris.dev",
+            uri_style: "path",
+            path: "/pgbackrest",
+            get_max: 6,
+        });
         assert!(conf.contains("archive-async=y\n"));
         assert!(conf.contains("archive-get-queue-max=1GiB\n"));
         assert!(conf.contains("[global:archive-get]\nprocess-max=6\n"));
