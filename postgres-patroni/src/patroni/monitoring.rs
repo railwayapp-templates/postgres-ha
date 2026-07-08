@@ -41,6 +41,13 @@ const WAL_PROBE_MAX_INTERVAL_SECS: u64 = 240;
 /// operator-overridable env vars), but `run_monitoring_loop` warns loudly at
 /// startup on an archiving cluster where the relationship doesn't hold.
 ///
+/// Scope: the dwell — like the reinitialize it gates — only governs replicas
+/// still inside STARTUP monitoring (never became healthy this container
+/// lifetime). A standby that reached consistency and runs wedged (streaming
+/// refused because the leader recycled its WAL, archive unreachable) reads
+/// as healthy here and exits the loop; `restore_command` itself is the
+/// remedy for that state, kicking in as soon as the archive is reachable.
+///
 /// `WAL_ARCHIVE_STALL_CONFIRM_SECONDS` env-overrides this default — mirrors
 /// `WAL_BACKUP_FULL_INTERVAL_SECONDS` in `backup_watcher.rs`: this dwell is a
 /// real-time wall-clock wait inside the running monitoring loop (unlike the

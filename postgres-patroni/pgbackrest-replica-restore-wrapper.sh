@@ -24,9 +24,11 @@
 # Don't expect it to engage often: Patroni's reinitialize and its
 # invalid-system-ID path both wipe pgdata BEFORE running replica methods,
 # so delta usually lands on an empty dir and auto-disables (pgBackRest
-# warns and does a full restore — harmless). It genuinely resumes only
-# when a failed pgbackrest restore is retried before the basebackup
-# fallback runs (whose pre-wipe destroys the partial).
+# warns and does a full restore — harmless). A retried partial restore
+# resumes only when the partial already contains PG_VERSION: without it
+# pgBackRest disables delta and then refuses the non-empty dir, so the
+# attempt fails and the basebackup fallback (whose pre-wipe destroys the
+# partial) takes over.
 # `--type=none` keeps pgBackRest from writing restore_command into
 # postgresql.auto.conf or creating recovery.signal — Patroni owns the
 # standby recovery config (and would sanitize those away regardless).
