@@ -3,7 +3,7 @@
 //! Handles the monitoring loop, signal handling, and health check management.
 
 use super::{check_health, self_heal, Config};
-use common::{Telemetry, TelemetryEvent};
+use common::{ConfigExt, Telemetry, TelemetryEvent};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::time::Duration;
@@ -38,6 +38,13 @@ const WAL_PROBE_MAX_INTERVAL_SECS: u64 = 240;
 /// An operator setting max_startup_timeout below ~this value would let the
 /// Stalled path wipe an archiving replica with less zero-progress time than
 /// the Waiting path demands; nothing enforces the relationship today.
+///
+/// `WAL_ARCHIVE_STALL_CONFIRM_SECONDS` env-overrides this default — mirrors
+/// `WAL_BACKUP_FULL_INTERVAL_SECONDS` in `backup_watcher.rs`: this dwell is a
+/// real-time wall-clock wait inside the running monitoring loop (unlike the
+/// pure `wal_reinit_confirmed` unit tests below, which exercise the arithmetic
+/// without waiting), so the e2e harness needs a way to shrink it to seconds
+/// instead of waiting out 300s per scenario.
 const WAL_ARCHIVE_STALL_CONFIRM_SECS: u64 = 300;
 
 /// Run the main monitoring loop for Patroni
@@ -113,6 +120,11 @@ pub async fn run_monitoring_loop(
     // this point (see `wal_reinit_confirmed`); resets with the other episode
     // state whenever progress lands.
     let mut wal_unrecoverable_since: Option<u64> = None;
+    // Resolved once per loop entry (not per-tick): the dwell only matters at
+    // the moment of the reinit decision, and re-reading the env every 5s tick
+    // buys nothing since it can't change under a running process.
+    let wal_archive_stall_confirm_secs =
+        u64::env_parse("WAL_ARCHIVE_STALL_CONFIRM_SECONDS", WAL_ARCHIVE_STALL_CONFIRM_SECS);
     // Short-timeout client for polling Patroni's local REST API for WAL
     // progress. Best-effort: if it can't be built we fall back to the
     // volume-usage signal alone.
@@ -295,7 +307,7 @@ pub async fn run_monitoring_loop(
                                 wal_unrecoverable_since = Some(startup_elapsed);
                                 if config.wal_archive_bucket.is_some() {
                                     warn!(
-                                        confirm_dwell_secs = WAL_ARCHIVE_STALL_CONFIRM_SECS,
+                                        confirm_dwell_secs = wal_archive_stall_confirm_secs,
                                         "WAL-too-old confirmed for streaming, but this cluster archives WAL and standbys self-serve missed segments via restore_command — deferring reinitialize until the zero-progress stall outlives the dwell"
                                     );
                                 }
@@ -305,6 +317,7 @@ pub async fn run_monitoring_loop(
                                     config.wal_archive_bucket.is_some(),
                                     wal_unrecoverable_since,
                                     startup_elapsed,
+                                    wal_archive_stall_confirm_secs,
                                 )
                                 && try_reinitialize_stalled_replica(config, telemetry, "wal_unrecoverable").await
                             {
@@ -513,21 +526,22 @@ fn classify_startup_tick(
 /// `restore_command`, and a *working* archive fallback surfaces as replay
 /// progress that resets the whole stall episode before this gate is ever
 /// consulted — so a positive verdict here still doesn't prove the node is
-/// stuck until the zero-progress stall has also outlived
-/// WAL_ARCHIVE_STALL_CONFIRM_SECS past the first positive verdict
-/// (`pending_since`, in startup-elapsed seconds). Both clocks reset together
-/// on any progress, so the subtraction never spans stall episodes. Pure and
-/// unit-tested.
+/// stuck until the zero-progress stall has also outlived `confirm_secs`
+/// (normally `WAL_ARCHIVE_STALL_CONFIRM_SECS`, env-overridable for tests) past
+/// the first positive verdict (`pending_since`, in startup-elapsed seconds).
+/// Both clocks reset together on any progress, so the subtraction never spans
+/// stall episodes. Pure and unit-tested.
 fn wal_reinit_confirmed(
     has_archive_fallback: bool,
     pending_since: Option<u64>,
     startup_elapsed: u64,
+    confirm_secs: u64,
 ) -> bool {
     if !has_archive_fallback {
         return true;
     }
     match pending_since {
-        Some(t) => startup_elapsed.saturating_sub(t) >= WAL_ARCHIVE_STALL_CONFIRM_SECS,
+        Some(t) => startup_elapsed.saturating_sub(t) >= confirm_secs,
         None => false,
     }
 }
@@ -594,25 +608,29 @@ mod tests {
     #[test]
     fn wal_reinit_fires_immediately_without_archive() {
         // Pre-archive behavior unchanged: streaming was the only WAL source,
-        // so a positive verdict is final on its own.
-        assert!(wal_reinit_confirmed(false, None, 30));
-        assert!(wal_reinit_confirmed(false, Some(30), 30));
+        // so a positive verdict is final on its own. confirm_secs is
+        // irrelevant on this branch — pass a nonzero value to prove it's
+        // ignored, not just coincidentally zero.
+        assert!(wal_reinit_confirmed(false, None, 30, WAL_ARCHIVE_STALL_CONFIRM_SECS));
+        assert!(wal_reinit_confirmed(false, Some(30), 30, WAL_ARCHIVE_STALL_CONFIRM_SECS));
     }
 
     #[test]
     fn wal_reinit_waits_out_archive_stall_dwell() {
         // First positive verdict arms at t=30; on an archiving cluster the
         // wipe waits until the zero-progress stall outlives the dwell.
-        assert!(!wal_reinit_confirmed(true, Some(30), 30));
+        assert!(!wal_reinit_confirmed(true, Some(30), 30, WAL_ARCHIVE_STALL_CONFIRM_SECS));
         assert!(!wal_reinit_confirmed(
             true,
             Some(30),
-            30 + WAL_ARCHIVE_STALL_CONFIRM_SECS - 1
+            30 + WAL_ARCHIVE_STALL_CONFIRM_SECS - 1,
+            WAL_ARCHIVE_STALL_CONFIRM_SECS
         ));
         assert!(wal_reinit_confirmed(
             true,
             Some(30),
-            30 + WAL_ARCHIVE_STALL_CONFIRM_SECS
+            30 + WAL_ARCHIVE_STALL_CONFIRM_SECS,
+            WAL_ARCHIVE_STALL_CONFIRM_SECS
         ));
     }
 
@@ -620,7 +638,32 @@ mod tests {
     fn wal_reinit_never_fires_unarmed_on_archiving_cluster() {
         // Defensive: however long the stall, a verdict that was never armed
         // (progress reset the episode) doesn't wipe.
-        assert!(!wal_reinit_confirmed(true, None, 9_999));
+        assert!(!wal_reinit_confirmed(true, None, 9_999, WAL_ARCHIVE_STALL_CONFIRM_SECS));
+    }
+
+    #[test]
+    fn wal_reinit_honors_a_shortened_confirm_secs() {
+        // The e2e harness overrides WAL_ARCHIVE_STALL_CONFIRM_SECONDS to a
+        // small value so it doesn't wait out the real 300s default; the gate
+        // must key off whatever confirm_secs it's handed, not the constant.
+        assert!(!wal_reinit_confirmed(true, Some(30), 34, 5));
+        assert!(wal_reinit_confirmed(true, Some(30), 35, 5));
+    }
+
+    #[test]
+    fn wal_reinit_confirm_secs_zero_fires_on_the_same_tick_it_arms() {
+        // Boundary: confirm_secs=0 means "no dwell" — the verdict is
+        // confirmed as soon as it's armed (pending_since == startup_elapsed).
+        assert!(wal_reinit_confirmed(true, Some(30), 30, 0));
+    }
+
+    #[test]
+    fn wal_reinit_pending_since_never_exceeds_startup_elapsed_in_practice() {
+        // Defensive against the impossible case (pending_since set from a
+        // future tick relative to startup_elapsed): saturating_sub floors at
+        // 0 rather than underflowing/panicking, so this stays a safe "not
+        // confirmed yet" instead of a crash.
+        assert!(!wal_reinit_confirmed(true, Some(100), 50, 10));
     }
 
     #[test]

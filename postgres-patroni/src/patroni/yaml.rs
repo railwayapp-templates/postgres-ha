@@ -289,6 +289,33 @@ mod tests {
         }
     }
 
+    fn test_config_with_timeout(wal_archive_bucket: Option<&str>, archive_timeout_secs: i64) -> Config {
+        Config {
+            archive_timeout_secs,
+            ..test_config(wal_archive_bucket)
+        }
+    }
+
+    #[test]
+    fn restore_command_is_independent_of_archive_timeout_value() {
+        // restore_command is a fixed wrapper invocation with no interpolated
+        // fields — unlike archive_command's archive_timeout, a custom
+        // POSTGRES_ARCHIVE_TIMEOUT must not change its rendered line, and
+        // both occurrences (bootstrap DCS + local params) must stay
+        // byte-identical to each other regardless of the timeout value.
+        for timeout in [60, 120, 5] {
+            let yaml = generate_patroni_config(&test_config_with_timeout(Some("bucket"), timeout), "replica");
+            let expected = "restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n";
+            let occurrences = yaml.matches(expected).count();
+            assert_eq!(
+                occurrences, 2,
+                "expected exactly 2 identical restore_command lines (bootstrap DCS + local) at timeout={timeout}, found {occurrences}"
+            );
+            // The archive_timeout line right next to it DOES vary with the value.
+            assert!(yaml.contains(&format!("archive_timeout: {timeout}\n")));
+        }
+    }
+
     #[test]
     fn basebackup_is_throttled_with_and_without_archiving() {
         for cfg in [test_config(Some("bucket")), test_config(None)] {

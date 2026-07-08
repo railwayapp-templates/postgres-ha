@@ -245,12 +245,20 @@ fn clamp(v: i64, lo: i64, hi: i64) -> u32 {
     v.clamp(lo, hi) as u32
 }
 
-fn env_or_clamp(var: &str, default: u32) -> u32 {
-    env::var(var)
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
+/// Pure parse+validate for a `process-max` override: accepts only a positive
+/// integer, falls back to `default` on anything missing/zero/malformed.
+/// Split out from `env_or_clamp` (mirrors `resolve_basebackup_max_rate` in
+/// config.rs) so the parsing logic is unit-testable without mutating process
+/// env — `PGBACKREST_*_PROCESS_MAX` vars would otherwise race across tests
+/// run in parallel within the same binary.
+fn parse_process_max(raw: Option<&str>, default: u32) -> u32 {
+    raw.and_then(|s| s.parse::<u32>().ok())
         .filter(|v| *v >= 1)
         .unwrap_or(default)
+}
+
+fn env_or_clamp(var: &str, default: u32) -> u32 {
+    parse_process_max(env::var(var).ok().as_deref(), default)
 }
 
 /// pg_wal drop ceiling (MiB) and pgBackRest archive-push spool ceiling (MiB).
@@ -641,7 +649,6 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
     }
 
     let conf_path = "/etc/pgbackrest/pgbackrest.conf";
-    let spool_dir = format!("{data_dir}/pgbackrest-spool");
 
     let cpus = detect_cpus().max(1) as i64;
     let push_max = env_or_clamp("PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX", clamp(cpus / 8, 2, 8));
@@ -675,7 +682,44 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
         .filter(|v| *v > 0)
         .unwrap_or(14);
 
-    let conf = format!(
+    let conf = build_pgbackrest_conf(
+        data_dir,
+        queue_max_mib,
+        push_max,
+        get_max,
+        backup_max,
+        restore_max,
+        retention_full,
+        retention_diff,
+    );
+
+    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
+    fs::write(conf_path, conf).context("Failed to write pgbackrest.conf")?;
+    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
+        .context("Failed to set pgbackrest.conf permissions")?;
+
+    info!("pgbackrest: rendered {}", conf_path);
+    Ok(())
+}
+
+/// Pure conf-string builder for the main `pgbackrest.conf`, split out of
+/// `render_pgbackrest_conf` so the process-max sizing (and its regression:
+/// `archive-get` used to default to a flat `1`, now `clamp(cpus/8, 2, 8)`
+/// like `archive-push`) is unit-testable without writing to the real
+/// `/etc/pgbackrest` path.
+#[allow(clippy::too_many_arguments)]
+fn build_pgbackrest_conf(
+    data_dir: &str,
+    queue_max_mib: u32,
+    push_max: u32,
+    get_max: u32,
+    backup_max: u32,
+    restore_max: u32,
+    retention_full: u32,
+    retention_diff: u32,
+) -> String {
+    let spool_dir = format!("{data_dir}/pgbackrest-spool");
+    format!(
         "[global]\n\
          repo1-type=s3\n\
          repo1-retention-full={retention_full}\n\
@@ -705,15 +749,7 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
          [main]\n\
          pg1-path={data_dir}\n\
          pg1-port=5432\n",
-    );
-
-    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
-    fs::write(conf_path, conf).context("Failed to write pgbackrest.conf")?;
-    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
-        .context("Failed to set pgbackrest.conf permissions")?;
-
-    info!("pgbackrest: rendered {}", conf_path);
-    Ok(())
+    )
 }
 
 /// Render `/etc/pgbackrest/pgbackrest-recovery-source.conf` when
@@ -761,8 +797,40 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
     let cpus = detect_cpus().max(1) as i64;
     let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", clamp(cpus / 8, 2, 8));
 
+    let conf = build_pgbackrest_recovery_source_conf(
+        data_dir, &bucket, &key, &secret, &region, &endpoint, &uri_style, &path, get_max,
+    );
+
+    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
+    let conf_path = "/etc/pgbackrest/pgbackrest-recovery-source.conf";
+    fs::write(conf_path, conf).context("Failed to write pgbackrest-recovery-source.conf")?;
+    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
+        .context("Failed to set pgbackrest-recovery-source.conf permissions")?;
+    info!("pgbackrest: rendered {}", conf_path);
+    Ok(())
+}
+
+/// Pure conf-string builder for `pgbackrest-recovery-source.conf`, split out
+/// of `render_pgbackrest_recovery_source_conf` for unit testing. This PR's
+/// regression to guard: `--config` REPLACES the main conf wholesale, so
+/// without `archive-async=y` + `archive-get-queue-max` + the
+/// `[global:archive-get]` process-max block repeated here, staged PITR replay
+/// silently runs sync at process-max=1 even when the main conf is tuned for
+/// parallel prefetch.
+#[allow(clippy::too_many_arguments)]
+fn build_pgbackrest_recovery_source_conf(
+    data_dir: &str,
+    bucket: &str,
+    key: &str,
+    secret: &str,
+    region: &str,
+    endpoint: &str,
+    uri_style: &str,
+    path: &str,
+    get_max: u32,
+) -> String {
     let spool_dir = format!("{data_dir}/pgbackrest-spool");
-    let conf = format!(
+    format!(
         "[global]\n\
          log-level-console=info\n\
          log-level-file=off\n\
@@ -784,15 +852,7 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
          [main]\n\
          pg1-path={data_dir}\n\
          pg1-port=5432\n",
-    );
-
-    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
-    let conf_path = "/etc/pgbackrest/pgbackrest-recovery-source.conf";
-    fs::write(conf_path, conf).context("Failed to write pgbackrest-recovery-source.conf")?;
-    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
-        .context("Failed to set pgbackrest-recovery-source.conf permissions")?;
-    info!("pgbackrest: rendered {}", conf_path);
-    Ok(())
+    )
 }
 
 /// Stage PITR replay before Patroni starts Postgres.
@@ -1446,9 +1506,171 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        data_dir_nonempty, is_uuid_shape, pgdata_is_dedicated_subdir, should_wipe_incomplete_clone,
-        wipe_pgdata_contents,
+        build_pgbackrest_conf, build_pgbackrest_recovery_source_conf, configure_pitr_recovery,
+        data_dir_nonempty, is_uuid_shape, parse_process_max, pgdata_is_dedicated_subdir,
+        should_wipe_incomplete_clone, wipe_pgdata_contents, Config,
     };
+
+    fn test_config(data_dir: &str) -> Config {
+        Config {
+            scope: "test-scope".into(),
+            name: "test-node".into(),
+            connect_address: "test-node".into(),
+            etcd_hosts: "etcd-1:2379".into(),
+            superuser: "postgres".into(),
+            superuser_pass: "pw".into(),
+            repl_user: "repl".into(),
+            repl_pass: "pw".into(),
+            app_user: "app".into(),
+            app_pass: "pw".into(),
+            app_db: "app".into(),
+            data_dir: data_dir.into(),
+            certs_dir: "/certs".into(),
+            ttl: "30".into(),
+            loop_wait: "10".into(),
+            retry_timeout: "10".into(),
+            health_check_interval: 5,
+            health_check_timeout: 3,
+            max_failures: 3,
+            startup_grace_period: 30,
+            max_startup_timeout: 1800,
+            adopt_existing_data: false,
+            wait_for_leader: false,
+            synchronous_mode: false,
+            wal_archive_bucket: None,
+            wal_recover_from_bucket: None,
+            pitr_target_time: None,
+            pitr_target_xid: None,
+            archive_timeout_secs: 60,
+            basebackup_max_rate: "20M".into(),
+        }
+    }
+
+    #[test]
+    fn parse_process_max_uses_default_when_unset_or_invalid() {
+        assert_eq!(parse_process_max(None, 4), 4);
+        assert_eq!(parse_process_max(Some(""), 4), 4);
+        assert_eq!(parse_process_max(Some("0"), 4), 4);
+        assert_eq!(parse_process_max(Some("-1"), 4), 4);
+        assert_eq!(parse_process_max(Some("not-a-number"), 4), 4);
+    }
+
+    #[test]
+    fn parse_process_max_accepts_positive_override() {
+        assert_eq!(parse_process_max(Some("16"), 4), 16);
+        assert_eq!(parse_process_max(Some("1"), 4), 1);
+    }
+
+    #[test]
+    fn archive_get_process_max_default_scales_with_cpus_not_flat_one() {
+        // Regression: archive-get used to hard-default to 1 (WAL replay
+        // assumed serial); it now sizes like archive-push,
+        // clamp(cpus/8, 2, 8), because archive-async prefetch parallelizes
+        // bulk catch-up. Exercise the same clamp() the real call site uses
+        // across the cpu range operators actually see.
+        for (cpus, expected_get_max) in [(1i64, 2u32), (8, 2), (16, 2), (64, 8), (256, 8)] {
+            let conf = build_pgbackrest_conf(
+                "/pgdata",
+                5120,
+                super::clamp(cpus / 8, 2, 8),
+                super::clamp(cpus / 8, 2, 8),
+                1,
+                1,
+                4,
+                14,
+            );
+            assert!(
+                conf.contains(&format!("[global:archive-get]\nprocess-max={expected_get_max}\n")),
+                "cpus={cpus}: expected archive-get process-max={expected_get_max} in:\n{conf}"
+            );
+        }
+    }
+
+    #[test]
+    fn pgbackrest_conf_renders_all_five_process_max_sections() {
+        let conf = build_pgbackrest_conf("/pgdata", 5120, 8, 4, 2, 32, 4, 14);
+        assert!(conf.contains("[global:archive-push]\nprocess-max=8\n"));
+        assert!(conf.contains("[global:archive-get]\nprocess-max=4\n"));
+        assert!(conf.contains("[global:backup]\nprocess-max=2\n"));
+        assert!(conf.contains("[global:restore]\nprocess-max=32\n"));
+        assert!(conf.contains("repo1-retention-full=4\n"));
+        assert!(conf.contains("repo1-retention-diff=14\n"));
+    }
+
+    #[test]
+    fn recovery_source_conf_runs_archive_get_in_async_parallel_mode() {
+        // Regression: --config REPLACES the main conf wholesale, so without
+        // these three lines repeated here, staged PITR replay silently ran
+        // sync archive-get at process-max=1 regardless of how the main conf
+        // was tuned — exactly the bulk-catch-up workload parallel prefetch
+        // targets.
+        let conf = build_pgbackrest_recovery_source_conf(
+            "/pgdata",
+            "source-bucket",
+            "key",
+            "secret",
+            "us-east-1",
+            "fly.storage.tigris.dev",
+            "path",
+            "/pgbackrest",
+            6,
+        );
+        assert!(conf.contains("archive-async=y\n"));
+        assert!(conf.contains("archive-get-queue-max=1GiB\n"));
+        assert!(conf.contains("[global:archive-get]\nprocess-max=6\n"));
+        assert!(conf.contains("repo1-s3-bucket=source-bucket\n"));
+        assert!(conf.contains("spool-path=/pgdata/pgbackrest-spool\n"));
+    }
+
+    #[test]
+    fn configure_pitr_recovery_creates_spool_dir_with_restricted_perms() {
+        let dir = std::env::temp_dir().join(format!("pitr_spool_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = test_config(dir.to_str().unwrap());
+        config.wal_recover_from_bucket = Some("source-bucket".into());
+        config.pitr_target_time = Some("2026-01-01T00:00:00Z".into());
+
+        configure_pitr_recovery(&config).unwrap();
+
+        let spool_dir = dir.join("pgbackrest-spool");
+        assert!(spool_dir.is_dir(), "spool dir must exist after staging");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&spool_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o750, "spool dir must be 0750, got {mode:o}");
+        }
+        assert!(dir.join("recovery.signal").exists());
+        assert!(dir.join(".pitr_staging").exists());
+        let auto_conf = std::fs::read_to_string(dir.join("postgresql.auto.conf")).unwrap();
+        assert!(auto_conf.contains("restore_command"));
+        assert!(auto_conf.contains("recovery_target_time"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn configure_pitr_recovery_skips_staging_without_recover_from_bucket() {
+        // Guard mirrored from postgres-ssl wrapper.sh: without
+        // WAL_RECOVER_FROM_BUCKET the recovery-source conf never renders, so
+        // staging recovery.signal here would archive-get FATAL at boot.
+        let dir = std::env::temp_dir().join(format!("pitr_spool_skip_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = test_config(dir.to_str().unwrap());
+        config.pitr_target_time = Some("2026-01-01T00:00:00Z".into());
+        // wal_recover_from_bucket left None.
+
+        configure_pitr_recovery(&config).unwrap();
+
+        assert!(!dir.join("pgbackrest-spool").exists());
+        assert!(!dir.join("recovery.signal").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn wipe_only_with_pg_control_absent_nonempty_and_distinct_leader() {
