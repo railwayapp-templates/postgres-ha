@@ -2106,9 +2106,9 @@ t_ha_failover_diff_chain_restore() {
   # shellcheck disable=SC2046
   read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher) -e "WAL_BACKUP_DIFF_INTERVAL_HOURS=24")
 
-  local leader1; leader1=$(wait_for_leader "$scope" 180) || { ko t_ha_failover_diff_chain_restore "no initial leader"; teardown_scope "$scope"; return; }
-  wait_for_replication "$scope" 2 240 || { ko t_ha_failover_diff_chain_restore "replicas didn't stream"; teardown_scope "$scope"; return; }
-  wait_for_stanza_create "$leader1" 90 || { ko t_ha_failover_diff_chain_restore "no stanza-create"; teardown_scope "$scope"; return; }
+  local leader1; leader1=$(wait_for_leader "$scope" 180) || { ko t_ha_failover_diff_chain_restore "no initial leader"; fail_dump t_ha_failover_diff_chain_restore "$n1" "$n2" "$n3"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_failover_diff_chain_restore "replicas didn't stream"; fail_dump t_ha_failover_diff_chain_restore "$leader1"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader1" 90 || { ko t_ha_failover_diff_chain_restore "no stanza-create"; fail_dump t_ha_failover_diff_chain_restore "$leader1"; teardown_scope "$scope"; return; }
 
   # Marker 1: inside the full's base.
   psql_leader "$leader1" -c "CREATE TABLE chain(id int, marker text);" >/dev/null
@@ -2121,12 +2121,20 @@ t_ha_failover_diff_chain_restore() {
   psql_leader "$leader1" -c "INSERT INTO chain VALUES (2,'after-full'); SELECT pg_switch_wal();" >/dev/null
   sleep 4
 
-  local fulls_before; fulls_before=$(count_backups_of_type "$leader1" full)
-  if [ "$fulls_before" != "1" ]; then
-    ko t_ha_failover_diff_chain_restore "unexpected pre-failover catalog state; fulls=$fulls_before"
-    teardown_scope "$scope"
-    return
-  fi
+  # Retry the catalog probe briefly: pgbackrest info can transiently error
+  # (masked to 0 by the helper's 2>/dev/null) right after the full lands.
+  local fulls_before deadline=$(($(date +%s) + 30))
+  while :; do
+    fulls_before=$(count_backups_of_type "$leader1" full)
+    [ "$fulls_before" = "1" ] && break
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      ko t_ha_failover_diff_chain_restore "unexpected pre-failover catalog state; fulls=$fulls_before"
+      fail_dump t_ha_failover_diff_chain_restore "$leader1"
+      teardown_scope "$scope"
+      return
+    fi
+    sleep 3
+  done
 
   log "killing leader $leader1"
   docker stop "$leader1" >/dev/null
@@ -2251,6 +2259,8 @@ print("ok" if ok else "bad")
   docker rm -f "$restore_n" >/dev/null 2>&1 || true
   new_volume "${restore_n}-vol"
   docker run -d --name "$restore_n" --label "$HA_LABEL" --network "$NET" \
+    -e "PGBACKREST_REPO1_TYPE=s3" \
+    -e "PGBACKREST_PG1_PATH=/var/lib/postgresql/data/pgdata" \
     -e "PGBACKREST_REPO1_S3_BUCKET=$BUCKET" \
     -e "PGBACKREST_REPO1_S3_ENDPOINT=http://${MINIO}:9000" \
     -e "PGBACKREST_REPO1_S3_REGION=us-east-1" \
@@ -2268,7 +2278,7 @@ chmod 0700 /var/lib/postgresql/data/pgdata
 gosu postgres pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/data/pgdata \
   --recovery-option=restore_command="pgbackrest --stanza=main archive-get %f %p" \
   restore
-exec gosu postgres postgres -D /var/lib/postgresql/data/pgdata -c archive_mode=off' >/dev/null
+exec gosu postgres postgres -D /var/lib/postgresql/data/pgdata -c archive_mode=off -c ssl=off' >/dev/null
 
   # Wait for restore + WAL replay + self-promotion.
   deadline=$(($(date +%s) + 240))
