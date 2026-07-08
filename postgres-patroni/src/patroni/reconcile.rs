@@ -41,7 +41,8 @@ use tracing::{info, warn};
 
 const PATRONI_REST: &str = "http://localhost:8008";
 const EXPECTED_ARCHIVE_MODE: &str = "on";
-const EXPECTED_ARCHIVE_COMMAND: &str = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
+pub(crate) const EXPECTED_ARCHIVE_COMMAND: &str =
+    "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
 
 /// Wait for Patroni's REST API to respond before reconciling. Patroni starts
 /// shortly after `patroni-runner` spawns it, but there's a startup window

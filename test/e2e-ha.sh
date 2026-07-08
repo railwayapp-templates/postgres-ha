@@ -2166,6 +2166,65 @@ t_ha_adopt_default_replica() {
   teardown_scope "$scope"
 }
 
+# Patroni's DCS-driven dynamic config sync can silently fail to apply
+# archive_command to a node's live Postgres even when Patroni's own /config
+# view (and this repo's reconcile_pgbackrest_archive_config check) reports
+# it as correct — observed in CI as a freshly-promoted leader whose every
+# periodic diff backup fails forever with "archive_command '' must contain
+# pgbackrest". Reproduces the end state directly (break the live GUC via
+# ALTER SYSTEM, bypassing Patroni, same as the underlying race) rather than
+# waiting on the rare promotion-timing window, and asserts the watcher's
+# exit-68 handler in run_backup notices, force-corrects it, and completes
+# the backup on retry.
+t_ha_backup_watcher_self_heals_archive_command() {
+  local scope=t-archrepair-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher) -e "WAL_BACKUP_DIFF_INTERVAL_HOURS=24")
+
+  local leader; leader=$(wait_for_leader "$scope" 240) || { ko t_ha_backup_watcher_self_heals_archive_command "no leader"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader" 90 || { ko t_ha_backup_watcher_self_heals_archive_command "no stanza-create"; teardown_scope "$scope"; return; }
+  psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$leader" full 120 || { ko t_ha_backup_watcher_self_heals_archive_command "no initial full"; fail_dump t_ha_backup_watcher_self_heals_archive_command "$leader"; teardown_scope "$scope"; return; }
+
+  log "breaking archive_command via ALTER SYSTEM"
+  docker exec -u postgres "$leader" psql -c "ALTER SYSTEM SET archive_command = '';" -c "SELECT pg_reload_conf();" >/dev/null
+  sleep 2
+  local broken; broken=$(docker exec -u postgres "$leader" psql -tAc "SHOW archive_command;")
+  log "archive_command is now: '$broken'"
+
+  docker exec -u postgres "$leader" bash -c '
+    f=/var/lib/postgresql/data/pgdata/.pgbackrest_backup_state
+    awk -v now=$(date +%s) "
+      /^last_full_at=/ { print \"last_full_at=\" now; next }
+      /^last_diff_at=/ { print \"last_diff_at=0\"; next }
+      { print }
+    " "$f" > "$f.tmp"
+    mv "$f.tmp" "$f"
+  '
+
+  if ! wait_for_watcher_backup "$leader" diff 60; then
+    ko t_ha_backup_watcher_self_heals_archive_command "watcher never self-healed archive_command within 60s"
+    fail_dump t_ha_backup_watcher_self_heals_archive_command "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  local fixed; fixed=$(docker exec -u postgres "$leader" psql -tAc "SHOW archive_command;")
+  log "archive_command after self-heal: '$fixed'"
+  if [ "$fixed" != "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p" ]; then
+    ko t_ha_backup_watcher_self_heals_archive_command "backup succeeded but archive_command still wrong: '$fixed'"
+    fail_dump t_ha_backup_watcher_self_heals_archive_command "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_backup_watcher_self_heals_archive_command
+  note "watcher self-healed archive_command via exit-68 handler and completed the diff"
+  teardown_scope "$scope"
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -2195,6 +2254,9 @@ ALL_TESTS=(
   # standalone→HA conversion: wal_level preservation (logical replication)
   t_ha_adopt_preserves_logical
   t_ha_adopt_default_replica
+  # watcher self-heals a live archive_command Patroni's own dynamic-config
+  # sync silently failed to apply (DCS-vs-live divergence)
+  t_ha_backup_watcher_self_heals_archive_command
 )
 
 usage() {

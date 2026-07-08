@@ -77,6 +77,7 @@
 //! cache that survives restarts. pgBackRest's stanza locks prevent
 //! concurrent backups across nodes.
 
+use super::reconcile::EXPECTED_ARCHIVE_COMMAND;
 use anyhow::Result;
 use std::env;
 use std::fs;
@@ -2063,6 +2064,45 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     }
 }
 
+/// Force `archive_command` directly via `ALTER SYSTEM` + reload, bypassing
+/// Patroni's DCS convergence. Only called after pgbackrest itself reports
+/// archive_command is missing/wrong (exit 68) — at that point Patroni's own
+/// `/config` view already claims the DCS-side value is correct (see
+/// `reconcile_pgbackrest_archive_config`), so waiting on another Patroni
+/// reconcile pass would just spin forever. `ALTER SYSTEM` writes
+/// postgresql.auto.conf directly and `pg_reload_conf()` SIGHUPs Postgres —
+/// archive_command is PGC_SIGHUP, so no restart is needed.
+async fn force_archive_command() -> Result<()> {
+    // ALTER SYSTEM cannot run inside a transaction block, and psql wraps a
+    // single `-c` argument containing multiple `;`-separated statements in
+    // one implicit transaction — so ALTER SYSTEM and the reload must be two
+    // separate `-c` flags, each its own simple-query round trip.
+    let alter_sql = format!("ALTER SYSTEM SET archive_command = '{EXPECTED_ARCHIVE_COMMAND}';");
+    let out = Command::new("psql")
+        .args([
+            "-U",
+            "postgres",
+            "-h",
+            "/var/run/postgresql",
+            "-tAXq",
+            "-c",
+            &alter_sql,
+            "-c",
+            "SELECT pg_reload_conf();",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "ALTER SYSTEM SET archive_command failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
 /// Run `pgbackrest backup --type=<type>` and apply the post-success
 /// bookkeeping (state-file timestamps, gap-recovery state clear on a
 /// full, PITR anchor emit). Returns `true` if the backup succeeded so
@@ -2100,6 +2140,32 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
             Ok(s) if s.success() => info!("pgbackrest-watcher: stanza-create completed"),
             Ok(s) => warn!(status = ?s, "pgbackrest-watcher: stanza-create failed"),
             Err(e) => warn!(error = %e, "pgbackrest-watcher: stanza-create invocation failed"),
+        }
+        res = Command::new("pgbackrest")
+            .args(["--stanza=main", "backup", &format!("--type={backup_type}")])
+            .env_remove("PGHOST")
+            .env_remove("PGPORT")
+            .status()
+            .await;
+    }
+
+    // Exit 68 = OptionInvalidValueError: archive_command doesn't satisfy
+    // pgbackrest's "must contain pgbackrest" check — i.e. Postgres's live
+    // GUC is empty or wrong even though Patroni's DCS-derived config (what
+    // `reconcile_pgbackrest_archive_config` checks) already says it's
+    // correct. Seen post-failover: a freshly-promoted former replica can
+    // end up with archive_command never actually written to its on-disk
+    // config, and nothing else re-drives Patroni to fix it since DCS
+    // already "matches intent" from Patroni's point of view. Force it
+    // directly via ALTER SYSTEM + reload rather than waiting on Patroni to
+    // notice a drift it doesn't think exists, then retry once.
+    if res.as_ref().ok().and_then(|s| s.code()) == Some(68) {
+        warn!(
+            "pgbackrest-watcher: archive_command misconfigured (exit 68), forcing it via ALTER SYSTEM then retrying"
+        );
+        match force_archive_command().await {
+            Ok(()) => info!("pgbackrest-watcher: archive_command repaired"),
+            Err(e) => warn!(error = %e, "pgbackrest-watcher: archive_command repair failed"),
         }
         res = Command::new("pgbackrest")
             .args(["--stanza=main", "backup", &format!("--type={backup_type}")])
