@@ -1757,12 +1757,20 @@ t_ha_replica_reseed_fallback_basebackup() {
 #    before promotion settles, certain rewind paths). This is pre-existing
 #    Patroni behavior, not something PR #78 introduced — but since PR #78
 #    is what makes restore_command exist at all, it also carries the fix:
-#    `reconcile_pgbackrest_archive_config`'s disable path now directly
-#    `ALTER SYSTEM SET restore_command = ''` + reloads on whichever node
-#    is currently leader, bypassing Patroni's config rendering entirely
-#    (`postgresql.auto.conf` loads after `postgresql.conf` and wins for
-#    the same key). So this test asserts ALL THREE nodes clear, leader
-#    included — no role-based skip.
+#    AFTER the disable patch lands in DCS,
+#    `reconcile_pgbackrest_archive_config` polls `SHOW restore_command`
+#    and issues `ALTER SYSTEM SET restore_command = ''` + reload on
+#    whichever node currently holds the leader lock, re-checking until
+#    the GUC actually reads empty. Both the ordering and the verify loop
+#    are load-bearing, each confirmed by a CI failure of an earlier
+#    revision: an ALTER issued BEFORE the DCS patch was reverted ~100ms
+#    later when Patroni's next config write sanitized the auto.conf
+#    override away (`_sanitize_auto_conf`) while postgresql.conf still
+#    rendered the stale line, and a one-shot boot-time /leader probe
+#    missed the eventual leader because all three nodes redeploy at once
+#    and reconcile runs before the election settles. So this test asserts
+#    ALL THREE nodes clear, leader included — no role-based skip — and
+#    polls for it, since the clear is asynchronous by design.
 t_ha_archive_disable_clears_restore_command() {
   local scope=t-archdis-${PG_VERSION}
   reset_bucket
@@ -1828,11 +1836,25 @@ t_ha_archive_disable_clears_restore_command() {
     return
   fi
 
-  # All three nodes must clear, leader included — clear_stale_restore_command_if_leader
-  # bypasses Patroni's own (standby-only) reconciliation for exactly this case.
+  # All three nodes must clear, leader included — the reconcile's post-patch
+  # verify loop ALTERs on the leader (Patroni never reconciles recovery
+  # params there) and standbys converge via Patroni's own recovery-config
+  # rewrite from the cleaned DCS. Both paths are asynchronous (the verify
+  # loop polls on a 5s cadence; Patroni applies within a loop_wait), so
+  # poll each node's GUC rather than sampling once. A poll iteration only
+  # counts as cleared when psql itself succeeded — an unreachable postgres
+  # must read as "not yet", not as an empty GUC.
+  local guc_deadline=$(($(date +%s) + 120))
   for n in "$n1" "$n2" "$n3"; do
-    local rc_after
-    rc_after=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SHOW restore_command" 2>/dev/null)
+    local rc_after="unqueried"
+    while [ "$(date +%s)" -lt "$guc_deadline" ]; do
+      if rc_after=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SHOW restore_command" 2>/dev/null); then
+        [ -z "$rc_after" ] && break
+      else
+        rc_after="unqueried"
+      fi
+      sleep 3
+    done
     if [ -n "$rc_after" ]; then
       local role="standby"; [ "$n" = "$leader" ] && role="leader"
       ko t_ha_archive_disable_clears_restore_command "$role $n still has restore_command='$rc_after' after disable"
@@ -1887,6 +1909,18 @@ t_ha_replica_selfheals_via_restore_command() {
   # from, which would fail every single attempt including retries and
   # isn't the staleness this test is trying to model.
   docker exec "$replica" sh -c 'printf "/pgbackrest/cluster-0000000000000000000" > /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path' >/dev/null 2>&1
+  # Prove the corruption actually landed before building on it — a silently
+  # failed docker exec here (its exit status is swallowed above) turns every
+  # downstream assertion into noise: the wrapper would resolve the correct
+  # path on its first attempt and the DCS-fallback assertion below could
+  # never pass.
+  local corrupted
+  corrupted=$(docker exec "$replica" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path 2>/dev/null | tr -d '\n\r')
+  if [ "$corrupted" != "/pgbackrest/cluster-0000000000000000000" ]; then
+    ko t_ha_replica_selfheals_via_restore_command "marker corruption did not take (marker reads '$corrupted')"
+    teardown_scope "$scope"
+    return
+  fi
 
   docker stop "$replica" >/dev/null 2>&1 || { ko t_ha_replica_selfheals_via_restore_command "couldn't stop replica"; teardown_scope "$scope"; return; }
 
@@ -1958,7 +1992,13 @@ t_ha_replica_selfheals_via_restore_command() {
   fi
 
   if ! docker logs "$replica" 2>&1 | grep -q "repo path '.*' is stale"; then
-    ko t_ha_replica_selfheals_via_restore_command "expected the archive-get wrapper's stale-marker DCS-fallback to have fired at least once"
+    # Include the marker's current content: it discriminates "corruption
+    # was undone by something before recovery ran" (marker already correct,
+    # wrapper never needed the fallback) from "fallback ran but its stderr
+    # never reached the container log".
+    local marker_now
+    marker_now=$(docker exec "$replica" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path 2>/dev/null | tr -d '\n\r')
+    ko t_ha_replica_selfheals_via_restore_command "expected the archive-get wrapper's stale-marker DCS-fallback to have fired at least once (marker now reads '$marker_now')"
     fail_dump t_ha_replica_selfheals_via_restore_command "$replica"
     teardown_scope "$scope"
     return
@@ -1980,18 +2020,36 @@ t_ha_replica_selfheals_via_restore_command() {
 # H12. WAL_ARCHIVE_STALL_CONFIRM_SECONDS dwell (PR #78's monitoring.rs
 # gate): on an archiving cluster, a WAL-too-old verdict must NOT
 # reinitialize the replica the moment it's first confirmed — only once
-# the zero-progress stall has also outlived the dwell. Proven here
-# against the real monitoring loop (not just the pure wal_reinit_confirmed
-# unit tests) by making the archive fallback itself totally unavailable
-# (MinIO stopped) so progress genuinely never comes, then observing: (1)
-# still not reinitialized shortly after the first positive verdict, (2)
-# reinitialized once the dwell elapses — via the basebackup fallback,
-# since pgbackrest's restore also needs the S3 that's still down. Uses a
-# short WAL_ARCHIVE_STALL_CONFIRM_SECONDS override so the test doesn't
-# wait out the real 300s default; see monitoring.rs for why the override
-# exists. MinIO is restarted immediately after the timed observation,
-# before any assertion, so a failure here can never strand the rest of
-# the suite with MinIO down.
+# the zero-progress stall has also outlived the dwell.
+#
+# The gate lives in STARTUP monitoring, so the scenario must keep the
+# replica from ever becoming healthy. A cleanly-stopped replica does NOT
+# qualify (learned from a CI failure of an earlier revision of this
+# test): it restarts into a RUNNING wedged standby — reaches consistency
+# from its own local WAL, accepts read-only connections, then just
+# retries streaming forever — which exits startup monitoring before the
+# probe ever arms; restore_command itself, not this gate, is the remedy
+# for that state. To pin the node in startup, its pg_wal is trimmed down
+# to the single OLDEST segment while it's stopped: the shutdown
+# checkpoint record lives at the WAL tail, so recovery cannot reach
+# consistency and Postgres start-fails under a live Patroni — exactly
+# the stall the gate watches — while the surviving segment keeps the
+# WAL-too-old probe's local upper bound readable (an empty pg_wal would
+# blind the probe entirely). Keeping the oldest rather than the newest
+# survivor also dodges recycled future segments, which sort above the
+# real position.
+#
+# With MinIO stopped the archive fallback can never deliver a byte, so
+# progress genuinely stays at zero and the test observes, against the
+# real monitoring loop (not just the pure wal_reinit_confirmed unit
+# tests): (1) still not reinitialized shortly after the first positive
+# verdict, (2) reinitialized once the dwell elapses — via the basebackup
+# fallback, since pgbackrest's restore also needs the S3 that's still
+# down. Uses a short WAL_ARCHIVE_STALL_CONFIRM_SECONDS override so the
+# test doesn't wait out the real 300s default; see monitoring.rs for why
+# the override exists. MinIO is restarted immediately after the timed
+# observation, before any assertion, so a failure here can never strand
+# the rest of the suite with MinIO down.
 t_ha_wal_archive_stall_dwell_gates_reinit() {
   local scope=t-dwell-${PG_VERSION}
   local confirm_secs=10
@@ -2034,6 +2092,32 @@ t_ha_wal_archive_stall_dwell_gates_reinit() {
     psql_leader "$leader" -c "INSERT INTO churn SELECT g, repeat('x', 500) FROM generate_series(1,300000) g;" >/dev/null
     psql_leader "$leader" -c "CHECKPOINT;" >/dev/null
   done
+
+  # Pin the replica in STARTUP (see header): trim its pg_wal to the single
+  # oldest segment so recovery cannot reach consistency without WAL it can
+  # only get from the (soon unreachable) archive or the (already recycled)
+  # leader. History files and the archive_status dir stay — startup wants
+  # them present — and the survivor keeps local_resume_upper_bound readable
+  # for the WAL-too-old probe. Runs via a throwaway container on the
+  # stopped replica's volume, then reads the segment count back: building
+  # the rest of the test on an unverified trim would make every downstream
+  # assertion unprovable.
+  docker run --rm --entrypoint /bin/bash -v "${replica}-vol:/var/lib/postgresql/data" "$IMAGE" -c '
+    cd /var/lib/postgresql/data/pgdata/pg_wal || exit 1
+    keep=$(ls -1 | grep -E "^[0-9A-F]{24}$" | sort | head -1)
+    [ -n "$keep" ] || exit 1
+    for f in $(ls -1 | grep -E "^[0-9A-F]{24}$"); do
+      [ "$f" = "$keep" ] || rm -f "$f"
+    done
+  ' >/dev/null 2>&1
+  local segs_left
+  segs_left=$(docker run --rm --entrypoint /bin/bash -v "${replica}-vol:/var/lib/postgresql/data" "$IMAGE" -c \
+    'ls -1 /var/lib/postgresql/data/pgdata/pg_wal 2>/dev/null | grep -cE "^[0-9A-F]{24}$"' 2>/dev/null | tr -d '[:space:]')
+  if [ "$segs_left" != "1" ]; then
+    ko t_ha_wal_archive_stall_dwell_gates_reinit "pg_wal trim did not take (segments left: '${segs_left:-unknown}')"
+    teardown_scope "$scope"
+    return
+  fi
 
   # Take the archive fallback itself off the table: with MinIO down,
   # restore_command can never actually deliver a segment, so progress
