@@ -3,7 +3,7 @@
 use super::config::HealthServerConfig;
 use super::postgres::{check_patroni_role, is_in_recovery};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Create the router with all health check endpoints
 pub fn create_router(config: HealthServerConfig) -> Router {
