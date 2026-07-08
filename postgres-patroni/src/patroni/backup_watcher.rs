@@ -2660,18 +2660,18 @@ mod tests {
 
     use super::{apply_adopt_decision, read_state_field, write_state_field};
 
-    fn temp_state_path(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!(
-            "pgbackrest_watcher_test_{name}_{:?}",
-            std::thread::current().id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir.join("state").to_string_lossy().into_owned()
+    /// Fresh tempdir per call. The returned guard keeps the dir alive for
+    /// the test's scope and removes it on drop, so no state file survives
+    /// into another test or a later `cargo test` run.
+    fn temp_state_path() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").to_string_lossy().into_owned();
+        (dir, path)
     }
 
     #[test]
     fn apply_adopt_writes_full_and_diff_to_state_file() {
-        let state_path = temp_state_path("writes_full_and_diff");
+        let (_dir, state_path) = temp_state_path();
         let decision = decide_adopt_backup_history(false, false, Some(FULL_AND_NEWER_DIFF_INFO));
         apply_adopt_decision(&state_path, decision, 12345);
         assert_eq!(
@@ -2692,7 +2692,7 @@ mod tests {
 
     #[test]
     fn apply_adopt_writes_full_only_when_no_diff_adopted() {
-        let state_path = temp_state_path("writes_full_only");
+        let (_dir, state_path) = temp_state_path();
         let decision = decide_adopt_backup_history(false, false, Some(FULL_ONLY_INFO));
         apply_adopt_decision(&state_path, decision, 12345);
         assert_eq!(
@@ -2708,7 +2708,7 @@ mod tests {
         // survive adoption: the adopted pair mirrors the catalog, and a
         // stale diff timestamp older than the adopted full would anchor the
         // diff cadence on it instead of the full.
-        let state_path = temp_state_path("clears_stale_diff");
+        let (_dir, state_path) = temp_state_path();
         write_state_field(&state_path, "last_diff_at", "50").unwrap();
 
         let decision = decide_adopt_backup_history(false, false, Some(FULL_ONLY_INFO));
@@ -2724,7 +2724,7 @@ mod tests {
     #[test]
     fn apply_adopt_not_applicable_and_fresh_stanza_touch_nothing() {
         for decision in [AdoptDecision::NotApplicable, AdoptDecision::FreshStanza] {
-            let state_path = temp_state_path(&format!("touches_nothing_{decision:?}"));
+            let (_dir, state_path) = temp_state_path();
             apply_adopt_decision(&state_path, decision, 12345);
             assert_eq!(read_state_field(&state_path, "last_full_at"), None);
             assert_eq!(read_state_field(&state_path, "last_full_failure_at"), None);
@@ -2737,7 +2737,7 @@ mod tests {
         // close: repeated Inconclusive results must not keep pushing the
         // backoff deadline forward with each new `now`, or a genuine S3
         // outage would never fall through to NEEDS_INITIAL_BACKUP at all.
-        let state_path = temp_state_path("inconclusive_once");
+        let (_dir, state_path) = temp_state_path();
 
         apply_adopt_decision(&state_path, AdoptDecision::Inconclusive, 1000);
         assert_eq!(
@@ -2758,7 +2758,7 @@ mod tests {
 
     #[test]
     fn apply_adopt_success_clears_a_prior_inconclusive_marker() {
-        let state_path = temp_state_path("success_clears_marker");
+        let (_dir, state_path) = temp_state_path();
         apply_adopt_decision(&state_path, AdoptDecision::Inconclusive, 1000);
         assert_eq!(
             read_state_field(&state_path, "last_full_failure_at"),
@@ -2776,20 +2776,17 @@ mod tests {
     }
 
     #[test]
-    fn apply_adopt_failed_write_does_not_adopt_diff_either() {
-        // If last_full_at can't be written (e.g. permissions), the function
-        // must bail before writing last_diff_at — a diff timestamp with no
-        // matching full would corrupt decide_action's invariants.
-        let dir = std::env::temp_dir().join(format!(
-            "pgbackrest_watcher_test_unwritable_{:?}",
-            std::thread::current().id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let state_path = dir.to_string_lossy().into_owned(); // a directory, not a file — write fails
+    fn apply_adopt_on_unwritable_state_path_leaves_no_partial_state() {
+        // Every write targets the same unwritable path (a directory), so
+        // this pins the coarse property — no panic, no partial state such
+        // as a last_diff_at with no matching last_full_at (which would
+        // corrupt decide_action's invariants) — rather than the order of
+        // the individual writes.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().to_string_lossy().into_owned(); // a directory, not a file — write fails
         let decision = decide_adopt_backup_history(false, false, Some(FULL_AND_NEWER_DIFF_INFO));
         apply_adopt_decision(&state_path, decision, 12345);
-        // No panic, and nothing under the directory got created as a stray file.
-        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 
     // ---- decide_gap_recovery: state-machine transitions ----
