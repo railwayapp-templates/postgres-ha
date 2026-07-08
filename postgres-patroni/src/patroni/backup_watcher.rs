@@ -6,12 +6,15 @@
 //! plus the cadence-override branch).
 //!
 //! Triggers (any of):
-//!   1. NEEDS_INITIAL_BACKUP — no full on record. Take the first full
-//!      immediately so PITR is restorable from this LSN forward.
-//!      pgbackrest brackets the base in pg_backup_start/stop and waits
-//!      for the closing WAL to archive before declaring success, so a
-//!      broken archive_command fails the backup loudly instead of
-//!      producing an unrestorable base.
+//!   1. NEEDS_INITIAL_BACKUP — no full on record locally AND none in the
+//!      S3 catalog. Take the first full immediately so PITR is restorable
+//!      from this LSN forward. pgbackrest brackets the base in
+//!      pg_backup_start/stop and waits for the closing WAL to archive
+//!      before declaring success, so a broken archive_command fails the
+//!      backup loudly instead of producing an unrestorable base. A node
+//!      with empty local state whose catalog already has a full (a
+//!      lifelong replica winning its first election) adopts the catalog
+//!      history instead of re-taking a full at the moment of promotion.
 //!   2. Gap recovery — a state machine that fires whenever WAL coverage is
 //!      diverging from the S3 catalog, regardless of cause. Entry conditions
 //!      (any of):
@@ -121,10 +124,13 @@ struct WatcherConfig {
     /// NEEDS_INITIAL_BACKUP and the catalog-verify rc=1 clear both leave
     /// `last_full_at` empty, which makes decide_action want a full every poll —
     /// so a full that keeps failing (S3 down, broken backup.info) would hammer
-    /// S3 with full-sized pushes. run_backup records `last_full_failure_at`
-    /// only on a failed full (cleared on success); decide_action suppresses the
-    /// next full until this elapses. A full after a *deliberate* `last_full_at`
-    /// clear carries no fresh failure marker, so it fires immediately.
+    /// S3 with full-sized pushes. `last_full_failure_at` has two writers:
+    /// run_backup on a failed full (cleared on success), and the
+    /// catalog-adoption step on an inconclusive `pgbackrest info` probe —
+    /// both mean "S3 didn't cooperate just now; hold the full". decide_action
+    /// suppresses the next full until this elapses. A full after a
+    /// *deliberate* `last_full_at` clear carries no fresh failure marker, so
+    /// it fires as soon as the adoption probe reads the catalog conclusively.
     full_retry_backoff: u64,
     /// Like `full_retry_backoff` but for the INITIAL full (none on record yet).
     /// Deliberately much shorter: a cluster with no full at all is completely
@@ -356,6 +362,8 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
     // spot. Running every iteration means a broken stanza is fixed on the next
     // poll rather than waiting up to catalog_verify_interval (default 3600 s).
     stanza_create_step().await;
+
+    adopt_backup_history_from_catalog(data_dir).await;
 
     // Gap-recovery state machine — detects WAL/catalog divergence and
     // drives the kick-and-diff sequence. Runs every iteration;
@@ -613,23 +621,9 @@ async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
             anyhow::anyhow!("malformed last_archived_wal: {}", stats.last_archived_wal)
         })?;
 
-    let out = tokio::time::timeout(
-        Duration::from_secs(30),
-        Command::new("pgbackrest")
-            .args(["--stanza=main", "--repo=1", "info", "--output=json"])
-            .env_remove("PGHOST")
-            .env_remove("PGPORT")
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("pgbackrest info timed out"))??;
-    if !out.status.success() {
-        anyhow::bail!(
-            "pgbackrest info exited non-zero: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let info_json = String::from_utf8_lossy(&out.stdout);
+    let info_json = pgbackrest_info_json().await.ok_or_else(|| {
+        anyhow::anyhow!("pgbackrest info errored, timed out, or returned empty output")
+    })?;
     let tl_hex = &stats.last_archived_wal[..8];
     let catalog_max = parse_catalog_max(&info_json, tl_hex)?;
     let lag = match catalog_max
@@ -678,8 +672,10 @@ fn parse_has_full(info_json: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// Probe the S3 catalog for repo1 and classify into the three states above.
-async fn catalog_check_backup() -> CatalogBackupState {
+/// Run `pgbackrest info --output=json` against repo1 and return stdout.
+/// `None` on timeout (60 s), spawn failure, non-zero exit, or empty output —
+/// callers treat all of those as inconclusive.
+async fn pgbackrest_info_json() -> Option<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(60),
         Command::new("pgbackrest")
@@ -691,19 +687,229 @@ async fn catalog_check_backup() -> CatalogBackupState {
     .await;
     let out = match out {
         Ok(Ok(o)) => o,
-        _ => return CatalogBackupState::Inconclusive,
+        _ => return None,
     };
     if !out.status.success() {
-        return CatalogBackupState::Inconclusive;
+        return None;
     }
-    let info_json = String::from_utf8_lossy(&out.stdout);
+    let info_json = String::from_utf8_lossy(&out.stdout).into_owned();
     if info_json.trim().is_empty() {
-        return CatalogBackupState::Inconclusive;
+        return None;
     }
+    Some(info_json)
+}
+
+/// Probe the S3 catalog for repo1 and classify into the three states above.
+async fn catalog_check_backup() -> CatalogBackupState {
+    let Some(info_json) = pgbackrest_info_json().await else {
+        return CatalogBackupState::Inconclusive;
+    };
     match parse_has_full(&info_json) {
         Ok(true) => CatalogBackupState::FullPresent,
         Ok(false) => CatalogBackupState::NoFull,
         Err(_) => CatalogBackupState::Inconclusive,
+    }
+}
+
+/// Newest full / diff backup stop times (epoch seconds) across all stanzas
+/// in `pgbackrest info --output=json`. Bubbles up serde_json errors so the
+/// caller can treat a parse failure as inconclusive.
+fn parse_latest_backup_stops(info_json: &str) -> Result<(Option<i64>, Option<i64>)> {
+    let v: serde_json::Value = serde_json::from_str(info_json)?;
+    let stanzas = v
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("pgbackrest info JSON top-level not an array"))?;
+    let mut full: Option<i64> = None;
+    let mut diff: Option<i64> = None;
+    for stanza in stanzas {
+        let Some(backups) = stanza.get("backup").and_then(|b| b.as_array()) else {
+            continue;
+        };
+        for backup in backups {
+            let Some(stop) = backup
+                .get("timestamp")
+                .and_then(|t| t.get("stop"))
+                .and_then(|s| s.as_i64())
+            else {
+                continue;
+            };
+            match backup.get("type").and_then(|t| t.as_str()) {
+                Some("full") => full = full.max(Some(stop)),
+                Some("diff") => diff = diff.max(Some(stop)),
+                _ => {}
+            }
+        }
+    }
+    Ok((full, diff))
+}
+
+/// What `adopt_backup_history_from_catalog` should do with local state,
+/// given the two cheap local-state guards plus (if fetched) the S3
+/// catalog's `pgbackrest info` JSON. Split out as a pure function so every
+/// branch is unit-testable without shelling out to pgbackrest.
+#[derive(Debug, PartialEq, Eq)]
+enum AdoptDecision {
+    /// Local state already has a full, or a WAL_REGRESSION migration is
+    /// pending — decide_action (or the migration) already owns this node.
+    NotApplicable,
+    /// The probe itself couldn't confirm either way (S3 hiccup, timeout,
+    /// unparseable JSON). NOT proof the catalog is empty — the caller
+    /// should back off before falling through to NEEDS_INITIAL_BACKUP
+    /// rather than treat one bad read as "nothing to adopt".
+    Inconclusive,
+    /// Probe succeeded and conclusively found no full — a genuinely fresh
+    /// stanza. NEEDS_INITIAL_BACKUP fires without delay (an empty cluster
+    /// has zero backup protection) unless a failure marker is already on
+    /// record — and FreshStanza must NOT clear that marker: after a failed
+    /// initial full the catalog stays empty, so every iteration reads
+    /// FreshStanza, and clearing here would erase run_backup's retry backoff
+    /// and hot-loop full attempts against a broken S3.
+    FreshStanza,
+    Adopt {
+        last_full_at: i64,
+        last_diff_at: Option<i64>,
+    },
+}
+
+fn decide_adopt_backup_history(
+    has_local_full: bool,
+    wal_regression_pending: bool,
+    info_json: Option<&str>,
+) -> AdoptDecision {
+    if has_local_full || wal_regression_pending {
+        return AdoptDecision::NotApplicable;
+    }
+    let Some(info_json) = info_json else {
+        return AdoptDecision::Inconclusive;
+    };
+    let Ok((full_stop, diff_stop)) = parse_latest_backup_stops(info_json) else {
+        return AdoptDecision::Inconclusive;
+    };
+    let Some(full_stop) = full_stop else {
+        return AdoptDecision::FreshStanza;
+    };
+    AdoptDecision::Adopt {
+        last_full_at: full_stop,
+        last_diff_at: diff_stop.filter(|d| *d > full_stop),
+    }
+}
+
+/// A node that has never run a backup (a lifelong replica winning its first
+/// election) has an empty local state file even when the stanza already
+/// holds backups taken by previous leaders. Left alone, its first leader
+/// iteration reads `last_full_at` as absent and fires NEEDS_INITIAL_BACKUP —
+/// a full-volume read at the exact moment of promotion, competing with
+/// production queries and any member mid-rewind/mid-clone against this
+/// node. Instead, seed `last_full_at`/`last_diff_at` from the catalog's
+/// newest full/diff stop times so the periodic cadence continues where the
+/// previous leader left off. A genuinely fresh stanza (no full in the
+/// catalog) still takes the initial full.
+///
+/// The moment right after promotion is exactly when a `pgbackrest info`
+/// probe is most likely to hit a one-off transient hiccup (network still
+/// settling, S3 briefly unreachable) — observed in practice. A single
+/// inconclusive probe used to fall straight through to decide_action's
+/// NEEDS_INITIAL_BACKUP, which fires immediately with no backoff on a
+/// first attempt, defeating the whole point of this function. Now an
+/// inconclusive probe writes the same `last_full_failure_at` marker
+/// `run_backup` writes on a real failed backup, so decide_action's
+/// existing `initial_full_retry_backoff` gate gives the probe several more
+/// iterations (at the fast initial-poll cadence) to succeed before falling
+/// back to taking a full.
+async fn adopt_backup_history_from_catalog(data_dir: &str) {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    let has_local_full = read_state_field(&state_path, "last_full_at").is_some();
+    // Mirror decide_action's migration guard: mid WAL_REGRESSION archive-path
+    // migration, `last_full_at` was deliberately cleared to force a full on
+    // the NEW repo path. `apply_active_path` flips the local marker/env early
+    // in that migration (before finalize_wal_regression_migration completes),
+    // so `pgbackrest info` is usually already reading the new (empty) path by
+    // the time this would matter — but if `apply_active_path` itself fails
+    // mid-migration, env can still point at the OLD path while the pending
+    // marker stays set. Skip adoption for the whole window rather than lean
+    // on that ordering.
+    let wal_regression_pending =
+        read_state_field(&state_path, "wal_regression_pending_new_path").is_some();
+    if has_local_full || wal_regression_pending {
+        return;
+    }
+    let info_json = pgbackrest_info_json().await;
+    let decision =
+        decide_adopt_backup_history(has_local_full, wal_regression_pending, info_json.as_deref());
+    apply_adopt_decision(&state_path, decision, now_epoch());
+}
+
+/// Applies an `AdoptDecision` to the on-disk state file. No pgbackrest
+/// calls here — fetching `info_json` is `adopt_backup_history_from_catalog`'s
+/// job; this is purely the state-file side, split out (and clock-injected
+/// via `now`) so it's unit-testable against a real temp file without
+/// shelling out or racing wall-clock resolution.
+///
+/// Every decision that reaches this function logs its outcome, so a
+/// freshly promoted leader's first iterations read as a clear adoption
+/// narrative in the deploy logs. NotApplicable is the exception: it's
+/// short-circuited at the caller before the probe, and decide_action's
+/// per-iteration no-action line already reports both of its causes
+/// (`all gates clean (last_full=…)` / `wal_regression migration pending`).
+fn apply_adopt_decision(state_path: &str, decision: AdoptDecision, now: i64) {
+    match decision {
+        AdoptDecision::NotApplicable => {}
+        AdoptDecision::FreshStanza => {
+            info!(
+                "pgbackrest-watcher: catalog conclusively holds no full — nothing to adopt; \
+                 initial full will fire via decide_action, honoring any existing retry backoff"
+            );
+        }
+        AdoptDecision::Inconclusive => {
+            // Stamp the marker only on the FIRST inconclusive probe.
+            // Refreshing it on every subsequent inconclusive iteration would
+            // perpetually push the backoff deadline forward, masking a
+            // genuinely longer-lived S3 outage from ever falling through to
+            // NEEDS_INITIAL_BACKUP at all. Leaving it untouched once set
+            // gives a single bounded initial_full_retry_backoff grace
+            // window from the first hiccup, not a sliding one.
+            if read_state_field(state_path, "last_full_failure_at").is_none() {
+                let _ = write_state_field(state_path, "last_full_failure_at", &now.to_string());
+                info!(
+                    "pgbackrest-watcher: adoption probe inconclusive; stamped failure marker \
+                     to hold the initial full for the retry backoff"
+                );
+            } else {
+                info!(
+                    "pgbackrest-watcher: adoption probe inconclusive again; backoff marker \
+                     unchanged"
+                );
+            }
+        }
+        AdoptDecision::Adopt {
+            last_full_at,
+            last_diff_at,
+        } => {
+            if let Err(e) = write_state_field(state_path, "last_full_at", &last_full_at.to_string())
+            {
+                warn!(error = %e, "pgbackrest-watcher: failed to adopt last_full_at from catalog");
+                return;
+            }
+            // Mirror the catalog for the whole pair: with no catalog diff
+            // newer than the adopted full, clear any stale local last_diff_at
+            // so the diff cadence anchors on the adopted full.
+            let diff_value = last_diff_at.map(|d| d.to_string()).unwrap_or_default();
+            let _ = write_state_field(state_path, "last_diff_at", &diff_value);
+            // Clear any soft-failure marker left by a prior inconclusive
+            // probe — mirrors run_backup's success-clears-failure convention.
+            let _ = write_state_field(state_path, "last_full_failure_at", "");
+            // The probe above already confirmed FullPresent, so stamp
+            // last_catalog_verify_at now — otherwise catalog_verify_step
+            // (which runs later this same iteration) sees no
+            // last_catalog_verify_at on record and immediately re-probes S3
+            // a second time for the same answer.
+            let _ = write_state_field(state_path, "last_catalog_verify_at", &now.to_string());
+            info!(
+                last_full_at,
+                last_diff_at = ?last_diff_at,
+                "pgbackrest-watcher: adopted backup history from S3 catalog (no local state)"
+            );
+        }
     }
 }
 
@@ -1789,11 +1995,13 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     // Full-retry backoff. NEEDS_INITIAL and the catalog-verify rc=1 clear both
     // leave last_full_at empty, so a full that keeps FAILING (S3 down, broken
     // backup.info) would otherwise be re-attempted every poll, hammering S3
-    // with full-sized pushes. run_backup records last_full_failure_at only when
-    // a full FAILS (and clears it on success), so this gates retries of a
-    // failing full without ever delaying a full that follows a deliberate
-    // last_full_at clear (fresh enable, rc=1 self-heal, WAL_REGRESSION migrate
-    // — none of which leave a fresh failure marker).
+    // with full-sized pushes. last_full_failure_at has two writers: run_backup
+    // when a full FAILS (cleared on success), and the catalog-adoption step
+    // when its pgbackrest info probe is inconclusive — both mean "S3 didn't
+    // cooperate just now; hold the full". A full that follows a deliberate
+    // last_full_at clear (fresh enable, rc=1 self-heal, WAL_REGRESSION
+    // migrate) leaves no marker, so it fires as soon as the adoption probe
+    // reads the catalog conclusively.
     let last_full_failure_at = read_state_field(&state_path, "last_full_failure_at")
         .and_then(|s| s.parse::<i64>().ok());
 
@@ -2053,9 +2261,9 @@ fn now_epoch() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_gap_recovery, full_retry_ready, parse_catalog_max, parse_has_full,
-        probe_async_duplicate_error, segment_to_number, wal_has_async_archive_duplicate_error,
-        GapRecoveryAction, GapRecoveryInputs,
+        decide_adopt_backup_history, decide_gap_recovery, full_retry_ready, parse_catalog_max,
+        parse_has_full, parse_latest_backup_stops, probe_async_duplicate_error, segment_to_number,
+        wal_has_async_archive_duplicate_error, AdoptDecision, GapRecoveryAction, GapRecoveryInputs,
     };
     use std::fs;
 
@@ -2265,6 +2473,344 @@ mod tests {
         // inconclusive — never as a false "no full" that would wrongly clear
         // last_full_at on a transient unparseable response.
         assert!(parse_has_full("not json").is_err());
+    }
+
+    // ---- parse_latest_backup_stops: catalog adoption ----
+
+    #[test]
+    fn parse_latest_backup_stops_picks_newest_of_each_type() {
+        let info = r#"[{"backup":[
+            {"type":"full","timestamp":{"start":100,"stop":200}},
+            {"type":"diff","timestamp":{"start":300,"stop":400}},
+            {"type":"full","timestamp":{"start":150,"stop":250}},
+            {"type":"incr","timestamp":{"start":500,"stop":600}}
+        ]}]"#;
+        assert_eq!(
+            parse_latest_backup_stops(info).unwrap(),
+            (Some(250), Some(400))
+        );
+    }
+
+    #[test]
+    fn parse_latest_backup_stops_none_when_no_backups() {
+        let info = r#"[{"archive":[{"id":"18-1"}],"backup":[]}]"#;
+        assert_eq!(parse_latest_backup_stops(info).unwrap(), (None, None));
+    }
+
+    #[test]
+    fn parse_latest_backup_stops_skips_entries_without_timestamp() {
+        // Older catalog entries or partial JSON: an entry missing
+        // timestamp.stop must not panic or poison the others.
+        let info = r#"[{"backup":[
+            {"type":"full"},
+            {"type":"full","timestamp":{"start":100,"stop":200}}
+        ]}]"#;
+        assert_eq!(parse_latest_backup_stops(info).unwrap(), (Some(200), None));
+    }
+
+    #[test]
+    fn parse_latest_backup_stops_errors_on_malformed_json() {
+        // Err (not (None, None)) so the adopt step skips this iteration
+        // instead of concluding "fresh stanza" from a transient bad read.
+        assert!(parse_latest_backup_stops("not json").is_err());
+    }
+
+    // ---- decide_adopt_backup_history: catalog-history adoption on promotion ----
+
+    const FULL_ONLY_INFO: &str = r#"[{"backup":[
+        {"type":"full","timestamp":{"start":100,"stop":200}}
+    ]}]"#;
+
+    const FULL_AND_NEWER_DIFF_INFO: &str = r#"[{"backup":[
+        {"type":"full","timestamp":{"start":100,"stop":200}},
+        {"type":"diff","timestamp":{"start":300,"stop":400}}
+    ]}]"#;
+
+    const FULL_AND_OLDER_DIFF_INFO: &str = r#"[{"backup":[
+        {"type":"full","timestamp":{"start":300,"stop":400}},
+        {"type":"diff","timestamp":{"start":100,"stop":200}}
+    ]}]"#;
+
+    const NO_BACKUP_INFO: &str = r#"[{"archive":[{"id":"18-1"}],"backup":[]}]"#;
+
+    #[test]
+    fn adopt_not_applicable_when_local_full_already_present() {
+        // has_local_full=true short-circuits regardless of what the catalog
+        // holds — decide_action already owns a node with local state.
+        assert_eq!(
+            decide_adopt_backup_history(true, false, Some(FULL_ONLY_INFO)),
+            AdoptDecision::NotApplicable
+        );
+    }
+
+    #[test]
+    fn adopt_not_applicable_when_wal_regression_migration_pending() {
+        // Mid archive-path migration, pgbackrest info may still read the old
+        // path (or the new, empty one) — either way adoption must wait.
+        assert_eq!(
+            decide_adopt_backup_history(false, true, Some(FULL_ONLY_INFO)),
+            AdoptDecision::NotApplicable
+        );
+    }
+
+    #[test]
+    fn adopt_not_applicable_when_both_guards_true() {
+        assert_eq!(
+            decide_adopt_backup_history(true, true, Some(FULL_ONLY_INFO)),
+            AdoptDecision::NotApplicable
+        );
+    }
+
+    #[test]
+    fn adopt_inconclusive_when_probe_returned_nothing() {
+        // pgbackrest_info_json() returned None (timeout, spawn failure,
+        // non-zero exit, empty output) — not proof of "no full". Distinct
+        // from NotApplicable/FreshStanza: the caller backs off and retries
+        // rather than treating this as settled either way.
+        assert_eq!(
+            decide_adopt_backup_history(false, false, None),
+            AdoptDecision::Inconclusive
+        );
+    }
+
+    #[test]
+    fn adopt_inconclusive_on_malformed_catalog_json() {
+        assert_eq!(
+            decide_adopt_backup_history(false, false, Some("not json")),
+            AdoptDecision::Inconclusive
+        );
+    }
+
+    #[test]
+    fn adopt_fresh_stanza_when_catalog_conclusively_has_no_backups() {
+        // Catalog probe succeeded but the backup list is empty — a real
+        // fresh stanza. NEEDS_INITIAL_BACKUP should fire without delay,
+        // unlike the Inconclusive case.
+        assert_eq!(
+            decide_adopt_backup_history(false, false, Some(NO_BACKUP_INFO)),
+            AdoptDecision::FreshStanza
+        );
+    }
+
+    #[test]
+    fn adopt_seeds_full_only_when_no_diff_present() {
+        assert_eq!(
+            decide_adopt_backup_history(false, false, Some(FULL_ONLY_INFO)),
+            AdoptDecision::Adopt {
+                last_full_at: 200,
+                last_diff_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn adopt_seeds_full_and_diff_when_diff_is_newer() {
+        assert_eq!(
+            decide_adopt_backup_history(false, false, Some(FULL_AND_NEWER_DIFF_INFO)),
+            AdoptDecision::Adopt {
+                last_full_at: 200,
+                last_diff_at: Some(400),
+            }
+        );
+    }
+
+    #[test]
+    fn adopt_drops_diff_older_than_the_adopted_full() {
+        // A diff stop time from before the newest full is stale relative to
+        // it (e.g. an earlier cycle's diff); only last_full_at is seeded so
+        // the diff cadence anchors off last_full_at instead.
+        assert_eq!(
+            decide_adopt_backup_history(false, false, Some(FULL_AND_OLDER_DIFF_INFO)),
+            AdoptDecision::Adopt {
+                last_full_at: 400,
+                last_diff_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn adopt_drops_diff_equal_to_the_adopted_full() {
+        // Boundary: diff_stop == full_stop is filtered out (`>`, not `>=`).
+        let info = r#"[{"backup":[
+            {"type":"full","timestamp":{"start":100,"stop":200}},
+            {"type":"diff","timestamp":{"start":100,"stop":200}}
+        ]}]"#;
+        assert_eq!(
+            decide_adopt_backup_history(false, false, Some(info)),
+            AdoptDecision::Adopt {
+                last_full_at: 200,
+                last_diff_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn adopt_picks_newest_full_across_multiple_entries() {
+        let info = r#"[{"backup":[
+            {"type":"full","timestamp":{"start":100,"stop":200}},
+            {"type":"full","timestamp":{"start":500,"stop":600}},
+            {"type":"full","timestamp":{"start":300,"stop":400}}
+        ]}]"#;
+        assert_eq!(
+            decide_adopt_backup_history(false, false, Some(info)),
+            AdoptDecision::Adopt {
+                last_full_at: 600,
+                last_diff_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn adopt_ignores_incr_backups() {
+        // Only full/diff feed last_full_at/last_diff_at — an incr-only
+        // catalog (shouldn't happen without a preceding full/diff, but
+        // defensively) must not be adopted as a full.
+        let info = r#"[{"backup":[
+            {"type":"incr","timestamp":{"start":100,"stop":200}}
+        ]}]"#;
+        assert_eq!(
+            decide_adopt_backup_history(false, false, Some(info)),
+            AdoptDecision::FreshStanza
+        );
+    }
+
+    // ---- apply_adopt_decision: real state-file side effects ----
+    //
+    // These drive the real, production `apply_adopt_decision` function
+    // against a real temp state file (the clock is injected, so no sleeps
+    // or wall-clock races — `decide_adopt_backup_history` above already
+    // covers what decision gets made from a given probe result; this
+    // covers what actually happens to the state file for each decision).
+
+    use super::{apply_adopt_decision, read_state_field, write_state_field};
+
+    /// Fresh tempdir per call. The returned guard keeps the dir alive for
+    /// the test's scope and removes it on drop, so no state file survives
+    /// into another test or a later `cargo test` run.
+    fn temp_state_path() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").to_string_lossy().into_owned();
+        (dir, path)
+    }
+
+    #[test]
+    fn apply_adopt_writes_full_and_diff_to_state_file() {
+        let (_dir, state_path) = temp_state_path();
+        let decision = decide_adopt_backup_history(false, false, Some(FULL_AND_NEWER_DIFF_INFO));
+        apply_adopt_decision(&state_path, decision, 12345);
+        assert_eq!(
+            read_state_field(&state_path, "last_full_at"),
+            Some("200".to_string())
+        );
+        assert_eq!(
+            read_state_field(&state_path, "last_diff_at"),
+            Some("400".to_string())
+        );
+        assert_eq!(
+            read_state_field(&state_path, "last_catalog_verify_at"),
+            Some("12345".to_string()),
+            "a successful adopt should stamp last_catalog_verify_at so \
+             catalog_verify_step doesn't immediately re-probe S3"
+        );
+    }
+
+    #[test]
+    fn apply_adopt_writes_full_only_when_no_diff_adopted() {
+        let (_dir, state_path) = temp_state_path();
+        let decision = decide_adopt_backup_history(false, false, Some(FULL_ONLY_INFO));
+        apply_adopt_decision(&state_path, decision, 12345);
+        assert_eq!(
+            read_state_field(&state_path, "last_full_at"),
+            Some("200".to_string())
+        );
+        assert_eq!(read_state_field(&state_path, "last_diff_at"), None);
+    }
+
+    #[test]
+    fn apply_adopt_clears_stale_local_diff_when_catalog_has_none_newer() {
+        // A local last_diff_at with no matching last_full_at must not
+        // survive adoption: the adopted pair mirrors the catalog, and a
+        // stale diff timestamp older than the adopted full would anchor the
+        // diff cadence on it instead of the full.
+        let (_dir, state_path) = temp_state_path();
+        write_state_field(&state_path, "last_diff_at", "50").unwrap();
+
+        let decision = decide_adopt_backup_history(false, false, Some(FULL_ONLY_INFO));
+        apply_adopt_decision(&state_path, decision, 12345);
+
+        assert_eq!(
+            read_state_field(&state_path, "last_full_at"),
+            Some("200".to_string())
+        );
+        assert_eq!(read_state_field(&state_path, "last_diff_at"), None);
+    }
+
+    #[test]
+    fn apply_adopt_not_applicable_and_fresh_stanza_touch_nothing() {
+        for decision in [AdoptDecision::NotApplicable, AdoptDecision::FreshStanza] {
+            let (_dir, state_path) = temp_state_path();
+            apply_adopt_decision(&state_path, decision, 12345);
+            assert_eq!(read_state_field(&state_path, "last_full_at"), None);
+            assert_eq!(read_state_field(&state_path, "last_full_failure_at"), None);
+        }
+    }
+
+    #[test]
+    fn apply_adopt_inconclusive_marker_is_stamped_once_not_refreshed() {
+        // Regression test for the redundant-full bug this backoff exists to
+        // close: repeated Inconclusive results must not keep pushing the
+        // backoff deadline forward with each new `now`, or a genuine S3
+        // outage would never fall through to NEEDS_INITIAL_BACKUP at all.
+        let (_dir, state_path) = temp_state_path();
+
+        apply_adopt_decision(&state_path, AdoptDecision::Inconclusive, 1000);
+        assert_eq!(
+            read_state_field(&state_path, "last_full_failure_at"),
+            Some("1000".to_string())
+        );
+
+        // Later iterations, later "now" values, still Inconclusive: the
+        // marker must stay pinned to the FIRST probe's timestamp.
+        apply_adopt_decision(&state_path, AdoptDecision::Inconclusive, 5000);
+        apply_adopt_decision(&state_path, AdoptDecision::Inconclusive, 9999);
+        assert_eq!(
+            read_state_field(&state_path, "last_full_failure_at"),
+            Some("1000".to_string()),
+            "backoff marker must stay pinned to the first inconclusive probe's timestamp"
+        );
+    }
+
+    #[test]
+    fn apply_adopt_success_clears_a_prior_inconclusive_marker() {
+        let (_dir, state_path) = temp_state_path();
+        apply_adopt_decision(&state_path, AdoptDecision::Inconclusive, 1000);
+        assert_eq!(
+            read_state_field(&state_path, "last_full_failure_at"),
+            Some("1000".to_string())
+        );
+
+        let decision = decide_adopt_backup_history(false, false, Some(FULL_ONLY_INFO));
+        apply_adopt_decision(&state_path, decision, 2000);
+
+        assert_eq!(read_state_field(&state_path, "last_full_failure_at"), None);
+        assert_eq!(
+            read_state_field(&state_path, "last_full_at"),
+            Some("200".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_adopt_on_unwritable_state_path_leaves_no_partial_state() {
+        // Every write targets the same unwritable path (a directory), so
+        // this pins the coarse property — no panic, no partial state such
+        // as a last_diff_at with no matching last_full_at (which would
+        // corrupt decide_action's invariants) — rather than the order of
+        // the individual writes.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().to_string_lossy().into_owned(); // a directory, not a file — write fails
+        let decision = decide_adopt_backup_history(false, false, Some(FULL_AND_NEWER_DIFF_INFO));
+        apply_adopt_decision(&state_path, decision, 12345);
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 
     // ---- decide_gap_recovery: state-machine transitions ----
