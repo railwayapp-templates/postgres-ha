@@ -1713,6 +1713,397 @@ t_ha_replica_reseed_fallback_basebackup() {
   teardown_scope "$scope"
 }
 
+# H10. Disabling archiving must actually turn off restore_command on
+# every STANDBY, and — for a cluster that was BORN archiving, where
+# bootstrap.dcs seeds restore_command into DCS at cluster genesis — must
+# clear it from DCS specifically, not just archive_mode/archive_command/
+# archive_timeout (PR #78's reconcile.rs fix). Before this fix, an
+# all-3-absent check that omitted restore_command meant a DCS state with
+# those three already clear but restore_command still set would
+# short-circuit to "already absent" and leave it stuck — every standby
+# spamming a failing archive-get against creds that are gone.
+#
+# Two things confirmed empirically while writing this test (do not
+# "fix" the code to make either of these assumptions true — they are
+# real, verified Patroni behavior):
+#
+# 1. Enabling archiving on an EXISTING vanilla cluster (this harness's
+#    own setup_patroni_cluster boot order, and the same path an operator
+#    hits by setting WAL_ARCHIVE_BUCKET on a running cluster and
+#    redeploying) never puts restore_command in DCS at all — yaml.rs's
+#    local (non-bootstrap) postgresql.parameters block supplies it on
+#    every start regardless of DCS, by design, so Postgres has it active
+#    either way (confirmed via `SHOW restore_command`, not just grepping
+#    DCS's /config). So the meaningful "enabled" assertion is the real
+#    GUC state, DCS-independent by construction; the DCS-specific fix is
+#    separately regression-tested by manually seeding DCS the way a
+#    born-archiving cluster's bootstrap.dcs would (a real PATCH here,
+#    not just the unit-tested pure function, exercises
+#    reconcile_pgbackrest_archive_config's actual GET/PATCH plumbing).
+#
+# 2. Whichever node is the LEADER at the moment archiving is disabled
+#    (and stays leader through it) keeps a STALE restore_command value
+#    in its live postgresql.conf indefinitely otherwise — confirmed
+#    surviving even a full container recreation (`run_patroni_node`, not
+#    just a Patroni-issued reload). Root cause: Patroni reconciles
+#    archive_mode/archive_command/archive_timeout generically (logged as
+#    "Changed X from Y to None"), but restore_command belongs to the
+#    recovery-parameter family it only writes/clears via the
+#    standby-specific code path (`_adjust_recovery_parameters`) — which
+#    never runs for a primary. Functionally harmless (a running primary
+#    never executes restore_command) but misleading via `SHOW
+#    restore_command` right after a disable, and a latent hazard if that
+#    node ever runs recovery while still primary-labeled (crash restart
+#    before promotion settles, certain rewind paths). This is pre-existing
+#    Patroni behavior, not something PR #78 introduced — but since PR #78
+#    is what makes restore_command exist at all, it also carries the fix:
+#    `reconcile_pgbackrest_archive_config`'s disable path now directly
+#    `ALTER SYSTEM SET restore_command = ''` + reloads on whichever node
+#    is currently leader, bypassing Patroni's config rendering entirely
+#    (`postgresql.auto.conf` loads after `postgresql.conf` and wins for
+#    the same key). So this test asserts ALL THREE nodes clear, leader
+#    included — no role-based skip.
+t_ha_archive_disable_clears_restore_command() {
+  local scope=t-archdis-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher))
+
+  local leader; leader=$(wait_for_leader "$scope" 240) || { ko t_ha_archive_disable_clears_restore_command "no leader"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_archive_disable_clears_restore_command "replicas didn't stream"; teardown_scope "$scope"; return; }
+
+  for n in "$n1" "$n2" "$n3"; do
+    local rc_val
+    rc_val=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SHOW restore_command" 2>/dev/null)
+    if [ "$rc_val" != "/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p" ]; then
+      ko t_ha_archive_disable_clears_restore_command "node $n has restore_command='$rc_val' while archiving is enabled"
+      fail_dump t_ha_archive_disable_clears_restore_command "$n"
+      teardown_scope "$scope"
+      return
+    fi
+  done
+
+  # Simulate a born-archiving cluster's bootstrap.dcs seed so the
+  # upcoming disable actually has a DCS-level restore_command to clear
+  # (this harness's own boot order never produces one on its own — see
+  # comment above). Same value already active via the local fallback,
+  # so this doesn't change current behavior, only DCS's dynamic config.
+  docker exec "$leader" curl -sf -X PATCH -H "Content-Type: application/json" \
+    -d '{"postgresql":{"parameters":{"restore_command":"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p"}}}' \
+    "http://localhost:8008/config" >/dev/null 2>&1
+  local cfg_seeded
+  cfg_seeded=$(docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null)
+  if ! echo "$cfg_seeded" | grep -q '"restore_command"'; then
+    ko t_ha_archive_disable_clears_restore_command "failed to seed a DCS-level restore_command to test clearing against: $cfg_seeded"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Disable: redeploy all 3 nodes without WAL_ARCHIVE_* (volumes kept,
+  # matching an operator unsetting the env var and redeploying).
+  for n in "$n1" "$n2" "$n3"; do
+    run_patroni_node "$scope" "$etcd_hosts" "$n"
+  done
+  leader=$(wait_for_leader "$scope" 240) || { ko t_ha_archive_disable_clears_restore_command "no leader after disable"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_archive_disable_clears_restore_command "replicas didn't restream after disable"; teardown_scope "$scope"; return; }
+
+  # reconcile_pgbackrest_archive_config runs once per node boot after
+  # Patroni's REST comes up; poll for it to land.
+  local cfg="" cleared=0 deadline=$(($(date +%s) + 90))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    cfg=$(docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null)
+    if ! echo "$cfg" | grep -q '"restore_command"' \
+       && ! echo "$cfg" | grep -q '"archive_mode"' \
+       && ! echo "$cfg" | grep -q '"archive_command"'; then
+      cleared=1
+      break
+    fi
+    sleep 3
+  done
+  if [ "$cleared" != "1" ]; then
+    ko t_ha_archive_disable_clears_restore_command "DCS still has archive params after disable: $cfg"
+    fail_dump t_ha_archive_disable_clears_restore_command "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # All three nodes must clear, leader included — clear_stale_restore_command_if_leader
+  # bypasses Patroni's own (standby-only) reconciliation for exactly this case.
+  for n in "$n1" "$n2" "$n3"; do
+    local rc_after
+    rc_after=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SHOW restore_command" 2>/dev/null)
+    if [ -n "$rc_after" ]; then
+      local role="standby"; [ "$n" = "$leader" ] && role="leader"
+      ko t_ha_archive_disable_clears_restore_command "$role $n still has restore_command='$rc_after' after disable"
+      fail_dump t_ha_archive_disable_clears_restore_command "$n"
+      teardown_scope "$scope"
+      return
+    fi
+  done
+
+  ok t_ha_archive_disable_clears_restore_command
+  note "restore_command effective on all nodes while enabled; DCS-seeded value + archive_mode/archive_command cleared; GUC empty on ALL nodes (leader included) after disable"
+  teardown_scope "$scope"
+}
+
+# H11. A standby whose needed WAL was recycled off the leader (extended
+# disconnect / slot reclaimed once the member's TTL expired) self-heals
+# by pulling the missing segments from the S3 archive via
+# restore_command — Postgres's own recovery machinery, not Patroni's
+# create_replica_methods/reinitialize (PR #78's second capability,
+# distinct from H8/H9's re-seed-from-S3 path). Also exercises the
+# archive-get wrapper's marker-stale DCS-fallback for real: the
+# replica's on-disk repo-path marker is deliberately corrupted before
+# the outage, so recovery can only succeed if the wrapper falls back to
+# Patroni DCS for the authoritative path.
+t_ha_replica_selfheals_via_restore_command() {
+  local scope=t-archget-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher))
+
+  local leader; leader=$(wait_for_leader "$scope" 240) || { ko t_ha_replica_selfheals_via_restore_command "no leader"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_replica_selfheals_via_restore_command "replicas didn't stream"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader" 90 || { ko t_ha_replica_selfheals_via_restore_command "no stanza-create"; teardown_scope "$scope"; return; }
+
+  local replica=""
+  for n in "$n1" "$n2" "$n3"; do
+    if [ "$n" != "$leader" ]; then replica="$n"; break; fi
+  done
+
+  psql_leader "$leader" -c "CREATE TABLE churn(id int, v text);" >/dev/null
+  wait_for_watcher_backup "$leader" full 120 || { ko t_ha_replica_selfheals_via_restore_command "no initial full backup"; teardown_scope "$scope"; return; }
+
+  # Corrupt the replica's on-disk marker BEFORE the outage, while it's
+  # still up — proves the DCS fallback actually ran on recovery, not
+  # just a marker that happened to already be correct. Must be a
+  # syntactically valid absolute path (real repo1-paths always are:
+  # "${WAL_ARCHIVE_PATH}/cluster-<sysid>") pointing at the WRONG
+  # cluster prefix — pgBackRest's option parser rejects a non-absolute
+  # value outright ("must begin with /") before ever reaching the
+  # S3/lookup step the DCS-fallback logic is actually meant to recover
+  # from, which would fail every single attempt including retries and
+  # isn't the staleness this test is trying to model.
+  docker exec "$replica" sh -c 'printf "/pgbackrest/cluster-0000000000000000000" > /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path' >/dev/null 2>&1
+
+  docker stop "$replica" >/dev/null 2>&1 || { ko t_ha_replica_selfheals_via_restore_command "couldn't stop replica"; teardown_scope "$scope"; return; }
+
+  # Deterministically simulate "the slot is gone" (what Patroni's own
+  # HA loop does once the stopped member's DCS lease expires) instead
+  # of waiting out the real TTL, then shrink max_wal_size so a modest
+  # amount of churn is enough to recycle the segments the replica left
+  # off at.
+  local slot="" slot_deadline=$(($(date +%s) + 30))
+  while [ "$(date +%s)" -lt "$slot_deadline" ]; do
+    slot=$(psql_leader "$leader" -At -c "SELECT slot_name FROM pg_replication_slots WHERE active = false LIMIT 1" 2>/dev/null)
+    [ -n "$slot" ] && break
+    sleep 2
+  done
+  if [ -z "$slot" ]; then
+    ko t_ha_replica_selfheals_via_restore_command "couldn't find the stopped replica's inactive replication slot"
+    teardown_scope "$scope"
+    return
+  fi
+  psql_leader "$leader" -c "SELECT pg_drop_replication_slot('${slot}');" >/dev/null
+  # Separate -c calls: psql wraps a single -c string's multiple
+  # statements in an implicit transaction block, and ALTER SYSTEM
+  # cannot run inside one.
+  psql_leader "$leader" -c "ALTER SYSTEM SET max_wal_size = '128MB';" >/dev/null
+  psql_leader "$leader" -c "SELECT pg_reload_conf();" >/dev/null
+
+  for _ in 1 2 3 4; do
+    psql_leader "$leader" -c "INSERT INTO churn SELECT g, repeat('x', 500) FROM generate_series(1,300000) g;" >/dev/null
+    psql_leader "$leader" -c "CHECKPOINT;" >/dev/null
+  done
+
+  # shellcheck disable=SC2046
+  run_patroni_node "$scope" "$etcd_hosts" "$replica" $(archive_env_fast_watcher)
+
+  # Neither wait_for_replication (reads the LEADER's aggregate /cluster
+  # view — the just-stopped member's OLD etcd key lingers for its TTL,
+  # the false-positive H8/H9's comments warn about) nor the replica's
+  # own /replica endpoint (returns 200 for "running as a standby",
+  # which happens almost immediately — Postgres accepts read-only
+  # connections and settles into a quiet "waiting for WAL" state well
+  # before restore_command's slower background retries (on
+  # wal_retrieve_retry_interval, default 5s — not retried in a tight
+  # loop) actually land) prove the thing this test is about. Poll
+  # directly for the real evidence: "restored log file" appearing
+  # anywhere in the FULL log (not tail-limited — the watcher's own
+  # 2-second poll noise fills a --tail window in well under a minute).
+  local restored=0 restore_deadline=$(($(date +%s) + 300))
+  while [ "$(date +%s)" -lt "$restore_deadline" ]; do
+    if docker logs "$replica" 2>&1 | grep -q "restored log file"; then
+      restored=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$restored" != "1" ]; then
+    ko t_ha_replica_selfheals_via_restore_command "no evidence restore_command actually supplied a WAL segment (no 'restored log file' in the postgres log) within 300s"
+    fail_dump t_ha_replica_selfheals_via_restore_command "$replica" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Must have self-healed via restore_command, NOT a reseed: pgdata
+  # survived the stop, so create_replica_methods never runs here.
+  if docker logs "$replica" 2>&1 | grep -q "replica has been created using"; then
+    ko t_ha_replica_selfheals_via_restore_command "replica was re-seeded instead of catching up via restore_command"
+    fail_dump t_ha_replica_selfheals_via_restore_command "$replica"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if ! docker logs "$replica" 2>&1 | grep -q "repo path '.*' is stale"; then
+    ko t_ha_replica_selfheals_via_restore_command "expected the archive-get wrapper's stale-marker DCS-fallback to have fired at least once"
+    fail_dump t_ha_replica_selfheals_via_restore_command "$replica"
+    teardown_scope "$scope"
+    return
+  fi
+
+  local marker
+  marker=$(docker exec "$replica" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path 2>/dev/null | tr -d '\n\r')
+  if [ "$marker" = "/pgbackrest/cluster-0000000000000000000" ]; then
+    ko t_ha_replica_selfheals_via_restore_command "marker was never corrected after the DCS fallback"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_replica_selfheals_via_restore_command
+  note "replica caught up via restore_command after its needed WAL was recycled off the leader; stale marker corrected to '$marker'"
+  teardown_scope "$scope"
+}
+
+# H12. WAL_ARCHIVE_STALL_CONFIRM_SECONDS dwell (PR #78's monitoring.rs
+# gate): on an archiving cluster, a WAL-too-old verdict must NOT
+# reinitialize the replica the moment it's first confirmed — only once
+# the zero-progress stall has also outlived the dwell. Proven here
+# against the real monitoring loop (not just the pure wal_reinit_confirmed
+# unit tests) by making the archive fallback itself totally unavailable
+# (MinIO stopped) so progress genuinely never comes, then observing: (1)
+# still not reinitialized shortly after the first positive verdict, (2)
+# reinitialized once the dwell elapses — via the basebackup fallback,
+# since pgbackrest's restore also needs the S3 that's still down. Uses a
+# short WAL_ARCHIVE_STALL_CONFIRM_SECONDS override so the test doesn't
+# wait out the real 300s default; see monitoring.rs for why the override
+# exists. MinIO is restarted immediately after the timed observation,
+# before any assertion, so a failure here can never strand the rest of
+# the suite with MinIO down.
+t_ha_wal_archive_stall_dwell_gates_reinit() {
+  local scope=t-dwell-${PG_VERSION}
+  local confirm_secs=10
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher) \
+    -e "WAL_ARCHIVE_STALL_CONFIRM_SECONDS=${confirm_secs}")
+
+  local leader; leader=$(wait_for_leader "$scope" 240) || { ko t_ha_wal_archive_stall_dwell_gates_reinit "no leader"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_wal_archive_stall_dwell_gates_reinit "replicas didn't stream"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader" 90 || { ko t_ha_wal_archive_stall_dwell_gates_reinit "no stanza-create"; teardown_scope "$scope"; return; }
+
+  local replica=""
+  for n in "$n1" "$n2" "$n3"; do
+    if [ "$n" != "$leader" ]; then replica="$n"; break; fi
+  done
+
+  psql_leader "$leader" -c "CREATE TABLE churn(id int, v text);" >/dev/null
+  docker stop "$replica" >/dev/null 2>&1 || { ko t_ha_wal_archive_stall_dwell_gates_reinit "couldn't stop replica"; teardown_scope "$scope"; return; }
+
+  local slot="" slot_deadline=$(($(date +%s) + 30))
+  while [ "$(date +%s)" -lt "$slot_deadline" ]; do
+    slot=$(psql_leader "$leader" -At -c "SELECT slot_name FROM pg_replication_slots WHERE active = false LIMIT 1" 2>/dev/null)
+    [ -n "$slot" ] && break
+    sleep 2
+  done
+  if [ -z "$slot" ]; then
+    ko t_ha_wal_archive_stall_dwell_gates_reinit "couldn't find the stopped replica's inactive replication slot"
+    teardown_scope "$scope"
+    return
+  fi
+  psql_leader "$leader" -c "SELECT pg_drop_replication_slot('${slot}');" >/dev/null
+  # Separate -c calls: psql wraps a single -c string's multiple
+  # statements in an implicit transaction block, and ALTER SYSTEM
+  # cannot run inside one.
+  psql_leader "$leader" -c "ALTER SYSTEM SET max_wal_size = '128MB';" >/dev/null
+  psql_leader "$leader" -c "SELECT pg_reload_conf();" >/dev/null
+  for _ in 1 2 3 4; do
+    psql_leader "$leader" -c "INSERT INTO churn SELECT g, repeat('x', 500) FROM generate_series(1,300000) g;" >/dev/null
+    psql_leader "$leader" -c "CHECKPOINT;" >/dev/null
+  done
+
+  # Take the archive fallback itself off the table: with MinIO down,
+  # restore_command can never actually deliver a segment, so progress
+  # genuinely stays at zero for as long as the outage lasts — this is
+  # what makes "not yet reinitialized" a meaningful observation rather
+  # than a race against a fallback that might work anyway.
+  docker stop "$MINIO" >/dev/null 2>&1
+
+  # shellcheck disable=SC2046
+  run_patroni_node "$scope" "$etcd_hosts" "$replica" $(archive_env_fast_watcher) \
+    -e "WAL_ARCHIVE_STALL_CONFIRM_SECONDS=${confirm_secs}"
+
+  # First positive WAL-too-old verdict arms at ~30s of zero progress
+  # (WAL_PROBE_GRACE_SECS). Sample shortly after that — before the dwell
+  # (confirm_secs=10) has had a full probe cycle to confirm on — and
+  # require it NOT reinitialized yet.
+  sleep 45
+  local reinit_early=0
+  docker logs "$replica" 2>&1 | grep -q "replica has been created using" && reinit_early=1
+
+  # Now give it a generous window past the dwell for the NEXT probe tick
+  # to fire the confirmed reinit (probe backoff after the first hit at
+  # ~30s lands the second probe at ~90s; 180s total is a comfortable
+  # margin above that on a loaded CI runner).
+  local created="" create_deadline=$(($(date +%s) + 180))
+  while [ "$(date +%s)" -lt "$create_deadline" ]; do
+    created=$(docker logs "$replica" 2>&1 | grep -o "replica has been created using [a-z_]*" | tail -1)
+    [ -n "$created" ] && break
+    sleep 5
+  done
+
+  # Restore shared test infra to a clean state BEFORE any assertion or
+  # early return below, so a failure here can never strand later tests
+  # in the suite with MinIO down.
+  docker start "$MINIO" >/dev/null 2>&1
+  local minio_deadline=$(($(date +%s) + 30))
+  while [ "$(date +%s)" -lt "$minio_deadline" ]; do
+    # `mc alias set` alone can't signal readiness: the helper's script
+    # runs it as a bare statement (no `&&`), so the container's exit
+    # code is whatever the LAST command returns — make that a real
+    # connectivity probe (`mc ls local`, which needs a working
+    # connection regardless of what buckets exist).
+    mc "mc ls local" >/dev/null 2>&1 && break
+    sleep 2
+  done
+
+  if [ "$reinit_early" = "1" ]; then
+    ko t_ha_wal_archive_stall_dwell_gates_reinit "replica was reinitialized before the dwell elapsed — the archive-stall dwell did not gate it"
+    fail_dump t_ha_wal_archive_stall_dwell_gates_reinit "$replica"
+    teardown_scope "$scope"
+    return
+  fi
+  if [ -z "$created" ]; then
+    ko t_ha_wal_archive_stall_dwell_gates_reinit "replica was never reinitialized even after the dwell elapsed — safety net did not fire"
+    fail_dump t_ha_wal_archive_stall_dwell_gates_reinit "$replica" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! docker logs "$replica" 2>&1 | grep -q "deferring reinitialize until the zero-progress stall outlives the dwell"; then
+    ko t_ha_wal_archive_stall_dwell_gates_reinit "expected the archive-aware dwell warning to have logged at least once"
+    fail_dump t_ha_wal_archive_stall_dwell_gates_reinit "$replica"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_wal_archive_stall_dwell_gates_reinit
+  note "dwell gated the reinit past the first verdict; fired later via '$created' once the stall outlived confirm_secs=${confirm_secs}s with S3 unreachable throughout"
+  teardown_scope "$scope"
+}
+
 # H5. PGHOST/PGPORT cleared in stanza-create + watcher subshells.
 # Pins port commit caea70a (postgres-ssl PR #51 equivalent). Asserts
 # via a customer-style PGHOST set to a deliberately-broken target —
@@ -2382,6 +2773,9 @@ ALL_TESTS=(
   # PR #78: replica re-seed from the S3 archive instead of the live leader
   t_ha_replica_reseed_pgbackrest
   t_ha_replica_reseed_fallback_basebackup
+  t_ha_archive_disable_clears_restore_command
+  t_ha_replica_selfheals_via_restore_command
+  t_ha_wal_archive_stall_dwell_gates_reinit
   t_ha_pghost_pgport_unset
   t_ha_restore_gate_logged_on_every_node
   t_ha_failover_watcher_handoff
