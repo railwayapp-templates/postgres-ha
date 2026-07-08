@@ -1577,8 +1577,18 @@ t_ha_restore_gate_logged_on_every_node() {
   done
 
   # Each runner emits the gate log near the top of main(), before any
-  # cluster join. 60s is generous.
-  local deadline=$(($(date +%s) + 60))
+  # cluster join — in practice all 3 nodes log it within ~25s of
+  # container start. The loop still exits the instant it sees all 3, so
+  # a generous ceiling costs nothing on a healthy run. It matters on a
+  # loaded one: this test runs ~35 tests into the suite, and a CI-only
+  # failure was observed where all 3 gate lines were already on disk by
+  # +25s but `docker logs` calls (dockerd contention from the dozens of
+  # container churns earlier in the job) made polling itself lag past
+  # the old 60s budget before ever performing the check that would have
+  # seen it. 240s absorbs that without masking a real regression — a
+  # genuinely broken gate would still never appear no matter how long we
+  # wait.
+  local deadline=$(($(date +%s) + 240))
   local seen_all=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local seen=0
@@ -1595,7 +1605,7 @@ t_ha_restore_gate_logged_on_every_node() {
   done
 
   if [ "$seen_all" != "1" ]; then
-    ko t_ha_restore_gate_logged_on_every_node "not all 3 nodes logged restore-gate state in 60s"
+    ko t_ha_restore_gate_logged_on_every_node "not all 3 nodes logged restore-gate state in 240s"
     for n in "$n1" "$n2" "$n3"; do fail_dump t_ha_restore_gate_logged_on_every_node "$n"; done
     teardown_scope "$scope"
     return
