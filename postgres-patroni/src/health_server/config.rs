@@ -17,6 +17,11 @@ pub struct HealthServerConfig {
     pub pg_database: String,
     /// Patroni REST API port for fallback (default: 8008)
     pub patroni_port: u16,
+    /// Total wall-clock budget in ms for a single /primary or /replica check,
+    /// covering both the direct PostgreSQL query and the Patroni/etcd fallback
+    /// (default: 2000). Must stay comfortably under HAProxy's own
+    /// HAPROXY_TIMEOUT_CHECK (default 3s) -- see routes.rs for why.
+    pub check_timeout_ms: u64,
 }
 
 impl HealthServerConfig {
@@ -33,6 +38,7 @@ impl HealthServerConfig {
             pg_password: String::env_parse("PGPASSWORD", String::new()),
             pg_database: String::env_parse("PGDATABASE", "postgres".to_string()),
             patroni_port: u16::env_parse("PATRONI_PORT", 8008),
+            check_timeout_ms: u64::env_parse("HEALTH_CHECK_TIMEOUT_MS", 2000),
         }
     }
 }
