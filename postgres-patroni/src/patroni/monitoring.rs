@@ -56,6 +56,24 @@ const WAL_PROBE_MAX_INTERVAL_SECS: u64 = 240;
 /// without waiting), so the e2e harness needs a way to shrink it to seconds
 /// instead of waiting out 300s per scenario.
 const WAL_ARCHIVE_STALL_CONFIRM_SECS: u64 = 300;
+/// Slack for the volume-usage progress signal: a poll-to-poll DROP larger
+/// than this is a data-directory wipe (a reinitialize, or Patroni's
+/// diverged-timeline cleanup) and rebaselines the high-water mark so the
+/// follow-up re-clone registers as progress from its first laid byte.
+/// Anything smaller is crash-cycle churn: a crash-looping startup (e.g. the
+/// archive-get connectivity breaker FATALing recovery every trip window)
+/// deletes and recreates small files on every cycle — postmaster.pid,
+/// pgbackrest spool status, RECOVERY temp files — which oscillates statvfs
+/// around a plateau with zero real progress. Judged poll-to-poll, the
+/// climb-back half of each oscillation read as growth and reset the
+/// zero-progress clock, so a wedged replica could never accrue the stall
+/// time the WAL-too-old reinit gate below requires (observed: resets every
+/// 10–25s at a byte-identical plateau, gate never armed). Judged against a
+/// high-water mark, churn stays at-or-below the mark and only genuinely new
+/// bytes count. 64 MiB is far above any plausible churn amplitude while any
+/// pgdata small enough to be wiped without tripping the rebaseline re-clones
+/// long before the progress gate's timeout could matter.
+const VOLUME_WIPE_REBASELINE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Run the main monitoring loop for Patroni
 ///
@@ -96,8 +114,10 @@ pub async fn run_monitoring_loop(
     // wedging the replica permanently. So we only accrue toward the recovery
     // exit while the node is making NO progress, where progress is either of
     // two independent signals:
-    //   1. Volume usage growing — pg_basebackup laying data files down. This is
-    //      the only signal available before Patroni's REST API answers.
+    //   1. Volume usage growing past its episode high-water mark —
+    //      pg_basebackup laying data files down. This is the only signal
+    //      available before Patroni's REST API answers. High-water, not
+    //      poll-to-poll: see `volume_progressed`.
     //   2. WAL position (received/replayed LSN) advancing — covers the
     //      post-basebackup catch-up phase, where the replica streams + replays
     //      WAL with disk usage ~flat (segments recycled about as fast as they
@@ -106,7 +126,7 @@ pub async fn run_monitoring_loop(
     // A genuinely stalled startup — and a hung clone (dead replication socket) —
     // advances NEITHER signal, so it still exits for recovery after the timeout.
     let mut startup_elapsed = 0u64;
-    let mut last_volume_used = volume_used_bytes(&config.data_dir);
+    let mut volume_baseline = volume_used_bytes(&config.data_dir);
     let mut last_xlog_pos: Option<i64> = None;
     // One forced reinitialize per container start. A replica that stalls before
     // ever becoming healthy is usually wedged in a way a restart can't fix — see
@@ -184,8 +204,7 @@ pub async fn run_monitoring_loop(
                 let healthy = check_health(config.health_check_timeout).await;
 
                 let used = volume_used_bytes(&config.data_dir);
-                let volume_grew = used > last_volume_used;
-                last_volume_used = used;
+                let volume_grew = volume_progressed(&mut volume_baseline, used);
 
                 // WAL position is the progress signal whole-volume bytes miss:
                 // during catch-up the replica streams + replays WAL while disk
@@ -268,7 +287,7 @@ pub async fn run_monitoring_loop(
                             // Rebaseline progress signals: the reinit wipes pgdata
                             // (volume shrinks, WAL cursor disappears) before the
                             // fresh clone starts laying bytes down.
-                            last_volume_used = volume_used_bytes(&config.data_dir);
+                            volume_baseline = volume_used_bytes(&config.data_dir);
                             last_xlog_pos = None;
                             continue;
                         }
@@ -348,7 +367,7 @@ pub async fn run_monitoring_loop(
                             {
                                 reinit_attempted = true;
                                 startup_elapsed = 0;
-                                last_volume_used = volume_used_bytes(&config.data_dir);
+                                volume_baseline = volume_used_bytes(&config.data_dir);
                                 last_xlog_pos = None;
                                 wal_unrecoverable_since = None;
                                 continue;
@@ -771,6 +790,27 @@ fn volume_used_bytes(path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Volume-growth progress judged against a high-water baseline rather than
+/// the previous poll. Returns true — and raises the baseline — only when
+/// `used` exceeds the highest usage seen so far, so the delete/recreate churn
+/// of a crash-looping startup (statvfs dips, then climbs back to the same
+/// plateau) never reads as progress. A drop larger than
+/// `VOLUME_WIPE_REBASELINE_BYTES` is a wipe, not churn: rebaseline downward —
+/// without claiming progress for the drop itself — so the subsequent
+/// re-clone's growth counts from its first byte instead of being swallowed by
+/// the pre-wipe mark (a clone must never be killed mid-stream for reading as
+/// stalled). Pure and unit-tested.
+fn volume_progressed(baseline: &mut u64, used: u64) -> bool {
+    if used > *baseline {
+        *baseline = used;
+        return true;
+    }
+    if baseline.saturating_sub(used) > VOLUME_WIPE_REBASELINE_BYTES {
+        *baseline = used;
+    }
+    false
+}
+
 /// True when the replica's WAL position advanced between two startup polls —
 /// progress that whole-volume byte growth misses during catch-up (WAL streamed
 /// in ≈ recycled out holds disk usage flat while received/replayed LSN climbs).
@@ -963,6 +1003,46 @@ mod tests {
         // volume signal; never counts as WAL progress on its own.
         assert!(!xlog_advanced(Some(2_000), None));
         assert!(!xlog_advanced(None, None));
+    }
+
+    #[test]
+    fn volume_progress_requires_a_new_high_water_mark() {
+        // Crash-cycle churn: statvfs dips below the plateau, then climbs back
+        // to it. Neither half may read as progress, and the mark must hold.
+        let mut baseline = 1_000_000u64;
+        assert!(!volume_progressed(&mut baseline, 900_000));
+        assert!(!volume_progressed(&mut baseline, 1_000_000));
+        assert_eq!(baseline, 1_000_000);
+        // Genuinely new bytes beyond the mark are progress and raise it.
+        assert!(volume_progressed(&mut baseline, 1_000_001));
+        assert_eq!(baseline, 1_000_001);
+    }
+
+    #[test]
+    fn volume_wipe_rebaselines_without_claiming_progress() {
+        let start = VOLUME_WIPE_REBASELINE_BYTES * 10;
+        let mut baseline = start;
+        let post_wipe = start - VOLUME_WIPE_REBASELINE_BYTES - 1;
+        // The wipe itself is not progress, but it moves the baseline down…
+        assert!(!volume_progressed(&mut baseline, post_wipe));
+        assert_eq!(baseline, post_wipe);
+        // …so the re-clone's very next bytes count as progress again, even
+        // though they are far below the pre-wipe mark.
+        assert!(volume_progressed(&mut baseline, post_wipe + 1));
+    }
+
+    #[test]
+    fn volume_drop_within_slack_is_churn_not_a_wipe() {
+        let start = VOLUME_WIPE_REBASELINE_BYTES * 10;
+        let mut baseline = start;
+        // A drop exactly at the slack boundary keeps the mark, so the
+        // climb-back to the old plateau must not read as progress.
+        assert!(!volume_progressed(
+            &mut baseline,
+            start - VOLUME_WIPE_REBASELINE_BYTES
+        ));
+        assert_eq!(baseline, start);
+        assert!(!volume_progressed(&mut baseline, start));
     }
 
     #[test]
