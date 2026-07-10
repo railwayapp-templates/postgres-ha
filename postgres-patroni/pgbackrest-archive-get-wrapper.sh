@@ -142,7 +142,9 @@ rc=$?
 DCS_PATH=$(curl -sf --max-time 2 http://localhost:8008/config 2>/dev/null \
   | python3 -c 'import json,sys; v = json.load(sys.stdin).get("pgbackrest_repo1_path") or ""; print(v if isinstance(v, str) else "")' 2>/dev/null)
 if [ -n "$DCS_PATH" ] && [ "$DCS_PATH" != "$USED_PATH" ]; then
-  if PGBACKREST_REPO1_PATH="$DCS_PATH" pgbackrest --stanza=main archive-get "$WAL_FILE" "$WAL_DEST"; then
+  PGBACKREST_REPO1_PATH="$DCS_PATH" pgbackrest --stanza=main archive-get "$WAL_FILE" "$WAL_DEST"
+  retry_rc=$?
+  if [ "$retry_rc" -eq 0 ]; then
     echo "pgbackrest-archive-get-wrapper: repo path '${USED_PATH:-<unset>}' is stale; ${WAL_FILE} found at DCS path '${DCS_PATH}' — rewriting marker" >&2
     # tmp + rename so concurrent readers (archive-push cats this file on
     # every WAL segment) never see a truncated marker; mirrors the backup
@@ -152,6 +154,12 @@ if [ -n "$DCS_PATH" ] && [ "$DCS_PATH" != "$USED_PATH" ]; then
       || rm -f "$MARKER_TMP" 2>/dev/null || true
     finish 0
   fi
+  # The retry ran against the authoritative DCS path, so ITS verdict is
+  # the one the breaker must judge — a genuine miss (1) here proves the
+  # repo answered and must clear the breaker, not inherit the stale-path
+  # first attempt's connectivity-class code. (The marker is only
+  # rewritten on a proven hit above; a miss can't vouch for the path.)
+  finish "$retry_rc"
 fi
 
 finish "$rc"
