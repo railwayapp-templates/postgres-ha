@@ -2149,7 +2149,7 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
             .await;
     }
 
-    // Exit 68 = OptionInvalidValueError: archive_command doesn't satisfy
+    // Exit 68 = ArchiveCommandInvalidError: archive_command doesn't satisfy
     // pgbackrest's "must contain pgbackrest" check — i.e. Postgres's live
     // GUC is empty or wrong even though Patroni's DCS-derived config (what
     // `reconcile_pgbackrest_archive_config` checks) already says it's
