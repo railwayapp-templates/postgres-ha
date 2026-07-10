@@ -46,8 +46,12 @@ pub(crate) const EXPECTED_ARCHIVE_COMMAND: &str =
     "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
 // Bounded poll before concluding Patroni's own dynamic-config sync missed
 // this node, rather than just being a poll_wait cycle behind a patch we
-// ourselves may have just issued moments ago.
-const LIVE_CHECK_ATTEMPTS: u32 = 5;
+// ourselves may have just issued moments ago. Must comfortably exceed
+// Patroni's loop_wait (10s, yaml.rs) — Patroni only applies a fresh DCS
+// patch on its next HA-loop tick, so a budget at or under loop_wait would
+// routinely misread ordinary application latency as a missed sync and
+// force via ALTER SYSTEM when Patroni was about to apply it anyway.
+const LIVE_CHECK_ATTEMPTS: u32 = 8;
 const LIVE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Wait for Patroni's REST API to respond before reconciling. Patroni starts
@@ -189,6 +193,51 @@ async fn force_live_archive_gucs(superuser: &str, archive_timeout_secs: i64) -> 
     if !out.status.success() {
         anyhow::bail!(
             "failed to force live archive GUCs: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+/// Undo [`force_live_archive_gucs`]'s `postgresql.auto.conf` entries via
+/// `ALTER SYSTEM RESET` + `pg_reload_conf()`. Without this, a node that
+/// ever self-healed through the force path keeps archiving forever after
+/// PITR is disabled: the disable flow only clears DCS, but `auto.conf`
+/// outranks Patroni's rendered `postgresql.conf`, so the pinned
+/// `archive_command` keeps firing with the S3 creds gone — the exact
+/// silent-degradation failure mode this module's header describes.
+/// `RESET` of a never-set GUC is a no-op, so this is safe to run
+/// unconditionally on every disabled-cluster startup. Runs fine on
+/// standbys too — `ALTER SYSTEM` writes `auto.conf` without WAL.
+async fn reset_live_archive_gucs(superuser: &str) -> Result<()> {
+    // Separate -c flags for the same reason as force_live_archive_gucs:
+    // ALTER SYSTEM cannot run inside psql's implicit multi-statement
+    // transaction block.
+    let out = Command::new("psql")
+        .args([
+            "-U",
+            superuser,
+            "-h",
+            "/var/run/postgresql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            "ALTER SYSTEM RESET archive_command;",
+            "-c",
+            "ALTER SYSTEM RESET archive_timeout;",
+            "-c",
+            "SELECT pg_reload_conf();",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output()
+        .await
+        .context("spawn psql")?;
+
+    if !out.status.success() {
+        anyhow::bail!(
+            "failed to reset live archive GUCs: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -338,6 +387,13 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
 
         verify_and_heal_live_archive_config(&config.superuser, expected_archive_timeout).await?;
     } else {
+        // Runs BEFORE the DCS-already-absent early return: DCS is
+        // cluster-wide state, cleared once by whichever node reconciles
+        // first, but the ALTER SYSTEM pin from force_live_archive_gucs
+        // lives in each node's own postgresql.auto.conf — every node must
+        // clear its own regardless of who won the DCS race.
+        reset_live_archive_gucs(&config.superuser).await?;
+
         if archive_mode.is_none() && archive_command.is_none() && archive_timeout.is_none() {
             info!("DCS archive config already absent (PITR disabled)");
             return Ok(());
