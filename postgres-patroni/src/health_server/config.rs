@@ -20,7 +20,10 @@ pub struct HealthServerConfig {
     /// Total wall-clock budget in ms for a single /primary or /replica check,
     /// covering both the direct PostgreSQL query and the Patroni/etcd fallback
     /// (default: 2000). Must stay comfortably under HAProxy's own
-    /// HAPROXY_TIMEOUT_CHECK (default 3s) -- see routes.rs for why.
+    /// HAPROXY_TIMEOUT_CHECK (default 3s) -- see routes.rs for why. postgres.rs
+    /// splits this in half internally to bound each of the two sequential
+    /// stages (pg connect, then the Patroni fallback) so one can't starve the
+    /// other of its turn.
     pub check_timeout_ms: u64,
 }
 
