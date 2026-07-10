@@ -61,6 +61,15 @@ if [ -f "$CONTROL/success_path" ]; then
     exit 0
   fi
 fi
+# miss_path: this path ANSWERS but lacks the file (genuine miss, exit 1),
+# while every other path still fails with fail_code — lets a test give the
+# stale-path attempt a connectivity-class code and the DCS retry a miss.
+if [ -f "$CONTROL/miss_path" ]; then
+  want="$(cat "$CONTROL/miss_path")"
+  if [ "${PGBACKREST_REPO1_PATH:-}" = "$want" ]; then
+    exit 1
+  fi
+fi
 if [ -f "$CONTROL/fail_code" ]; then
   exit "$(cat "$CONTROL/fail_code")"
 fi
@@ -460,22 +469,47 @@ t_archive_get_dcs_unreachable_on_miss_returns_original_failure() {
   teardown
 }
 
-t_archive_get_double_miss_returns_first_attempts_exit_code() {
-  # Sharp regression guard on a real subtlety: when the DCS-path retry ALSO
-  # fails, the script's final `exit "$rc"` still refers to the FIRST
-  # attempt's $rc (the retry's own status is only checked by the `if`, never
-  # captured) — so a double-miss always surfaces the original code, not the
-  # retry's, even when they differ. Exercise that with distinct fail codes to
-  # prove which one actually wins.
+t_archive_get_double_miss_returns_retry_exit_code() {
+  # When the DCS-path retry also fails, the surfaced code is the RETRY's
+  # own $retry_rc — the verdict against the authoritative path — not the
+  # stale-path first attempt's. Here both fail with the same code, so this
+  # pins the shape (exit code passthrough, both paths attempted, marker
+  # untouched); the distinct-code case is covered by
+  # t_archive_get_dcs_retry_miss_clears_breaker below.
   setup
   echo "marker-path" > "$(marker_path)"
   dcs_json_for "dcs-path"
   echo "9" > "$TMPROOT/control/fail_code"   # no success_path -> every attempt fails with 9
   WAL_ARCHIVE_BUCKET=bucket run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   local rc; rc=$(exit_code)
-  assert_eq "$rc" "9" "double-miss must surface the first attempt's exit code" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
+  assert_eq "$rc" "9" "double-miss must surface the failing exit code" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
   assert_eq "$(pgbackrest_call_count)" "2" "must attempt both marker and DCS paths before giving up" || { ko "$FUNCNAME" "call count mismatch"; teardown; return; }
   assert_eq "$(marker_content)" "marker-path" "a failed retry must never rewrite the marker" || { ko "$FUNCNAME" "marker changed on failed retry"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_get_dcs_retry_miss_clears_breaker() {
+  # The scenario the retry-verdict capture exists for: a standby with a
+  # stale marker gets a connectivity-class code (103) against the wrong
+  # path, but the DCS-path retry ANSWERS with a genuine miss (1 — segment
+  # simply not archived yet, normal at the leading edge of catch-up). The
+  # wrapper must surface the retry's 1 and CLEAR the breaker: the
+  # authoritative repo just proved reachable, so inheriting the stale
+  # path's 103 would count a healthy catching-up standby toward the
+  # connectivity trip on every not-yet-archived segment.
+  setup
+  echo "marker-path" > "$(marker_path)"
+  dcs_json_for "dcs-path"
+  echo "103" > "$TMPROOT/control/fail_code"      # stale-path attempt: connectivity-class
+  echo "dcs-path" > "$TMPROOT/control/miss_path" # DCS retry: repo answers, file absent
+  # Pre-seed a breaker count to prove the miss CLEARS it, not just fails to bump it.
+  printf '2 %s\n' "$(date +%s)" > "$(breaker_path)"
+  WAL_ARCHIVE_BUCKET=bucket run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  assert_eq "$(exit_code)" "1" "the DCS retry's genuine miss must win over the stale path's 103" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
+  assert_eq "$(pgbackrest_call_count)" "2" "must attempt both marker and DCS paths" || { ko "$FUNCNAME" "call count mismatch"; teardown; return; }
+  if [ -f "$(breaker_path)" ]; then ko "$FUNCNAME" "a DCS-path miss proves connectivity and must clear the breaker"; teardown; return; fi
+  assert_eq "$(marker_content)" "marker-path" "a miss can't vouch for the path; marker must not be rewritten" || { ko "$FUNCNAME" "marker changed on miss"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
@@ -497,7 +531,8 @@ ALL_TESTS=(
   t_archive_get_stale_marker_falls_back_to_dcs_and_rewrites
   t_archive_get_genuine_miss_dcs_agrees_no_second_attempt
   t_archive_get_dcs_unreachable_on_miss_returns_original_failure
-  t_archive_get_double_miss_returns_first_attempts_exit_code
+  t_archive_get_double_miss_returns_retry_exit_code
+  t_archive_get_dcs_retry_miss_clears_breaker
   t_archive_get_connectivity_breaker_trips_at_threshold
   t_archive_get_genuine_miss_resets_breaker
   t_archive_get_success_resets_breaker
