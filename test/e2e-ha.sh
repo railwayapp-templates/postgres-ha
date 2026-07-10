@@ -772,7 +772,9 @@ t_pitr_happy_path() {
   # leader-side `pgbackrest restore` to seed the volume first.
   local deadline=$(($(date +%s) + 30)) gate_seen=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$rest_n1" 2>&1 | grep -q "pgbackrest: restore-gate state"; then
+    # grep -c (not -q): -q's first-match exit can SIGPIPE docker logs
+    # under this script's pipefail, misreporting a present line as absent.
+    if docker logs "$rest_n1" 2>&1 | grep -c "pgbackrest: restore-gate state" >/dev/null; then
       gate_seen=1; break
     fi
     sleep 2
@@ -1626,7 +1628,10 @@ t_ha_restore_gate_logged_on_every_node() {
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local seen=0
     for n in "$n1" "$n2" "$n3"; do
-      if docker logs "$n" 2>&1 | grep -q "pgbackrest: restore-gate state"; then
+      # grep -c (not -q): -q's first-match exit can SIGPIPE docker logs
+      # under this script's pipefail, misreporting a present line as
+      # absent — observed here in CI with all 3 gate lines on disk.
+      if docker logs "$n" 2>&1 | grep -c "pgbackrest: restore-gate state" >/dev/null; then
         seen=$((seen + 1))
       fi
     done
