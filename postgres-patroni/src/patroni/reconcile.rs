@@ -207,9 +207,10 @@ async fn force_live_archive_gucs(superuser: &str, archive_timeout_secs: i64) -> 
 /// outranks Patroni's rendered `postgresql.conf`, so the pinned
 /// `archive_command` keeps firing with the S3 creds gone — the exact
 /// silent-degradation failure mode this module's header describes.
-/// `RESET` of a never-set GUC is a no-op, so this is safe to run
-/// unconditionally on every disabled-cluster startup. Runs fine on
-/// standbys too — `ALTER SYSTEM` writes `auto.conf` without WAL.
+/// Runs fine on standbys too — `ALTER SYSTEM` writes `auto.conf`
+/// without WAL. Requires a live Postgres; callers gate on
+/// [`archive_gucs_pinned_in_auto_conf`] so that requirement only
+/// applies to nodes that actually carry a pin.
 async fn reset_live_archive_gucs(superuser: &str) -> Result<()> {
     // Separate -c flags for the same reason as force_live_archive_gucs:
     // ALTER SYSTEM cannot run inside psql's implicit multi-statement
@@ -243,6 +244,28 @@ async fn reset_live_archive_gucs(superuser: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// True when `postgresql.auto.conf` carries an archive GUC pin that
+/// [`reset_live_archive_gucs`] would need to clear. Read from disk, not
+/// via SQL, so the answer is available even while Postgres is down —
+/// which matters on the disable path: it runs on every node startup,
+/// including mid-clone replicas and nodes whose Postgres never comes up
+/// this boot, and demanding a live Postgres just to learn "there was
+/// never a pin" would leave the reconcile retry loop spinning (and
+/// WARN-logging) for the whole window on the overwhelmingly common
+/// pin-free node. When a pin IS found, the psql-based reset genuinely
+/// must wait for Postgres — the caller's retry loop is that wait.
+/// An absent/unreadable file cannot carry a pin: false.
+async fn archive_gucs_pinned_in_auto_conf(data_dir: &str) -> bool {
+    let auto_conf = format!("{data_dir}/postgresql.auto.conf");
+    match tokio::fs::read_to_string(&auto_conf).await {
+        Ok(contents) => contents.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("archive_command") || line.starts_with("archive_timeout")
+        }),
+        Err(_) => false,
+    }
 }
 
 /// Verify the live Postgres GUCs actually match `expected_archive_timeout`,
@@ -392,7 +415,9 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
         // first, but the ALTER SYSTEM pin from force_live_archive_gucs
         // lives in each node's own postgresql.auto.conf — every node must
         // clear its own regardless of who won the DCS race.
-        reset_live_archive_gucs(&config.superuser).await?;
+        if archive_gucs_pinned_in_auto_conf(&config.data_dir).await {
+            reset_live_archive_gucs(&config.superuser).await?;
+        }
 
         if archive_mode.is_none() && archive_command.is_none() && archive_timeout.is_none() {
             info!("DCS archive config already absent (PITR disabled)");
