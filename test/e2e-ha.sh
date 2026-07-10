@@ -2294,6 +2294,7 @@ exec gosu postgres postgres -D /var/lib/postgresql/data/pgdata -c archive_mode=o
     ko t_ha_failover_diff_chain_restore "restored node never finished recovery / promoted"
     fail_dump t_ha_failover_diff_chain_restore "$restore_n"
     docker rm -f "$restore_n" >/dev/null 2>&1 || true
+    docker volume rm "${restore_n}-vol" >/dev/null 2>&1 || true
     teardown_scope "$scope"
     return
   fi
@@ -2305,6 +2306,7 @@ exec gosu postgres postgres -D /var/lib/postgresql/data/pgdata -c archive_mode=o
     ko t_ha_failover_diff_chain_restore "restored data incomplete; markers='$markers'"
     fail_dump t_ha_failover_diff_chain_restore "$restore_n"
     docker rm -f "$restore_n" >/dev/null 2>&1 || true
+    docker volume rm "${restore_n}-vol" >/dev/null 2>&1 || true
     teardown_scope "$scope"
     return
   fi
