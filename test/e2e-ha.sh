@@ -1017,19 +1017,32 @@ t_watcher_gap_recovery_full() {
   # state machine needs to see the catalog actually move; a single
   # switch may race the next iteration.
   #
-  # Poll for "gap-recovery state cleared" directly rather than the diff
-  # backup log: clear_gap_recovery_state is called AFTER run_backup returns,
-  # which itself logs "backup completed" before emit_pitr_anchor and
-  # refresh_archiver_stats (two psql round-trips). Polling the diff count
-  # and then immediately grepping for the second log races that async gap.
+  # Poll for the gap-recovery-diff clear specifically (reason=cleared by
+  # gap-recovery diff) rather than the generic "gap-recovery state cleared"
+  # message: that message is shared with the unrelated full-backup path
+  # (clear_gap_recovery_state's "cleared by full backup" reason), which
+  # reliably fires moments earlier in this same test — the leader's very
+  # first archive-push always fails before stanza-create exists, tripping
+  # decide_gap_recovery's failed_trigger before the initial full has even
+  # landed; decide_action's NEEDS_INITIAL_BACKUP check (which runs before
+  # the gap-marker gate) then takes that full regardless, incidentally
+  # clearing the marker gap-recovery had just written. Matching the bare
+  # substring made this loop's first iteration false-hit on that stale,
+  # pre-existing log line instead of waiting for the diff this test
+  # actually injects the marker to provoke — see
+  # 'no gap-recovery diff' failures for the symptom.
+  # grep -c (not -q) keeps the pipe SIGPIPE-free under `set -o pipefail`:
+  # -q exits on first match, and once the container's log outgrows the
+  # pipe buffer that early exit SIGPIPEs docker logs, which pipefail then
+  # reports as a false-negative failure even though the pattern matched.
   local deadline=$(($(date +%s) + 90)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null 2>&1
-    if logs_contain "$leader" "gap-recovery state cleared"; then hit=1; break; fi
+    if docker logs "$leader" 2>&1 | grep -c "cleared by gap-recovery diff" >/dev/null; then hit=1; break; fi
     sleep 3
   done
   if [ "$hit" != "1" ]; then
-    ko t_watcher_gap_recovery_full "expected 'gap-recovery state cleared' log line"
+    ko t_watcher_gap_recovery_full "expected 'cleared by gap-recovery diff' log line"
     fail_dump t_watcher_gap_recovery_full "$leader"
     teardown_scope "$scope"
     return
