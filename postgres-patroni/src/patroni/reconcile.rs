@@ -43,8 +43,7 @@ use tracing::{info, warn};
 
 const PATRONI_REST: &str = "http://localhost:8008";
 const EXPECTED_ARCHIVE_MODE: &str = "on";
-pub(crate) const EXPECTED_ARCHIVE_COMMAND: &str =
-    "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
+const EXPECTED_ARCHIVE_COMMAND: &str = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
 // Bounded poll before concluding Patroni's own dynamic-config sync missed
 // this node, rather than just being a loop_wait cycle behind a patch we
 // ourselves may have just issued moments ago. Only SUCCESSFUL reads count
@@ -341,7 +340,8 @@ async fn clear_forced_sentinel(data_dir: &str) {
 /// [`verify_and_heal_live_archive_config`] only auto-corrects when every
 /// mismatching field clears this bar, and reports otherwise.
 fn looks_like_never_applied(live: &LiveArchiveGucs, expected_archive_timeout: i64) -> bool {
-    let command_ok = live.archive_command == EXPECTED_ARCHIVE_COMMAND || live.archive_command.is_empty();
+    let command_ok =
+        live.archive_command == EXPECTED_ARCHIVE_COMMAND || live.archive_command.is_empty();
     let timeout_ok =
         live.archive_timeout_secs == expected_archive_timeout || live.archive_timeout_secs == 0;
     command_ok && timeout_ok
@@ -399,6 +399,11 @@ async fn verify_and_heal_live_archive_config(
         info!(
             "live archive_command/archive_timeout corrected via ALTER SYSTEM + pg_reload_conf()"
         );
+        telemetry.send(TelemetryEvent::ArchiveConfigForced {
+            node: config.name.clone(),
+            live_archive_command: live.archive_command,
+            live_archive_timeout_secs: live.archive_timeout_secs,
+        });
         return Ok(());
     }
 
@@ -589,15 +594,29 @@ pub async fn reconcile_pgbackrest_archive_config(
         // cluster-wide state, cleared once by whichever node reconciles
         // first, but the ALTER SYSTEM pin from force_live_archive_gucs
         // lives in each node's own postgresql.auto.conf — every node must
-        // clear its own regardless of who won the DCS race.
-        if archive_gucs_pinned_in_auto_conf(&config.data_dir).await {
-            reset_live_archive_gucs(&config.superuser).await?;
+        // clear its own regardless of who won the DCS race. Gated on the
+        // sentinel, same as the enable path: our pin never exists without
+        // one (written before the force; pg_basebackup/pgBackRest copy the
+        // pair into clones and backups together), so a pin without a
+        // sentinel is an operator's own ALTER SYSTEM edit — theirs to keep
+        // even with PITR off, and this branch runs on every boot of every
+        // cluster that never enabled PITR at all.
+        if archive_gucs_forced_by_us(&config.data_dir).await {
+            if archive_gucs_pinned_in_auto_conf(&config.data_dir).await {
+                reset_live_archive_gucs(&config.superuser).await?;
+            }
+            // After the reset (not before): a failed reset propagates above
+            // and keeps the sentinel for the retry. Cleared even when no
+            // pin was found — an operator may have RESET the GUCs by hand,
+            // and a stale sentinel would cause a pointless reset on a later
+            // re-enable.
+            clear_forced_sentinel(&config.data_dir).await;
+        } else if archive_gucs_pinned_in_auto_conf(&config.data_dir).await {
+            warn!(
+                "archive GUCs pinned in postgresql.auto.conf without our sentinel — \
+                 operator-set, leaving in place (PITR disabled)"
+            );
         }
-        // After the reset (not before): a failed reset propagates above and
-        // keeps the sentinel for the retry. Cleared even when no pin was
-        // found — an operator may have RESET the GUCs by hand, and a stale
-        // sentinel would cause a pointless reset on a later re-enable.
-        clear_forced_sentinel(&config.data_dir).await;
 
         if archive_mode.is_none() && archive_command.is_none() && archive_timeout.is_none() {
             info!("DCS archive config already absent (PITR disabled)");

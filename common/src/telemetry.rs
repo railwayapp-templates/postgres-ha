@@ -130,6 +130,19 @@ pub enum TelemetryEvent {
         expected_archive_timeout_secs: i64,
     },
 
+    /// Live `archive_command`/`archive_timeout` on this node diverged from
+    /// a correct DCS in exactly the shape Patroni's apply-race leaves
+    /// behind (see reconcile.rs), and was force-corrected via
+    /// `ALTER SYSTEM` + `pg_reload_conf()`. Every occurrence is a confirmed
+    /// hit of the race that would otherwise have been an invisible
+    /// PITR-coverage gap — fleet-wide frequency of this event measures how
+    /// often the upstream Patroni bug actually fires.
+    ArchiveConfigForced {
+        node: String,
+        live_archive_command: String,
+        live_archive_timeout_secs: i64,
+    },
+
     // === etcd Events ===
     /// etcd cluster bootstrap initiated
     EtcdBootstrap {
@@ -218,6 +231,7 @@ impl TelemetryEvent {
             Self::SelfHealGaveUp { .. } => "POSTGRES_HA_SELF_HEAL_GAVE_UP",
             Self::IncompleteCloneWiped { .. } => "POSTGRES_HA_INCOMPLETE_CLONE_WIPED",
             Self::ArchiveConfigDrifted { .. } => "POSTGRES_HA_ARCHIVE_CONFIG_DRIFTED",
+            Self::ArchiveConfigForced { .. } => "POSTGRES_HA_ARCHIVE_CONFIG_FORCED",
             Self::EtcdBootstrap { .. } => "ETCD_CLUSTER_BOOTSTRAP",
             Self::EtcdNodeJoined { .. } => "ETCD_NODE_JOINED",
             Self::EtcdNodePromoted { .. } => "ETCD_NODE_PROMOTED",
@@ -335,6 +349,16 @@ impl TelemetryEvent {
                 format!(
                     "Archive config on {} doesn't match expected settings (live archive_command={:?}, archive_timeout={}s, expected timeout={}s) — not auto-corrected, looks like it may have been changed intentionally",
                     node, live_archive_command, live_archive_timeout_secs, expected_archive_timeout_secs
+                )
+            }
+            Self::ArchiveConfigForced {
+                node,
+                live_archive_command,
+                live_archive_timeout_secs,
+            } => {
+                format!(
+                    "Archive config on {} was never applied by Patroni despite correct DCS (live archive_command={:?}, archive_timeout={}s) — force-corrected via ALTER SYSTEM + pg_reload_conf()",
+                    node, live_archive_command, live_archive_timeout_secs
                 )
             }
             Self::EtcdBootstrap {
