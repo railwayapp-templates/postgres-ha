@@ -123,9 +123,17 @@ pub enum TelemetryEvent {
     /// intentional `ALTER SYSTEM` edit. Reported rather than overwritten;
     /// an operator who set this on purpose should see why it's flagged,
     /// not have it silently reverted.
+    ///
+    /// Deliberately does NOT carry the live `archive_command` value itself.
+    /// Unlike `ArchiveConfigForced` (only ever the known-safe empty or
+    /// expected-wrapper-script baseline), this is exactly the branch where
+    /// the live value can be genuine, arbitrary operator content — and this
+    /// event is transmitted off-box to Railway's backboard service. Full
+    /// detail is still in the `warn!` immediately preceding this event,
+    /// which stays local to the node's own logs.
     ArchiveConfigDrifted {
         node: String,
-        live_archive_command: String,
+        live_archive_command_matches_expected: bool,
         live_archive_timeout_secs: i64,
         expected_archive_timeout_secs: i64,
     },
@@ -342,13 +350,13 @@ impl TelemetryEvent {
             }
             Self::ArchiveConfigDrifted {
                 node,
-                live_archive_command,
+                live_archive_command_matches_expected,
                 live_archive_timeout_secs,
                 expected_archive_timeout_secs,
             } => {
                 format!(
-                    "Archive config on {} doesn't match expected settings (live archive_command={:?}, archive_timeout={}s, expected timeout={}s) — not auto-corrected, looks like it may have been changed intentionally",
-                    node, live_archive_command, live_archive_timeout_secs, expected_archive_timeout_secs
+                    "Archive config on {} doesn't match expected settings (archive_command matches expected: {}, archive_timeout={}s, expected timeout={}s) — not auto-corrected, looks like it may have been changed intentionally",
+                    node, live_archive_command_matches_expected, live_archive_timeout_secs, expected_archive_timeout_secs
                 )
             }
             Self::ArchiveConfigForced {

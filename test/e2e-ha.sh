@@ -1849,6 +1849,114 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
   teardown_scope "$scope"
 }
 
+# looks_like_never_applied's value-shape heuristic alone can't tell the
+# apply-race apart from an operator who deliberately chose a
+# baseline-looking value: ALTER SYSTEM SET archive_timeout = 0 (turning off
+# timeout-based switching on purpose) while archive_command is already
+# correct is byte-for-byte identical, at the live-GUC level, to the race's
+# own end state. should_force_heal's foreign-auto.conf-pin gate is what's
+# supposed to tell them apart — a pin with no
+# ".railway_forced_archive_gucs" sentinel can only be an operator's own
+# edit (reconcile always clears its own pin before this check runs), so
+# the live-check must report it via ArchiveConfigDrifted rather than
+# silently reverting it back to 60, even though the value alone looks like
+# the race.
+t_ha_enabled_pitr_preserves_operator_archive_timeout_pin() {
+  local scope=t-foreigntimeout-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher))
+
+  local leader; leader=$(wait_for_leader "$scope" 180) || { ko t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "no leader"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader" 90 || { ko t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "no stanza-create"; teardown_scope "$scope"; return; }
+
+  local pgdata=/var/lib/postgresql/data/pgdata
+  local auto_conf=$pgdata/postgresql.auto.conf
+  local sentinel=$pgdata/.railway_forced_archive_gucs
+
+  local before; before=$(docker exec -u postgres "$leader" psql -tAc "SHOW archive_command;" 2>/dev/null)
+  if [ "$before" != "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p" ]; then
+    ko t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "archive_command not correctly set before the test even started: '$before'"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Pin ONLY archive_timeout, to a value indistinguishable from the race's
+  # own baseline (0) — archive_command is deliberately left untouched and
+  # correct, mirroring the exact partial-mismatch shape
+  # looks_like_never_applied is designed to auto-heal.
+  log "setting archive_timeout=0 on $leader via ALTER SYSTEM (archive_command left alone, no sentinel)"
+  docker exec -u postgres "$leader" psql -c "ALTER SYSTEM SET archive_timeout = 0;" -c "SELECT pg_reload_conf();" >/dev/null
+  sleep 2
+  if ! docker exec "$leader" grep -q "^archive_timeout = '0'" "$auto_conf"; then
+    ko t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "failed to set operator pin for the test; auto.conf missing the archive_timeout pin"
+    fail_dump t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if docker exec "$leader" test -f "$sentinel"; then
+    ko t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "sentinel unexpectedly present before restart — test setup invalid"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Restart re-runs patroni-runner's startup sequence, including the
+  # one-shot reconcile task and its live-check poll. With no sentinel, the
+  # foreign-pin gate must win over looks_like_never_applied's baseline
+  # heuristic and leave the pin alone.
+  log "restarting $leader to re-trigger the boot-time reconcile pass"
+  docker restart "$leader" >/dev/null
+
+  local deadline=$(($(date +%s) + 120)) settled=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec -u postgres "$leader" psql -tAc "SELECT 1;" >/dev/null 2>&1; then
+      settled=1
+      break
+    fi
+    sleep 3
+  done
+
+  if [ "$settled" != "1" ]; then
+    ko t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "postgres never came back up within 120s of restart"
+    fail_dump t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  # Give the boot-time reconcile task's live-check poll its full window
+  # (LIVE_CHECK_MAX_ATTEMPTS * LIVE_CHECK_INTERVAL = 60s) plus margin to
+  # run to completion before asserting nothing was force-corrected — this
+  # is checking for the ABSENCE of an action, so it must outlast the
+  # window the bug would need to fire in, not just glance at the state.
+  sleep 75
+
+  if ! docker exec "$leader" grep -q "^archive_timeout = '0'" "$auto_conf"; then
+    ko t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "operator's archive_timeout pin was reset — a foreign pin must not be overwritten even at a baseline-looking value"
+    fail_dump t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if docker exec "$leader" test -f "$sentinel"; then
+    ko t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "our sentinel appeared — reconcile force-corrected an operator's pin it should have left alone"
+    fail_dump t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if ! docker logs "$leader" 2>&1 | grep -c "pinned in postgresql.auto.conf by something other than us" >/dev/null; then
+    ko t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "pin survived but the diagnostic log line never fired — check the foreign-pin gate actually ran"
+    fail_dump t_ha_enabled_pitr_preserves_operator_archive_timeout_pin "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_enabled_pitr_preserves_operator_archive_timeout_pin
+  note "operator's baseline-looking archive_timeout pin survived reconcile's live-check with no sentinel present"
+  teardown_scope "$scope"
+}
+
 # H7. Failover handoff: kill the leader, new leader is elected, NEW
 # leader's watcher takes over within one poll cycle. Archive head
 # keeps growing without gap. The marquee HA test.
@@ -2407,6 +2515,9 @@ ALL_TESTS=(
   # disable-path pin reset must not touch an operator's own ALTER SYSTEM
   # archive_command when PITR was never enabled (no forced-GUCs sentinel)
   t_ha_disabled_pitr_preserves_operator_archive_pin
+  # foreign auto.conf pin wins over the value-shape heuristic even when
+  # PITR is enabled and the pinned value looks like the race's baseline
+  t_ha_enabled_pitr_preserves_operator_archive_timeout_pin
   t_ha_failover_watcher_handoff
   # catalog-history adoption on promotion (S3 catalog fix)
   t_ha_failover_adopts_catalog_history
