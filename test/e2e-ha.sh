@@ -1714,8 +1714,50 @@ t_ha_archive_config_live_reconcile_heals_after_restart() {
     return
   fi
 
+  # Phase 2 — the heal wrote an ALTER SYSTEM pin (postgresql.auto.conf)
+  # plus a sentinel marking the pin as ours. On the NEXT boot reconcile
+  # must reset the pin, drop the sentinel, and re-verify against Patroni's
+  # own rendered config — a stale pin outranks postgresql.conf and would
+  # shadow any future env-driven archive_timeout change forever.
+  local pgdata=/var/lib/postgresql/data/pgdata
+  local sentinel=$pgdata/.railway_forced_archive_gucs
+  if ! docker exec "$leader" test -f "$sentinel"; then
+    ko t_ha_archive_config_live_reconcile_heals_after_restart "heal ran but the forced-GUCs sentinel was not written"
+    fail_dump t_ha_archive_config_live_reconcile_heals_after_restart "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  log "restarting $leader again — the pin + sentinel must self-clean"
+  docker restart "$leader" >/dev/null
+
+  deadline=$(($(date +%s) + 120))
+  local cleaned=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    # One compound probe: sentinel gone, no archive pin lines left in
+    # auto.conf, and the live GUC still correct — now served by Patroni's
+    # rendered config rather than the pin. The live value is echoed only
+    # when the file-state conditions hold, so a single string compare
+    # gates all three.
+    local state
+    state=$(docker exec -u postgres "$leader" sh -c \
+      "test ! -f '$sentinel' && ! grep -q '^archive_' '$pgdata/postgresql.auto.conf' && psql -tAc 'SHOW archive_command;'" 2>/dev/null)
+    if [ "$state" = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p" ]; then
+      cleaned=1
+      break
+    fi
+    sleep 3
+  done
+
+  if [ "$cleaned" != "1" ]; then
+    ko t_ha_archive_config_live_reconcile_heals_after_restart "pin + sentinel never self-cleaned within 120s of the second restart"
+    fail_dump t_ha_archive_config_live_reconcile_heals_after_restart "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
   ok t_ha_archive_config_live_reconcile_heals_after_restart
-  note "live archive_command healed by the boot-time reconcile pass alone, no backup attempt involved"
+  note "healed by the boot-time reconcile alone, and the ALTER SYSTEM pin self-cleaned on the following boot"
   teardown_scope "$scope"
 }
 
