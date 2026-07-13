@@ -1648,6 +1648,220 @@ t_ha_restore_gate_logged_on_every_node() {
   teardown_scope "$scope"
 }
 
+# Patroni's own dynamic-config sync has a startup race: a node's first
+# set_dynamic_configuration call can land while its own Postgres isn't yet
+# RUNNING (e.g. mid-basebackup on a freshly-joining replica), which silently
+# skips the actual postgresql.conf write + reload — but Patroni still marks
+# that DCS config version as "seen" and never revisits it, even though it
+# was never truly applied. reconcile_pgbackrest_archive_config's DCS-only
+# check then reads as permanently correct while the live GUC stays wrong.
+# Confirmed happening in practice: a freshly-booted replica with a
+# provably-correct DCS config and a live archive_command of ''.
+#
+# This test doesn't try to win that race (rare, boot-order-dependent) —
+# it simulates the END STATE directly (DCS correct, live wrong) via
+# ALTER SYSTEM, then restarts the node to re-run reconcile's one-shot
+# boot check, and asserts it self-heals the live GUC with NO backup
+# attempt involved. This is the key difference from a backup-triggered
+# repair: WAL archiving itself (individual segment archive-push, not just
+# pgbackrest's backup command) is broken by this bug and stays broken
+# until something checks the live value — reconcile now does that on
+# every boot, closing the gap before a node is ever promoted.
+t_ha_archive_config_live_reconcile_heals_after_restart() {
+  local scope=t-livereconcile-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher))
+
+  local leader; leader=$(wait_for_leader "$scope" 180) || { ko t_ha_archive_config_live_reconcile_heals_after_restart "no leader"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader" 90 || { ko t_ha_archive_config_live_reconcile_heals_after_restart "no stanza-create"; teardown_scope "$scope"; return; }
+
+  local before; before=$(docker exec -u postgres "$leader" psql -tAc "SHOW archive_command;" 2>/dev/null)
+  if [ "$before" != "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p" ]; then
+    ko t_ha_archive_config_live_reconcile_heals_after_restart "archive_command not correctly set before the test even started: '$before'"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Simulate the bug's end state directly: DCS stays correct (untouched),
+  # only the live GUC is broken — exactly what a missed dynamic-config
+  # sync produces. Bypassing Patroni entirely, same as the bug itself.
+  log "breaking live archive_command on $leader via ALTER SYSTEM (DCS untouched)"
+  docker exec -u postgres "$leader" psql -c "ALTER SYSTEM SET archive_command = '';" -c "SELECT pg_reload_conf();" >/dev/null
+  sleep 2
+  local broken; broken=$(docker exec -u postgres "$leader" psql -tAc "SHOW archive_command;" 2>/dev/null)
+  if [ -n "$broken" ]; then
+    ko t_ha_archive_config_live_reconcile_heals_after_restart "failed to break archive_command for the test; still '$broken'"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Restart re-runs patroni-runner's startup sequence, including the
+  # one-shot reconcile task — the ONLY thing this test needs to trigger
+  # the fix. No backup, no promotion, no watcher activity required.
+  log "restarting $leader to re-trigger the boot-time reconcile pass"
+  docker restart "$leader" >/dev/null
+
+  local deadline=$(($(date +%s) + 120)) healed=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local live; live=$(docker exec -u postgres "$leader" psql -tAc "SHOW archive_command;" 2>/dev/null)
+    if [ "$live" = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p" ]; then
+      healed=1
+      break
+    fi
+    sleep 3
+  done
+
+  if [ "$healed" != "1" ]; then
+    ko t_ha_archive_config_live_reconcile_heals_after_restart "live archive_command never healed within 120s of restart"
+    fail_dump t_ha_archive_config_live_reconcile_heals_after_restart "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if ! docker logs "$leader" 2>&1 | grep -c "Patroni's dynamic-config sync silently missed this node" >/dev/null; then
+    ko t_ha_archive_config_live_reconcile_heals_after_restart "archive_command healed but the diagnostic log line never fired — check reconcile's live-check path actually ran"
+    fail_dump t_ha_archive_config_live_reconcile_heals_after_restart "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Phase 2 — the heal wrote an ALTER SYSTEM pin (postgresql.auto.conf)
+  # plus a sentinel marking the pin as ours. On the NEXT boot reconcile
+  # must reset the pin, drop the sentinel, and re-verify against Patroni's
+  # own rendered config — a stale pin outranks postgresql.conf and would
+  # shadow any future env-driven archive_timeout change forever.
+  local pgdata=/var/lib/postgresql/data/pgdata
+  local sentinel=$pgdata/.railway_forced_archive_gucs
+  if ! docker exec "$leader" test -f "$sentinel"; then
+    ko t_ha_archive_config_live_reconcile_heals_after_restart "heal ran but the forced-GUCs sentinel was not written"
+    fail_dump t_ha_archive_config_live_reconcile_heals_after_restart "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  log "restarting $leader again — the pin + sentinel must self-clean"
+  docker restart "$leader" >/dev/null
+
+  deadline=$(($(date +%s) + 120))
+  local cleaned=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    # One compound probe: sentinel gone, no archive pin lines left in
+    # auto.conf, and the live GUC still correct — now served by Patroni's
+    # rendered config rather than the pin. The live value is echoed only
+    # when the file-state conditions hold, so a single string compare
+    # gates all three.
+    local state
+    state=$(docker exec -u postgres "$leader" sh -c \
+      "test ! -f '$sentinel' && ! grep -q '^archive_' '$pgdata/postgresql.auto.conf' && psql -tAc 'SHOW archive_command;'" 2>/dev/null)
+    if [ "$state" = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p" ]; then
+      cleaned=1
+      break
+    fi
+    sleep 3
+  done
+
+  if [ "$cleaned" != "1" ]; then
+    ko t_ha_archive_config_live_reconcile_heals_after_restart "pin + sentinel never self-cleaned within 120s of the second restart"
+    fail_dump t_ha_archive_config_live_reconcile_heals_after_restart "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_archive_config_live_reconcile_heals_after_restart
+  note "healed by the boot-time reconcile alone, and the ALTER SYSTEM pin self-cleaned on the following boot"
+  teardown_scope "$scope"
+}
+
+# reconcile's disable-path reset must only ever clear a pin IT wrote — an
+# operator who set their own archive_command via ALTER SYSTEM on a
+# PITR-disabled cluster (no WAL_ARCHIVE_BUCKET at all) carries a pin with
+# no ".railway_forced_archive_gucs" sentinel, and that's indistinguishable
+# from ours at the auto.conf level. Without the sentinel gate, the
+# disable-path reset (which runs on every boot of every non-PITR cluster)
+# would wipe it on the next restart with no telemetry — silently
+# overwriting something a human set on purpose, which is exactly the
+# behavior the enable-path drift check already refuses to do.
+t_ha_disabled_pitr_preserves_operator_archive_pin() {
+  local scope=t-foreignpin-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # No archive_env_fast_watcher: WAL_ARCHIVE_BUCKET stays unset, PITR
+  # disabled from the very first boot.
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
+
+  local leader; leader=$(wait_for_leader "$scope" 180) || { ko t_ha_disabled_pitr_preserves_operator_archive_pin "no leader"; teardown_scope "$scope"; return; }
+
+  local pgdata=/var/lib/postgresql/data/pgdata
+  local auto_conf=$pgdata/postgresql.auto.conf
+  local sentinel=$pgdata/.railway_forced_archive_gucs
+
+  log "setting an operator archive_command on $leader via ALTER SYSTEM (no sentinel, PITR disabled)"
+  docker exec -u postgres "$leader" psql -c "ALTER SYSTEM SET archive_command = '/bin/true';" -c "SELECT pg_reload_conf();" >/dev/null
+  sleep 2
+  # archive_mode stays 'off' on this cluster for the test's whole
+  # lifetime (WAL_ARCHIVE_BUCKET was never set), and Postgres's own
+  # show_archive_command() GUC hook masks archive_command as literal
+  # "(disabled)" via SHOW/current_setting()/pg_settings.setting whenever
+  # archive_mode is off — checked auto.conf directly instead, which is
+  # exactly what archive_gucs_pinned_in_auto_conf itself reads.
+  if ! docker exec "$leader" grep -q "^archive_command = '/bin/true'" "$auto_conf"; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "failed to set operator pin for the test; auto.conf missing the pin"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if docker exec "$leader" test -f "$sentinel"; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "sentinel unexpectedly present before restart — test setup invalid"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Restart re-runs patroni-runner's startup sequence, including the
+  # disable-path reset. With no sentinel, it must leave the pin alone.
+  log "restarting $leader to re-trigger the boot-time reconcile pass"
+  docker restart "$leader" >/dev/null
+
+  local deadline=$(($(date +%s) + 120)) settled=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec -u postgres "$leader" psql -tAc "SELECT 1;" >/dev/null 2>&1; then
+      settled=1
+      break
+    fi
+    sleep 3
+  done
+
+  if [ "$settled" != "1" ]; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "postgres never came back up within 120s of restart"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  # Give the boot-time reconcile task a moment to run its (fast,
+  # no-poll) disable-path branch before asserting on its outcome.
+  sleep 5
+
+  if ! docker exec "$leader" grep -q "^archive_command = '/bin/true'" "$auto_conf"; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "operator's archive_command pin was reset — disable-path reset must not touch a pin without our sentinel"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if ! docker logs "$leader" 2>&1 | grep -c "operator-set, leaving in place" >/dev/null; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "pin survived but the diagnostic log line never fired — check reconcile's sentinel-gate actually ran"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_disabled_pitr_preserves_operator_archive_pin
+  note "operator pin survived the disable-path reset with no sentinel present"
+  teardown_scope "$scope"
+}
+
 # H7. Failover handoff: kill the leader, new leader is elected, NEW
 # leader's watcher takes over within one poll cycle. Archive head
 # keeps growing without gap. The marquee HA test.
@@ -2200,6 +2414,12 @@ ALL_TESTS=(
   t_ha_recovery_source_conf_isolation
   t_ha_pghost_pgport_unset
   t_ha_restore_gate_logged_on_every_node
+  # boot-time reconcile self-heals a live archive_command Patroni's own
+  # dynamic-config sync silently failed to apply (DCS-vs-live divergence)
+  t_ha_archive_config_live_reconcile_heals_after_restart
+  # disable-path pin reset must not touch an operator's own ALTER SYSTEM
+  # archive_command when PITR was never enabled (no forced-GUCs sentinel)
+  t_ha_disabled_pitr_preserves_operator_archive_pin
   t_ha_failover_watcher_handoff
   # catalog-history adoption on promotion (S3 catalog fix)
   t_ha_failover_adopts_catalog_history
