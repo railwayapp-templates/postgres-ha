@@ -362,47 +362,19 @@ async fn clear_forced_sentinel(data_dir: &str) {
 /// already correct (set by an earlier config pass, or never touched by
 /// this specific race) — requiring *both* fields to be simultaneously
 /// blank would misclassify that exact, documented case as "maybe
-/// intentional" and leave it unfixed. Any mismatching field that ISN'T at
-/// this baseline is a real, distinct value a human could plausibly have
-/// set. This value-shape check alone is necessary but not sufficient,
-/// though: an operator *can* deliberately choose a baseline-looking value
-/// (e.g. `ALTER SYSTEM SET archive_timeout = 0` to turn off timeout-based
-/// switching on purpose), which is exactly why [`should_force_heal`] also
-/// gates on whether a foreign `postgresql.auto.conf` pin is present before
-/// treating this function's answer as license to auto-correct.
+/// intentional" and leave it unfixed. Nobody chooses these baseline
+/// values on purpose (an intentional `archive_timeout` edit is never
+/// literally "off", and a hand-set `archive_command` is never the empty
+/// string), so any mismatching field that ISN'T at this baseline is a
+/// real, distinct value a human could plausibly have set —
+/// [`verify_and_heal_live_archive_config`] only auto-corrects when every
+/// mismatching field clears this bar, and reports otherwise.
 fn looks_like_never_applied(live: &LiveArchiveGucs, expected_archive_timeout: i64) -> bool {
     let command_ok =
         live.archive_command == EXPECTED_ARCHIVE_COMMAND || live.archive_command.is_empty();
     let timeout_ok =
         live.archive_timeout_secs == expected_archive_timeout || live.archive_timeout_secs == 0;
     command_ok && timeout_ok
-}
-
-/// Whether [`verify_and_heal_live_archive_config`] should force-correct via
-/// [`force_live_archive_gucs`], vs. only report
-/// [`TelemetryEvent::ArchiveConfigDrifted`] and leave the live value alone.
-///
-/// [`looks_like_never_applied`]'s value-shape heuristic alone can't tell
-/// the race apart from deliberate operator intent: Postgres's own untouched
-/// baseline (`archive_command` empty, `archive_timeout` `0`) is exactly the
-/// value an operator would see who ran e.g. `ALTER SYSTEM SET
-/// archive_timeout = 0` on purpose (to turn off timeout-based switching
-/// entirely) while leaving `archive_command` alone. `has_foreign_auto_conf_pin`
-/// closes that gap: by the time this runs, the caller has already reset and
-/// cleared any pin *this module* previously wrote (see
-/// `reconcile_pgbackrest_archive_config`'s enabled branch), so an
-/// `archive_command`/`archive_timeout` line still present in
-/// `postgresql.auto.conf` can only be an operator's own `ALTER SYSTEM` edit
-/// — Patroni itself never writes to `auto.conf`, only to `postgresql.conf`.
-/// A foreign pin is proof of deliberate intent regardless of which value it
-/// happens to pin to, so it wins over the value-shape heuristic rather than
-/// the other way around.
-fn should_force_heal(
-    live: &LiveArchiveGucs,
-    expected_archive_timeout: i64,
-    has_foreign_auto_conf_pin: bool,
-) -> bool {
-    !has_foreign_auto_conf_pin && looks_like_never_applied(live, expected_archive_timeout)
 }
 
 /// Verify the live Postgres GUCs actually match `expected_archive_timeout`,
@@ -420,11 +392,11 @@ fn should_force_heal(
 /// with a provably-correct DCS config and a live `archive_command` of ''.
 /// If that replica is later promoted, WAL archiving silently never starts.
 ///
-/// Only [`should_force_heal`] divergence is auto-corrected. Any other live
-/// value is reported via [`TelemetryEvent::ArchiveConfigDrifted`] and left
-/// alone — it's indistinguishable from an operator's own `ALTER SYSTEM`
-/// edit, and this module has no business silently overwriting something a
-/// human may have set on purpose.
+/// Only [`looks_like_never_applied`] divergence is auto-corrected. Any
+/// other live value is reported via [`TelemetryEvent::ArchiveConfigDrifted`]
+/// and left alone — it's indistinguishable from an operator's own
+/// `ALTER SYSTEM` edit, and this module has no business silently
+/// overwriting something a human may have set on purpose.
 async fn verify_and_heal_live_archive_config(
     config: &Config,
     telemetry: &Telemetry,
@@ -453,12 +425,7 @@ async fn verify_and_heal_live_archive_config(
         LivePoll::Diverged(live) => live,
     };
 
-    // Any pin still present here can only be an operator's own — the caller
-    // already reset and cleared our own pin (if any) immediately before
-    // this call. See `should_force_heal`.
-    let has_foreign_auto_conf_pin = archive_gucs_pinned_in_auto_conf(&config.data_dir).await?;
-
-    if should_force_heal(&live, expected_archive_timeout, has_foreign_auto_conf_pin) {
+    if looks_like_never_applied(&live, expected_archive_timeout) {
         warn!(
             live_archive_command = %live.archive_command,
             live_archive_timeout = live.archive_timeout_secs,
@@ -481,10 +448,8 @@ async fn verify_and_heal_live_archive_config(
     warn!(
         live_archive_command = %live.archive_command,
         live_archive_timeout = live.archive_timeout_secs,
-        foreign_auto_conf_pin = has_foreign_auto_conf_pin,
         "live archive config diverged from DCS but doesn't look like the known apply-race \
-         (not the untouched baseline, or pinned in postgresql.auto.conf by something other \
-         than us) — reporting, not overwriting"
+         (not the untouched baseline) — reporting, not overwriting"
     );
     telemetry.send(TelemetryEvent::ArchiveConfigDrifted {
         node: config.name.clone(),
@@ -827,33 +792,6 @@ mod tests {
             &gucs(EXPECTED_ARCHIVE_COMMAND, 60),
             60
         ));
-    }
-
-    #[test]
-    fn foreign_auto_conf_pin_blocks_force_even_at_baseline_value() {
-        // The exact gap looks_like_never_applied's value-shape check can't
-        // close on its own: an operator who deliberately ran `ALTER SYSTEM
-        // SET archive_timeout = 0` (disabling timeout-based switching on
-        // purpose) while archive_command is already correct looks
-        // byte-for-byte identical to the race's own end state. A foreign
-        // auto.conf pin is the tie-breaker — it proves the value was set on
-        // purpose, so should_force_heal must refuse to overwrite it even
-        // though looks_like_never_applied alone would say "force".
-        assert!(looks_like_never_applied(
-            &gucs(EXPECTED_ARCHIVE_COMMAND, 0),
-            60
-        ));
-        assert!(!should_force_heal(
-            &gucs(EXPECTED_ARCHIVE_COMMAND, 0),
-            60,
-            true
-        ));
-    }
-
-    #[test]
-    fn no_foreign_pin_defers_to_the_value_shape_heuristic() {
-        assert!(should_force_heal(&gucs("", 60), 60, false));
-        assert!(!should_force_heal(&gucs("/bin/true", 0), 60, false));
     }
 
     /// Scripted stand-in for [`query_live_archive_gucs`]. Panics if the
