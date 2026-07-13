@@ -2192,10 +2192,24 @@ t_ha_wal_archive_stall_dwell_gates_reinit() {
   # slower); the dwell/reinit assertions below are unaffected because the
   # WAL probe reads pg_wal offline and the monitor keeps classifying
   # Waiting across postgres crash cycles.
+  #
+  # The RUNTIME self-heal watcher (self_heal.rs) spawns alongside startup
+  # monitoring and sees the same breaker-induced crash loop: its
+  # start-failed dwell (180s) and crash-loop counter race the dwell-gated
+  # startup path to POST /reinitialize, and when they win (observed:
+  # reason=patroni_start_failed at ~190s, node recovered 40s later before
+  # the startup line ever logged) this test can no longer tell whether the
+  # gate it exists to prove works at all. Push both of the watcher's
+  # crash signals out of reach on this node so the startup monitor is the
+  # only reinit actor; the watcher's third trigger (timeline divergence)
+  # needs a healthy running/streaming replica and cannot fire here. The
+  # watcher's own behavior is covered by its unit tests.
   # shellcheck disable=SC2046
   RUN_NODE_VOLUME="${replica}-vol-tmpfs" run_patroni_node "$scope" "$etcd_hosts" "$replica" $(archive_env_fast_watcher) \
     -e "WAL_ARCHIVE_STALL_CONFIRM_SECONDS=${confirm_secs}" \
-    -e "WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=10"
+    -e "WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=10" \
+    -e "SELF_HEAL_START_FAILED_DWELL_SECONDS=100000" \
+    -e "SELF_HEAL_CRASH_LOOP_THRESHOLD=100000"
 
   # First positive WAL-too-old verdict arms at ~30s of zero progress
   # (WAL_PROBE_GRACE_SECS). Sample shortly after that — before the dwell

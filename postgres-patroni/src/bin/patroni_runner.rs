@@ -6,7 +6,10 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use common::init_logging;
+use nix::sys::signal::{SigHandler, Signal};
 use nix::sys::stat::{umask, Mode};
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::{ForkResult, Pid};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
@@ -20,6 +23,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -1253,8 +1257,98 @@ fn spawn_bootstrap_stanza_create() {
     });
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// PID of the real patroni-runner process, for the mini-init's
+/// signal-forwarding handler. Written exactly once, before the handlers
+/// are installed.
+static MINI_INIT_CHILD: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn mini_init_forward(sig: nix::libc::c_int) {
+    let pid = MINI_INIT_CHILD.load(Ordering::Relaxed);
+    if pid > 0 {
+        // Async-signal-safe: raw kill only.
+        unsafe { nix::libc::kill(pid, sig) };
+    }
+}
+
+/// Run as a minimal init: fork, let the child continue as the real
+/// program, and keep the parent behind as the process the kernel hands
+/// orphans to — reaping them forever and forwarding terminal signals to
+/// the child.
+///
+/// This process is PID 1 in the container (postgres-wrapper and gosu both
+/// exec into us), and PID 1 inherits every orphaned descendant. Reaping
+/// them is not cosmetic: Patroni's stop-timeout path
+/// (`PostmasterProcess.signal_kill`) SIGKILLs the postmaster BEFORE its
+/// children, so those children die as orphans — and then Patroni blocks in
+/// `psutil.wait_procs(children + [self])`, which has no timeout and polls
+/// for the PIDs to vanish. An unreaped zombie's PID never vanishes, so the
+/// async task thread that issued the stop (e.g. a reinitialize) hangs
+/// forever, taking Patroni's single task slot with it: every later
+/// `/reinitialize` logs "Cancelling long running task", then blocks on
+/// `_finish_event.wait()` for a thread that can never finish. Observed
+/// end-state: "reinitialize in progress" for the rest of the container's
+/// life, immune to postgres dying and to re-issued reinitializes alike.
+///
+/// The fork-parent design (rather than a `waitpid(-1)` loop inside the
+/// tokio process) is what makes blanket reaping safe: the parent has
+/// exactly one direct child of its own, so `waitpid(-1)` can only ever
+/// collect that child or orphans — never the exit status of a subprocess
+/// the real program is still `wait()`ing on.
+///
+/// Returns in the CHILD; the parent never returns (it exits with the
+/// child's status once the child dies).
+fn run_as_mini_init() -> Result<()> {
+    // Belt-and-suspenders for any future entrypoint shuffle that puts a
+    // non-reaping process above us: subreaper routes our subtree's orphans
+    // here even when we are not PID 1. (prctl is Linux-only; the image is.)
+    #[cfg(target_os = "linux")]
+    let _ = nix::sys::prctl::set_child_subreaper(true);
+
+    let child = match unsafe { nix::unistd::fork() }.context("mini-init fork failed")? {
+        ForkResult::Child => return Ok(()),
+        ForkResult::Parent { child } => child,
+    };
+
+    MINI_INIT_CHILD.store(child.as_raw(), Ordering::Relaxed);
+    for sig in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGQUIT, Signal::SIGHUP] {
+        // SAFETY: handler is async-signal-safe (atomic load + kill).
+        unsafe {
+            let _ = nix::sys::signal::signal(sig, SigHandler::Handler(mini_init_forward));
+        }
+    }
+
+    loop {
+        match waitpid(Pid::from_raw(-1), None) {
+            Ok(WaitStatus::Exited(pid, code)) if pid == child => std::process::exit(code),
+            Ok(WaitStatus::Signaled(pid, sig, _)) if pid == child => {
+                std::process::exit(128 + sig as i32)
+            }
+            // An orphan reaped — the entire point of standing here.
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => {}
+            // No children at all: the real child is gone without us seeing
+            // its status (should not happen; don't spin on it).
+            Err(nix::errno::Errno::ECHILD) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("mini-init: waitpid failed: {e}; exiting");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    // Must run before the tokio runtime exists: fork() and threads don't mix.
+    run_as_mini_init()?;
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let _guard = init_logging("patroni-runner");
 
     // Screen WAL_ARCHIVE_BUCKET shape before translation so a junk value
