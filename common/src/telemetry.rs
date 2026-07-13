@@ -116,6 +116,20 @@ pub enum TelemetryEvent {
     /// failing (e.g. a replica volume smaller than the primary).
     IncompleteCloneWiped { node: String, leader: String },
 
+    /// Live `archive_command`/`archive_timeout` on this node diverged from
+    /// what DCS says they should be, and the divergence doesn't look like
+    /// Patroni's own apply-race (see reconcile.rs) — the live value isn't
+    /// the untouched pre-config baseline, so it may be an operator's
+    /// intentional `ALTER SYSTEM` edit. Reported rather than overwritten;
+    /// an operator who set this on purpose should see why it's flagged,
+    /// not have it silently reverted.
+    ArchiveConfigDrifted {
+        node: String,
+        live_archive_command: String,
+        live_archive_timeout_secs: i64,
+        expected_archive_timeout_secs: i64,
+    },
+
     // === etcd Events ===
     /// etcd cluster bootstrap initiated
     EtcdBootstrap {
@@ -203,6 +217,7 @@ impl TelemetryEvent {
             Self::SelfHealRecovered { .. } => "POSTGRES_HA_SELF_HEAL_RECOVERED",
             Self::SelfHealGaveUp { .. } => "POSTGRES_HA_SELF_HEAL_GAVE_UP",
             Self::IncompleteCloneWiped { .. } => "POSTGRES_HA_INCOMPLETE_CLONE_WIPED",
+            Self::ArchiveConfigDrifted { .. } => "POSTGRES_HA_ARCHIVE_CONFIG_DRIFTED",
             Self::EtcdBootstrap { .. } => "ETCD_CLUSTER_BOOTSTRAP",
             Self::EtcdNodeJoined { .. } => "ETCD_NODE_JOINED",
             Self::EtcdNodePromoted { .. } => "ETCD_NODE_PROMOTED",
@@ -309,6 +324,17 @@ impl TelemetryEvent {
                 format!(
                     "Wiped incomplete-clone data dir on {} (non-empty, missing pg_control) — re-cloning from leader {}",
                     node, leader
+                )
+            }
+            Self::ArchiveConfigDrifted {
+                node,
+                live_archive_command,
+                live_archive_timeout_secs,
+                expected_archive_timeout_secs,
+            } => {
+                format!(
+                    "Archive config on {} doesn't match expected settings (live archive_command={:?}, archive_timeout={}s, expected timeout={}s) — not auto-corrected, looks like it may have been changed intentionally",
+                    node, live_archive_command, live_archive_timeout_secs, expected_archive_timeout_secs
                 )
             }
             Self::EtcdBootstrap {

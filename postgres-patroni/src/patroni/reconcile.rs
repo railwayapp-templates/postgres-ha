@@ -35,6 +35,7 @@
 
 use super::Config;
 use anyhow::{Context, Result};
+use common::{Telemetry, TelemetryEvent};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::process::Command;
@@ -268,8 +269,23 @@ async fn archive_gucs_pinned_in_auto_conf(data_dir: &str) -> bool {
     }
 }
 
+/// True when both live GUCs sit at Postgres's own untouched baseline —
+/// `archive_command` empty, `archive_timeout` `0` — rather than at some
+/// other concrete value. This is what the apply-race in
+/// [`verify_and_heal_live_archive_config`]'s doc actually produces: Patroni
+/// never wrote anything, so Postgres is still on whatever it booted with.
+/// Nobody chooses these values on purpose (an intentional
+/// `archive_timeout` edit is never literally "off", and a hand-set
+/// `archive_command` is never the empty string) — anything other than this
+/// exact baseline is a real, distinct value that a human could plausibly
+/// have set, so [`verify_and_heal_live_archive_config`] only auto-corrects
+/// this case and reports every other divergence instead.
+fn looks_like_never_applied(live: &LiveArchiveGucs) -> bool {
+    live.archive_command.is_empty() && live.archive_timeout_secs == 0
+}
+
 /// Verify the live Postgres GUCs actually match `expected_archive_timeout`,
-/// self-healing if Patroni's own sync silently missed this node.
+/// self-healing the specific case Patroni's own sync is known to produce.
 ///
 /// DCS being correct is necessary but not sufficient. Patroni's dynamic
 /// config sync has a startup race: a node's first `set_dynamic_configuration`
@@ -282,13 +298,20 @@ async fn archive_gucs_pinned_in_auto_conf(data_dir: &str) -> bool {
 /// stays empty. Confirmed happening in practice: a freshly-booted replica
 /// with a provably-correct DCS config and a live `archive_command` of ''.
 /// If that replica is later promoted, WAL archiving silently never starts.
+///
+/// Only [`looks_like_never_applied`] divergence is auto-corrected. Any
+/// other live value is reported via [`TelemetryEvent::ArchiveConfigDrifted`]
+/// and left alone — it's indistinguishable from an operator's own
+/// `ALTER SYSTEM` edit, and this module has no business silently
+/// overwriting something a human may have set on purpose.
 async fn verify_and_heal_live_archive_config(
-    superuser: &str,
+    config: &Config,
+    telemetry: &Telemetry,
     expected_archive_timeout: i64,
 ) -> Result<()> {
     let mut last_err = None;
     for attempt in 1..=LIVE_CHECK_ATTEMPTS {
-        match query_live_archive_gucs(superuser).await {
+        match query_live_archive_gucs(&config.superuser).await {
             Ok(live)
                 if live.archive_command == EXPECTED_ARCHIVE_COMMAND
                     && live.archive_timeout_secs == expected_archive_timeout =>
@@ -301,14 +324,31 @@ async fn verify_and_heal_live_archive_config(
                     tokio::time::sleep(LIVE_CHECK_INTERVAL).await;
                     continue;
                 }
+                if looks_like_never_applied(&live) {
+                    warn!(
+                        live_archive_command = %live.archive_command,
+                        live_archive_timeout = live.archive_timeout_secs,
+                        "live archive config diverged from DCS despite DCS being correct — \
+                         Patroni's dynamic-config sync silently missed this node; forcing directly"
+                    );
+                    force_live_archive_gucs(&config.superuser, expected_archive_timeout).await?;
+                    info!(
+                        "live archive_command/archive_timeout corrected via ALTER SYSTEM + pg_reload_conf()"
+                    );
+                    return Ok(());
+                }
                 warn!(
                     live_archive_command = %live.archive_command,
                     live_archive_timeout = live.archive_timeout_secs,
-                    "live archive config diverged from DCS despite DCS being correct — \
-                     Patroni's dynamic-config sync silently missed this node; forcing directly"
+                    "live archive config diverged from DCS but doesn't look like the known apply-race \
+                     (not the untouched baseline) — reporting, not overwriting"
                 );
-                force_live_archive_gucs(superuser, expected_archive_timeout).await?;
-                info!("live archive_command/archive_timeout corrected via ALTER SYSTEM + pg_reload_conf()");
+                telemetry.send(TelemetryEvent::ArchiveConfigDrifted {
+                    node: config.name.clone(),
+                    live_archive_command: live.archive_command,
+                    live_archive_timeout_secs: live.archive_timeout_secs,
+                    expected_archive_timeout_secs: expected_archive_timeout,
+                });
                 return Ok(());
             }
             Err(e) => {
@@ -336,7 +376,10 @@ async fn verify_and_heal_live_archive_config(
 ///   archive_mode from a previous enable doesn't keep firing
 ///   archive_command after disable.
 /// - Idempotent: no patch issued when DCS already matches intent.
-pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> {
+pub async fn reconcile_pgbackrest_archive_config(
+    config: &Config,
+    telemetry: &Telemetry,
+) -> Result<()> {
     let enabled = config.wal_archive_bucket.is_some();
     let expected_archive_timeout = config.archive_timeout_secs;
 
@@ -408,7 +451,7 @@ pub async fn reconcile_pgbackrest_archive_config(config: &Config) -> Result<()> 
             info!("DCS archive params patched in (PITR enabled)");
         }
 
-        verify_and_heal_live_archive_config(&config.superuser, expected_archive_timeout).await?;
+        verify_and_heal_live_archive_config(config, telemetry, expected_archive_timeout).await?;
     } else {
         // Runs BEFORE the DCS-already-absent early return: DCS is
         // cluster-wide state, cleared once by whichever node reconciles
@@ -465,4 +508,43 @@ async fn send_patch(client: &reqwest::Client, patch: &Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gucs(archive_command: &str, archive_timeout_secs: i64) -> LiveArchiveGucs {
+        LiveArchiveGucs {
+            archive_command: archive_command.to_string(),
+            archive_timeout_secs,
+        }
+    }
+
+    #[test]
+    fn never_applied_baseline_is_recognized() {
+        assert!(looks_like_never_applied(&gucs("", 0)));
+    }
+
+    #[test]
+    fn nonempty_command_is_not_never_applied_even_with_zero_timeout() {
+        // A hand-set archive_command with the timeout untouched — still a
+        // concrete value someone could have set on purpose.
+        assert!(!looks_like_never_applied(&gucs("/bin/true", 0)));
+    }
+
+    #[test]
+    fn nonzero_timeout_is_not_never_applied_even_with_empty_command() {
+        assert!(!looks_like_never_applied(&gucs("", 120)));
+    }
+
+    #[test]
+    fn expected_value_is_not_never_applied() {
+        // Confirms the two branches are disjoint: a fully-correct live
+        // config never routes through the never-applied path.
+        assert!(!looks_like_never_applied(&gucs(
+            EXPECTED_ARCHIVE_COMMAND,
+            60
+        )));
+    }
 }
