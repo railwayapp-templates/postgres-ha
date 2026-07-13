@@ -269,19 +269,27 @@ async fn archive_gucs_pinned_in_auto_conf(data_dir: &str) -> bool {
     }
 }
 
-/// True when both live GUCs sit at Postgres's own untouched baseline —
-/// `archive_command` empty, `archive_timeout` `0` — rather than at some
-/// other concrete value. This is what the apply-race in
-/// [`verify_and_heal_live_archive_config`]'s doc actually produces: Patroni
-/// never wrote anything, so Postgres is still on whatever it booted with.
-/// Nobody chooses these values on purpose (an intentional
-/// `archive_timeout` edit is never literally "off", and a hand-set
-/// `archive_command` is never the empty string) — anything other than this
-/// exact baseline is a real, distinct value that a human could plausibly
-/// have set, so [`verify_and_heal_live_archive_config`] only auto-corrects
-/// this case and reports every other divergence instead.
-fn looks_like_never_applied(live: &LiveArchiveGucs) -> bool {
-    live.archive_command.is_empty() && live.archive_timeout_secs == 0
+/// True when every FIELD that doesn't already match `expected_*` sits at
+/// Postgres's own untouched baseline — `archive_command` empty,
+/// `archive_timeout` `0` — rather than some other concrete value. Checked
+/// per field, not as a joint "both blank" condition: the apply-race in
+/// [`verify_and_heal_live_archive_config`]'s doc has only ever been
+/// confirmed leaving `archive_command` blank while `archive_timeout` was
+/// already correct (set by an earlier config pass, or never touched by
+/// this specific race) — requiring *both* fields to be simultaneously
+/// blank would misclassify that exact, documented case as "maybe
+/// intentional" and leave it unfixed. Nobody chooses these baseline
+/// values on purpose (an intentional `archive_timeout` edit is never
+/// literally "off", and a hand-set `archive_command` is never the empty
+/// string), so any mismatching field that ISN'T at this baseline is a
+/// real, distinct value a human could plausibly have set —
+/// [`verify_and_heal_live_archive_config`] only auto-corrects when every
+/// mismatching field clears this bar, and reports otherwise.
+fn looks_like_never_applied(live: &LiveArchiveGucs, expected_archive_timeout: i64) -> bool {
+    let command_ok = live.archive_command == EXPECTED_ARCHIVE_COMMAND || live.archive_command.is_empty();
+    let timeout_ok =
+        live.archive_timeout_secs == expected_archive_timeout || live.archive_timeout_secs == 0;
+    command_ok && timeout_ok
 }
 
 /// Verify the live Postgres GUCs actually match `expected_archive_timeout`,
@@ -324,7 +332,7 @@ async fn verify_and_heal_live_archive_config(
                     tokio::time::sleep(LIVE_CHECK_INTERVAL).await;
                     continue;
                 }
-                if looks_like_never_applied(&live) {
+                if looks_like_never_applied(&live, expected_archive_timeout) {
                     warn!(
                         live_archive_command = %live.archive_command,
                         live_archive_timeout = live.archive_timeout_secs,
@@ -522,29 +530,57 @@ mod tests {
     }
 
     #[test]
-    fn never_applied_baseline_is_recognized() {
-        assert!(looks_like_never_applied(&gucs("", 0)));
+    fn both_fields_blank_is_recognized() {
+        assert!(looks_like_never_applied(&gucs("", 0), 60));
     }
 
     #[test]
-    fn nonempty_command_is_not_never_applied_even_with_zero_timeout() {
-        // A hand-set archive_command with the timeout untouched — still a
-        // concrete value someone could have set on purpose.
-        assert!(!looks_like_never_applied(&gucs("/bin/true", 0)));
+    fn command_blank_timeout_already_correct_is_recognized() {
+        // The actual documented/confirmed-in-practice shape of the race:
+        // only archive_command went unapplied. Regression pin — an
+        // earlier version of this check required BOTH fields blank and
+        // misclassified exactly this as "maybe intentional", leaving a
+        // genuinely broken node unfixed (caught by
+        // t_ha_archive_config_live_reconcile_heals_after_restart).
+        assert!(looks_like_never_applied(&gucs("", 60), 60));
     }
 
     #[test]
-    fn nonzero_timeout_is_not_never_applied_even_with_empty_command() {
-        assert!(!looks_like_never_applied(&gucs("", 120)));
-    }
-
-    #[test]
-    fn expected_value_is_not_never_applied() {
-        // Confirms the two branches are disjoint: a fully-correct live
-        // config never routes through the never-applied path.
-        assert!(!looks_like_never_applied(&gucs(
-            EXPECTED_ARCHIVE_COMMAND,
+    fn timeout_blank_command_already_correct_is_recognized() {
+        // Mirror of the above: archive_command already landed, only
+        // archive_timeout is sitting at the untouched baseline.
+        assert!(looks_like_never_applied(
+            &gucs(EXPECTED_ARCHIVE_COMMAND, 0),
             60
-        )));
+        ));
+    }
+
+    #[test]
+    fn nonempty_nonexpected_command_is_not_never_applied() {
+        // A concrete, non-blank archive_command someone could have set on
+        // purpose — even with the timeout at its blank baseline.
+        assert!(!looks_like_never_applied(&gucs("/bin/true", 0), 60));
+    }
+
+    #[test]
+    fn nonzero_nonexpected_timeout_is_not_never_applied() {
+        // A concrete, non-blank, non-expected archive_timeout — even with
+        // the command already correct.
+        assert!(!looks_like_never_applied(
+            &gucs(EXPECTED_ARCHIVE_COMMAND, 120),
+            60
+        ));
+    }
+
+    #[test]
+    fn fully_matching_value_is_never_applied_vacuously() {
+        // Not reached in practice — the caller's own early-return catches
+        // a fully-matching pair before this function runs — but the
+        // function's contract ("every mismatching field is at baseline")
+        // holds vacuously when nothing mismatches.
+        assert!(looks_like_never_applied(
+            &gucs(EXPECTED_ARCHIVE_COMMAND, 60),
+            60
+        ));
     }
 }
