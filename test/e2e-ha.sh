@@ -772,7 +772,9 @@ t_pitr_happy_path() {
   # leader-side `pgbackrest restore` to seed the volume first.
   local deadline=$(($(date +%s) + 30)) gate_seen=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$rest_n1" 2>&1 | grep -q "pgbackrest: restore-gate state"; then
+    # grep -c (not -q): -q's first-match exit can SIGPIPE docker logs
+    # under this script's pipefail, misreporting a present line as absent.
+    if docker logs "$rest_n1" 2>&1 | grep -c "pgbackrest: restore-gate state" >/dev/null; then
       gate_seen=1; break
     fi
     sleep 2
@@ -1626,7 +1628,10 @@ t_ha_restore_gate_logged_on_every_node() {
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local seen=0
     for n in "$n1" "$n2" "$n3"; do
-      if docker logs "$n" 2>&1 | grep -q "pgbackrest: restore-gate state"; then
+      # grep -c (not -q): -q's first-match exit can SIGPIPE docker logs
+      # under this script's pipefail, misreporting a present line as
+      # absent — observed here in CI with all 3 gate lines on disk.
+      if docker logs "$n" 2>&1 | grep -c "pgbackrest: restore-gate state" >/dev/null; then
         seen=$((seen + 1))
       fi
     done
@@ -2091,6 +2096,233 @@ t_ha_failover_adopts_catalog_history() {
   teardown_scope "$scope"
 }
 
+# H7c. The cross-node backup chain is actually restorable. Catalog-history
+# adoption (H7b) proves the new leader doesn't re-take a redundant backup —
+# this test proves the diff that leader2 later takes against leader1's full
+# is a real, restorable increment, not just a catalog entry:
+#   full on leader1 → failover → adoption on leader2 → watcher-driven diff
+#   on leader2 → pgbackrest info confirms the diff references leader1's
+#   full → restore full+diff+WAL into a fresh node → all four marker rows
+#   (spanning the failover and the diff) are present.
+t_ha_failover_diff_chain_restore() {
+  local scope=t-diffchain-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher) -e "WAL_BACKUP_DIFF_INTERVAL_HOURS=24")
+
+  local leader1; leader1=$(wait_for_leader "$scope" 180) || { ko t_ha_failover_diff_chain_restore "no initial leader"; fail_dump t_ha_failover_diff_chain_restore "$n1" "$n2" "$n3"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_failover_diff_chain_restore "replicas didn't stream"; fail_dump t_ha_failover_diff_chain_restore "$leader1"; teardown_scope "$scope"; return; }
+  wait_for_stanza_create "$leader1" 90 || { ko t_ha_failover_diff_chain_restore "no stanza-create"; fail_dump t_ha_failover_diff_chain_restore "$leader1"; teardown_scope "$scope"; return; }
+
+  # Marker 1: inside the full's base.
+  psql_leader "$leader1" -c "CREATE TABLE chain(id int, marker text);" >/dev/null
+  psql_leader "$leader1" -c "INSERT INTO chain VALUES (1,'before-full'); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$leader1" full 120 || { ko t_ha_failover_diff_chain_restore "no initial full on leader1"; fail_dump t_ha_failover_diff_chain_restore "$leader1"; teardown_scope "$scope"; return; }
+
+  # Marker 2: after the full, before the failover — streamed to the
+  # replicas, so it's in leader2's pgdata at promotion and lands in the
+  # diff's delta.
+  psql_leader "$leader1" -c "INSERT INTO chain VALUES (2,'after-full'); SELECT pg_switch_wal();" >/dev/null
+  sleep 4
+
+  # Retry the catalog probe briefly: pgbackrest info can transiently error
+  # (masked to 0 by the helper's 2>/dev/null) right after the full lands.
+  local fulls_before deadline=$(($(date +%s) + 30))
+  while :; do
+    fulls_before=$(count_backups_of_type "$leader1" full)
+    [ "$fulls_before" = "1" ] && break
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      ko t_ha_failover_diff_chain_restore "unexpected pre-failover catalog state; fulls=$fulls_before"
+      fail_dump t_ha_failover_diff_chain_restore "$leader1"
+      teardown_scope "$scope"
+      return
+    fi
+    sleep 3
+  done
+
+  log "killing leader $leader1"
+  docker stop "$leader1" >/dev/null
+
+  local leader2; leader2=$(wait_for_new_leader "$leader1" 180 "$n1" "$n2" "$n3")
+  if [ -z "$leader2" ]; then
+    ko t_ha_failover_diff_chain_restore "no new leader elected after killing $leader1"
+    fail_dump t_ha_failover_diff_chain_restore "$n1" "$n2" "$n3"
+    teardown_scope "$scope"
+    return
+  fi
+  log "new leader: $leader2"
+
+  # Wait for catalog-history adoption so last_full_at anchors on leader1's
+  # full — the state this test's diff must chain from. grep -c (not -q)
+  # keeps the pipe SIGPIPE-free under pipefail.
+  local deadline=$(($(date +%s) + 60)) adopted=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$leader2" 2>&1 | grep -c "pgbackrest-watcher: adopted backup history from S3 catalog" >/dev/null; then
+      adopted=1
+      break
+    fi
+    sleep 3
+  done
+  if [ "$adopted" != "1" ]; then
+    ko t_ha_failover_diff_chain_restore "new leader $leader2 never logged catalog-history adoption"
+    fail_dump t_ha_failover_diff_chain_restore "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Marker 3: written on leader2 before the diff — inside the diff's delta.
+  psql_leader "$leader2" -c "INSERT INTO chain VALUES (3,'after-failover'); SELECT pg_switch_wal();" >/dev/null
+
+  # Force the watcher's periodic-diff branch NOW: backdate last_diff_at so
+  # the diff anchor is ancient. last_full_at stays at the ADOPTED value —
+  # touching it would sidestep the exact state this test exists to prove
+  # works.
+  docker exec -u postgres "$leader2" bash -c '
+    f=/var/lib/postgresql/data/pgdata/.pgbackrest_backup_state
+    awk "
+      /^last_diff_at=/ { print \"last_diff_at=0\"; seen=1; next }
+      { print }
+      END { if (!seen) print \"last_diff_at=0\" }
+    " "$f" > "$f.tmp"
+    mv "$f.tmp" "$f"
+  '
+
+  if ! wait_for_watcher_backup "$leader2" diff 90; then
+    ko t_ha_failover_diff_chain_restore "no watcher diff on new leader within 90s"
+    fail_dump t_ha_failover_diff_chain_restore "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Chain shape: exactly leader1's full + leader2's diff. If pgbackrest had
+  # silently promoted the diff to a full (no usable prior full), fulls
+  # would read 2 and the chain claim would be vacuous.
+  local fulls_after diffs_after
+  fulls_after=$(count_backups_of_type "$leader2" full)
+  diffs_after=$(count_backups_of_type "$leader2" diff)
+  if [ "$fulls_after" != "1" ] || [ "$diffs_after" != "1" ]; then
+    ko t_ha_failover_diff_chain_restore "expected 1 full + 1 diff; got fulls=$fulls_after diffs=$diffs_after"
+    fail_dump t_ha_failover_diff_chain_restore "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # The diff's reference list must name the full as its base — the
+  # catalog-level statement of "this diff chains to the previous leader's
+  # full".
+  local chain_ok
+  chain_ok=$(docker exec -u postgres "$leader2" bash -c "$(_pgbackrest_env_preamble)
+    pgbackrest --stanza=main info --output=json 2>/dev/null
+  " 2>/dev/null | python3 -c '
+import json, sys
+backups = json.load(sys.stdin)[0]["backup"]
+fulls = [b["label"] for b in backups if b["type"] == "full"]
+diffs = [b for b in backups if b["type"] == "diff"]
+ok = len(fulls) == 1 and len(diffs) == 1 and fulls[0] in (diffs[0].get("reference") or [])
+print("ok" if ok else "bad")
+' 2>/dev/null)
+  if [ "$chain_ok" != "ok" ]; then
+    ko t_ha_failover_diff_chain_restore "diff does not reference the pre-failover full as its base"
+    fail_dump t_ha_failover_diff_chain_restore "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Marker 4: after the diff — reaches the restore only via archived WAL
+  # replayed on top of the chain. Wait for the async archiver to actually
+  # push it before killing the cluster.
+  local wal_before; wal_before=$(count_archived_wal_segments)
+  psql_leader "$leader2" -c "INSERT INTO chain VALUES (4,'after-diff'); SELECT pg_switch_wal();" >/dev/null
+  deadline=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$(count_archived_wal_segments)" -gt "${wal_before:-0}" ]; then
+      break
+    fi
+    sleep 3
+  done
+  if [ "$(count_archived_wal_segments)" -le "${wal_before:-0}" ]; then
+    ko t_ha_failover_diff_chain_restore "post-diff WAL never reached the archive"
+    fail_dump t_ha_failover_diff_chain_restore "$leader2"
+    teardown_scope "$scope"
+    return
+  fi
+
+  local src_path
+  src_path=$(docker exec "$leader2" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path | tr -d '\n\r')
+
+  # Stop the cluster: nothing may keep writing to the stanza while we
+  # prove what's already in S3 is sufficient on its own.
+  for n in "$n1" "$n2" "$n3"; do
+    docker stop "$n" >/dev/null 2>&1 || true
+  done
+
+  # Fresh node, no Patroni: pgbackrest restore picks the latest set
+  # (leader2's diff + leader1's full underneath) and writes recovery.signal,
+  # so postgres replays archived WAL to the end and self-promotes.
+  local restore_n="${scope}-restore"
+  docker rm -f "$restore_n" >/dev/null 2>&1 || true
+  new_volume "${restore_n}-vol"
+  docker run -d --name "$restore_n" --label "$HA_LABEL" --network "$NET" \
+    -e "PGBACKREST_REPO1_TYPE=s3" \
+    -e "PGBACKREST_PG1_PATH=/var/lib/postgresql/data/pgdata" \
+    -e "PGBACKREST_REPO1_S3_BUCKET=$BUCKET" \
+    -e "PGBACKREST_REPO1_S3_ENDPOINT=http://${MINIO}:9000" \
+    -e "PGBACKREST_REPO1_S3_REGION=us-east-1" \
+    -e "PGBACKREST_REPO1_S3_KEY=$MINIO_USER" \
+    -e "PGBACKREST_REPO1_S3_KEY_SECRET=$MINIO_PASS" \
+    -e "PGBACKREST_REPO1_S3_URI_STYLE=path" \
+    -e "PGBACKREST_REPO1_PATH=$src_path" \
+    -v "${restore_n}-vol:/var/lib/postgresql/data" \
+    --entrypoint /bin/bash \
+    "$IMAGE" \
+    -c 'set -e
+mkdir -p /var/lib/postgresql/data/pgdata
+chown -R postgres:postgres /var/lib/postgresql/data
+chmod 0700 /var/lib/postgresql/data/pgdata
+gosu postgres pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/data/pgdata \
+  --recovery-option=restore_command="pgbackrest --stanza=main archive-get %f %p" \
+  restore
+exec gosu postgres postgres -D /var/lib/postgresql/data/pgdata -c archive_mode=off -c ssl=off' >/dev/null
+
+  # Wait for restore + WAL replay + self-promotion.
+  deadline=$(($(date +%s) + 240))
+  local promoted=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$(docker exec -u postgres "$restore_n" psql -U postgres -h /var/run/postgresql -At -c 'SELECT pg_is_in_recovery()' 2>/dev/null)" = "f" ]; then
+      promoted=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$promoted" != "1" ]; then
+    ko t_ha_failover_diff_chain_restore "restored node never finished recovery / promoted"
+    fail_dump t_ha_failover_diff_chain_restore "$restore_n"
+    docker rm -f "$restore_n" >/dev/null 2>&1 || true
+    docker volume rm "${restore_n}-vol" >/dev/null 2>&1 || true
+    teardown_scope "$scope"
+    return
+  fi
+
+  local markers
+  markers=$(docker exec -u postgres "$restore_n" psql -U postgres -h /var/run/postgresql -At \
+    -c "SELECT string_agg(marker, ',' ORDER BY id) FROM chain" 2>/dev/null)
+  if [ "$markers" != "before-full,after-full,after-failover,after-diff" ]; then
+    ko t_ha_failover_diff_chain_restore "restored data incomplete; markers='$markers'"
+    fail_dump t_ha_failover_diff_chain_restore "$restore_n"
+    docker rm -f "$restore_n" >/dev/null 2>&1 || true
+    docker volume rm "${restore_n}-vol" >/dev/null 2>&1 || true
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_failover_diff_chain_restore
+  note "full by $leader1 + diff by $leader2 restored on a fresh node with all 4 markers"
+  docker rm -f "$restore_n" >/dev/null 2>&1 || true
+  docker volume rm "${restore_n}-vol" >/dev/null 2>&1 || true
+  teardown_scope "$scope"
+}
+
 # H7. WAL_ARCHIVE_BUCKET validator rejects junk shapes (unresolved Railway
 # template refs, raw bucket-id UUIDs) before they reach pgBackRest and
 # create a fake PITR gap from what's actually an upstream wiring bug.
@@ -2423,6 +2655,8 @@ ALL_TESTS=(
   t_ha_failover_watcher_handoff
   # catalog-history adoption on promotion (S3 catalog fix)
   t_ha_failover_adopts_catalog_history
+  # post-failover diff chains to the previous leader's full and restores
+  t_ha_failover_diff_chain_restore
   # audit follow-up (M4 + L7 — see plan ok-fix-all-of-cheerful-wolf.md)
   t_ha_invalid_bucket_validator
   # standalone→HA conversion: wal_level preservation (logical replication)
