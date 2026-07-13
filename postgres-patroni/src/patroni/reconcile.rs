@@ -92,17 +92,34 @@ async fn wait_for_patroni_rest(client: &reqwest::Client) -> Result<()> {
     }
 }
 
-/// Live `archive_command` / `archive_timeout` GUC values read directly from
-/// the running Postgres, bypassing Patroni and DCS entirely.
+/// Live `archive_mode` / `archive_command` / `archive_timeout` GUC values
+/// read directly from the running Postgres, bypassing Patroni and DCS
+/// entirely. `archive_mode` is read alongside the other two specifically so
+/// callers can tell a genuine divergence apart from Postgres's own
+/// `archive_command` masking (see [`query_live_archive_gucs`]).
 struct LiveArchiveGucs {
+    archive_mode: String,
     archive_command: String,
     archive_timeout_secs: i64,
 }
 
-/// Query the live `archive_command` / `archive_timeout` GUCs over the unix
-/// socket. `Err` here means "couldn't ask" (postgres not up yet, socket not
-/// ready) — distinct from a successful query that reads back an empty/wrong
-/// value, which is the actual defect this module exists to catch.
+/// Query the live `archive_mode` / `archive_command` / `archive_timeout`
+/// GUCs over the unix socket. `Err` here means "couldn't ask" (postgres not
+/// up yet, socket not ready) — distinct from a successful query that reads
+/// back an empty/wrong value, which is the actual defect this module exists
+/// to catch.
+///
+/// `archive_mode` is read too, not just for its own sake: Postgres's
+/// `show_archive_command()` GUC hook masks `archive_command` as the literal
+/// string `"(disabled)"` — via `SHOW`, `current_setting()`, and
+/// `pg_settings.setting` alike — whenever `archive_mode` isn't active.
+/// `archive_mode` is `PGC_POSTMASTER` (restart-only; see this module's
+/// header), so a node can easily be mid-`pending_restart` with DCS already
+/// correct — a normal, expected state, not a defect. Without reading
+/// `archive_mode` too, that masked `"(disabled)"` reading would be
+/// indistinguishable from a real, concrete operator-set value and get
+/// misreported as [`TelemetryEvent::ArchiveConfigDrifted`] on every ordinary
+/// enable-PITR-on-an-existing-cluster boot.
 async fn query_live_archive_gucs(superuser: &str) -> Result<LiveArchiveGucs> {
     let out = Command::new("psql")
         .args([
@@ -119,8 +136,9 @@ async fn query_live_archive_gucs(superuser: &str) -> Result<LiveArchiveGucs> {
             // formatting (e.g. "1min" instead of "60") for GUC_UNIT_S
             // parameters, which a bare ::int cast rejects. pg_settings.setting
             // is always the raw value in the GUC's base unit (seconds here),
-            // with no suffix.
-            "SELECT current_setting('archive_command'), \
+            // with no suffix. archive_mode itself is never masked (only
+            // archive_command is), so current_setting() is fine for it.
+            "SELECT current_setting('archive_mode'), current_setting('archive_command'), \
              (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'archive_timeout')::int",
         ])
         .env_remove("PGHOST")
@@ -137,12 +155,16 @@ async fn query_live_archive_gucs(superuser: &str) -> Result<LiveArchiveGucs> {
     }
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // trim_end_matches (not trim()) — the first column is empty exactly
-    // when this function's caller most needs a correct answer (a broken
-    // archive_command), and generic trim() strips the leading tab
-    // separator along with it, silently shifting the second column into
-    // the first field and reporting "missing" instead of "empty".
-    let mut fields = stdout.trim_end_matches('\n').splitn(2, '\t');
+    // trim_end_matches (not trim()) — the archive_command column is empty
+    // exactly when this function's caller most needs a correct answer (a
+    // broken archive_command), and generic trim() strips a leading tab
+    // separator along with it, silently shifting a later column into an
+    // earlier field and reporting "missing" instead of "empty".
+    let mut fields = stdout.trim_end_matches('\n').splitn(3, '\t');
+    let archive_mode = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing archive_mode field in psql output"))?
+        .to_string();
     let archive_command = fields
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing archive_command field in psql output"))?
@@ -154,6 +176,7 @@ async fn query_live_archive_gucs(superuser: &str) -> Result<LiveArchiveGucs> {
         .context("parse archive_timeout")?;
 
     Ok(LiveArchiveGucs {
+        archive_mode,
         archive_command,
         archive_timeout_secs,
     })
@@ -264,15 +287,22 @@ async fn reset_live_archive_gucs(superuser: &str) -> Result<()> {
 /// WARN-logging) for the whole window on the overwhelmingly common
 /// pin-free node. When a pin IS found, the psql-based reset genuinely
 /// must wait for Postgres — the caller's retry loop is that wait.
-/// An absent/unreadable file cannot carry a pin: false.
-async fn archive_gucs_pinned_in_auto_conf(data_dir: &str) -> bool {
+/// An absent file cannot carry a pin: `Ok(false)`. Any OTHER read failure
+/// (permissions, I/O error) propagates as `Err` rather than silently
+/// reading as "no pin" — on the disable path in particular, misreading an
+/// unreadable-but-present `auto.conf` as pin-free would skip
+/// [`reset_live_archive_gucs`] entirely and leave a stale `archive_command`
+/// pin (pointed at now-gone S3 creds) armed, with no retry and no signal
+/// that anything was skipped.
+async fn archive_gucs_pinned_in_auto_conf(data_dir: &str) -> Result<bool> {
     let auto_conf = format!("{data_dir}/postgresql.auto.conf");
     match tokio::fs::read_to_string(&auto_conf).await {
-        Ok(contents) => contents.lines().any(|line| {
+        Ok(contents) => Ok(contents.lines().any(|line| {
             let line = line.trim_start();
             line.starts_with("archive_command") || line.starts_with("archive_timeout")
-        }),
-        Err(_) => false,
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("read {auto_conf}")),
     }
 }
 
@@ -384,6 +414,14 @@ async fn verify_and_heal_live_archive_config(
             info!("live archive_command/archive_timeout confirmed applied");
             return Ok(());
         }
+        LivePoll::RestartPending => {
+            info!(
+                "live archive_mode isn't \"on\" yet — Patroni has a pending restart for this \
+                 DCS change (archive_mode is restart-only); archive_command's live value can't \
+                 be trusted until then, so skipping verification for this boot"
+            );
+            return Ok(());
+        }
         LivePoll::Diverged(live) => live,
     };
 
@@ -423,11 +461,14 @@ async fn verify_and_heal_live_archive_config(
 }
 
 /// Verdict from [`poll_live_archive_gucs`]: the live values either matched
-/// the expectation (`Applied`) or persistently mismatched across the whole
-/// observation window (`Diverged`). "Couldn't read enough to tell" is not a
-/// verdict — it propagates as `Err` instead.
+/// the expectation (`Applied`), `archive_mode` isn't live-`"on"` yet so
+/// `archive_command`'s reading can't be trusted at all (`RestartPending`),
+/// or the values persistently mismatched across the whole observation
+/// window despite `archive_mode` being on (`Diverged`). "Couldn't read
+/// enough to tell" is not a verdict — it propagates as `Err` instead.
 enum LivePoll {
     Applied,
+    RestartPending,
     Diverged(LiveArchiveGucs),
 }
 
@@ -435,16 +476,25 @@ enum LivePoll {
 /// only-successful-reads-count policy is unit-testable without a live
 /// Postgres; production passes [`query_live_archive_gucs`].
 ///
-/// A single matching read returns `Applied` immediately. `Diverged` needs
-/// [`LIVE_CHECK_MISMATCH_READS`] successful reads all showing a mismatch —
-/// an interleaved read error neither counts toward nor resets that tally
-/// (a connection blip says nothing about whether Patroni applied the
-/// config, and the per-attempt sleeps still guarantee the tally spans the
-/// intended observation window). If [`LIVE_CHECK_MAX_ATTEMPTS`] runs out
-/// before either verdict, the last read error propagates: deciding
-/// "diverged" off fewer reads would re-open the exact
-/// no-absorption-window hole this poll exists to close, and the caller's
-/// outer retry loop re-runs the whole idempotent pass anyway.
+/// A read showing `archive_mode` isn't `"on"` returns `RestartPending`
+/// immediately, with no further polling: `archive_mode` is
+/// `PGC_POSTMASTER`, so it cannot flip on this same running Postgres
+/// process without a full restart — unlike `archive_command`'s apply race,
+/// there's no "about to catch up" window to wait out, and Postgres masks
+/// `archive_command` as `"(disabled)"` in this state anyway (see
+/// [`query_live_archive_gucs`]), so further reads would tell us nothing new.
+///
+/// Otherwise, a single matching read returns `Applied` immediately.
+/// `Diverged` needs [`LIVE_CHECK_MISMATCH_READS`] successful reads all
+/// showing a mismatch — an interleaved read error neither counts toward
+/// nor resets that tally (a connection blip says nothing about whether
+/// Patroni applied the config, and the per-attempt sleeps still guarantee
+/// the tally spans the intended observation window). If
+/// [`LIVE_CHECK_MAX_ATTEMPTS`] runs out before either verdict, the last
+/// read error propagates: deciding "diverged" off fewer reads would
+/// re-open the exact no-absorption-window hole this poll exists to close,
+/// and the caller's outer retry loop re-runs the whole idempotent pass
+/// anyway.
 async fn poll_live_archive_gucs<F, Fut>(
     mut read_live: F,
     expected_archive_timeout: i64,
@@ -458,6 +508,9 @@ where
     let mut last_err = None;
     for attempt in 1..=LIVE_CHECK_MAX_ATTEMPTS {
         match read_live().await {
+            Ok(live) if live.archive_mode != EXPECTED_ARCHIVE_MODE => {
+                return Ok(LivePoll::RestartPending);
+            }
             Ok(live)
                 if live.archive_command == EXPECTED_ARCHIVE_COMMAND
                     && live.archive_timeout_secs == expected_archive_timeout =>
@@ -578,7 +631,7 @@ pub async fn reconcile_pgbackrest_archive_config(
         // re-marks. Gated on the sentinel so an operator's own ALTER SYSTEM
         // pin is never cleared while PITR is enabled.
         if archive_gucs_forced_by_us(&config.data_dir).await {
-            if archive_gucs_pinned_in_auto_conf(&config.data_dir).await {
+            if archive_gucs_pinned_in_auto_conf(&config.data_dir).await? {
                 reset_live_archive_gucs(&config.superuser).await?;
                 info!(
                     "cleared our previous ALTER SYSTEM archive-GUC pin — \
@@ -602,7 +655,7 @@ pub async fn reconcile_pgbackrest_archive_config(
         // even with PITR off, and this branch runs on every boot of every
         // cluster that never enabled PITR at all.
         if archive_gucs_forced_by_us(&config.data_dir).await {
-            if archive_gucs_pinned_in_auto_conf(&config.data_dir).await {
+            if archive_gucs_pinned_in_auto_conf(&config.data_dir).await? {
                 reset_live_archive_gucs(&config.superuser).await?;
             }
             // After the reset (not before): a failed reset propagates above
@@ -611,7 +664,7 @@ pub async fn reconcile_pgbackrest_archive_config(
             // and a stale sentinel would cause a pointless reset on a later
             // re-enable.
             clear_forced_sentinel(&config.data_dir).await;
-        } else if archive_gucs_pinned_in_auto_conf(&config.data_dir).await {
+        } else if archive_gucs_pinned_in_auto_conf(&config.data_dir).await? {
             warn!(
                 "archive GUCs pinned in postgresql.auto.conf without our sentinel — \
                  operator-set, leaving in place (PITR disabled)"
@@ -671,7 +724,16 @@ mod tests {
     use super::*;
 
     fn gucs(archive_command: &str, archive_timeout_secs: i64) -> LiveArchiveGucs {
+        gucs_with_mode(EXPECTED_ARCHIVE_MODE, archive_command, archive_timeout_secs)
+    }
+
+    fn gucs_with_mode(
+        archive_mode: &str,
+        archive_command: &str,
+        archive_timeout_secs: i64,
+    ) -> LiveArchiveGucs {
         LiveArchiveGucs {
+            archive_mode: archive_mode.to_string(),
             archive_command: archive_command.to_string(),
             archive_timeout_secs,
         }
@@ -771,6 +833,7 @@ mod tests {
         match verdict {
             LivePoll::Diverged(live) => assert_eq!(live.archive_command, ""),
             LivePoll::Applied => panic!("persistent mismatch must not read as Applied"),
+            LivePoll::RestartPending => panic!("archive_mode is \"on\" in this scenario"),
         }
     }
 
@@ -842,6 +905,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_returns_restart_pending_when_archive_mode_off_and_stops_polling() {
+        // archive_mode is PGC_POSTMASTER — it cannot change on a running
+        // Postgres process without a full restart, so a single "off" read
+        // is a stable, structural signal for the rest of this boot, not a
+        // race to poll through. scripted() panics on a second read, pinning
+        // that this returns immediately instead of accumulating toward a
+        // Diverged verdict.
+        let verdict = poll_live_archive_gucs(
+            scripted(vec![Ok(gucs_with_mode("off", "", 0))]),
+            60,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(verdict, LivePoll::RestartPending));
+    }
+
+    #[tokio::test]
+    async fn poll_treats_masked_disabled_command_as_restart_pending_not_diverged() {
+        // The exact false positive this fix closes: Postgres masks
+        // archive_command as the literal "(disabled)" via current_setting()
+        // whenever archive_mode is off (e.g. a Patroni-deferred restart
+        // hasn't happened yet). Before reading archive_mode too, that
+        // string was neither the empty baseline nor the expected command,
+        // so a completely normal "restart not yet applied" boot would
+        // misclassify as ArchiveConfigDrifted (operator edit).
+        let verdict = poll_live_archive_gucs(
+            scripted(vec![Ok(gucs_with_mode("off", "(disabled)", 60))]),
+            60,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(verdict, LivePoll::RestartPending));
+    }
+
+    #[tokio::test]
     async fn forced_sentinel_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap();
@@ -852,5 +952,51 @@ mod tests {
         assert!(!archive_gucs_forced_by_us(data_dir).await);
         // Clearing an already-absent sentinel is a quiet no-op.
         clear_forced_sentinel(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn pinned_in_auto_conf_is_false_when_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        assert!(!archive_gucs_pinned_in_auto_conf(data_dir).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pinned_in_auto_conf_detects_an_archive_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        tokio::fs::write(
+            format!("{data_dir}/postgresql.auto.conf"),
+            "some_other_param = '1'\narchive_command = '/bin/true'\n",
+        )
+        .await
+        .unwrap();
+        assert!(archive_gucs_pinned_in_auto_conf(data_dir).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pinned_in_auto_conf_is_false_with_no_archive_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        tokio::fs::write(
+            format!("{data_dir}/postgresql.auto.conf"),
+            "some_other_param = '1'\n",
+        )
+        .await
+        .unwrap();
+        assert!(!archive_gucs_pinned_in_auto_conf(data_dir).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pinned_in_auto_conf_propagates_non_notfound_errors() {
+        // A directory can't be read_to_string'd as a file — this stands in
+        // for "unreadable for a reason other than absence", which must
+        // propagate as Err rather than silently reading as "no pin".
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        tokio::fs::create_dir(format!("{data_dir}/postgresql.auto.conf"))
+            .await
+            .unwrap();
+        assert!(archive_gucs_pinned_in_auto_conf(data_dir).await.is_err());
     }
 }
