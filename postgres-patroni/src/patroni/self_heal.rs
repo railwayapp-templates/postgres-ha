@@ -622,7 +622,13 @@ fn accrue_divergence_window(
             // Unknown cursor on either side → cannot prove a stall.
             _ => false,
         };
-        let leader_tl_frozen = obs.leader_tl <= w.leader_tl_at_open;
+        // Strict equality, not `<=`: a leader timeline can only legitimately
+        // advance (a promotion), never regress, so any observed difference —
+        // in either direction — means the baseline no longer describes the
+        // current leader relationship and the window must not treat it as
+        // frozen. `<=` would have silently treated a stale/regressed DCS read
+        // as still-frozen instead of resetting on it.
+        let leader_tl_frozen = obs.leader_tl == w.leader_tl_at_open;
         if timeline_frozen && progress_frozen && leader_tl_frozen {
             // Late-bind the leader-progress baseline: if the leader was
             // unmeasurable on the poll this window opened, the first later poll
@@ -654,6 +660,21 @@ fn accrue_divergence_window(
         leader_advanced: false,
         leader_tl_at_open: obs.leader_tl,
     })
+}
+
+/// The leader timeline to feed into this poll's dwell-window accrual: this
+/// poll's own reading (`fresh`) when available, else the existing window's
+/// baseline (`leader_tl_at_open`) as a stand-in. A real reading always wins
+/// over the fallback, including one that differs from the baseline — that
+/// case still reaches `accrue_divergence_window`, whose `leader_tl_frozen`
+/// check (exact equality) resets the window on it exactly as before. This
+/// only softens the case where the leader probe couldn't measure anything
+/// at all this poll, so a single transient miss doesn't cost the whole dwell.
+fn leader_timeline_for_accrual(
+    fresh: Option<i64>,
+    window: Option<&DivergenceWindow>,
+) -> Option<i64> {
+    fresh.or_else(|| window.map(|w| w.leader_tl_at_open))
 }
 
 // ====================================================================
@@ -1299,7 +1320,14 @@ async fn iteration(
 
     let role = parse_role(local.role.as_deref());
     if matches!(role, Role::Leader) {
-        // Leaders are never acted on. Skip the rest of the work.
+        // Leaders are never acted on. Clear any dwell window accrued from a
+        // former life as a replica — otherwise a promoted node keeps carrying
+        // a matured (or maturing) window that would apply to whatever replica
+        // it demotes back into, measured against a leader relationship that no
+        // longer holds. Only an actual demotion (which always regresses
+        // `local_tl` below the new leader's) would otherwise be relied on to
+        // reset it; clearing here makes that explicit instead of incidental.
+        *divergence_window = None;
         return Ok(());
     }
 
@@ -1362,15 +1390,31 @@ async fn iteration(
     // Highest WAL position Patroni reports for this node — the axis (besides the
     // timeline) on which a catching-up replica makes visible progress.
     let local_progress = local.xlog.and_then(|x| x.highest_location());
-    let current_obs =
-        replay_tracking_eligible(role, &patroni_state, local_timeline, leader_timeline).map(
-            |(local_tl, leader_tl)| DivergenceObs {
-                local_tl,
-                progress: local_progress,
-                leader_progress: leader.progress,
-                leader_tl,
-            },
-        );
+    // A single missed leader-timeline read (a transient `/cluster` blip) would
+    // otherwise force `current_obs` to `None` below and clear the whole dwell
+    // window — paying for one flaky poll with a full re-accrual (up to
+    // `wal_stall_dwell_secs`, several minutes, before a real stall can fire
+    // again). For accrual purposes only, fall back via
+    // `leader_timeline_for_accrual` to the window's existing leader-timeline
+    // baseline so a single miss holds the window rather than wiping it. This
+    // does NOT affect the decision snapshot below —
+    // `SelfHealInputs::leader_timeline` stays this poll's real (possibly
+    // `None`) reading, so a reinit can only ever fire on a poll that actually
+    // measured the leader.
+    let leader_timeline_for_accrual =
+        leader_timeline_for_accrual(leader_timeline, divergence_window.as_ref());
+    let current_obs = replay_tracking_eligible(
+        role,
+        &patroni_state,
+        local_timeline,
+        leader_timeline_for_accrual,
+    )
+    .map(|(local_tl, leader_tl)| DivergenceObs {
+        local_tl,
+        progress: local_progress,
+        leader_progress: leader.progress,
+        leader_tl,
+    });
     *divergence_window = accrue_divergence_window(current_obs, *divergence_window, now);
     let diverged_for_secs = divergence_window
         .map(|w| now.saturating_sub(w.since).max(0) as u64)
@@ -2361,6 +2405,43 @@ mod tests {
             } => {}
             other => panic!("expected TimelineDivergence Reinitialize, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn leader_timeline_for_accrual_falls_back_to_window_baseline_on_a_missed_read() {
+        // Regression pin for the flaky-poll blind spot: a single transient
+        // `/cluster` miss (fresh = None) must not itself wipe the window —
+        // it should fall back to the existing baseline as a stand-in.
+        let w = DivergenceWindow {
+            since: 1_000,
+            local_tl: 3,
+            progress: Some(100),
+            leader_progress_at_open: Some(500),
+            leader_advanced: false,
+            leader_tl_at_open: 7,
+        };
+        assert_eq!(leader_timeline_for_accrual(None, Some(&w)), Some(7));
+        // A real reading always wins over the fallback, even one that
+        // differs from the baseline — that case still reaches
+        // `accrue_divergence_window`, which resets on the mismatch itself.
+        assert_eq!(leader_timeline_for_accrual(Some(9), Some(&w)), Some(9));
+        // No window open yet and nothing fresh → nothing to fall back to.
+        assert_eq!(leader_timeline_for_accrual(None, None), None);
+    }
+
+    #[test]
+    fn progress_advanced_past_requires_strict_increase_past_a_measurable_baseline() {
+        // Strictly past the baseline → advanced.
+        assert!(progress_advanced_past(Some(101), Some(100)));
+        // Equal to the baseline → still frozen, not an advance.
+        assert!(!progress_advanced_past(Some(100), Some(100)));
+        // Behind the baseline (shouldn't happen for a monotonic WAL cursor,
+        // but must not be misread as an advance either way).
+        assert!(!progress_advanced_past(Some(99), Some(100)));
+        // Either side unmeasurable → cannot prove an advance.
+        assert!(!progress_advanced_past(None, Some(100)));
+        assert!(!progress_advanced_past(Some(100), None));
+        assert!(!progress_advanced_past(None, None));
     }
 
     // Sentinel leader timeline held constant across every poll in tests that
