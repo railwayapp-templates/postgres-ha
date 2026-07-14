@@ -1596,10 +1596,13 @@ async fn async_main() -> Result<()> {
     // permanently leave archive_mode unset. Does not abort patroni-runner.
     {
         let reconcile_config = Config::from_env()?;
+        let reconcile_telemetry = telemetry.clone();
         tokio::spawn(async move {
             let mut delay = Duration::from_secs(10);
             loop {
-                match reconcile_pgbackrest_archive_config(&reconcile_config).await {
+                match reconcile_pgbackrest_archive_config(&reconcile_config, &reconcile_telemetry)
+                    .await
+                {
                     Ok(()) => return,
                     Err(e) => {
                         warn!(
