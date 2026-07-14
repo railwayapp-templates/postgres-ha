@@ -44,22 +44,26 @@
 //!    startup-health gate in `monitoring.rs` SIGKILLs the container every
 //!    `max_startup_timeout`, resetting the crash-loop counter before it trips),
 //!    we don't infer from a timer or a stalled cursor. We read two segment
-//!    numbers: `pg_controldata` gives the checkpoint REDO segment — a lower
-//!    bound on what the replica must stream from (read offline, works while
-//!    Postgres is down) — and a `pg_ls_waldir()` query on the leader gives the
-//!    oldest segment it still retains. If the former predates the latter the
-//!    replica is too far behind to stream-catch-up (standbys here have no
-//!    archive fallback: push-only `archive_command`, no `restore_command`).
-//!    Because REDO is a lower bound this never misses a real case (no wedged
-//!    replica left to restart-loop), at the cost of a possible bounded over-fire;
-//!    see the detection section comment for the full argument. The startup gate
-//!    calls this before wiping.
+//!    numbers: the successor of the newest segment in the replica's own
+//!    `pg_wal` — an UPPER BOUND on what it must resume streaming from (read
+//!    offline, works while Postgres is down) — and a `pg_ls_waldir()` query on
+//!    the leader gives the oldest segment it still retains. If the former
+//!    predates the latter the replica provably cannot stream-catch-up; see the
+//!    detection section comment for the full argument. On clusters without a
+//!    WAL archive that verdict is final (push-only `archive_command`, no
+//!    `restore_command`) and the startup gate wipes on it directly. On
+//!    archiving clusters standbys self-serve missed segments through
+//!    `restore_command`, so the gate additionally requires the zero-progress
+//!    stall to outlive an archive-stall dwell before wiping — see
+//!    `wal_reinit_confirmed` in `monitoring.rs`.
 //!
 //! ## Action
 //! `POST /reinitialize {"force": true}` on the local Patroni REST API.
-//! Patroni wipes pgdata and runs a full pg_basebackup from the leader.
-//! Bypasses pg_rewind entirely — the right move when rewind isn't the
-//! problem but its aftermath is.
+//! Patroni wipes pgdata and re-creates the replica via its configured
+//! `create_replica_methods` — on archiving clusters a parallel `pgbackrest`
+//! restore from the S3 archive with `pg_basebackup` off the leader as the
+//! fallback; plain `pg_basebackup` elsewhere. Bypasses pg_rewind entirely —
+//! the right move when rewind isn't the problem but its aftermath is.
 //!
 //! ## Safety
 //! Enforced by `decide_self_heal` and unit-tested:
@@ -541,10 +545,21 @@ fn state_file_path() -> String {
 // ====================================================================
 //
 // Rather than infer WAL-too-old from a stalled log cursor or a quiet timer, we
-// read WAL segment numbers directly and compare them. Standbys here have no
-// archive fallback (archive_command is push-only; there is no restore_command),
-// so a replica is unrecoverable-by-streaming exactly when the segment it must
-// resume streaming from is older than everything the leader still retains.
+// read WAL segment numbers directly and compare them: a replica is
+// unrecoverable-by-STREAMING exactly when the segment it must resume streaming
+// from is older than everything the leader still retains. On clusters without
+// a WAL archive (no restore_command; archive_command is push-only) streaming
+// is the standby's only WAL source, so that verdict is final. On archiving
+// clusters yaml.rs installs restore_command on every standby, which self-serves
+// missed segments from the S3 archive — Postgres retries it on its own, so a
+// positive verdict there usually coincides with recovery quietly fixing
+// itself (and that surfaces as replay progress, which resets the startup gate
+// before it ever probes). The gate therefore wipes on the verdict directly
+// only where it is final, and on archiving clusters additionally requires the
+// zero-progress stall to outlive a confirmation dwell — at which point the
+// archive path is provably stalled too (a WAL gap in the archive, a stale repo
+// path, or an object-store outage longer than the dwell); see
+// `wal_reinit_confirmed` in monitoring.rs.
 //
 // A reinitialize WIPES pgdata and forces a full re-clone, so the verdict MUST be
 // a SUFFICIENT condition: fire only when the replica is *provably* unable to
@@ -766,15 +781,20 @@ fn streaming_unrecoverable(
 /// WAL-too-old probe: `true` when the replica is PROVABLY unable to stream-catch-
 /// up — an UPPER BOUND on the segment it must resume from (the successor of its
 /// newest local WAL segment) is older than the oldest WAL the leader still
-/// retains, and standbys here have no archive fallback. This is a SUFFICIENT
-/// condition: it never wipes a replica a restart could recover (no false
-/// positives), at the cost of possibly missing a genuine case in a narrow
-/// boundary band (a safe false negative — the node keeps restart-looping as it
-/// does today). Any uncertainty — pg_wal/control file unreadable, no leader
-/// endpoint, leader query failed, or the needed segment is still present —
-/// returns `false`. See the section comment for the full argument. Replaces every
-/// prior heuristic (stalled cursor, stderr scraping, dwell timers, REDO lower-
-/// bound) for the "replica never becomes healthy" manifestation.
+/// retains. On clusters without a WAL archive that alone means unrecoverable
+/// (streaming is the only WAL source); on archiving clusters standbys can still
+/// self-serve the gap through restore_command, so callers gate the destructive
+/// reinit behind an archive-stall dwell on top of this verdict
+/// (`wal_reinit_confirmed` in monitoring.rs). For the streaming half this is a
+/// SUFFICIENT condition: it never fires on a replica a restart could recover
+/// into streaming (no false positives), at the cost of possibly missing a
+/// genuine case in a narrow boundary band (a safe false negative — the node
+/// keeps restart-looping as it does today). Any uncertainty — pg_wal/control
+/// file unreadable, no leader endpoint, leader query failed, or the needed
+/// segment is still present — returns `false`. See the section comment for the
+/// full argument. Replaces every prior heuristic (stalled cursor, stderr
+/// scraping, dwell timers, REDO lower-bound) for the "replica never becomes
+/// healthy" manifestation.
 pub async fn confirm_wal_unrecoverable(client: &reqwest::Client, config: &Config) -> bool {
     let resume_upper_bound = local_resume_upper_bound(&config.data_dir).await;
     if resume_upper_bound.is_none() {
@@ -793,7 +813,8 @@ pub async fn confirm_wal_unrecoverable(client: &reqwest::Client, config: &Config
             resume_upper_bound = ?resume_upper_bound,
             leader_oldest = ?leader_oldest,
             leader_host = %host,
-            "self-heal: the segment this replica must resume from is older than the leader's oldest retained WAL (no archive fallback) — provably unrecoverable by streaming"
+            archive_fallback = config.wal_archive_bucket.is_some(),
+            "self-heal: the segment this replica must resume from is older than the leader's oldest retained WAL — provably unrecoverable by streaming"
         );
     }
     unrecoverable

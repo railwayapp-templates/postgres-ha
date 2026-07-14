@@ -41,11 +41,41 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // WAL while the latest reachable target stays pinned at the last commit.
     // Without this GUC the picker falls back to lastArchivedAt and the user
     // can pick an unreachable target. Mirrors postgres-ssl PRs #52 + #58.
+    // restore_command gives every standby an archive fallback: when streaming
+    // breaks and the leader has already recycled the WAL a standby needs
+    // (post-rewind catch-up, long clone, extended disconnect), recovery pulls
+    // the missing segments from the stanza's own S3 archive instead of
+    // wedging on "requested WAL segment has already been removed". Patroni
+    // moves recovery parameters out of postgresql.parameters into the
+    // recovery section it writes for standbys (_adjust_recovery_parameters →
+    // build_recovery_params), so this reaches every standby and never the
+    // primary. It goes through the archive-get wrapper because repo1-path
+    // must be resolved at call time — volume marker first, Patroni DCS on a
+    // miss (the marker can go stale on standbys after a leader-side path
+    // migration): the env Postgres inherits from Patroni still holds the
+    // pre-derivation base path, and pgBackRest prefers env over
+    // pgbackrest.conf.
     let pgbackrest_archive_params = if config.wal_archive_bucket.is_some() {
         format!(
-            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n",
+            "        archive_mode: \"on\"\n        archive_command: \"/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p\"\n        archive_timeout: {}\n        track_commit_timestamp: \"on\"\n        restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n",
             config.archive_timeout_secs,
         )
+    } else {
+        String::new()
+    };
+
+    // Re-seed replicas from the S3 archive instead of the live leader:
+    // pgbackrest restore downloads the base backup from object storage in
+    // parallel and replays archived WAL via restore_command, placing zero
+    // read load on the leader's volume. pg_basebackup — a single sequential
+    // stream read directly off the leader, competing with production
+    // queries for the same disk — stays as the fallback for fresh stanzas
+    // (no backup in the catalog yet) and restore failures. The wrapper
+    // resolves the per-cluster repo1-path at call time (DCS → volume
+    // marker → env default): a wiped volume has neither pg_control nor the
+    // marker, and the env Patroni inherited holds only the base path.
+    let pgbackrest_replica_method = if config.wal_archive_bucket.is_some() {
+        "  create_replica_methods:\n    - pgbackrest\n    - basebackup\n  pgbackrest:\n    command: \"/usr/local/bin/pgbackrest-replica-restore-wrapper.sh\"\n    keep_data: true\n    no_params: true\n".to_string()
     } else {
         String::new()
     };
@@ -60,7 +90,7 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // priority when both are present and agree; if DCS is empty at startup
     // the local value fills the gap and avoids the reload→pending_restart trap.
     let pgbackrest_local_params = if config.wal_archive_bucket.is_some() {
-        "    archive_mode: \"on\"\n    track_commit_timestamp: \"on\"\n".to_string()
+        "    archive_mode: \"on\"\n    track_commit_timestamp: \"on\"\n    restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n".to_string()
     } else {
         String::new()
     };
@@ -130,7 +160,7 @@ postgresql:
   listen: "*:5432"
   connect_address: {connect_address}:5432
   data_dir: {data_dir}
-  basebackup:
+{pgbackrest_replica_method}  basebackup:
     max-rate: {basebackup_max_rate}
     checkpoint: fast
   pgpass: /tmp/pgpass
@@ -259,12 +289,85 @@ mod tests {
         }
     }
 
+    fn test_config_with_timeout(wal_archive_bucket: Option<&str>, archive_timeout_secs: i64) -> Config {
+        Config {
+            archive_timeout_secs,
+            ..test_config(wal_archive_bucket)
+        }
+    }
+
+    #[test]
+    fn restore_command_is_independent_of_archive_timeout_value() {
+        // restore_command is a fixed wrapper invocation with no interpolated
+        // fields — unlike archive_command's archive_timeout, a custom
+        // POSTGRES_ARCHIVE_TIMEOUT must not change its rendered line, and
+        // both occurrences (bootstrap DCS + local params) must stay
+        // byte-identical to each other regardless of the timeout value.
+        for timeout in [60, 120, 5] {
+            let yaml = generate_patroni_config(&test_config_with_timeout(Some("bucket"), timeout), "replica");
+            let expected = "restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n";
+            let occurrences = yaml.matches(expected).count();
+            assert_eq!(
+                occurrences, 2,
+                "expected exactly 2 identical restore_command lines (bootstrap DCS + local) at timeout={timeout}, found {occurrences}"
+            );
+            // The archive_timeout line right next to it DOES vary with the value.
+            assert!(yaml.contains(&format!("archive_timeout: {timeout}\n")));
+        }
+    }
+
+    #[test]
+    fn archiving_enabled_seeds_replica_method_and_restore_command() {
+        let yaml = generate_patroni_config(&test_config(Some("bucket")), "replica");
+
+        // Replica re-seed method ahead of basebackup, via the call-time
+        // repo-path-resolving wrapper.
+        assert!(yaml.contains("  create_replica_methods:\n    - pgbackrest\n    - basebackup\n"));
+        assert!(yaml.contains("command: \"/usr/local/bin/pgbackrest-replica-restore-wrapper.sh\""));
+        assert!(yaml.contains("keep_data: true"));
+        assert!(yaml.contains("no_params: true"));
+
+        // Archive fallback for standbys, in both bootstrap DCS seed (8-space
+        // indent) and local postgresql.parameters (4-space indent).
+        assert!(yaml.contains(
+            "        restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n"
+        ));
+        assert!(yaml.contains(
+            "    restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n"
+        ));
+    }
+
+    #[test]
+    fn archiving_disabled_omits_replica_method_and_restore_command() {
+        let yaml = generate_patroni_config(&test_config(None), "replica");
+
+        assert!(!yaml.contains("create_replica_methods"));
+        assert!(!yaml.contains("restore_command"));
+        assert!(!yaml.contains("pgbackrest"));
+        // The interpolation site must still render valid YAML: with no
+        // replica-method block, data_dir is directly followed by the
+        // basebackup throttle options.
+        assert!(yaml.contains("  data_dir: /var/lib/postgresql/data/pgdata\n  basebackup:"));
+    }
+
+    #[test]
+    fn replica_method_block_renders_between_data_dir_and_basebackup_options() {
+        let yaml = generate_patroni_config(&test_config(Some("bucket")), "replica");
+        assert!(yaml.contains(
+            "  data_dir: /var/lib/postgresql/data/pgdata\n  create_replica_methods:"
+        ));
+        assert!(yaml.contains("    no_params: true\n  basebackup:"));
+    }
+
     #[test]
     fn basebackup_is_throttled_with_and_without_archiving() {
+        // No data_dir adjacency here: with archiving enabled the
+        // replica-method block sits between data_dir and this options
+        // block. The throttle itself must render either way.
         for cfg in [test_config(Some("bucket")), test_config(None)] {
             let yaml = generate_patroni_config(&cfg, "replica");
             assert!(yaml.contains(
-                "  data_dir: /var/lib/postgresql/data/pgdata\n  basebackup:\n    max-rate: 20M\n    checkpoint: fast\n  pgpass: /tmp/pgpass\n"
+                "  basebackup:\n    max-rate: 20M\n    checkpoint: fast\n  pgpass: /tmp/pgpass\n"
             ));
         }
     }

@@ -6,7 +6,10 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use common::init_logging;
+use nix::sys::signal::{SigHandler, Signal};
 use nix::sys::stat::{umask, Mode};
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::{ForkResult, Pid};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
@@ -20,6 +23,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -245,12 +249,20 @@ fn clamp(v: i64, lo: i64, hi: i64) -> u32 {
     v.clamp(lo, hi) as u32
 }
 
-fn env_or_clamp(var: &str, default: u32) -> u32 {
-    env::var(var)
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
+/// Pure parse+validate for a `process-max` override: accepts only a positive
+/// integer, falls back to `default` on anything missing/zero/malformed.
+/// Split out from `env_or_clamp` (mirrors `resolve_basebackup_max_rate` in
+/// config.rs) so the parsing logic is unit-testable without mutating process
+/// env — `PGBACKREST_*_PROCESS_MAX` vars would otherwise race across tests
+/// run in parallel within the same binary.
+fn parse_process_max(raw: Option<&str>, default: u32) -> u32 {
+    raw.and_then(|s| s.parse::<u32>().ok())
         .filter(|v| *v >= 1)
         .unwrap_or(default)
+}
+
+fn env_or_clamp(var: &str, default: u32) -> u32 {
+    parse_process_max(env::var(var).ok().as_deref(), default)
 }
 
 /// pg_wal drop ceiling (MiB) and pgBackRest archive-push spool ceiling (MiB).
@@ -544,11 +556,15 @@ async fn start_patroni() -> Result<tokio::process::Child> {
 ///
 /// Per-command `process-max` is sized off cgroup-detected vCPU. Each
 /// command has a different bottleneck shape: archive-push is gated by
-/// serial WAL arrival + S3 PUT overhead; archive-get by serial replay
-/// inside Postgres; restore is unbounded (DB is down) up to pgBackRest's
-/// plateau around 32 workers. Backup is capped at 2: volume read
-/// throughput does not scale with vCPU, so extra readers only deepen the
-/// volume's request queue — starving live queries and any member
+/// serial WAL arrival + S3 PUT overhead; archive-get is sized like push —
+/// with `archive-async=y` it prefetches segments into the spool ahead of
+/// replay, and during bulk catch-up per-segment S3 GET latency dominates,
+/// so parallel prefetch directly shortens catch-up (this conf serves the
+/// standby archive fallback; staged replay reads the recovery-source
+/// conf, which mirrors these settings); restore is unbounded (DB is down) up to
+/// pgBackRest's plateau around 32 workers. Backup is capped at 2: volume
+/// read throughput does not scale with vCPU, so extra readers only deepen
+/// the volume's request queue — starving live queries and any member
 /// mid-rewind or mid-clone that is reading from this node.
 ///
 /// No-op when neither archive nor recover-from is configured. Otherwise
@@ -637,11 +653,10 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
     }
 
     let conf_path = "/etc/pgbackrest/pgbackrest.conf";
-    let spool_dir = format!("{data_dir}/pgbackrest-spool");
 
     let cpus = detect_cpus().max(1) as i64;
     let push_max = env_or_clamp("PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX", clamp(cpus / 8, 2, 8));
-    let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", 1);
+    let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", clamp(cpus / 8, 2, 8));
     let backup_max = env_or_clamp("PGBACKREST_BACKUP_PROCESS_MAX", clamp(cpus / 4, 1, 2));
     let restore_max = env_or_clamp("PGBACKREST_RESTORE_PROCESS_MAX", clamp(cpus, 1, 32));
 
@@ -671,7 +686,60 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
         .filter(|v| *v > 0)
         .unwrap_or(14);
 
-    let conf = format!(
+    let conf = build_pgbackrest_conf(&PgbackrestConfParams {
+        data_dir,
+        queue_max_mib,
+        push_max,
+        get_max,
+        backup_max,
+        restore_max,
+        retention_full,
+        retention_diff,
+    });
+
+    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
+    fs::write(conf_path, conf).context("Failed to write pgbackrest.conf")?;
+    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
+        .context("Failed to set pgbackrest.conf permissions")?;
+
+    info!("pgbackrest: rendered {}", conf_path);
+    Ok(())
+}
+
+/// Inputs for [`build_pgbackrest_conf`], bundled so the builder doesn't need
+/// eight positional args (`clippy::too_many_arguments`) — every field maps
+/// 1:1 to a line in the rendered conf, so a struct with named fields also
+/// reads better at the call site than a wall of positional numbers.
+#[derive(Clone, Copy)]
+struct PgbackrestConfParams<'a> {
+    data_dir: &'a str,
+    queue_max_mib: u32,
+    push_max: u32,
+    get_max: u32,
+    backup_max: u32,
+    restore_max: u32,
+    retention_full: u32,
+    retention_diff: u32,
+}
+
+/// Pure conf-string builder for the main `pgbackrest.conf`, split out of
+/// `render_pgbackrest_conf` so the process-max sizing (and its regression:
+/// `archive-get` used to default to a flat `1`, now `clamp(cpus/8, 2, 8)`
+/// like `archive-push`) is unit-testable without writing to the real
+/// `/etc/pgbackrest` path.
+fn build_pgbackrest_conf(params: &PgbackrestConfParams) -> String {
+    let PgbackrestConfParams {
+        data_dir,
+        queue_max_mib,
+        push_max,
+        get_max,
+        backup_max,
+        restore_max,
+        retention_full,
+        retention_diff,
+    } = *params;
+    let spool_dir = format!("{data_dir}/pgbackrest-spool");
+    format!(
         "[global]\n\
          repo1-type=s3\n\
          repo1-retention-full={retention_full}\n\
@@ -701,15 +769,7 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
          [main]\n\
          pg1-path={data_dir}\n\
          pg1-port=5432\n",
-    );
-
-    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
-    fs::write(conf_path, conf).context("Failed to write pgbackrest.conf")?;
-    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
-        .context("Failed to set pgbackrest.conf permissions")?;
-
-    info!("pgbackrest: rendered {}", conf_path);
-    Ok(())
+    )
 }
 
 /// Render `/etc/pgbackrest/pgbackrest-recovery-source.conf` when
@@ -719,6 +779,12 @@ fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> {
 /// bucket as repo1 (numbering is per-config) so post-promote
 /// archive-push from the fork's main pgbackrest.conf can never fan out
 /// to source's read-only bucket and 403. Mirrors postgres-ssl PR #49.
+///
+/// `--config` REPLACES the main pgbackrest.conf, so the async parallel
+/// archive-get settings must be repeated here or staged replay silently
+/// runs sync with process-max=1 — bulk WAL replay to a PITR target is
+/// exactly the workload where per-segment S3 GET latency dominates.
+/// Sizing and env override mirror `render_pgbackrest_conf`.
 fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
     let bucket = match env::var("WAL_RECOVER_FROM_BUCKET") {
         Ok(b) if !b.is_empty() => b,
@@ -748,11 +814,74 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/pgbackrest".to_string());
 
+    let cpus = detect_cpus().max(1) as i64;
+    let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", clamp(cpus / 8, 2, 8));
+
+    let conf = build_pgbackrest_recovery_source_conf(&RecoverySourceConfParams {
+        data_dir,
+        bucket: &bucket,
+        key: &key,
+        secret: &secret,
+        region: &region,
+        endpoint: &endpoint,
+        uri_style: &uri_style,
+        path: &path,
+        get_max,
+    });
+
+    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
+    let conf_path = "/etc/pgbackrest/pgbackrest-recovery-source.conf";
+    fs::write(conf_path, conf).context("Failed to write pgbackrest-recovery-source.conf")?;
+    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
+        .context("Failed to set pgbackrest-recovery-source.conf permissions")?;
+    info!("pgbackrest: rendered {}", conf_path);
+    Ok(())
+}
+
+/// Inputs for [`build_pgbackrest_recovery_source_conf`], bundled for the same
+/// reason as [`PgbackrestConfParams`] — avoids a nine-positional-argument
+/// signature (`clippy::too_many_arguments`) where several args share the
+/// `&str` type and are easy to transpose by position (`region` vs.
+/// `endpoint` vs. `uri_style`) but not by name.
+#[derive(Clone, Copy)]
+struct RecoverySourceConfParams<'a> {
+    data_dir: &'a str,
+    bucket: &'a str,
+    key: &'a str,
+    secret: &'a str,
+    region: &'a str,
+    endpoint: &'a str,
+    uri_style: &'a str,
+    path: &'a str,
+    get_max: u32,
+}
+
+/// Pure conf-string builder for `pgbackrest-recovery-source.conf`, split out
+/// of `render_pgbackrest_recovery_source_conf` for unit testing. This PR's
+/// regression to guard: `--config` REPLACES the main conf wholesale, so
+/// without `archive-async=y` + `archive-get-queue-max` + the
+/// `[global:archive-get]` process-max block repeated here, staged PITR replay
+/// silently runs sync at process-max=1 even when the main conf is tuned for
+/// parallel prefetch.
+fn build_pgbackrest_recovery_source_conf(params: &RecoverySourceConfParams) -> String {
+    let RecoverySourceConfParams {
+        data_dir,
+        bucket,
+        key,
+        secret,
+        region,
+        endpoint,
+        uri_style,
+        path,
+        get_max,
+    } = *params;
     let spool_dir = format!("{data_dir}/pgbackrest-spool");
-    let conf = format!(
+    format!(
         "[global]\n\
          log-level-console=info\n\
          log-level-file=off\n\
+         archive-async=y\n\
+         archive-get-queue-max=1GiB\n\
          spool-path={spool_dir}\n\
          repo1-type=s3\n\
          repo1-s3-bucket={bucket}\n\
@@ -763,18 +892,13 @@ fn render_pgbackrest_recovery_source_conf(data_dir: &str) -> Result<()> {
          repo1-s3-uri-style={uri_style}\n\
          repo1-path={path}\n\
          \n\
+         [global:archive-get]\n\
+         process-max={get_max}\n\
+         \n\
          [main]\n\
          pg1-path={data_dir}\n\
          pg1-port=5432\n",
-    );
-
-    fs::create_dir_all("/etc/pgbackrest").context("Failed to create /etc/pgbackrest")?;
-    let conf_path = "/etc/pgbackrest/pgbackrest-recovery-source.conf";
-    fs::write(conf_path, conf).context("Failed to write pgbackrest-recovery-source.conf")?;
-    fs::set_permissions(conf_path, std::fs::Permissions::from_mode(0o640))
-        .context("Failed to set pgbackrest-recovery-source.conf permissions")?;
-    info!("pgbackrest: rendered {}", conf_path);
-    Ok(())
+    )
 }
 
 /// Stage PITR replay before Patroni starts Postgres.
@@ -897,6 +1021,16 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
         .context("Failed to open postgresql.auto.conf")?;
     f.write_all(addition.as_bytes())
         .context("Failed to append recovery settings")?;
+
+    // The recovery-source conf runs archive-get in async mode, which needs
+    // the spool dir. `spawn_bootstrap_stanza_create` only mkdirs it after
+    // pg_isready — too late for replay, whose archive-gets start first.
+    // Safe here: pgdata is populated (postgresql.auto.conf was just written
+    // into it), so Patroni's empty-dir bootstrap gate is not in play.
+    let spool_dir = format!("{data_dir}/pgbackrest-spool");
+    fs::create_dir_all(&spool_dir).context("Failed to create pgbackrest spool dir")?;
+    fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o750))
+        .context("Failed to set pgbackrest spool dir permissions")?;
 
     fs::File::create(&signal).context("Failed to create recovery.signal")?;
     fs::write(&staging, "").context("Failed to write PITR staging marker")?;
@@ -1123,8 +1257,98 @@ fn spawn_bootstrap_stanza_create() {
     });
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// PID of the real patroni-runner process, for the mini-init's
+/// signal-forwarding handler. Written exactly once, before the handlers
+/// are installed.
+static MINI_INIT_CHILD: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn mini_init_forward(sig: nix::libc::c_int) {
+    let pid = MINI_INIT_CHILD.load(Ordering::Relaxed);
+    if pid > 0 {
+        // Async-signal-safe: raw kill only.
+        unsafe { nix::libc::kill(pid, sig) };
+    }
+}
+
+/// Run as a minimal init: fork, let the child continue as the real
+/// program, and keep the parent behind as the process the kernel hands
+/// orphans to — reaping them forever and forwarding terminal signals to
+/// the child.
+///
+/// This process is PID 1 in the container (postgres-wrapper and gosu both
+/// exec into us), and PID 1 inherits every orphaned descendant. Reaping
+/// them is not cosmetic: Patroni's stop-timeout path
+/// (`PostmasterProcess.signal_kill`) SIGKILLs the postmaster BEFORE its
+/// children, so those children die as orphans — and then Patroni blocks in
+/// `psutil.wait_procs(children + [self])`, which has no timeout and polls
+/// for the PIDs to vanish. An unreaped zombie's PID never vanishes, so the
+/// async task thread that issued the stop (e.g. a reinitialize) hangs
+/// forever, taking Patroni's single task slot with it: every later
+/// `/reinitialize` logs "Cancelling long running task", then blocks on
+/// `_finish_event.wait()` for a thread that can never finish. Observed
+/// end-state: "reinitialize in progress" for the rest of the container's
+/// life, immune to postgres dying and to re-issued reinitializes alike.
+///
+/// The fork-parent design (rather than a `waitpid(-1)` loop inside the
+/// tokio process) is what makes blanket reaping safe: the parent has
+/// exactly one direct child of its own, so `waitpid(-1)` can only ever
+/// collect that child or orphans — never the exit status of a subprocess
+/// the real program is still `wait()`ing on.
+///
+/// Returns in the CHILD; the parent never returns (it exits with the
+/// child's status once the child dies).
+fn run_as_mini_init() -> Result<()> {
+    // Belt-and-suspenders for any future entrypoint shuffle that puts a
+    // non-reaping process above us: subreaper routes our subtree's orphans
+    // here even when we are not PID 1. (prctl is Linux-only; the image is.)
+    #[cfg(target_os = "linux")]
+    let _ = nix::sys::prctl::set_child_subreaper(true);
+
+    let child = match unsafe { nix::unistd::fork() }.context("mini-init fork failed")? {
+        ForkResult::Child => return Ok(()),
+        ForkResult::Parent { child } => child,
+    };
+
+    MINI_INIT_CHILD.store(child.as_raw(), Ordering::Relaxed);
+    for sig in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGQUIT, Signal::SIGHUP] {
+        // SAFETY: handler is async-signal-safe (atomic load + kill).
+        unsafe {
+            let _ = nix::sys::signal::signal(sig, SigHandler::Handler(mini_init_forward));
+        }
+    }
+
+    loop {
+        match waitpid(Pid::from_raw(-1), None) {
+            Ok(WaitStatus::Exited(pid, code)) if pid == child => std::process::exit(code),
+            Ok(WaitStatus::Signaled(pid, sig, _)) if pid == child => {
+                std::process::exit(128 + sig as i32)
+            }
+            // An orphan reaped — the entire point of standing here.
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => {}
+            // No children at all: the real child is gone without us seeing
+            // its status (should not happen; don't spin on it).
+            Err(nix::errno::Errno::ECHILD) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("mini-init: waitpid failed: {e}; exiting");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    // Must run before the tokio runtime exists: fork() and threads don't mix.
+    run_as_mini_init()?;
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let _guard = init_logging("patroni-runner");
 
     // Screen WAL_ARCHIVE_BUCKET shape before translation so a junk value
@@ -1421,9 +1645,181 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        data_dir_nonempty, is_uuid_shape, pgdata_is_dedicated_subdir, should_wipe_incomplete_clone,
-        wipe_pgdata_contents,
+        build_pgbackrest_conf, build_pgbackrest_recovery_source_conf, configure_pitr_recovery,
+        data_dir_nonempty, is_uuid_shape, parse_process_max, pgdata_is_dedicated_subdir,
+        should_wipe_incomplete_clone, wipe_pgdata_contents, Config, PgbackrestConfParams,
+        RecoverySourceConfParams,
     };
+
+    fn test_config(data_dir: &str) -> Config {
+        Config {
+            scope: "test-scope".into(),
+            name: "test-node".into(),
+            connect_address: "test-node".into(),
+            etcd_hosts: "etcd-1:2379".into(),
+            superuser: "postgres".into(),
+            superuser_pass: "pw".into(),
+            repl_user: "repl".into(),
+            repl_pass: "pw".into(),
+            app_user: "app".into(),
+            app_pass: "pw".into(),
+            app_db: "app".into(),
+            data_dir: data_dir.into(),
+            certs_dir: "/certs".into(),
+            ttl: "30".into(),
+            loop_wait: "10".into(),
+            retry_timeout: "10".into(),
+            health_check_interval: 5,
+            health_check_timeout: 3,
+            max_failures: 3,
+            startup_grace_period: 30,
+            max_startup_timeout: 1800,
+            adopt_existing_data: false,
+            wait_for_leader: false,
+            synchronous_mode: false,
+            wal_archive_bucket: None,
+            wal_recover_from_bucket: None,
+            pitr_target_time: None,
+            pitr_target_xid: None,
+            archive_timeout_secs: 60,
+            basebackup_max_rate: "20M".into(),
+        }
+    }
+
+    #[test]
+    fn parse_process_max_uses_default_when_unset_or_invalid() {
+        assert_eq!(parse_process_max(None, 4), 4);
+        assert_eq!(parse_process_max(Some(""), 4), 4);
+        assert_eq!(parse_process_max(Some("0"), 4), 4);
+        assert_eq!(parse_process_max(Some("-1"), 4), 4);
+        assert_eq!(parse_process_max(Some("not-a-number"), 4), 4);
+    }
+
+    #[test]
+    fn parse_process_max_accepts_positive_override() {
+        assert_eq!(parse_process_max(Some("16"), 4), 16);
+        assert_eq!(parse_process_max(Some("1"), 4), 1);
+    }
+
+    #[test]
+    fn archive_get_process_max_default_scales_with_cpus_not_flat_one() {
+        // Regression: archive-get used to hard-default to 1 (WAL replay
+        // assumed serial); it now sizes like archive-push,
+        // clamp(cpus/8, 2, 8), because archive-async prefetch parallelizes
+        // bulk catch-up. Exercise the same clamp() the real call site uses
+        // across the cpu range operators actually see.
+        for (cpus, expected_get_max) in [(1i64, 2u32), (8, 2), (16, 2), (64, 8), (256, 8)] {
+            let conf = build_pgbackrest_conf(&PgbackrestConfParams {
+                data_dir: "/pgdata",
+                queue_max_mib: 5120,
+                push_max: super::clamp(cpus / 8, 2, 8),
+                get_max: super::clamp(cpus / 8, 2, 8),
+                backup_max: 1,
+                restore_max: 1,
+                retention_full: 4,
+                retention_diff: 14,
+            });
+            assert!(
+                conf.contains(&format!("[global:archive-get]\nprocess-max={expected_get_max}\n")),
+                "cpus={cpus}: expected archive-get process-max={expected_get_max} in:\n{conf}"
+            );
+        }
+    }
+
+    #[test]
+    fn pgbackrest_conf_renders_all_five_process_max_sections() {
+        let conf = build_pgbackrest_conf(&PgbackrestConfParams {
+            data_dir: "/pgdata",
+            queue_max_mib: 5120,
+            push_max: 8,
+            get_max: 4,
+            backup_max: 2,
+            restore_max: 32,
+            retention_full: 4,
+            retention_diff: 14,
+        });
+        assert!(conf.contains("[global:archive-push]\nprocess-max=8\n"));
+        assert!(conf.contains("[global:archive-get]\nprocess-max=4\n"));
+        assert!(conf.contains("[global:backup]\nprocess-max=2\n"));
+        assert!(conf.contains("[global:restore]\nprocess-max=32\n"));
+        assert!(conf.contains("repo1-retention-full=4\n"));
+        assert!(conf.contains("repo1-retention-diff=14\n"));
+    }
+
+    #[test]
+    fn recovery_source_conf_runs_archive_get_in_async_parallel_mode() {
+        // Regression: --config REPLACES the main conf wholesale, so without
+        // these three lines repeated here, staged PITR replay silently ran
+        // sync archive-get at process-max=1 regardless of how the main conf
+        // was tuned — exactly the bulk-catch-up workload parallel prefetch
+        // targets.
+        let conf = build_pgbackrest_recovery_source_conf(&RecoverySourceConfParams {
+            data_dir: "/pgdata",
+            bucket: "source-bucket",
+            key: "key",
+            secret: "secret",
+            region: "us-east-1",
+            endpoint: "fly.storage.tigris.dev",
+            uri_style: "path",
+            path: "/pgbackrest",
+            get_max: 6,
+        });
+        assert!(conf.contains("archive-async=y\n"));
+        assert!(conf.contains("archive-get-queue-max=1GiB\n"));
+        assert!(conf.contains("[global:archive-get]\nprocess-max=6\n"));
+        assert!(conf.contains("repo1-s3-bucket=source-bucket\n"));
+        assert!(conf.contains("spool-path=/pgdata/pgbackrest-spool\n"));
+    }
+
+    #[test]
+    fn configure_pitr_recovery_creates_spool_dir_with_restricted_perms() {
+        let dir = std::env::temp_dir().join(format!("pitr_spool_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = test_config(dir.to_str().unwrap());
+        config.wal_recover_from_bucket = Some("source-bucket".into());
+        config.pitr_target_time = Some("2026-01-01T00:00:00Z".into());
+
+        configure_pitr_recovery(&config).unwrap();
+
+        let spool_dir = dir.join("pgbackrest-spool");
+        assert!(spool_dir.is_dir(), "spool dir must exist after staging");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&spool_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o750, "spool dir must be 0750, got {mode:o}");
+        }
+        assert!(dir.join("recovery.signal").exists());
+        assert!(dir.join(".pitr_staging").exists());
+        let auto_conf = std::fs::read_to_string(dir.join("postgresql.auto.conf")).unwrap();
+        assert!(auto_conf.contains("restore_command"));
+        assert!(auto_conf.contains("recovery_target_time"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn configure_pitr_recovery_skips_staging_without_recover_from_bucket() {
+        // Guard mirrored from postgres-ssl wrapper.sh: without
+        // WAL_RECOVER_FROM_BUCKET the recovery-source conf never renders, so
+        // staging recovery.signal here would archive-get FATAL at boot.
+        let dir = std::env::temp_dir().join(format!("pitr_spool_skip_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = test_config(dir.to_str().unwrap());
+        config.pitr_target_time = Some("2026-01-01T00:00:00Z".into());
+        // wal_recover_from_bucket left None.
+
+        configure_pitr_recovery(&config).unwrap();
+
+        assert!(!dir.join("pgbackrest-spool").exists());
+        assert!(!dir.join("recovery.signal").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn wipe_only_with_pg_control_absent_nonempty_and_distinct_leader() {
