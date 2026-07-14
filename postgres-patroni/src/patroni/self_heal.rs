@@ -491,8 +491,10 @@ fn stalled_timeline_divergence(s: &SelfHealInputs) -> Option<(i64, i64)> {
 /// `wal_stall_dwell_secs` while Patroni still reports it healthy. Unlike a
 /// cross-timeline gap (always abnormal — a healthy replica never falls
 /// behind on timeline), a frozen cursor on a matching timeline has one
-/// legitimate cause: a genuinely idle primary. `wal_stall_dwell_secs`
-/// defaults well past `checkpoint_timeout` specifically to rule that out (see
+/// legitimate cause: a genuinely idle primary. The real guard against that
+/// false positive is `leader_advanced_during_stall`, not the dwell — Postgres
+/// skips scheduled checkpoints entirely when idle, so `wal_stall_dwell_secs`
+/// doesn't bound the false-positive window on its own (see
 /// [`DEFAULT_WAL_STALL_DWELL_SECONDS`]). The canonical broken case: Postgres
 /// stuck replaying a corrupt/incomplete local WAL segment, logging
 /// `record with incorrect prev-link` / `invalid resource manager ID` and
@@ -1401,20 +1403,17 @@ async fn iteration(
     // `SelfHealInputs::leader_timeline` stays this poll's real (possibly
     // `None`) reading, so a reinit can only ever fire on a poll that actually
     // measured the leader.
-    let leader_timeline_for_accrual =
+    let leader_tl_for_accrual =
         leader_timeline_for_accrual(leader_timeline, divergence_window.as_ref());
-    let current_obs = replay_tracking_eligible(
-        role,
-        &patroni_state,
-        local_timeline,
-        leader_timeline_for_accrual,
-    )
-    .map(|(local_tl, leader_tl)| DivergenceObs {
-        local_tl,
-        progress: local_progress,
-        leader_progress: leader.progress,
-        leader_tl,
-    });
+    let current_obs =
+        replay_tracking_eligible(role, &patroni_state, local_timeline, leader_tl_for_accrual).map(
+            |(local_tl, leader_tl)| DivergenceObs {
+                local_tl,
+                progress: local_progress,
+                leader_progress: leader.progress,
+                leader_tl,
+            },
+        );
     *divergence_window = accrue_divergence_window(current_obs, *divergence_window, now);
     let diverged_for_secs = divergence_window
         .map(|w| now.saturating_sub(w.since).max(0) as u64)
@@ -1704,8 +1703,8 @@ async fn probe_leader(client: &reqwest::Client, timeout_secs: u64) -> LeaderProb
         return LeaderProbe::default();
     };
     // Carry the leader's timeline even before the health probe — the divergence
-    // check needs it, and a leader that fails the /health probe still pins the
-    // timeline a stuck replica should be measured against.
+    // check needs it, and a leader that fails the reachability probe still
+    // pins the timeline a stuck replica should be measured against.
     let timeline = leader.timeline;
     if leader.state != "running" {
         return LeaderProbe {
@@ -1722,36 +1721,29 @@ async fn probe_leader(client: &reqwest::Client, timeout_secs: u64) -> LeaderProb
         };
     };
     let api_url = api_url.trim_end_matches('/');
-    // Patroni's /health endpoint mirrors /leader on the leader: 200 if
-    // healthy, 503 otherwise. Reuse the shared client with a per-request
-    // timeout override so we keep the connection pool warm across polls.
-    let health_url = format!("{api_url}/health");
-    let reachable = matches!(
-        client
-            .get(&health_url)
-            .timeout(Duration::from_secs(timeout_secs))
-            .send()
-            .await
-            .map(|r| r.status().as_u16()),
-        Ok(200)
-    );
-    // The leader's own WAL position, straight from its `/patroni` — fetched
-    // independently of (and regardless of) the /health outcome above, same as
-    // `timeline` is carried regardless of reachability: a flaky /health poll
-    // shouldn't also blind the same-timeline-stall check to real leader
-    // progress. Best-effort: `None` on any failure, never fatal to the probe.
-    // Uses the same tight `timeout_secs` override as the /health check above
-    // (rather than the client's looser default) so this extra per-iteration
-    // request doesn't inflate worst-case poll latency.
-    let progress = fetch_patroni_status(
+    // A single `/patroni` request against the leader doubles as both the
+    // reachability probe and the WAL-position read, rather than a separate
+    // `/health` round-trip plus a `/patroni` one every poll: `state ==
+    // "running"` mirrors `/health`'s 200/healthy vs 503/unhealthy semantics
+    // (Postgres up and accepting connections), and the same response body
+    // already carries the WAL position we need. Reuse the shared client with
+    // a per-request timeout override so we keep the connection pool warm
+    // across polls. Best-effort: any failure (timeout, non-JSON body) reads
+    // as unreachable with no progress, never fatal to the probe.
+    let leader_status = fetch_patroni_status(
         client,
         &format!("{api_url}/patroni"),
         Some(Duration::from_secs(timeout_secs)),
     )
     .await
-    .ok()
-    .and_then(|p| p.xlog)
-    .and_then(|x| x.highest_location());
+    .ok();
+    let reachable = matches!(
+        leader_status.as_ref().and_then(|p| p.state.as_deref()),
+        Some("running")
+    );
+    let progress = leader_status
+        .and_then(|p| p.xlog)
+        .and_then(|x| x.highest_location());
     LeaderProbe {
         reachable,
         timeline,
@@ -1774,10 +1766,10 @@ fn progress_advanced_past(fresh: Option<i64>, frozen_progress: Option<i64>) -> b
 /// (local) and `/cluster` (leader) — not the snapshot the decision was made
 /// from — then re-applies the exact structural guards via
 /// [`timeline_divergence_present`] plus an explicit active-leader check
-/// (`reachable`, i.e. leader present, `running`, and `/health` 200), plus a
-/// direct check that the local WAL cursor hasn't advanced past
-/// `frozen_progress` (the dwell window's frozen baseline) — the multi-poll
-/// accrual proves the cursor was frozen as of the LAST regular poll, but not
+/// (`reachable`, i.e. leader present, `running`, and its own `/patroni` state
+/// also `running`), plus a direct check that the local WAL cursor hasn't
+/// advanced past `frozen_progress` (the dwell window's frozen baseline) — the
+/// multi-poll accrual proves the cursor was frozen as of the LAST regular poll, but not
 /// as of this instant, and the structural gap check alone can't see cursor
 /// movement on a timeline that hasn't crossed a switchpoint yet. Any
 /// disagreement returns `false` and the caller backs off. This is the final
@@ -1810,6 +1802,15 @@ async fn confirm_timeline_divergence(
     .is_some()
 }
 
+// How long `confirm_replay_stall` waits between its own two cursor reads.
+// Guards against confirming a stall right as an asymmetric partition heals:
+// the replica's walreceiver can take a few seconds to reconnect after the
+// leader becomes reachable again, during which a single fresh read still
+// looks frozen even though the replica is about to resume on its own.
+// Matches Postgres's own default `wal_retrieve_retry_interval` (5s) — the
+// interval a genuinely healed replica needs to retry the connection.
+const REPLAY_STALL_RECHECK_DELAY_SECS: u64 = 5;
+
 /// Independent fresh-read re-check for the same-timeline replay-stall
 /// trigger, mirroring [`confirm_timeline_divergence`]. Re-verifies the
 /// structural conditions (replica, healthy state, leader reachable, timelines
@@ -1819,6 +1820,12 @@ async fn confirm_timeline_divergence(
 /// or that the leader genuinely advanced during it — the multi-poll accrual
 /// already established both; this just guards against acting on a single
 /// stale/flaky read.
+///
+/// Also takes a *second* cursor read `REPLAY_STALL_RECHECK_DELAY_SECS` later
+/// and aborts if it moved past the first: the structural/dwell checks above
+/// only rule out a stale poll, not a replica whose walreceiver reconnects
+/// between this function's own first read and the reinit that would follow
+/// it — the exact shape of an asymmetric-partition heal landing mid-recheck.
 async fn confirm_replay_stall(
     client: &reqwest::Client,
     cfg: &WatcherConfig,
@@ -1831,10 +1838,8 @@ async fn confirm_replay_stall(
     if !leader.reachable {
         return false;
     }
-    if progress_advanced_past(
-        local.xlog.and_then(|x| x.highest_location()),
-        frozen_progress,
-    ) {
+    let first_progress = local.xlog.and_then(|x| x.highest_location());
+    if progress_advanced_past(first_progress, frozen_progress) {
         return false;
     }
     match replay_tracking_eligible(
@@ -1843,9 +1848,15 @@ async fn confirm_replay_stall(
         local.timeline,
         leader.timeline,
     ) {
-        Some((l, r)) => l == r,
-        None => false,
+        Some((l, r)) if l == r => {}
+        _ => return false,
     }
+    sleep(Duration::from_secs(REPLAY_STALL_RECHECK_DELAY_SECS)).await;
+    let Ok(recheck_local) = fetch_local_patroni(client).await else {
+        return false;
+    };
+    let second_progress = recheck_local.xlog.and_then(|x| x.highest_location());
+    !progress_advanced_past(second_progress, first_progress)
 }
 
 async fn issue_reinitialize(client: &reqwest::Client) -> Result<()> {
