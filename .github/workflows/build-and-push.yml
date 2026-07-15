@@ -1,9 +1,9 @@
 name: Build and Push Docker Images
 
 on:
-  # Run weekly on Mondays at midnight UTC
+  # Run daily at midnight UTC
   schedule:
-    - cron: '0 0 * * 1'
+    - cron: '0 0 * * *'
   # Allow manual trigger
   workflow_dispatch:
   # Build on push to main
