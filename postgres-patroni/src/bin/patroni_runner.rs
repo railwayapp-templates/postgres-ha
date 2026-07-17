@@ -1683,6 +1683,7 @@ mod tests {
             pitr_target_xid: None,
             archive_timeout_secs: 60,
             basebackup_max_rate: "20M".into(),
+            max_slot_wal_keep_size: "512000MB".into(),
         }
     }
 

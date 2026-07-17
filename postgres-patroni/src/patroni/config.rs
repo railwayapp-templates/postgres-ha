@@ -91,6 +91,105 @@ pub struct Config {
     /// can never monopolize the leader's volume. Validated
     /// `POSTGRES_BASEBACKUP_MAX_RATE` override or the `20M` default.
     pub basebackup_max_rate: String,
+    /// `max_slot_wal_keep_size` — the ceiling on WAL the leader retains for a
+    /// lagging member's replication slot. Rendered as a PG size string, or
+    /// `-1` (unlimited, PG's default) when the volume can't be measured.
+    /// Sized off this node's own volume; validated
+    /// `POSTGRES_MAX_SLOT_WAL_KEEP_SIZE` override wins when set.
+    pub max_slot_wal_keep_size: String,
+}
+
+/// Fraction of the volume a lagging member's slot may pin before PostgreSQL
+/// invalidates it. 1/4 leaves the other 3/4 for the base data, `max_wal_size`,
+/// the pgBackRest spool (itself capped at 5 GiB by `compute_volume_thresholds`)
+/// and recovery temp files.
+const SLOT_KEEP_VOLUME_FRACTION: u64 = 4;
+
+/// Floor for the derived cap: 1 GiB (64 × 16 MiB segments). Below this a slot
+/// is invalidated by routine churn (a replica restart, a brief disconnect) and
+/// the re-clone it forces costs far more than the WAL it saves.
+const SLOT_KEEP_FLOOR_MIB: u64 = 1024;
+
+/// Resolve `max_slot_wal_keep_size` from this node's volume size.
+///
+/// `use_slots: true` means every member holds a physical replication slot on
+/// the leader, and PostgreSQL's default `max_slot_wal_keep_size = -1` lets a
+/// slot pin WAL **without bound**. A replica that replays slower than the
+/// leader writes therefore grows the leader's `pg_wal` until the volume is
+/// full, at which point the leader takes `PANIC: could not write to file
+/// "pg_wal/xlogtemp.N": No space left on device`, crash-restarts, loses its
+/// etcd lock and bumps the timeline — a sick *replica* killing the *primary*,
+/// which inverts the entire point of HA. Confirmed live 2026-07-10: a 2 TB
+/// leader volume went 1083 GB → 1985 GB in 13 h and PANICked.
+///
+/// Capping trades that outage for a bounded, recoverable one: past the cap
+/// PostgreSQL invalidates the slot, frees the WAL and keeps the leader up. The
+/// replica then catches up from the S3 archive via `restore_command`, or
+/// re-seeds through `create_replica_methods: [pgbackrest, basebackup]` — both
+/// wired up by #78 — so on an archiving cluster the invalidation is usually
+/// invisible. Without archiving it forces a re-clone, which is still strictly
+/// better than losing the primary, so this is deliberately **not** gated on
+/// `wal_archive_bucket`.
+///
+/// Sized per-node off the local volume rather than seeded cluster-wide into
+/// `bootstrap.dcs`: the value is a property of the disk under *this* node, any
+/// member can become leader, and `bootstrap.dcs` only applies at cluster
+/// genesis — an existing cluster would never pick it up.
+///
+/// An unmeasurable volume falls back to `-1`, preserving today's behaviour
+/// rather than guessing a cap that could invalidate slots wrongly.
+fn resolve_max_slot_wal_keep_size(env_value: Option<String>, volume_total_mib: u64) -> String {
+    const UNLIMITED: &str = "-1";
+
+    if let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        if is_valid_slot_keep_size(&v) {
+            return v;
+        }
+        warn!(
+            value = %v,
+            "invalid POSTGRES_MAX_SLOT_WAL_KEEP_SIZE (need -1 or a positive PG size like 512GB); deriving from volume size"
+        );
+    }
+
+    if volume_total_mib == 0 {
+        warn!(
+            "volume size unknown; leaving max_slot_wal_keep_size unlimited (a lagging replica's slot can fill the leader's disk)"
+        );
+        return UNLIMITED.to_string();
+    }
+
+    let mib = (volume_total_mib / SLOT_KEEP_VOLUME_FRACTION).max(SLOT_KEEP_FLOOR_MIB);
+    format!("{mib}MB")
+}
+
+/// Accept `-1` (explicitly unlimited) or a positive PG size string. PG's size
+/// units are powers of 1024 and a bare integer means MB for this GUC, so bare
+/// digits are safe here — unlike `POSTGRES_BASEBACKUP_MAX_RATE`, where a bare
+/// value silently means kB/s.
+fn is_valid_slot_keep_size(v: &str) -> bool {
+    if v == "-1" {
+        return true;
+    }
+    let digits = v
+        .strip_suffix("kB")
+        .or_else(|| v.strip_suffix("MB"))
+        .or_else(|| v.strip_suffix("GB"))
+        .or_else(|| v.strip_suffix("TB"))
+        .unwrap_or(v)
+        .trim();
+    digits.parse::<u64>().is_ok_and(|n| n > 0)
+}
+
+/// Total size of the filesystem holding `path`, in MiB. `0` when it can't be
+/// measured. Mirrors `compute_volume_thresholds`' probe in patroni_runner.
+fn volume_total_mib(path: &str) -> u64 {
+    use nix::sys::statvfs::statvfs;
+
+    statvfs(std::path::Path::new(path))
+        .ok()
+        .and_then(|s| (s.blocks() as u64).checked_mul(s.fragment_size() as u64))
+        .map(|bytes| bytes / (1024 * 1024))
+        .unwrap_or(0)
 }
 
 /// Validate an operator-supplied pg_basebackup --max-rate override. Requires
@@ -183,13 +282,82 @@ impl Config {
             basebackup_max_rate: resolve_basebackup_max_rate(
                 env::var("POSTGRES_BASEBACKUP_MAX_RATE").ok(),
             ),
+            max_slot_wal_keep_size: resolve_max_slot_wal_keep_size(
+                env::var("POSTGRES_MAX_SLOT_WAL_KEEP_SIZE").ok(),
+                volume_total_mib(&crate::volume_root()),
+            ),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_basebackup_max_rate;
+    use super::{resolve_basebackup_max_rate, resolve_max_slot_wal_keep_size};
+
+    /// 2 TB volume, the rampmetrics-api geometry that PANICked on 2026-07-10.
+    const TWO_TB_MIB: u64 = 2_000_000_000_000 / (1024 * 1024);
+
+    #[test]
+    fn slot_keep_size_is_a_quarter_of_the_volume() {
+        assert_eq!(
+            resolve_max_slot_wal_keep_size(None, TWO_TB_MIB),
+            format!("{}MB", TWO_TB_MIB / 4)
+        );
+    }
+
+    #[test]
+    fn slot_keep_size_would_have_survived_the_2026_07_10_incident() {
+        // The leader retained ~900 GB of WAL for a lagging replica's slot
+        // before the volume filled. The derived cap must invalidate the slot
+        // well short of that, and still leave room for the base data (~1071 GB
+        // at the time) on the same 2 TB volume.
+        let cap = resolve_max_slot_wal_keep_size(None, TWO_TB_MIB);
+        let cap_mib: u64 = cap.trim_end_matches("MB").parse().unwrap();
+        let cap_gb = cap_mib * 1024 * 1024 / 1_000_000_000;
+        assert!(cap_gb < 900, "cap {cap_gb} GB must trip before the ~900 GB that filled the disk");
+        assert!(1071 + cap_gb < 2000, "data + capped WAL ({} GB) must fit the 2 TB volume", 1071 + cap_gb);
+    }
+
+    #[test]
+    fn slot_keep_size_floors_on_tiny_volumes() {
+        // A 1 GiB volume would derive 256 MiB (~16 segments) — routine churn
+        // would invalidate the slot. Floor it instead.
+        assert_eq!(resolve_max_slot_wal_keep_size(None, 1024), "1024MB");
+        assert_eq!(resolve_max_slot_wal_keep_size(None, 1), "1024MB");
+    }
+
+    #[test]
+    fn slot_keep_size_unmeasurable_volume_stays_unlimited() {
+        // Never guess a cap we can't size: an unmeasurable volume keeps PG's
+        // default rather than risk invalidating slots wrongly.
+        assert_eq!(resolve_max_slot_wal_keep_size(None, 0), "-1");
+    }
+
+    #[test]
+    fn slot_keep_size_accepts_operator_override() {
+        assert_eq!(
+            resolve_max_slot_wal_keep_size(Some("512GB".into()), TWO_TB_MIB),
+            "512GB"
+        );
+        // Explicitly opting back into unlimited is a valid escape hatch.
+        assert_eq!(resolve_max_slot_wal_keep_size(Some("-1".into()), TWO_TB_MIB), "-1");
+        // Bare digits mean MB for this GUC — no unit footgun, so accept them.
+        assert_eq!(
+            resolve_max_slot_wal_keep_size(Some("4096".into()), TWO_TB_MIB),
+            "4096"
+        );
+    }
+
+    #[test]
+    fn slot_keep_size_rejects_junk_override_and_derives_instead() {
+        for junk in ["0", "abc", "-5", "12MiB", ""] {
+            assert_eq!(
+                resolve_max_slot_wal_keep_size(Some(junk.into()), TWO_TB_MIB),
+                format!("{}MB", TWO_TB_MIB / 4),
+                "junk override {junk:?} must fall back to the derived cap"
+            );
+        }
+    }
 
     #[test]
     fn max_rate_accepts_suffixed_values_in_range() {

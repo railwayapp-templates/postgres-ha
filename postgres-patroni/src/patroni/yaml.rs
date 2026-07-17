@@ -89,6 +89,14 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // place them in Patroni's local postgresql.parameters section. DCS takes
     // priority when both are present and agree; if DCS is empty at startup
     // the local value fills the gap and avoids the reload→pending_restart trap.
+    // max_slot_wal_keep_size bounds what a lagging member's slot can pin on the
+    // leader. It lives in the LOCAL parameters, not bootstrap.dcs: the value is
+    // derived from this node's own volume, every member can become leader, and
+    // bootstrap.dcs only seeds DCS at cluster genesis — existing clusters (the
+    // ones already at risk) would never pick it up. DCS still wins if an
+    // operator sets it there. PGC_SIGHUP, so a reload applies it. See
+    // Config::resolve_max_slot_wal_keep_size for the sizing and the failure it
+    // prevents.
     let pgbackrest_local_params = if config.wal_archive_bucket.is_some() {
         "    archive_mode: \"on\"\n    track_commit_timestamp: \"on\"\n    restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n".to_string()
     } else {
@@ -186,6 +194,7 @@ postgresql:
     ssl_cert_file: "{certs_dir}/server.crt"
     ssl_key_file: "{certs_dir}/server.key"
     ssl_ca_file: "{certs_dir}/root.crt"
+    max_slot_wal_keep_size: {max_slot_wal_keep_size}
 {pgbackrest_local_params}"#,
         scope = config.scope,
         name = config.name,
@@ -205,6 +214,7 @@ postgresql:
         certs_dir = config.certs_dir,
         synchronous_mode = config.synchronous_mode,
         basebackup_max_rate = config.basebackup_max_rate,
+        max_slot_wal_keep_size = config.max_slot_wal_keep_size,
         pgbackrest_archive_params = pgbackrest_archive_params,
         pgbackrest_local_params = pgbackrest_local_params,
     )
@@ -286,6 +296,7 @@ mod tests {
             pitr_target_xid: None,
             archive_timeout_secs: 60,
             basebackup_max_rate: "20M".into(),
+            max_slot_wal_keep_size: "512000MB".into(),
         }
     }
 
@@ -314,6 +325,31 @@ mod tests {
             // The archive_timeout line right next to it DOES vary with the value.
             assert!(yaml.contains(&format!("archive_timeout: {timeout}\n")));
         }
+    }
+
+    #[test]
+    fn max_slot_wal_keep_size_renders_locally_and_regardless_of_archiving() {
+        // Local parameters, NOT bootstrap.dcs: the cap is derived from this
+        // node's own volume and must reach clusters that already bootstrapped
+        // (exactly the ones at risk), which bootstrap.dcs never would.
+        for bucket in [Some("bucket"), None] {
+            let yaml = generate_patroni_config(&test_config(bucket), "replica");
+            let occurrences = yaml.matches("max_slot_wal_keep_size: 512000MB").count();
+            assert_eq!(
+                occurrences, 1,
+                "expected exactly 1 local max_slot_wal_keep_size line (archiving={bucket:?}), found {occurrences}"
+            );
+        }
+
+        // It must sit under the local `postgresql:` section, after the ssl
+        // params — not inside bootstrap.dcs.
+        let yaml = generate_patroni_config(&test_config(None), "replica");
+        let bootstrap_end = yaml.find("postgresql:\n  listen:").expect("local postgresql section");
+        let cap_at = yaml.find("max_slot_wal_keep_size:").expect("cap rendered");
+        assert!(
+            cap_at > bootstrap_end,
+            "max_slot_wal_keep_size must render in the local section, not bootstrap.dcs"
+        );
     }
 
     #[test]
