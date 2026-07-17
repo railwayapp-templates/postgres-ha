@@ -4,7 +4,7 @@ use crate::{pgdata, ssl_dir};
 use anyhow::Result;
 use common::ConfigExt;
 use std::env;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Configuration for Patroni runner
 pub struct Config {
@@ -99,16 +99,37 @@ pub struct Config {
     pub max_slot_wal_keep_size: String,
 }
 
-/// Fraction of the volume a lagging member's slot may pin before PostgreSQL
-/// invalidates it. 1/4 leaves the other 3/4 for the base data, `max_wal_size`,
-/// the pgBackRest spool (itself capped at 5 GiB by `compute_volume_thresholds`)
-/// and recovery temp files.
-const SLOT_KEEP_VOLUME_FRACTION: u64 = 4;
+/// Percent of the TOTAL volume a slot may pin, regardless of how empty the disk
+/// looks right now. The free-space bound below is the one that actually
+/// protects the primary, but it's measured once at startup: a node that has just
+/// re-cloned has a small data dir and momentarily abundant free space, and the
+/// data grows afterwards while this value stays put. Bounding against total as
+/// well keeps that case honest.
+const SLOT_KEEP_TOTAL_PCT: u64 = 25;
 
-/// Floor for the derived cap: 1 GiB (64 × 16 MiB segments). Below this a slot
-/// is invalidated by routine churn (a replica restart, a brief disconnect) and
-/// the re-clone it forces costs far more than the WAL it saves.
-const SLOT_KEEP_FLOOR_MIB: u64 = 1024;
+/// Percent of CURRENT FREE space a slot may pin. This is the half that keeps the
+/// primary alive: what matters isn't how big the disk is, it's how much of it is
+/// still empty. The remainder absorbs data growth, `max_wal_size`, the pgBackRest
+/// spool (itself capped at 5 GiB by `compute_volume_thresholds`) and recovery
+/// temp files.
+///
+/// Tighter when archiving is on, because the replica then has a cheap way back —
+/// `restore_command` pulls the missing WAL from S3, and a re-seed streams from
+/// S3 rather than off the leader (#78) — so we can bias hard toward primary
+/// survival. Looser when it isn't, because invalidation there forces a
+/// throttled `pg_basebackup` re-clone off the live leader; still bounded,
+/// because an unbounded slot kills the primary outright.
+const SLOT_KEEP_FREE_PCT_ARCHIVING: u64 = 50;
+const SLOT_KEEP_FREE_PCT_NO_ARCHIVE: u64 = 75;
+
+/// Keep the cap functional: 4 × 16 MiB WAL segments. A cap near zero invalidates
+/// slots on routine churn (a replica restart, a brief disconnect) and re-clones
+/// forever. Deliberately small, and never allowed to exceed the total-based
+/// bound — a floor larger than the volume is not a cap at all, it's the
+/// unbounded default wearing a hat. (An earlier 1 GiB floor did exactly that on
+/// the fleet's 500 MB volumes: 1 GiB > the whole disk, so the slot could never
+/// be invalidated and the leader could still fill up.)
+const SLOT_KEEP_FLOOR_MIB: u64 = 64;
 
 /// Resolve `max_slot_wal_keep_size` from this node's volume size.
 ///
@@ -127,9 +148,24 @@ const SLOT_KEEP_FLOOR_MIB: u64 = 1024;
 /// replica then catches up from the S3 archive via `restore_command`, or
 /// re-seeds through `create_replica_methods: [pgbackrest, basebackup]` — both
 /// wired up by #78 — so on an archiving cluster the invalidation is usually
-/// invisible. Without archiving it forces a re-clone, which is still strictly
-/// better than losing the primary, so this is deliberately **not** gated on
-/// `wal_archive_bucket`.
+/// invisible. Without archiving it forces a re-clone off the leader, which is
+/// still strictly better than losing the primary, so archiving changes only
+/// *how tight* the cap is (via `SLOT_KEEP_FREE_PCT_*`), never *whether* there
+/// is one.
+///
+/// The cap is the lesser of a total-based and a free-space-based bound:
+///
+/// - **free-space bound** is the one that keeps the primary alive. The disk
+///   fills when `data + retained WAL` exceeds the volume, so the headroom that
+///   matters is what's still empty, not the size of the disk.
+/// - **total bound** covers the case free space can't: it's sampled once at
+///   startup, and a node that has just re-cloned has a nearly-empty data dir, so
+///   free space momentarily looks abundant while the data is about to grow into
+///   it.
+///
+/// Taking the lesser means each covers the other's blind spot, and it removes
+/// any need for an absolute floor to be large — on a 500 MB volume the bounds
+/// simply come out small, instead of a fixed floor overshooting the disk.
 ///
 /// Sized per-node off the local volume rather than seeded cluster-wide into
 /// `bootstrap.dcs`: the value is a property of the disk under *this* node, any
@@ -138,7 +174,12 @@ const SLOT_KEEP_FLOOR_MIB: u64 = 1024;
 ///
 /// An unmeasurable volume falls back to `-1`, preserving today's behaviour
 /// rather than guessing a cap that could invalidate slots wrongly.
-fn resolve_max_slot_wal_keep_size(env_value: Option<String>, volume_total_mib: u64) -> String {
+fn resolve_max_slot_wal_keep_size(
+    env_value: Option<String>,
+    volume_total_mib: u64,
+    volume_free_mib: u64,
+    archiving_enabled: bool,
+) -> String {
     const UNLIMITED: &str = "-1";
 
     if let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
@@ -158,7 +199,35 @@ fn resolve_max_slot_wal_keep_size(env_value: Option<String>, volume_total_mib: u
         return UNLIMITED.to_string();
     }
 
-    let mib = (volume_total_mib / SLOT_KEEP_VOLUME_FRACTION).max(SLOT_KEEP_FLOOR_MIB);
+    let free_pct = if archiving_enabled {
+        SLOT_KEEP_FREE_PCT_ARCHIVING
+    } else {
+        SLOT_KEEP_FREE_PCT_NO_ARCHIVE
+    };
+    let by_total = volume_total_mib * SLOT_KEEP_TOTAL_PCT / 100;
+    let by_free = volume_free_mib * free_pct / 100;
+
+    // The floor keeps the cap usable on a nearly-full disk, but must never push
+    // it back above the total bound — otherwise it reintroduces the very
+    // unbounded behaviour this exists to stop. `.max(1)` because 0 is not
+    // "small", it's a distinct PG mode that refuses to retain WAL for slots at
+    // all.
+    let mib = by_total
+        .min(by_free)
+        .max(SLOT_KEEP_FLOOR_MIB)
+        .min(by_total)
+        .max(1);
+
+    info!(
+        volume_total_mib,
+        volume_free_mib,
+        archiving_enabled,
+        by_total_mib = by_total,
+        by_free_mib = by_free,
+        max_slot_wal_keep_size_mib = mib,
+        "sized max_slot_wal_keep_size from volume free space"
+    );
+
     format!("{mib}MB")
 }
 
@@ -180,16 +249,24 @@ fn is_valid_slot_keep_size(v: &str) -> bool {
     digits.parse::<u64>().is_ok_and(|n| n > 0)
 }
 
-/// Total size of the filesystem holding `path`, in MiB. `0` when it can't be
-/// measured. Mirrors `compute_volume_thresholds`' probe in patroni_runner.
-fn volume_total_mib(path: &str) -> u64 {
+/// `(total, available)` for the filesystem holding `path`, in MiB. `(0, 0)` when
+/// it can't be measured. Mirrors `compute_volume_thresholds`' probe in
+/// patroni_runner.
+///
+/// Uses `blocks_available` (what an unprivileged process can actually claim)
+/// rather than `blocks_free`, which counts the root-reserved blocks Postgres
+/// will never get to use.
+fn volume_total_and_free_mib(path: &str) -> (u64, u64) {
     use nix::sys::statvfs::statvfs;
 
     statvfs(std::path::Path::new(path))
         .ok()
-        .and_then(|s| (s.blocks() as u64).checked_mul(s.fragment_size() as u64))
-        .map(|bytes| bytes / (1024 * 1024))
-        .unwrap_or(0)
+        .map(|s| {
+            let frag = s.fragment_size() as u64;
+            let mib = |blocks: u64| blocks.saturating_mul(frag) / (1024 * 1024);
+            (mib(s.blocks() as u64), mib(s.blocks_available() as u64))
+        })
+        .unwrap_or((0, 0))
 }
 
 /// Validate an operator-supplied pg_basebackup --max-rate override. Requires
@@ -233,6 +310,15 @@ impl Config {
         let connect_address = String::env_required("RAILWAY_PRIVATE_DOMAIN")?;
         let etcd_hosts = String::env_required("PATRONI_ETCD3_HOSTS")?;
 
+        let wal_archive_bucket = env::var("WAL_ARCHIVE_BUCKET").ok().filter(|s| !s.is_empty());
+        let (volume_total_mib, volume_free_mib) = volume_total_and_free_mib(&crate::volume_root());
+        let max_slot_wal_keep_size = resolve_max_slot_wal_keep_size(
+            env::var("POSTGRES_MAX_SLOT_WAL_KEEP_SIZE").ok(),
+            volume_total_mib,
+            volume_free_mib,
+            wal_archive_bucket.is_some(),
+        );
+
         Ok(Self {
             scope: String::env_or("PATRONI_SCOPE", "railway-pg-ha"),
             name,
@@ -262,9 +348,7 @@ impl Config {
             adopt_existing_data: bool::env_parse("PATRONI_ADOPT_EXISTING_DATA", false),
             wait_for_leader: bool::env_parse("PATRONI_WAIT_FOR_LEADER", false),
             synchronous_mode: bool::env_parse("PATRONI_SYNCHRONOUS_MODE", false),
-            wal_archive_bucket: env::var("WAL_ARCHIVE_BUCKET")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            wal_archive_bucket,
             wal_recover_from_bucket: env::var("WAL_RECOVER_FROM_BUCKET")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -282,68 +366,161 @@ impl Config {
             basebackup_max_rate: resolve_basebackup_max_rate(
                 env::var("POSTGRES_BASEBACKUP_MAX_RATE").ok(),
             ),
-            max_slot_wal_keep_size: resolve_max_slot_wal_keep_size(
-                env::var("POSTGRES_MAX_SLOT_WAL_KEEP_SIZE").ok(),
-                volume_total_mib(&crate::volume_root()),
-            ),
+            max_slot_wal_keep_size,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_basebackup_max_rate, resolve_max_slot_wal_keep_size};
+    use super::{
+        resolve_basebackup_max_rate, resolve_max_slot_wal_keep_size, SLOT_KEEP_FLOOR_MIB,
+        SLOT_KEEP_TOTAL_PCT,
+    };
 
-    /// 2 TB volume, the rampmetrics-api geometry that PANICked on 2026-07-10.
+    /// The rampmetrics-api geometry that PANICked on 2026-07-10: a 2 TB volume
+    /// holding ~1226 GB (data + WAL) at the time of measurement.
     const TWO_TB_MIB: u64 = 2_000_000_000_000 / (1024 * 1024);
+    const TWO_TB_USED_MIB: u64 = 1_226_000_000_000 / (1024 * 1024);
+    const TWO_TB_FREE_MIB: u64 = TWO_TB_MIB - TWO_TB_USED_MIB;
+
+    /// The fleet's smallest volume: 500 Railway MB (= 1e6 bytes) ≈ 476 MiB.
+    /// 14 postgres HA nodes run on these.
+    const FIVE_HUNDRED_MB_MIB: u64 = 500 * 1_000_000 / (1024 * 1024);
+
+    fn cap_mib(s: &str) -> u64 {
+        s.trim_end_matches("MB").parse().expect("derived cap is MB")
+    }
 
     #[test]
-    fn slot_keep_size_is_a_quarter_of_the_volume() {
-        assert_eq!(
-            resolve_max_slot_wal_keep_size(None, TWO_TB_MIB),
-            format!("{}MB", TWO_TB_MIB / 4)
-        );
+    fn slot_keep_size_is_bounded_by_free_space_not_just_total() {
+        // Free space is the bound that actually protects the primary: 50% of
+        // the 2 TB volume's remaining ~774 GB, which is tighter than 25% of
+        // total, so it wins.
+        let cap = cap_mib(&resolve_max_slot_wal_keep_size(
+            None,
+            TWO_TB_MIB,
+            TWO_TB_FREE_MIB,
+            true,
+        ));
+        assert_eq!(cap, TWO_TB_FREE_MIB / 2);
+        assert!(cap < TWO_TB_MIB / 4, "free bound must beat the total bound here");
     }
 
     #[test]
     fn slot_keep_size_would_have_survived_the_2026_07_10_incident() {
-        // The leader retained ~900 GB of WAL for a lagging replica's slot
-        // before the volume filled. The derived cap must invalidate the slot
-        // well short of that, and still leave room for the base data (~1071 GB
-        // at the time) on the same 2 TB volume.
-        let cap = resolve_max_slot_wal_keep_size(None, TWO_TB_MIB);
-        let cap_mib: u64 = cap.trim_end_matches("MB").parse().unwrap();
-        let cap_gb = cap_mib * 1024 * 1024 / 1_000_000_000;
+        // The leader retained ~900 GB of WAL for a lagging replica's slot before
+        // the 2 TB volume filled. The cap must trip well short of that and still
+        // leave the ~1226 GB already on disk room to sit.
+        let cap = cap_mib(&resolve_max_slot_wal_keep_size(
+            None,
+            TWO_TB_MIB,
+            TWO_TB_FREE_MIB,
+            true,
+        ));
+        let cap_gb = cap * 1024 * 1024 / 1_000_000_000;
         assert!(cap_gb < 900, "cap {cap_gb} GB must trip before the ~900 GB that filled the disk");
-        assert!(1071 + cap_gb < 2000, "data + capped WAL ({} GB) must fit the 2 TB volume", 1071 + cap_gb);
+        assert!(
+            1226 + cap_gb < 2000,
+            "used + capped WAL ({} GB) must fit the 2 TB volume",
+            1226 + cap_gb
+        );
     }
 
     #[test]
-    fn slot_keep_size_floors_on_tiny_volumes() {
-        // A 1 GiB volume would derive 256 MiB (~16 segments) — routine churn
-        // would invalidate the slot. Floor it instead.
-        assert_eq!(resolve_max_slot_wal_keep_size(None, 1024), "1024MB");
-        assert_eq!(resolve_max_slot_wal_keep_size(None, 1), "1024MB");
+    fn slot_keep_size_never_exceeds_a_500mb_volume() {
+        // Regression: an earlier 1 GiB floor was larger than the entire 476 MiB
+        // volume, so the slot could never be invalidated and the leader could
+        // still fill up — the fix silently degraded to the unbounded default on
+        // exactly the 14 smallest nodes in the fleet.
+        for free in [FIVE_HUNDRED_MB_MIB, FIVE_HUNDRED_MB_MIB / 2, 10, 0] {
+            for archiving in [true, false] {
+                let cap = cap_mib(&resolve_max_slot_wal_keep_size(
+                    None,
+                    FIVE_HUNDRED_MB_MIB,
+                    free,
+                    archiving,
+                ));
+                assert!(
+                    cap < FIVE_HUNDRED_MB_MIB,
+                    "cap {cap} MiB must stay under the {FIVE_HUNDRED_MB_MIB} MiB volume (free={free}, archiving={archiving})"
+                );
+                assert!(cap > 0, "cap must never be 0 — that's a distinct PG mode");
+            }
+        }
+    }
+
+    #[test]
+    fn slot_keep_size_total_bound_covers_the_freshly_cloned_node() {
+        // A just-re-cloned node has an empty data dir, so free space looks like
+        // the whole volume. The free bound alone would hand out 50% of a 2 TB
+        // disk; the total bound holds it to 25% so the data can grow into the
+        // rest.
+        let cap = cap_mib(&resolve_max_slot_wal_keep_size(None, TWO_TB_MIB, TWO_TB_MIB, true));
+        assert_eq!(cap, TWO_TB_MIB / 4);
+    }
+
+    #[test]
+    fn slot_keep_size_is_tighter_when_the_archive_can_recover_the_replica() {
+        // With S3 the replica catches up via restore_command or re-seeds from
+        // the archive (#78), so invalidation is cheap and we bias toward primary
+        // survival. Without it, invalidation forces a basebackup re-clone off the
+        // live leader, so leave more slack before tripping.
+        let with_s3 = cap_mib(&resolve_max_slot_wal_keep_size(
+            None,
+            TWO_TB_MIB,
+            TWO_TB_FREE_MIB,
+            true,
+        ));
+        let without_s3 = cap_mib(&resolve_max_slot_wal_keep_size(
+            None,
+            TWO_TB_MIB,
+            TWO_TB_FREE_MIB,
+            false,
+        ));
+        assert!(
+            with_s3 < without_s3,
+            "archiving should tighten the cap ({with_s3} vs {without_s3} MiB)"
+        );
+        // Both stay bounded — no-archive is never a licence to fill the disk.
+        assert!(without_s3 <= TWO_TB_MIB / 4);
+    }
+
+    #[test]
+    fn slot_keep_size_floor_stays_functional_but_never_beats_the_total_bound() {
+        // Nearly-full disk: the free bound collapses toward zero. The floor keeps
+        // the cap usable instead of invalidating slots on every hiccup, but must
+        // not climb back above the total bound.
+        let cap = cap_mib(&resolve_max_slot_wal_keep_size(None, TWO_TB_MIB, 0, true));
+        assert_eq!(cap, SLOT_KEEP_FLOOR_MIB);
+
+        // On a volume so small the floor would overshoot, the total bound wins.
+        let tiny = cap_mib(&resolve_max_slot_wal_keep_size(None, 100, 0, true));
+        assert!(tiny <= 100 * SLOT_KEEP_TOTAL_PCT / 100);
+        assert!(tiny > 0);
     }
 
     #[test]
     fn slot_keep_size_unmeasurable_volume_stays_unlimited() {
         // Never guess a cap we can't size: an unmeasurable volume keeps PG's
         // default rather than risk invalidating slots wrongly.
-        assert_eq!(resolve_max_slot_wal_keep_size(None, 0), "-1");
+        assert_eq!(resolve_max_slot_wal_keep_size(None, 0, 0, true), "-1");
     }
 
     #[test]
     fn slot_keep_size_accepts_operator_override() {
         assert_eq!(
-            resolve_max_slot_wal_keep_size(Some("512GB".into()), TWO_TB_MIB),
+            resolve_max_slot_wal_keep_size(Some("512GB".into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
             "512GB"
         );
         // Explicitly opting back into unlimited is a valid escape hatch.
-        assert_eq!(resolve_max_slot_wal_keep_size(Some("-1".into()), TWO_TB_MIB), "-1");
+        assert_eq!(
+            resolve_max_slot_wal_keep_size(Some("-1".into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
+            "-1"
+        );
         // Bare digits mean MB for this GUC — no unit footgun, so accept them.
         assert_eq!(
-            resolve_max_slot_wal_keep_size(Some("4096".into()), TWO_TB_MIB),
+            resolve_max_slot_wal_keep_size(Some("4096".into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
             "4096"
         );
     }
@@ -352,8 +529,8 @@ mod tests {
     fn slot_keep_size_rejects_junk_override_and_derives_instead() {
         for junk in ["0", "abc", "-5", "12MiB", ""] {
             assert_eq!(
-                resolve_max_slot_wal_keep_size(Some(junk.into()), TWO_TB_MIB),
-                format!("{}MB", TWO_TB_MIB / 4),
+                resolve_max_slot_wal_keep_size(Some(junk.into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
+                format!("{}MB", TWO_TB_FREE_MIB / 2),
                 "junk override {junk:?} must fall back to the derived cap"
             );
         }
