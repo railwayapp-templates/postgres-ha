@@ -13,7 +13,8 @@ use nix::unistd::{ForkResult, Pid};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
-    spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
+    spawn_backup_watcher, spawn_self_heal_watcher, spawn_slot_recovery_watcher,
+    update_pg_hba_for_replication, Config,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
@@ -1638,6 +1639,14 @@ async fn async_main() -> Result<()> {
     // catch (notably WAL-too-old after demoted-leader pg_rewind). No-op
     // on leaders. Honors SELF_HEAL_DISABLED=1 as a kill switch.
     spawn_self_heal_watcher(volume_root.clone(), telemetry.clone());
+
+    // Spawn the leader-only slot-recovery watcher. Recreates replication slots
+    // PostgreSQL invalidated when they breached max_slot_wal_keep_size (Patroni
+    // 4.1.0 neither notices nor repairs these), and keeps the cap sized to the
+    // leader's live free space. Without it the disk-fill cap would trade a loud
+    // leader PANIC for a silently un-streamable, un-promotable replica. No-op on
+    // replicas; each iteration re-checks /leader.
+    spawn_slot_recovery_watcher(volume_root.clone());
 
     run_monitoring_loop(&config, child, &telemetry).await
 }

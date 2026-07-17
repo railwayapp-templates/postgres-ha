@@ -199,6 +199,42 @@ fn resolve_max_slot_wal_keep_size(
         return UNLIMITED.to_string();
     }
 
+    match derive_slot_keep_mib(volume_total_mib, volume_free_mib, archiving_enabled) {
+        Some(mib) => {
+            info!(
+                volume_total_mib,
+                volume_free_mib,
+                archiving_enabled,
+                max_slot_wal_keep_size_mib = mib,
+                "sized max_slot_wal_keep_size from volume free space"
+            );
+            format!("{mib}MB")
+        }
+        None => {
+            warn!(
+                "volume size unknown; leaving max_slot_wal_keep_size unlimited (a lagging replica's slot can fill the leader's disk)"
+            );
+            UNLIMITED.to_string()
+        }
+    }
+}
+
+/// The numeric cap in MiB, or `None` when the volume can't be measured (caller
+/// renders that as `-1`, unlimited). Split out from
+/// [`resolve_max_slot_wal_keep_size`] so the leader-side reconciler can
+/// re-derive the same value from *live* free space without re-parsing the env
+/// override — `Config::from_env` samples free space once at startup, and a
+/// long-lived leader whose data grows needs the cap recomputed against current
+/// free space, not the boot-time reading.
+pub(crate) fn derive_slot_keep_mib(
+    volume_total_mib: u64,
+    volume_free_mib: u64,
+    archiving_enabled: bool,
+) -> Option<u64> {
+    if volume_total_mib == 0 {
+        return None;
+    }
+
     let free_pct = if archiving_enabled {
         SLOT_KEEP_FREE_PCT_ARCHIVING
     } else {
@@ -212,23 +248,23 @@ fn resolve_max_slot_wal_keep_size(
     // unbounded behaviour this exists to stop. `.max(1)` because 0 is not
     // "small", it's a distinct PG mode that refuses to retain WAL for slots at
     // all.
-    let mib = by_total
-        .min(by_free)
-        .max(SLOT_KEEP_FLOOR_MIB)
-        .min(by_total)
-        .max(1);
+    Some(
+        by_total
+            .min(by_free)
+            .max(SLOT_KEEP_FLOOR_MIB)
+            .min(by_total)
+            .max(1),
+    )
+}
 
-    info!(
-        volume_total_mib,
-        volume_free_mib,
-        archiving_enabled,
-        by_total_mib = by_total,
-        by_free_mib = by_free,
-        max_slot_wal_keep_size_mib = mib,
-        "sized max_slot_wal_keep_size from volume free space"
-    );
-
-    format!("{mib}MB")
+/// The operator's `POSTGRES_MAX_SLOT_WAL_KEEP_SIZE`, if set to a valid value.
+/// `Some` means the operator pinned the cap by hand, and the leader-side
+/// reconciler must leave it alone rather than override it with a derived value.
+pub(crate) fn slot_keep_operator_override() -> Option<String> {
+    env::var("POSTGRES_MAX_SLOT_WAL_KEEP_SIZE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && is_valid_slot_keep_size(s))
 }
 
 /// Accept `-1` (explicitly unlimited) or a positive PG size string. PG's size
@@ -256,7 +292,7 @@ fn is_valid_slot_keep_size(v: &str) -> bool {
 /// Uses `blocks_available` (what an unprivileged process can actually claim)
 /// rather than `blocks_free`, which counts the root-reserved blocks Postgres
 /// will never get to use.
-fn volume_total_and_free_mib(path: &str) -> (u64, u64) {
+pub(crate) fn volume_total_and_free_mib(path: &str) -> (u64, u64) {
     use nix::sys::statvfs::statvfs;
 
     statvfs(std::path::Path::new(path))

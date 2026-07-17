@@ -2048,6 +2048,117 @@ t_ha_replica_selfheals_via_restore_command() {
   teardown_scope "$scope"
 }
 
+# H11b. max_slot_wal_keep_size caps a lagging member's slot, and the
+# leader-side slot-recovery watcher makes that survivable end-to-end.
+#
+# This is the test that would have caught the original blocker: capping the
+# slot keeps the leader alive, but PostgreSQL then leaves the slot
+# `wal_status='lost'` and Patroni 4.1.0 never repairs it (its
+# load_replication_slots never selects wal_status), so without the watcher the
+# replica can never stream again. The watcher drops the lost member slot;
+# Patroni recreates it; the replica resumes streaming.
+#
+# Deterministic causality: while the restarted replica is a live member with a
+# lost slot, Patroni will NOT drop it (its only physical-slot drop path needs
+# expected_active=false), so the watcher is the ONLY thing that can — and we
+# assert on the watcher's own log line, not just the end state.
+t_ha_slot_recovery_recreates_invalidated_slot() {
+  local scope=t-slotrec-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # Tiny fixed cap so a modest churn invalidates the stopped member's slot;
+  # 5s watcher poll so recovery lands inside the test window. The explicit
+  # override also exercises the reconciler's "leave an operator-pinned cap
+  # alone" path.
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" \
+    $(archive_env_fast_watcher) \
+    -e POSTGRES_MAX_SLOT_WAL_KEEP_SIZE=32MB \
+    -e SLOT_RECOVERY_POLL_SECONDS=5)
+
+  local leader; leader=$(wait_for_leader "$scope" 240) || { ko t_ha_slot_recovery_recreates_invalidated_slot "no leader"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_slot_recovery_recreates_invalidated_slot "replicas didn't stream"; teardown_scope "$scope"; return; }
+
+  local replica=""
+  for n in "$n1" "$n2" "$n3"; do
+    if [ "$n" != "$leader" ]; then replica="$n"; break; fi
+  done
+
+  # The stopped member's slot: capture its name before the outage.
+  local slot
+  slot=$(psql_leader "$leader" -At -c \
+    "SELECT slot_name FROM pg_replication_slots WHERE slot_type='physical' AND active ORDER BY slot_name LIMIT 1" 2>/dev/null)
+  if [ -z "$slot" ]; then
+    ko t_ha_slot_recovery_recreates_invalidated_slot "no active physical slot to target"
+    teardown_scope "$scope"; return
+  fi
+
+  docker stop "$replica" >/dev/null 2>&1 || { ko t_ha_slot_recovery_recreates_invalidated_slot "couldn't stop replica"; teardown_scope "$scope"; return; }
+
+  # Churn WAL past the 32MB cap + checkpoint until PostgreSQL invalidates the
+  # stopped member's slot. Invalidation is a pure PG mechanism (a checkpoint
+  # sees restart_lsn fall behind the cap), independent of Patroni/DCS timing.
+  psql_leader "$leader" -c "CREATE TABLE IF NOT EXISTS churn(id int, v text);" >/dev/null
+  local lost=0 lost_deadline=$(($(date +%s) + 180))
+  while [ "$(date +%s)" -lt "$lost_deadline" ]; do
+    psql_leader "$leader" -c "INSERT INTO churn SELECT g, repeat('x',500) FROM generate_series(1,200000) g;" >/dev/null 2>&1
+    psql_leader "$leader" -c "CHECKPOINT;" >/dev/null 2>&1
+    local st
+    st=$(psql_leader "$leader" -At -c "SELECT wal_status FROM pg_replication_slots WHERE slot_name='${slot}'" 2>/dev/null)
+    if [ "$st" = "lost" ]; then lost=1; break; fi
+    sleep 2
+  done
+  if [ "$lost" != "1" ]; then
+    ko t_ha_slot_recovery_recreates_invalidated_slot "slot '${slot}' never reached wal_status=lost (cap didn't fire)"
+    fail_dump t_ha_slot_recovery_recreates_invalidated_slot "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  # Core survival claim: the sick replica's slot filled to the cap, and the
+  # LEADER is still up and accepting writes. This is the whole point of the
+  # cap — a lagging replica must never take the primary down.
+  if ! psql_leader "$leader" -c "INSERT INTO churn VALUES (-1,'leader-alive')" >/dev/null 2>&1; then
+    ko t_ha_slot_recovery_recreates_invalidated_slot "leader not accepting writes after its WAL was capped"
+    fail_dump t_ha_slot_recovery_recreates_invalidated_slot "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  # Bring the member back. It will try to stream on the lost slot, PG refuses,
+  # and only the watcher can repair it.
+  docker start "$replica" >/dev/null 2>&1 || { ko t_ha_slot_recovery_recreates_invalidated_slot "couldn't restart replica"; teardown_scope "$scope"; return; }
+
+  # Causal assertion: the watcher's own drop line, proving OUR code did it
+  # (Patroni leaves a live member's lost slot alone).
+  local dropped=0 drop_deadline=$(($(date +%s) + 180))
+  while [ "$(date +%s)" -lt "$drop_deadline" ]; do
+    if logs_contain "$leader" "dropped invalidated member slot"; then dropped=1; break; fi
+    sleep 5
+  done
+  if [ "$dropped" != "1" ]; then
+    ko t_ha_slot_recovery_recreates_invalidated_slot "slot-recovery watcher never dropped the invalidated slot"
+    fail_dump t_ha_slot_recovery_recreates_invalidated_slot "$leader" "$replica"
+    teardown_scope "$scope"; return
+  fi
+
+  # End state: Patroni recreated the slot and the replica is streaming again.
+  if ! wait_for_replication "$scope" 2 240; then
+    ko t_ha_slot_recovery_recreates_invalidated_slot "replica didn't resume streaming after slot recovery"
+    fail_dump t_ha_slot_recovery_recreates_invalidated_slot "$leader" "$replica"
+    teardown_scope "$scope"; return
+  fi
+
+  local final_status
+  final_status=$(psql_leader "$leader" -At -c "SELECT wal_status FROM pg_replication_slots WHERE slot_name='${slot}'" 2>/dev/null)
+  if [ "$final_status" = "lost" ]; then
+    ko t_ha_slot_recovery_recreates_invalidated_slot "slot '${slot}' still wal_status=lost after recovery"
+    teardown_scope "$scope"; return
+  fi
+
+  ok t_ha_slot_recovery_recreates_invalidated_slot
+  note "cap invalidated the lagging slot (leader survived), watcher dropped it, Patroni recreated it, replica re-streamed (wal_status now '${final_status}')"
+  teardown_scope "$scope"
+}
+
 # H12. WAL_ARCHIVE_STALL_CONFIRM_SECONDS dwell (PR #78's monitoring.rs
 # gate): on an archiving cluster, a WAL-too-old verdict must NOT
 # reinitialize the replica the moment it's first confirmed — only once
@@ -3417,6 +3528,8 @@ ALL_TESTS=(
   t_ha_replica_reseed_fallback_basebackup
   t_ha_archive_disable_clears_restore_command
   t_ha_replica_selfheals_via_restore_command
+  # max_slot_wal_keep_size cap + leader-side slot-recovery watcher end-to-end
+  t_ha_slot_recovery_recreates_invalidated_slot
   t_ha_wal_archive_stall_dwell_gates_reinit
   t_ha_pghost_pgport_unset
   t_ha_restore_gate_logged_on_every_node
