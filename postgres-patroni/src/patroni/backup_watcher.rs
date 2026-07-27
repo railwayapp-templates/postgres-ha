@@ -2077,8 +2077,25 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
     };
     info!(backup_type = %backup_type, "pgbackrest-watcher: running backup");
 
+    // --no-expire-auto: pgBackRest's default (expire-auto=y) runs the
+    // post-backup retention expire as part of this same command, so a
+    // failure/timeout during expire (e.g. a slow S3-compatible endpoint on
+    // the post-backup bucket listing) makes `backup` itself return non-zero
+    // even though the backup already landed and is durable in the catalog.
+    // That false failure used to keep last_full_at empty forever, so
+    // decide_action treated the backup as permanently overdue and re-ran a
+    // brand-new FULL upload every retry cycle — unbounded egress from
+    // re-uploading the entire database in a loop. Expire now runs as its
+    // own explicit, non-gating step below, only after the backup is
+    // confirmed to have actually succeeded. Mirrors postgres-ssl's
+    // `pgbackrest-backup-watcher.sh` fix.
     let mut res = Command::new("pgbackrest")
-        .args(["--stanza=main", "backup", &format!("--type={backup_type}")])
+        .args([
+            "--stanza=main",
+            "backup",
+            &format!("--type={backup_type}"),
+            "--no-expire-auto",
+        ])
         .env_remove("PGHOST")
         .env_remove("PGPORT")
         .status()
@@ -2102,7 +2119,12 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
             Err(e) => warn!(error = %e, "pgbackrest-watcher: stanza-create invocation failed"),
         }
         res = Command::new("pgbackrest")
-            .args(["--stanza=main", "backup", &format!("--type={backup_type}")])
+            .args([
+                "--stanza=main",
+                "backup",
+                &format!("--type={backup_type}"),
+                "--no-expire-auto",
+            ])
             .env_remove("PGHOST")
             .env_remove("PGPORT")
             .status()
@@ -2151,6 +2173,27 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
                 _ => {}
             }
             info!(backup_type = %backup_type, "pgbackrest-watcher: backup completed");
+
+            // Retention is best-effort and deliberately decoupled from
+            // backup success (see --no-expire-auto above): a failure here
+            // just leaves old backups/WAL around for one more cycle. The
+            // next scheduled backup (full or diff, per the normal cadence —
+            // no dedicated retry loop for expire alone) tries again;
+            // nothing about current restorability regresses in the
+            // meantime. Logged distinctly from "backup failed" above so
+            // this can't be mistaken for a backup failure.
+            let expire_res = Command::new("pgbackrest")
+                .args(["--stanza=main", "expire"])
+                .env_remove("PGHOST")
+                .env_remove("PGPORT")
+                .status()
+                .await;
+            match expire_res {
+                Ok(s) if s.success() => {}
+                Ok(s) => warn!(status = ?s, backup_type = %backup_type, "pgbackrest-watcher: expire failed after successful backup (retention not enforced this cycle; will retry after next backup)"),
+                Err(e) => warn!(error = %e, backup_type = %backup_type, "pgbackrest-watcher: expire invocation failed after successful backup (retention not enforced this cycle; will retry after next backup)"),
+            }
+
             emit_pitr_anchor().await;
             true
         }

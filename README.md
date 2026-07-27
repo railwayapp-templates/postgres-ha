@@ -275,10 +275,18 @@ Earlier iterations proposed a bucket-side TTL as a safety net but it's
 superfluous: any TTL shorter than expire's horizon would yank WAL out
 from under live manifests, and any TTL ≥ that horizon is redundant.
 
-`pgbackrest expire` runs automatically after each `pgbackrest backup`
-the watcher invokes, removing fulls/diffs beyond
+The watcher invokes each `pgbackrest backup` with `--no-expire-auto`,
+then calls `pgbackrest expire` as its own step right after a
+*successful* backup, removing fulls/diffs beyond
 `WAL_BACKUP_RETENTION_FULL` / `WAL_BACKUP_RETENTION_DIFF`, plus the WAL
-their manifests no longer pin. The default retention (full=4, diff=14,
+their manifests no longer pin. Splitting the two matters because
+pgBackRest's default (`expire-auto=y`) folds expire into the same
+command, so a transient expire failure (e.g. a slow S3-compatible
+endpoint on the post-backup listing) would otherwise fail the whole
+`backup` invocation even though the backup itself landed and is
+durable — leaving the watcher's `last_full_at` unset and re-triggering
+a brand new full upload every retry cycle instead of just deferring
+retention to the next backup. The default retention (full=4, diff=14,
 weekly fulls + daily diffs) covers approximately a four-week PITR
 window before the oldest full ages out.
 
