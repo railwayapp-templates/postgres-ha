@@ -11,6 +11,7 @@ use nix::sys::stat::{umask, Mode};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{ForkResult, Pid};
 use postgres_patroni::health_server::{self, HealthServerConfig};
+use postgres_patroni::major_upgrade;
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
     spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
@@ -1388,6 +1389,26 @@ async fn async_main() -> Result<()> {
         update_pg_hba_for_replication(&config)?;
     }
 
+    // Major-upgrade guards, before anything reads or mutates the data
+    // directory. Both are fail-stop by design: a marker that is not
+    // `completed` means the upgrade workflow owns this volume and the data
+    // directory may be absent or half-promoted, and a major mismatch means the
+    // tag was changed without upgrading the data files. Either one would
+    // otherwise reach the incomplete-clone wipe below, or Patroni's own
+    // bootstrap, and lose data. See postgres_patroni::major_upgrade.
+    // PG_MAJOR is exported by the official postgres base image this one is
+    // built FROM, so it is the image's own major at runtime — no build arg to
+    // keep in sync. Absent (a base image that stops setting it) means the
+    // version guard abstains rather than guessing.
+    let image_major = std::env::var("PG_MAJOR").ok();
+    if let Some(reason) = major_upgrade::boot_refusal_reason(
+        &volume_root,
+        &config.data_dir,
+        image_major.as_deref(),
+    ) {
+        anyhow::bail!("{reason}");
+    }
+
     let pg_control_path = format!("{}/global/pg_control", config.data_dir);
     let has_pg_control = Path::new(&pg_control_path).exists();
     let has_marker = Path::new(&bootstrap_marker).exists();
@@ -1415,6 +1436,17 @@ async fn async_main() -> Result<()> {
     // itself be a healthy leader). Without a distinct leader we leave the dir
     // for manual recovery rather than risk wiping the only copy.
     if !has_pg_control && data_dir_nonempty(&config.data_dir) {
+        // Redundant with the boot guard above, deliberately: this is the call
+        // that destroys data, so it states its own precondition rather than
+        // inheriting one from fifty lines earlier. A missing pg_control during
+        // an upgrade window is the EXPECTED mid-swap state, not clone debris.
+        if major_upgrade::upgrade_in_flight(&volume_root) {
+            anyhow::bail!(
+                "Refusing to wipe {} — a major version upgrade is in progress on this volume. \
+                 A missing pg_control is expected mid-upgrade and is not clone debris.",
+                config.data_dir
+            );
+        }
         let dedicated = pgdata_is_dedicated_subdir(&config.data_dir, &volume_root);
         // Skip the etcd probe entirely when pgdata is the volume root — we
         // won't wipe regardless, so there's no point asking who the leader is.

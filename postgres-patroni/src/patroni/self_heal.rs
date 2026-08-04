@@ -86,6 +86,7 @@
 //! delay.
 
 use super::Config;
+use crate::major_upgrade;
 use anyhow::Result;
 use common::{Telemetry, TelemetryEvent};
 use serde::Deserialize;
@@ -977,6 +978,7 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
 
     loop {
         if let Err(e) = iteration(
+            &volume_root,
             &client,
             &cfg,
             &state_path,
@@ -996,6 +998,7 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
 }
 
 async fn iteration(
+    volume_root: &str,
     client: &reqwest::Client,
     cfg: &WatcherConfig,
     state_path: &str,
@@ -1007,6 +1010,20 @@ async fn iteration(
     telemetry: &Telemetry,
 ) -> Result<()> {
     let now = now_epoch();
+
+    // A major upgrade owns this volume for its window, and this watcher is the
+    // one actor here that a Patroni DCS pause does NOT stop — the control plane
+    // pauses failover for the upgrade, and without this check we would keep
+    // POSTing /reinitialize anyway. A replica reinitialized while the leader is
+    // mid-upgrade wipes itself and then cannot clone at all: pg_basebackup
+    // refuses across majors, so it ends up empty rather than rebuilt. Every
+    // symptom this watcher looks for (crash loops, "start failed", a timeline
+    // behind the leader) is EXPECTED while the cluster's leader is being
+    // upgraded, so the whole iteration stands down.
+    if major_upgrade::upgrade_in_flight(volume_root) {
+        info!("self-heal: major upgrade in progress on this volume — standing down");
+        return Ok(());
+    }
 
     // 1. Local Patroni status: role, state, postmaster_start_time.
     let local = match fetch_local_patroni(client).await {

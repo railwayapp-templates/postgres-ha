@@ -282,6 +282,28 @@ their manifests no longer pin. The default retention (full=4, diff=14,
 weekly fulls + daily diffs) covers approximately a four-week PITR
 window before the oldest full ages out.
 
+## Major version upgrades
+
+A major upgrade is driven from outside this image: the control plane pauses
+Patroni failover, stops the leader, runs a one-shot job image carrying both
+majors' binaries against the leader's volume, repins the service image, then
+rebuilds each replica from the upgraded primary and resumes failover.
+
+While that window is open the job marks the volume with
+`.railway-major-upgrade.json` at the **volume root** (PGDATA is replaced
+wholesale by `pg_upgrade`, so a marker inside it would not survive). The image
+consults that marker in three places, because each of them destroys data if it
+ignores it and none of them can see the control plane:
+
+| Guard | Without it |
+|-------|-----------|
+| Boot refuses while the marker is not `completed` | PGDATA can be absent mid-swap; Patroni treats the member as fresh and bootstraps over it |
+| Boot refuses when `PG_VERSION` ≠ the image's major | Postgres only refuses deep into startup, and the incomplete-clone wipe may run first |
+| The self-heal watcher stands down | **A Patroni DCS pause does not stop this watcher.** A replica it reinitializes mid-upgrade wipes itself and then cannot clone at all — `pg_basebackup` refuses across majors — so it ends up empty rather than rebuilt |
+
+All three are fail-stop and loud: this image never tries to repair a mid-upgrade
+volume, because that state belongs to the upgrade workflow.
+
 ## Quick Start
 
 ### Deploy to Railway

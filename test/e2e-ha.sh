@@ -79,9 +79,16 @@ assert_contains() {
 }
 
 # ----- environment management ------------------------------------------------
+# Always build. The Rust binaries under test are compiled INTO this image, so
+# an existence check silently tests a stale copy of the very code being changed
+# — the failure mode looks like a product bug and costs a debug cycle. Docker's
+# layer cache keeps the repeat build cheap when nothing changed.
+#
+# Set E2E_SKIP_BUILD=1 to reuse the existing image when iterating on the
+# harness itself rather than on the image.
 ensure_image() {
-  if docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    log "image $IMAGE already built"
+  if [ "${E2E_SKIP_BUILD:-0}" = "1" ] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    log "image $IMAGE reused (E2E_SKIP_BUILD=1)"
     return
   fi
   log "building $IMAGE from $DOCKERFILE (this may take a few minutes the first time)"
@@ -406,6 +413,24 @@ run_patroni_node() {
     "${extra_args[@]}" \
     -v "${RUN_NODE_VOLUME:-${n}-vol}:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
+}
+
+# Wait for ONE named node to report itself Patroni leader. The 3-node
+# wait_for_leader derives names from the scope, so single-node tests need this.
+wait_for_node_leader() {
+  local n="$1" timeout_secs="${2:-180}"
+  local deadline=$(($(date +%s) + timeout_secs))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec "$n" curl -sf -o /dev/null -w '%{http_code}' \
+       http://localhost:8008/leader 2>/dev/null | grep -q "^200$"; then
+      return 0
+    fi
+    if [ "$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null)" = "exited" ]; then
+      return 1
+    fi
+    sleep 3
+  done
+  return 1
 }
 
 # Wait for one of the 3 nodes to become Patroni leader. Returns the
@@ -2311,6 +2336,191 @@ t_ha_wal_archive_stall_dwell_gates_reinit() {
 # if the env vars leaked into pgbackrest's libpq calls, stanza-create
 # (which uses libpq for pg_backup_start/stop) and the watcher's
 # pg_isready/psql probes would all fail.
+# ---------------------------------------------------------------------------
+# Major-upgrade guards
+#
+# An in-place major upgrade is driven from outside this image and marks the
+# volume with .railway-major-upgrade.json while it owns it. Three things here
+# destroy data if they ignore that marker, and none of them can see the control
+# plane: booting mid-swap, booting the wrong major, and the self-heal watcher's
+# /reinitialize (which a Patroni DCS pause does NOT stop).
+# ---------------------------------------------------------------------------
+
+# A marker that is not "completed" must stop the member from starting at all —
+# mid-swap the data directory can be absent, and Patroni would bootstrap over it.
+t_ha_upgrade_marker_blocks_boot() {
+  local scope=t-upgmarker-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  local n="${scope}-n1"
+  local vol="${n}-vol"
+
+  docker volume rm "$vol" >/dev/null 2>&1 || true
+  docker volume create "$vol" >/dev/null
+  # Plant the marker on an otherwise-fresh volume: the guard must fire before
+  # any data exists, which is exactly the mid-swap shape.
+  docker run --rm -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$IMAGE" -c \
+    'echo "{\"phase\": \"upgraded\", \"from\": \"16\", \"to\": \"17\"}" > /var/lib/postgresql/data/.railway-major-upgrade.json' >/dev/null
+
+  RUN_NODE_VOLUME="$vol" run_patroni_node "$scope" "$etcd_hosts" "$n"
+
+  local deadline=$(($(date +%s) + 60)) status=running
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status=$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null)
+    [ "$status" = "exited" ] && break
+    sleep 2
+  done
+
+  if [ "$status" != "exited" ]; then
+    ko t_ha_upgrade_marker_blocks_boot "node kept running with an in-flight upgrade marker (status=$status)"
+    fail_dump t_ha_upgrade_marker_blocks_boot "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+  if ! docker logs "$n" 2>&1 | grep -q "upgrade is in progress"; then
+    ko t_ha_upgrade_marker_blocks_boot "exited without naming the upgrade marker"
+    fail_dump t_ha_upgrade_marker_blocks_boot "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+
+  # And it must clear once the marker says completed: this is the same volume,
+  # so a guard that latched would leave the member permanently unbootable.
+  docker rm -f "$n" >/dev/null 2>&1 || true
+  docker run --rm -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$IMAGE" -c \
+    'echo "{\"phase\": \"completed\", \"from\": \"16\", \"to\": \"'"${PG_VERSION}"'\"}" > /var/lib/postgresql/data/.railway-major-upgrade.json' >/dev/null
+  RUN_NODE_VOLUME="$vol" run_patroni_node "$scope" "$etcd_hosts" "$n"
+  # Poll THIS container: wait_for_leader only knows the 3-node cluster's names.
+  if ! wait_for_node_leader "$n" 240; then
+    ko t_ha_upgrade_marker_blocks_boot "node did not boot after the marker said completed"
+    fail_dump t_ha_upgrade_marker_blocks_boot "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+
+  ok t_ha_upgrade_marker_blocks_boot
+  note "in-flight marker refused the boot; completed marker allowed it on the same volume"
+  teardown_scope "$scope"
+  docker volume rm "$vol" >/dev/null 2>&1 || true
+}
+
+# On-disk PG_VERSION must match the image's major. Today a cross-major tag edit
+# boots and dies deep in startup — or worse, reaches the incomplete-clone wipe.
+t_ha_major_mismatch_blocks_boot() {
+  local scope=t-upgmismatch-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  local n="${scope}-n1"
+  local vol="${n}-vol"
+  local other_major=$((PG_VERSION - 1))
+
+  docker volume rm "$vol" >/dev/null 2>&1 || true
+  docker volume create "$vol" >/dev/null
+  # A data directory claiming a different major, with pg_control present so
+  # nothing mistakes it for clone debris.
+  docker run --rm -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$IMAGE" -c \
+    "mkdir -p /var/lib/postgresql/data/pgdata/global && echo $other_major > /var/lib/postgresql/data/pgdata/PG_VERSION && touch /var/lib/postgresql/data/pgdata/global/pg_control" >/dev/null
+
+  RUN_NODE_VOLUME="$vol" run_patroni_node "$scope" "$etcd_hosts" "$n"
+
+  local deadline=$(($(date +%s) + 60)) status=running
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status=$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null)
+    [ "$status" = "exited" ] && break
+    sleep 2
+  done
+
+  if [ "$status" != "exited" ]; then
+    ko t_ha_major_mismatch_blocks_boot "node kept running on major $other_major data (status=$status)"
+    fail_dump t_ha_major_mismatch_blocks_boot "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+  if ! docker logs "$n" 2>&1 | grep -q "holds major version $other_major"; then
+    ko t_ha_major_mismatch_blocks_boot "exited without naming the on-disk major"
+    fail_dump t_ha_major_mismatch_blocks_boot "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+  # The data directory must be intact: the whole point is refusing before the
+  # incomplete-clone wipe or a Patroni bootstrap can touch it.
+  if ! docker run --rm -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$IMAGE" -c \
+    "grep -qx $other_major /var/lib/postgresql/data/pgdata/PG_VERSION"; then
+    ko t_ha_major_mismatch_blocks_boot "data directory was modified despite the refusal"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+
+  ok t_ha_major_mismatch_blocks_boot
+  note "refused major $other_major data on a PG${PG_VERSION} image, data intact"
+  teardown_scope "$scope"
+  docker volume rm "$vol" >/dev/null 2>&1 || true
+}
+
+# The in-image self-heal watcher must stand down while a marker is present. It
+# is the one actor a Patroni DCS pause does not stop, and a replica it
+# reinitializes mid-upgrade cannot clone (pg_basebackup refuses across majors).
+t_ha_selfheal_stands_down_during_upgrade() {
+  local scope=t-upgselfheal-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || {
+    ko t_ha_selfheal_stands_down_during_upgrade "no leader elected"
+    fail_dump t_ha_selfheal_stands_down_during_upgrade "$n1" "$n2" "$n3"
+    teardown_scope "$scope"
+    return
+  }
+  if ! wait_for_replication "$scope" 2 240; then
+    ko t_ha_selfheal_stands_down_during_upgrade "replicas did not stream"
+    fail_dump t_ha_selfheal_stands_down_during_upgrade "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Pick a replica and plant the marker on its volume, then make it look like
+  # the case the watcher acts on: stopped postgres with a live Patroni.
+  local replica
+  for c in "$n1" "$n2" "$n3"; do
+    [ "$c" != "$leader" ] && replica="$c" && break
+  done
+
+  docker exec "$replica" sh -c \
+    'echo "{\"phase\": \"upgraded\", \"from\": \"16\", \"to\": \"17\"}" > /var/lib/postgresql/data/.railway-major-upgrade.json' >/dev/null
+
+  local deadline=$(($(date +%s) + 90)) saw_standdown=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$replica" 2>&1 | grep -q "standing down"; then
+      saw_standdown=1
+      break
+    fi
+    sleep 5
+  done
+
+  if [ "$saw_standdown" -ne 1 ]; then
+    ko t_ha_selfheal_stands_down_during_upgrade "watcher never reported standing down"
+    fail_dump t_ha_selfheal_stands_down_during_upgrade "$replica"
+    teardown_scope "$scope"
+    return
+  fi
+  # It must not have reinitialized anything while standing down.
+  if docker logs "$replica" 2>&1 | grep -qE "self-heal: (reinitializ|force)"; then
+    ko t_ha_selfheal_stands_down_during_upgrade "watcher reinitialized during the upgrade window"
+    fail_dump t_ha_selfheal_stands_down_during_upgrade "$replica"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_selfheal_stands_down_during_upgrade
+  note "replica=$replica watcher stood down with an in-flight marker; no reinit"
+  teardown_scope "$scope"
+}
+
 t_ha_pghost_pgport_unset() {
   local scope=t-pghost-${PG_VERSION}
   reset_bucket
@@ -3419,6 +3629,9 @@ ALL_TESTS=(
   t_ha_replica_selfheals_via_restore_command
   t_ha_wal_archive_stall_dwell_gates_reinit
   t_ha_pghost_pgport_unset
+  t_ha_upgrade_marker_blocks_boot
+  t_ha_major_mismatch_blocks_boot
+  t_ha_selfheal_stands_down_during_upgrade
   t_ha_restore_gate_logged_on_every_node
   # boot-time reconcile self-heals a live archive_command Patroni's own
   # dynamic-config sync silently failed to apply (DCS-vs-live divergence)
