@@ -304,6 +304,34 @@ ignores it and none of them can see the control plane:
 All three are fail-stop and loud: this image never tries to repair a mid-upgrade
 volume, because that state belongs to the upgrade workflow.
 
+One marker phase is the exception to fail-stop, because it exists to make the
+replica rebuild possible at all: **`{"phase": "reseed"}`**, written by the HA
+workflow onto each replica's volume before it pauses failover. Boot is
+*allowed* through both guards; if the on-disk `PG_VERSION` differs from the
+image's major the runner wipes pgdata — only under the same safety predicate
+as the incomplete-clone wipe (dedicated pgdata subdir + a DISTINCT member
+holding the DCS leader lock) — and deletes the marker at wipe time, so Patroni
+re-clones the member from the upgraded leader. On a matching major the boot
+just sheds the marker (the rollback shape). Streaming replication cannot cross
+majors, so without this phase the version-mismatch guard would refuse the
+exact boot the reseed depends on. The marker also keeps the self-heal watcher
+standing down for the window, which is the production path by which that
+standdown actually engages.
+
+> **UNVERIFIED against a real cluster — read before implementing or operating
+> the upgrade.** The whole HA upgrade choreography (pause → leader pg_upgrade
+> → repin → per-replica reseed → resume) has not yet been exercised end to end
+> against a live Patroni cluster. One known sharp edge: Patroni's DCS
+> `initialize` key stores the cluster's *old* system identifier, and
+> `pg_upgrade` assigns a new one — the upgraded leader may refuse to (re)join
+> with "system ID mismatch, node belongs to a different cluster". The known
+> mitigation shape is Zalando's documented in-place `pg_upgrade` procedure:
+> clear the scope's DCS state (`patronictl remove <scope>`, or delete the
+> scope's etcd keys) during the paused window so the upgraded leader
+> re-initializes the cluster identity before failover resumes. Whether and
+> where the control-plane workflow needs that step must be settled against a
+> real cluster before this path is trusted.
+
 ## Quick Start
 
 ### Deploy to Railway

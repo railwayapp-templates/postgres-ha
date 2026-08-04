@@ -108,6 +108,30 @@ pub enum TelemetryEvent {
         last_reason: String,
     },
 
+    /// A boot was refused by the major-upgrade guard: either the volume
+    /// carries an in-flight upgrade marker, or the on-disk PG_VERSION doesn't
+    /// match the image's major. Emitted once per refused boot (the process
+    /// exits right after), so a crash-looping refused member surfaces as a
+    /// stream of these rather than silence.
+    MajorUpgradeBootRefused { node: String, reason: String },
+
+    /// The runner consumed a `reseed` upgrade marker on a cross-major data
+    /// directory: pgdata was wiped (under the same distinct-leader safety
+    /// predicate as the incomplete-clone wipe) so Patroni re-clones this
+    /// replica from the upgraded leader. One event per wipe.
+    MajorUpgradeReseedWiped {
+        node: String,
+        leader: String,
+        from_major: String,
+        to_major: String,
+    },
+
+    /// The self-heal watcher stood down because a major upgrade owns this
+    /// volume (in-flight or reseed marker present). Emitted ONCE per
+    /// standdown episode, not per poll; a second event for the same node
+    /// means the marker was removed and later re-appeared.
+    SelfHealUpgradeStanddown { node: String },
+
     /// Preflight wiped a non-empty data directory that had no `global/pg_control`
     /// — the debris a `pg_basebackup` killed mid-clone leaves behind — so Patroni
     /// re-clones from the leader. Replica only; fires only when a distinct member
@@ -237,6 +261,9 @@ impl TelemetryEvent {
             Self::SelfHealReinitRequestFailed { .. } => "POSTGRES_HA_SELF_HEAL_REINIT_REQUEST_FAILED",
             Self::SelfHealRecovered { .. } => "POSTGRES_HA_SELF_HEAL_RECOVERED",
             Self::SelfHealGaveUp { .. } => "POSTGRES_HA_SELF_HEAL_GAVE_UP",
+            Self::MajorUpgradeBootRefused { .. } => "POSTGRES_HA_MAJOR_UPGRADE_BOOT_REFUSED",
+            Self::MajorUpgradeReseedWiped { .. } => "POSTGRES_HA_MAJOR_UPGRADE_RESEED_WIPED",
+            Self::SelfHealUpgradeStanddown { .. } => "POSTGRES_HA_SELF_HEAL_UPGRADE_STANDDOWN",
             Self::IncompleteCloneWiped { .. } => "POSTGRES_HA_INCOMPLETE_CLONE_WIPED",
             Self::ArchiveConfigDrifted { .. } => "POSTGRES_HA_ARCHIVE_CONFIG_DRIFTED",
             Self::ArchiveConfigForced { .. } => "POSTGRES_HA_ARCHIVE_CONFIG_FORCED",
@@ -340,6 +367,26 @@ impl TelemetryEvent {
                 format!(
                     "Self-heal: giving up on {} after {} attempts (last: {}); manual intervention required",
                     node, attempts, last_reason
+                )
+            }
+            Self::MajorUpgradeBootRefused { node, reason } => {
+                format!("Boot refused on {} by the major-upgrade guard: {}", node, reason)
+            }
+            Self::MajorUpgradeReseedWiped {
+                node,
+                leader,
+                from_major,
+                to_major,
+            } => {
+                format!(
+                    "Reseed marker consumed on {}: wiped major {} data so Patroni re-clones from leader {} on major {}",
+                    node, from_major, leader, to_major
+                )
+            }
+            Self::SelfHealUpgradeStanddown { node } => {
+                format!(
+                    "Self-heal watcher on {} standing down: a major upgrade owns this volume",
+                    node
                 )
             }
             Self::IncompleteCloneWiped { node, leader } => {

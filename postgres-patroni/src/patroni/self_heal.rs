@@ -975,6 +975,11 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
     // "start failed" observation is fresh and the dwell clock correctly
     // restarts from zero.
     let mut start_failed_since: Option<i64> = None;
+    // Dedupe the upgrade-standdown telemetry: the marker sits on the volume
+    // for the whole upgrade window, so without a latch every poll would emit.
+    // One event per standdown episode; the latch clears once the marker is
+    // gone, so a later window emits again.
+    let mut upgrade_standdown_emitted = false;
 
     loop {
         if let Err(e) = iteration(
@@ -987,6 +992,7 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
             &mut gave_up_emitted,
             &mut divergence_window,
             &mut start_failed_since,
+            &mut upgrade_standdown_emitted,
             &telemetry,
         )
         .await
@@ -1007,6 +1013,7 @@ async fn iteration(
     gave_up_emitted: &mut bool,
     divergence_window: &mut Option<DivergenceWindow>,
     start_failed_since: &mut Option<i64>,
+    upgrade_standdown_emitted: &mut bool,
     telemetry: &Telemetry,
 ) -> Result<()> {
     let now = now_epoch();
@@ -1019,11 +1026,26 @@ async fn iteration(
     // refuses across majors, so it ends up empty rather than rebuilt. Every
     // symptom this watcher looks for (crash loops, "start failed", a timeline
     // behind the leader) is EXPECTED while the cluster's leader is being
-    // upgraded, so the whole iteration stands down.
+    // upgraded, so the whole iteration stands down. In production choreography
+    // the marker that engages this is the `reseed` marker the HA workflow
+    // writes onto each replica's volume before pausing failover.
     if major_upgrade::upgrade_in_flight(volume_root) {
-        info!("self-heal: major upgrade in progress on this volume — standing down");
+        // Clear the transient dwell state so none of it accrues across the
+        // unobserved window: a replica that spent the whole upgrade lagging
+        // must re-earn its divergence/start-failed dwell from zero once the
+        // marker is gone, not inherit a matured one and get wiped instantly.
+        *divergence_window = None;
+        *start_failed_since = None;
+        if !*upgrade_standdown_emitted {
+            info!("self-heal: major upgrade in progress on this volume — standing down");
+            telemetry.send(TelemetryEvent::SelfHealUpgradeStanddown {
+                node: env::var("PATRONI_NAME").unwrap_or_else(|_| "unknown".to_string()),
+            });
+            *upgrade_standdown_emitted = true;
+        }
         return Ok(());
     }
+    *upgrade_standdown_emitted = false;
 
     // 1. Local Patroni status: role, state, postmaster_start_time.
     let local = match fetch_local_patroni(client).await {

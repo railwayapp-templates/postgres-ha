@@ -10,6 +10,15 @@
 //!   phase == "upgraded"  pg_upgrade succeeded, the directory swap may be
 //!                        incomplete — the data directory can be missing
 //!   phase == "completed" the swap is done; the TARGET major's image boots
+//!   phase == "reseed"    written by the HA workflow onto each REPLICA's
+//!                        volume before it pauses failover: boot is ALLOWED,
+//!                        and if the on-disk major differs from the image's
+//!                        the runner wipes pgdata (with the same safety
+//!                        predicate as the incomplete-clone wipe) and deletes
+//!                        the marker so Patroni re-clones from the upgraded
+//!                        leader. Without this phase the version-mismatch
+//!                        guard below would refuse the exact boot the reseed
+//!                        depends on.
 //!
 //! Three things in this image will destroy data if they run during that
 //! window, and none of them can see the control plane:
@@ -28,15 +37,43 @@
 //! no network call. Fail-stop and loud beats clever recovery here.
 
 use serde::Deserialize;
-use std::path::Path;
 
 pub const MARKER_FILENAME: &str = ".railway-major-upgrade.json";
+
+/// Marker phase written by the HA workflow onto replica volumes; see the
+/// module doc. Boot is allowed and the runner consumes the marker.
+pub const PHASE_RESEED: &str = "reseed";
 
 #[derive(Debug, Deserialize)]
 pub struct UpgradeMarker {
     pub phase: Option<String>,
+    #[serde(default, deserialize_with = "de_major")]
     pub from: Option<String>,
+    #[serde(default, deserialize_with = "de_major")]
     pub to: Option<String>,
+}
+
+/// Accept `"16"` or `16` for the marker's major fields. More than one producer
+/// writes this file (the upgrade job image and the HA workflow's reseed
+/// activity); a numeric major must not fail the whole struct parse, because a
+/// failed parse degrades to `phase: None` — which refuses boot, and on a
+/// reseed marker that would wedge the replica the marker exists to rebuild.
+fn de_major<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrNum {
+        S(String),
+        N(i64),
+    }
+    Ok(
+        Option::<StrOrNum>::deserialize(deserializer)?.map(|v| match v {
+            StrOrNum::S(s) => s,
+            StrOrNum::N(n) => n.to_string(),
+        }),
+    )
 }
 
 pub fn marker_path(volume_root: &str) -> String {
@@ -48,16 +85,18 @@ pub fn marker_path(volume_root: &str) -> String {
 /// cannot parse still means an upgrade touched this volume, and treating that
 /// as "nothing in flight" is the one interpretation that can lose data.
 pub fn read_marker(volume_root: &str) -> Option<UpgradeMarker> {
-    let path = marker_path(volume_root);
-    if !Path::new(&path).exists() {
-        return None;
-    }
-    match std::fs::read_to_string(&path) {
+    // Read first and branch on the error kind, not on Path::exists():
+    // exists() returns false on ANY stat error (EACCES, EIO), which would
+    // read a marker we merely cannot stat as "nothing in flight" — the one
+    // interpretation the module contract forbids. Only a definite NotFound
+    // means absent; every other failure counts as in-flight.
+    match std::fs::read_to_string(marker_path(volume_root)) {
         Ok(body) => Some(serde_json::from_str(&body).unwrap_or(UpgradeMarker {
             phase: None,
             from: None,
             to: None,
         })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => Some(UpgradeMarker {
             phase: None,
             from: None,
@@ -67,11 +106,30 @@ pub fn read_marker(volume_root: &str) -> Option<UpgradeMarker> {
 }
 
 /// True while an upgrade is in flight — anything other than a marker that is
-/// absent or explicitly `completed`.
+/// absent or explicitly `completed`. A `reseed` marker counts as in flight on
+/// purpose: it exists exactly for the window where the cluster's leader is
+/// being upgraded, which is when the self-heal watcher must stand down.
 pub fn upgrade_in_flight(volume_root: &str) -> bool {
     match read_marker(volume_root) {
         None => false,
         Some(marker) => marker.phase.as_deref() != Some("completed"),
+    }
+}
+
+/// True when the marker requests a replica reseed (phase == "reseed").
+pub fn reseed_requested(volume_root: &str) -> bool {
+    matches!(
+        read_marker(volume_root),
+        Some(m) if m.phase.as_deref() == Some(PHASE_RESEED)
+    )
+}
+
+/// Remove the marker. Absent is success — the consumers (reseed handling,
+/// rollback cleanup) only care that no marker remains.
+pub fn remove_marker(volume_root: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(marker_path(volume_root)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -87,6 +145,16 @@ pub fn data_dir_major(data_dir: &str) -> Option<String> {
 /// Why booting must not proceed, or None when it may. Both cases are
 /// fail-stop: this image never tries to repair either one, because both are
 /// mid-flight states owned by the upgrade workflow.
+///
+/// A `reseed` marker allows the boot unconditionally — including across a
+/// major mismatch, which is the state a replica is deliberately left in after
+/// the leader was upgraded and the replica repinned. The runner's reseed
+/// handler (patroni_runner) is what resolves the mismatch: it wipes pgdata
+/// under the incomplete-clone safety predicate and deletes the marker so
+/// Patroni clones from the leader. In standalone mode nothing consumes the
+/// marker, but that boot is still non-destructive: docker-entrypoint never
+/// initdb's a non-empty PGDATA, and Postgres itself refuses a cross-major
+/// data directory during startup without touching the files.
 pub fn boot_refusal_reason(
     volume_root: &str,
     data_dir: &str,
@@ -94,6 +162,9 @@ pub fn boot_refusal_reason(
 ) -> Option<String> {
     if let Some(marker) = read_marker(volume_root) {
         let phase = marker.phase.as_deref().unwrap_or("unreadable");
+        if phase == PHASE_RESEED {
+            return None;
+        }
         if phase != "completed" {
             return Some(format!(
                 "A major version upgrade is in progress on this volume (marker phase: {phase}). \
@@ -116,6 +187,7 @@ pub fn boot_refusal_reason(
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn write_marker(root: &Path, body: &str) {
@@ -197,5 +269,77 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         fs::write(dir.path().join("PG_VERSION"), "16").unwrap();
         assert!(boot_refusal_reason(root, root, None).is_none());
+    }
+
+    // ---- reseed phase -------------------------------------------------
+
+    // The whole point of the phase: a replica repinned to the new major still
+    // holds old-major data, and the boot that performs the wipe-and-reclone
+    // must be allowed through both guards.
+    #[test]
+    fn reseed_marker_allows_boot_across_major_mismatch() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        write_marker(dir.path(), r#"{"phase":"reseed","from":"16","to":"17"}"#);
+        fs::write(dir.path().join("PG_VERSION"), "16").unwrap();
+        assert!(boot_refusal_reason(root, root, Some("17")).is_none());
+    }
+
+    #[test]
+    fn reseed_marker_allows_boot_on_matching_major() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        write_marker(dir.path(), r#"{"phase":"reseed","from":"16","to":"17"}"#);
+        fs::write(dir.path().join("PG_VERSION"), "17").unwrap();
+        assert!(boot_refusal_reason(root, root, Some("17")).is_none());
+    }
+
+    // A reseed marker exists exactly for the window where the leader is being
+    // upgraded, so the self-heal watcher must treat it as in flight.
+    #[test]
+    fn reseed_marker_is_in_flight_for_self_heal_standdown() {
+        let dir = tempdir().unwrap();
+        write_marker(dir.path(), r#"{"phase":"reseed","from":"16","to":"17"}"#);
+        let root = dir.path().to_str().unwrap();
+        assert!(upgrade_in_flight(root));
+        assert!(reseed_requested(root));
+    }
+
+    #[test]
+    fn reseed_requested_is_false_for_other_phases_and_absence() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        assert!(!reseed_requested(root));
+        write_marker(dir.path(), r#"{"phase":"upgraded","from":"16","to":"17"}"#);
+        assert!(!reseed_requested(root));
+        write_marker(dir.path(), r#"{"phase":"completed","from":"16","to":"17"}"#);
+        assert!(!reseed_requested(root));
+    }
+
+    // Numeric majors must not fail the whole parse: a failed parse reads as
+    // phase None, which refuses boot — the one degradation that would wedge a
+    // replica whose marker exists to rebuild it.
+    #[test]
+    fn reseed_marker_with_numeric_majors_still_parses() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        write_marker(dir.path(), r#"{"phase":"reseed","from":16,"to":17}"#);
+        assert!(reseed_requested(root));
+        let marker = read_marker(root).unwrap();
+        assert_eq!(marker.from.as_deref(), Some("16"));
+        assert_eq!(marker.to.as_deref(), Some("17"));
+        fs::write(dir.path().join("PG_VERSION"), "16").unwrap();
+        assert!(boot_refusal_reason(root, root, Some("17")).is_none());
+    }
+
+    #[test]
+    fn remove_marker_removes_and_tolerates_absence() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        write_marker(dir.path(), r#"{"phase":"reseed","from":"16","to":"17"}"#);
+        remove_marker(root).unwrap();
+        assert!(read_marker(root).is_none());
+        // Absent is success: nothing left to remove is the desired state.
+        remove_marker(root).unwrap();
     }
 }

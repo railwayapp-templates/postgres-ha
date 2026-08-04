@@ -2521,6 +2521,145 @@ t_ha_selfheal_stands_down_during_upgrade() {
   teardown_scope "$scope"
 }
 
+# The reseed contract, end to end. The HA workflow writes {"phase":"reseed"}
+# onto each replica's volume before pausing failover; after the leader is
+# upgraded the replica is repinned and redeployed, and THAT boot rebuilds it:
+# a cross-major pgdata is wiped (only with a DISTINCT member holding the DCS
+# leader lock — a live clone source) and the marker deleted AT WIPE TIME, so
+# Patroni re-clones from the leader. On a MATCHING major (the rollback shape:
+# the workflow failed before the repin) the boot just sheds the marker and
+# keeps the data. Without the reseed phase, the version-mismatch boot guard
+# would refuse the exact boot the rebuild depends on.
+t_ha_reseed_marker_reclone() {
+  local scope=t-reseed-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || {
+    ko t_ha_reseed_marker_reclone "no leader elected"
+    fail_dump t_ha_reseed_marker_reclone "$n1" "$n2" "$n3"
+    teardown_scope "$scope"
+    return
+  }
+  if ! wait_for_replication "$scope" 2 240; then
+    ko t_ha_reseed_marker_reclone "replicas did not stream"
+    fail_dump t_ha_reseed_marker_reclone "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # A row the re-cloned replica can only have gotten from the leader.
+  psql_leader "$leader" -q -c \
+    "CREATE TABLE reseed_probe(v text); INSERT INTO reseed_probe VALUES ('from-leader')" >/dev/null
+
+  local r_mismatch="" r_match=""
+  for c in "$n1" "$n2" "$n3"; do
+    [ "$c" = "$leader" ] && continue
+    if [ -z "$r_mismatch" ]; then r_mismatch="$c"; else r_match="$c"; fi
+  done
+  local other_major=$((PG_VERSION - 1))
+
+  # ---- Phase 1: reseed marker + cross-major pgdata → wipe and re-clone ----
+  # Forge the exact state the workflow leaves a replica in after the leader
+  # was upgraded and the member repinned: an old-major PG_VERSION under a
+  # new-major image, with the reseed marker at the volume root. Only the
+  # version file is forged — the wipe doesn't read anything else, and the
+  # re-clone replaces the directory wholesale.
+  docker exec "$r_mismatch" sh -c \
+    'echo "{\"phase\": \"reseed\", \"from\": \"'"$other_major"'\", \"to\": \"'"${PG_VERSION}"'\"}" > /var/lib/postgresql/data/.railway-major-upgrade.json && echo '"$other_major"' > /var/lib/postgresql/data/pgdata/PG_VERSION' >/dev/null
+  docker restart "$r_mismatch" >/dev/null
+
+  local deadline=$(($(date +%s) + 120)) wiped=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if logs_contain "$r_mismatch" "wiping pgdata so Patroni re-clones"; then
+      wiped=1
+      break
+    fi
+    sleep 3
+  done
+  if [ "$wiped" -ne 1 ]; then
+    ko t_ha_reseed_marker_reclone "boot never wiped the cross-major pgdata (guard refused, or the reseed path did not run)"
+    fail_dump t_ha_reseed_marker_reclone "$r_mismatch"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! wait_for_replication "$scope" 2 300; then
+    ko t_ha_reseed_marker_reclone "reseeded replica never came back streaming"
+    fail_dump t_ha_reseed_marker_reclone "$r_mismatch" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  if docker exec "$r_mismatch" test -f /var/lib/postgresql/data/.railway-major-upgrade.json; then
+    ko t_ha_reseed_marker_reclone "reseed marker still present after the wipe-and-reclone"
+    fail_dump t_ha_reseed_marker_reclone "$r_mismatch"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! docker exec "$r_mismatch" sh -c "grep -qx ${PG_VERSION} /var/lib/postgresql/data/pgdata/PG_VERSION"; then
+    ko t_ha_reseed_marker_reclone "re-cloned pgdata does not carry the image's major"
+    fail_dump t_ha_reseed_marker_reclone "$r_mismatch"
+    teardown_scope "$scope"
+    return
+  fi
+  local probe
+  probe=$(docker exec "$r_mismatch" psql -U postgres -h /var/run/postgresql -At -c \
+    "SELECT v FROM reseed_probe" 2>/dev/null)
+  if [ "$probe" != "from-leader" ]; then
+    ko t_ha_reseed_marker_reclone "re-cloned replica is missing the leader's data (got '$probe')"
+    fail_dump t_ha_reseed_marker_reclone "$r_mismatch" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # ---- Phase 2: reseed marker on a MATCHING major → consume and boot ----
+  # The rollback shape: the workflow wrote markers, failed before the repin,
+  # and the marker removal itself failed too. The old image boots its own
+  # data; the boot must shed the marker and must NOT wipe.
+  docker exec "$r_match" sh -c \
+    'echo "{\"phase\": \"reseed\", \"from\": \"'"$other_major"'\", \"to\": \"'"${PG_VERSION}"'\"}" > /var/lib/postgresql/data/.railway-major-upgrade.json && touch /var/lib/postgresql/data/pgdata/reseed_canary' >/dev/null
+  docker restart "$r_match" >/dev/null
+
+  deadline=$(($(date +%s) + 120))
+  local consumed=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if logs_contain "$r_match" "consuming the marker and booting normally"; then
+      consumed=1
+      break
+    fi
+    sleep 3
+  done
+  if [ "$consumed" -ne 1 ]; then
+    ko t_ha_reseed_marker_reclone "matching-major boot never consumed the reseed marker"
+    fail_dump t_ha_reseed_marker_reclone "$r_match"
+    teardown_scope "$scope"
+    return
+  fi
+  if docker exec "$r_match" test -f /var/lib/postgresql/data/.railway-major-upgrade.json; then
+    ko t_ha_reseed_marker_reclone "reseed marker still present after a matching-major boot"
+    fail_dump t_ha_reseed_marker_reclone "$r_match"
+    teardown_scope "$scope"
+    return
+  fi
+  # The canary proves the data directory was NOT wiped: same files, no clone.
+  if ! docker exec "$r_match" test -f /var/lib/postgresql/data/pgdata/reseed_canary; then
+    ko t_ha_reseed_marker_reclone "matching-major reseed boot wiped pgdata (canary gone)"
+    fail_dump t_ha_reseed_marker_reclone "$r_match"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! wait_for_replication "$scope" 2 240; then
+    ko t_ha_reseed_marker_reclone "matching-major replica never came back streaming"
+    fail_dump t_ha_reseed_marker_reclone "$r_match" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_reseed_marker_reclone
+  note "cross-major: wiped+re-cloned from $leader, marker consumed; matching-major: marker shed, data intact"
+  teardown_scope "$scope"
+}
+
 t_ha_pghost_pgport_unset() {
   local scope=t-pghost-${PG_VERSION}
   reset_bucket
@@ -3632,6 +3771,8 @@ ALL_TESTS=(
   t_ha_upgrade_marker_blocks_boot
   t_ha_major_mismatch_blocks_boot
   t_ha_selfheal_stands_down_during_upgrade
+  # reseed marker: the boot that rebuilds a replica across majors
+  t_ha_reseed_marker_reclone
   t_ha_restore_gate_logged_on_every_node
   # boot-time reconcile self-heals a live archive_command Patroni's own
   # dynamic-config sync silently failed to apply (DCS-vs-live divergence)
