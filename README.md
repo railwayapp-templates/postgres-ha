@@ -401,10 +401,15 @@ docs are ambiguous about:
 > pipeline driving stop/repin/redeploy, and the real volume lifecycle (locks,
 > snapshots, a crash-looping member being restarted by the platform
 > mid-window). That gets exercised against a real Railway cluster right after
-> this ships. **There is no one-click revert for an HA upgrade** — a failed
-> real run falls back to the manual path `revert.ts` already points to:
-> restore the pre-upgrade backup with Patroni failover paused for the whole
-> operation.
+> this ships. A *failed* upgrade is already handled by the workflow itself —
+> it resumes failover and restarts the old image on its own, no button
+> needed. **"Revert" is a separate, discretionary thing: undoing an upgrade
+> that succeeded, because you've since decided against it.** That always
+> discards every write made since the upgrade completed (it restores the
+> pre-upgrade backup), and **there is no one-click revert for an HA
+> upgrade** — doing it manually means restoring that backup with Patroni
+> failover paused for the whole operation, which `revert.ts` already points
+> operators at.
 
 ## Quick Start
 
