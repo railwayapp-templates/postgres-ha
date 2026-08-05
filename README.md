@@ -318,19 +318,73 @@ exact boot the reseed depends on. The marker also keeps the self-heal watcher
 standing down for the window, which is the production path by which that
 standdown actually engages.
 
-> **UNVERIFIED against a real cluster — read before implementing or operating
-> the upgrade.** The whole HA upgrade choreography (pause → leader pg_upgrade
-> → repin → per-replica reseed → resume) has not yet been exercised end to end
-> against a live Patroni cluster. One known sharp edge: Patroni's DCS
-> `initialize` key stores the cluster's *old* system identifier, and
-> `pg_upgrade` assigns a new one — the upgraded leader may refuse to (re)join
-> with "system ID mismatch, node belongs to a different cluster". The known
-> mitigation shape is Zalando's documented in-place `pg_upgrade` procedure:
-> clear the scope's DCS state (`patronictl remove <scope>`, or delete the
-> scope's etcd keys) during the paused window so the upgraded leader
-> re-initializes the cluster identity before failover resumes. Whether and
-> where the control-plane workflow needs that step must be settled against a
-> real cluster before this path is trusted.
+### Verified end to end against a real cluster
+
+The whole choreography — pause → leader `pg_upgrade` (16→17) → leader on the
+new image → per-replica reseed → resume → switchover — has been exercised
+against a live 3-node Patroni 4.1.0 + etcd cluster, and is pinned permanently
+by `t_ha_major_upgrade_full_choreography` in `test/e2e-ha.sh` (it runs a real
+`pg_upgrade` of the leader's volume using postgres-ssl's job image; CI runs it
+as its own job). The load-bearing facts it settled, each of which the docs are
+ambiguous about:
+
+- **Stopping a paused member is an unclean stop by design.** Patroni logs
+  `Leader key is not deleted and Postgresql is not stopped due paused state`
+  and exits without stopping the postmaster, which the container teardown then
+  SIGKILLs. The upgrade job's WAL-replay quiesce is therefore the *normal*
+  path for an HA leader, not an edge case. The stale leader key simply expires
+  via its DCS lease TTL; paused replicas do not take it.
+- **The DCS `initialize` key really does hold the old system identifier, and
+  the upgraded leader really is refused — but the observed shape is a wedge,
+  not a crash.** Under pause Patroni warns `system ID has changed while in
+  paused mode. Patroni will exit when resuming unless system ID is reset:
+  <old> != <new>` and then sits at `PAUSE: postgres is not running` forever —
+  a paused Patroni never starts a stopped postgres, so the redeployed leader
+  stays up with the database down. (Unpaused, that warning becomes the fatal
+  "belongs to a different cluster" exit.)
+- **The minimal mitigation is two calls, both available from inside a member
+  container:** delete *only* `/service/<scope>/initialize` via etcd's HTTP v3
+  API (`curl -X POST http://$ETCD_HOST/v3/kv/deleterange` with the base64 key
+  — `etcdctl` is not in this image; `curl`, `base64` and `PATRONI_ETCD3_HOSTS`
+  are), then `POST /restart` to the leader's Patroni REST. A paused Patroni
+  honors the explicit restart, starts postgres, logs `PAUSE: acquired session
+  lock as a leader`, and writes a fresh `initialize` key carrying the new
+  sysid — while `/config`, **including `pause: true` and every dynamic
+  postgresql parameter, survives untouched**.
+- **`patronictl remove <scope>` is NOT an acceptable substitute** (despite
+  being the mitigation Zalando's procedure describes): verified to delete the
+  entire `/service/<scope>/` prefix including `/config`, which destroys the
+  pause flag — waking failover mid-window — and every dynamic parameter
+  (`archive_mode` etc. on PITR clusters).
+- **A paused Patroni will not clone a member on its own.** After the reseed
+  boot wipes a cross-major pgdata the member sits at `PAUSE: running with
+  empty data directory` indefinitely. `POST /reinitialize` *is* honored under
+  pause and performs the basebackup clone from the upgraded leader, so the
+  reseed walk can stay inside the paused window — but only with that explicit
+  kick per replica.
+- **Resume ordering matters and must stay last.** The old-major replicas'
+  live (paused) Patronis tolerate the new `initialize` key only *because* the
+  cluster is paused; resuming before they are rebuilt would make them exit
+  fatally on the sysid mismatch, and the restart that follows on the old image
+  would consume the reseed marker (matching-major shape), leaving the later
+  repin+redeploy refused by the version-mismatch guard.
+- Incidentals: `pg_upgrade --link` succeeds on a Patroni-managed data
+  directory (`patroni.dynamic.json`, Patroni-rendered conf and pg_hba are not
+  blockers); the job container must receive the service's `PGDATA`
+  (`…/data/pgdata`) explicitly, because the job image inherits the official
+  base image's `PGDATA=/var/lib/postgresql/data` — the volume root, which the
+  job refuses (in production the job runs as a deployment of the service and
+  inherits its variables); after the mitigated window a real switchover to a
+  reseeded replica completes and bumps the timeline.
+
+> **Still unverified — the Railway-production-specific parts only:** the
+> control plane's exec transport (the reseed markers, the etcd HTTP delete and
+> the REST calls are exec'd/tunneled through Railway instead of `docker
+> exec`), the deploy pipeline (stop/repin/redeploy as Railway deployments
+> rather than `docker rm`+`run`), and the real volume lifecycle (locks,
+> snapshots, restart policies — e.g. a crash-looping member being restarted by
+> the platform mid-window). The Patroni/etcd/pg_upgrade behavior itself is
+> pinned by the e2e test above.
 
 ## Quick Start
 

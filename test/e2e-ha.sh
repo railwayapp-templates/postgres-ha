@@ -181,6 +181,56 @@ ensure_etcd_image() {
   docker build -q -f "$REPO_ROOT/etcd/Dockerfile" -t "$ETCD_IMAGE" "$REPO_ROOT" >/dev/null
 }
 
+# Build this repo's HA image for an arbitrary major. The choreography test
+# starts its cluster on the PREVIOUS major and upgrades onto $IMAGE, so it
+# needs a second image the fixed ensure_image doesn't cover. Same
+# always-rebuild policy (and E2E_SKIP_BUILD escape hatch) as ensure_image.
+ensure_image_for_major() {
+  local major="$1"
+  local tag="postgres-ha-pitr:${major}"
+  if [ "${E2E_SKIP_BUILD:-0}" = "1" ] && docker image inspect "$tag" >/dev/null 2>&1; then
+    log "image $tag reused (E2E_SKIP_BUILD=1)"
+    return 0
+  fi
+  log "building $tag from $DOCKERFILE"
+  docker build -q --build-arg POSTGRES_VERSION="$major" \
+    -f "$DOCKERFILE" -t "$tag" "$REPO_ROOT" >/dev/null
+}
+
+# Build the dual-binary upgrade job image (postgres-ssl's Dockerfile.upgrade)
+# for a FROM->TO pair. Resolution order:
+#   1. a local sibling checkout (E2E_UPGRADE_JOB_DIR, then the conventional
+#      sibling paths) — so a local run exercises uncommitted job changes;
+#   2. a docker git build context against the postgres-ssl repo — so this
+#      repo's CI can build the job image without the sibling checkout.
+#      BuildKit resolves -f inside the remote context (verified: the git
+#      context build produces a digest identical to the local build).
+# NOTE: UPGRADE_JOB_GIT_REF defaults to the postgres-ssl PR branch that
+# carries Dockerfile.upgrade (pcs/major-upgrade-job). Flip the default to
+# `main` once railwayapp-templates/postgres-ssl#113 merges.
+ensure_upgrade_job_image() {
+  local from="$1" to="$2" tag="$3"
+  if [ "${E2E_SKIP_BUILD:-0}" = "1" ] && docker image inspect "$tag" >/dev/null 2>&1; then
+    log "image $tag reused (E2E_SKIP_BUILD=1)"
+    return 0
+  fi
+  local dir
+  for dir in "${E2E_UPGRADE_JOB_DIR:-}" \
+             "$REPO_ROOT/../postgres-ssl-upgrade-wt" \
+             "$REPO_ROOT/../postgres-ssl"; do
+    [ -n "$dir" ] && [ -f "$dir/Dockerfile.upgrade" ] || continue
+    log "building $tag from local $dir"
+    docker build -q --build-arg FROM_VERSION="$from" --build-arg TO_VERSION="$to" \
+      -f "$dir/Dockerfile.upgrade" -t "$tag" "$dir" >/dev/null
+    return $?
+  done
+  local ref="${UPGRADE_JOB_GIT_REF:-pcs/major-upgrade-job}"
+  log "building $tag from git context railwayapp-templates/postgres-ssl#${ref}"
+  docker build -q --build-arg FROM_VERSION="$from" --build-arg TO_VERSION="$to" \
+    -f Dockerfile.upgrade -t "$tag" \
+    "https://github.com/railwayapp-templates/postgres-ssl.git#${ref}" >/dev/null
+}
+
 # ----- HA cluster helpers ----------------------------------------------------
 
 # Tag containers / volumes per harness for cleanup, plus a per-cluster
@@ -413,6 +463,27 @@ run_patroni_node() {
     "${extra_args[@]}" \
     -v "${RUN_NODE_VOLUME:-${n}-vol}:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
+}
+
+# Same as run_patroni_node but with an explicit image: the major-upgrade
+# choreography boots the same member first on the FROM major's image and
+# later on $IMAGE, against the same volume.
+run_patroni_node_with_image() {
+  local scope="$1" etcd_hosts="$2" n="$3" image="$4"
+  docker rm -f "$n" >/dev/null 2>&1 || true
+  docker run -d --name "$n" --label "$HA_LABEL" --network "$NET" \
+    --hostname "$n" \
+    -e "PATRONI_ENABLED=true" \
+    -e "PATRONI_NAME=${n}" \
+    -e "PATRONI_SCOPE=${scope}" \
+    -e "RAILWAY_PRIVATE_DOMAIN=${n}" \
+    -e "PATRONI_ETCD3_HOSTS=${etcd_hosts}" \
+    -e "POSTGRES_PASSWORD=test" \
+    -e "PATRONI_REPLICATION_PASSWORD=replpass" \
+    -e "PATRONI_SUPERUSER_PASSWORD=test" \
+    -e "PGDATA=/var/lib/postgresql/data/pgdata" \
+    -v "${n}-vol:/var/lib/postgresql/data" \
+    "$image" >/dev/null
 }
 
 # Wait for ONE named node to report itself Patroni leader. The 3-node
@@ -2660,6 +2731,442 @@ t_ha_reseed_marker_reclone() {
   teardown_scope "$scope"
 }
 
+# The FULL major-upgrade choreography against a real cluster — a real
+# pg_upgrade of the leader's volume, from-major-1 → this harness's major,
+# mirroring mono's databaseHaMajorUpgradeWorkflow step for step: reseed
+# markers on the replicas → pause failover → stop the leader → job image
+# (check, then upgrade) on the leader's volume → leader redeployed on the
+# new major → replicas reseeded → resume → post-resume switchover.
+#
+# Every non-obvious assertion below pins a fact that was settled EMPIRICALLY
+# on 2026-08-05 (Patroni 4.1.0 / etcd3), because the docs are ambiguous on
+# all of them:
+#
+#   1. Stopping a PAUSED member is an UNCLEAN stop by design. Patroni logs
+#      "Leader key is not deleted and Postgresql is not stopped due paused
+#      state" and exits, leaving the postmaster to be SIGKILLed with the
+#      container — so the job's WAL-replay quiesce path is the NORMAL case
+#      for an HA leader, not an edge. The leader key then simply expires
+#      via its DCS lease TTL; paused replicas do not take it.
+#
+#   2. The DCS `initialize` key holds the cluster's OLD system identifier
+#      and pg_upgrade mints a new one. The upgraded leader booted against
+#      an untouched DCS does NOT crash-loop: Patroni warns "system ID has
+#      changed while in paused mode. Patroni will exit when resuming unless
+#      system ID is reset" and then sits at "PAUSE: postgres is not
+#      running" forever — a paused Patroni never starts a stopped postgres,
+#      so the redeployed leader wedges with the database down.
+#
+#   3. The minimal mitigation is exactly two calls, both possible from
+#      inside a member container (mono's exec bridge interface): delete
+#      ONLY /service/<scope>/initialize via etcd's HTTP v3 API (etcdctl is
+#      not in this image; curl + base64 + PATRONI_ETCD3_HOSTS are), then
+#      POST /restart to the leader's Patroni REST. A paused Patroni honors
+#      an explicit restart, starts postgres, logs "PAUSE: acquired session
+#      lock as a leader", and writes a NEW initialize key carrying the new
+#      sysid — while /config (and pause:true in it) SURVIVES untouched.
+#      `patronictl remove <scope>` is NOT a substitute: verified to delete
+#      the entire /service/<scope>/ prefix including /config, which
+#      destroys the pause flag (and every dynamic postgresql parameter)
+#      mid-window.
+#
+#   4. A paused Patroni will NOT clone a member on its own. After the
+#      reseed boot wipes the cross-major pgdata it sits at "PAUSE: running
+#      with empty data directory" indefinitely; POST /reinitialize (force)
+#      IS honored under pause and performs the basebackup clone from the
+#      upgraded leader. So the reseed walk can stay inside the paused
+#      window — the window where a not-yet-rebuilt replica must not be a
+#      promotion candidate — but only with the explicit reinitialize.
+#
+#   5. After the mitigated window closes (resume with every member rebuilt
+#      and sysid-coherent), the failover machinery genuinely works again:
+#      a switchover to a reseeded replica completes and bumps the timeline.
+t_ha_major_upgrade_full_choreography() {
+  local scope=t-majorchor-${PG_VERSION}
+  local from_major=$((PG_VERSION - 1))
+  local from_image="postgres-ha-pitr:${from_major}"
+  local job_image="postgres-upgrade-e2e:${from_major}-${PG_VERSION}"
+  local job_ctr="${scope}-upgrade-job"
+  local vol_root="/var/lib/postgresql/data"
+  local marker_path="${vol_root}/.railway-major-upgrade.json"
+
+  if ! ensure_image_for_major "$from_major"; then
+    ko t_ha_major_upgrade_full_choreography "could not build the PG${from_major} HA image"
+    return
+  fi
+  if ! ensure_upgrade_job_image "$from_major" "$PG_VERSION" "$job_image"; then
+    ko t_ha_major_upgrade_full_choreography "could not build the upgrade job image ($job_image) from a local postgres-ssl checkout or the git context (UPGRADE_JOB_GIT_REF=${UPGRADE_JOB_GIT_REF:-pcs/major-upgrade-job})"
+    return
+  fi
+
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  local n1="${scope}-pg-1" n2="${scope}-pg-2" n3="${scope}-pg-3"
+  for n in "$n1" "$n2" "$n3"; do
+    docker rm -f "$n" >/dev/null 2>&1 || true
+    new_volume "${n}-vol"
+  done
+  for n in "$n1" "$n2" "$n3"; do
+    run_patroni_node_with_image "$scope" "$etcd_hosts" "$n" "$from_image"
+  done
+
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || {
+    ko t_ha_major_upgrade_full_choreography "no leader elected on the PG${from_major} cluster"
+    fail_dump t_ha_major_upgrade_full_choreography "$n1" "$n2" "$n3"
+    teardown_scope "$scope"
+    return
+  }
+  if ! wait_for_replication "$scope" 2 240; then
+    ko t_ha_major_upgrade_full_choreography "replicas did not stream on the PG${from_major} cluster"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Seed a row the reseeded replicas can only have gotten via the upgraded
+  # leader, and capture the pre-upgrade system identifier from DCS.
+  psql_leader "$leader" -q -c \
+    "CREATE TABLE major_upgrade_probe(v text); INSERT INTO major_upgrade_probe VALUES ('seeded-on-${from_major}')" >/dev/null
+  local old_sysid
+  old_sysid=$(docker exec "${scope}-etcd-1" etcdctl get "/service/${scope}/initialize" --print-value-only 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$old_sysid" ]; then
+    ko t_ha_major_upgrade_full_choreography "DCS initialize key is empty before the upgrade"
+    teardown_scope "$scope"
+    return
+  fi
+
+  local r1="" r2=""
+  for c in "$n1" "$n2" "$n3"; do
+    [ "$c" = "$leader" ] && continue
+    if [ -z "$r1" ]; then r1="$c"; else r2="$c"; fi
+  done
+
+  # Step 1 — reseed markers on both replica volumes, byte-for-byte what
+  # mono's writeHaReseedMarkersActivity writes (atomic tmp+rename at the
+  # volume root, string majors).
+  local marker_json="{\"phase\":\"reseed\",\"from\":\"${from_major}\",\"to\":\"${PG_VERSION}\"}"
+  for r in "$r1" "$r2"; do
+    if ! docker exec "$r" sh -c "printf '%s' '${marker_json}' > ${marker_path}.tmp && mv -f ${marker_path}.tmp ${marker_path}"; then
+      ko t_ha_major_upgrade_full_choreography "couldn't write the reseed marker on $r"
+      teardown_scope "$scope"
+      return
+    fi
+  done
+
+  # Step 2 — pause failover exactly as mono does (PATCH /config against the
+  # leader REST API), and confirm strictly by reading it back.
+  docker exec "$leader" curl -sf -X PATCH -H "Content-Type: application/json" \
+    -d '{"pause":true}' http://localhost:8008/config >/dev/null
+  local paused=""
+  local deadline=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    paused=$(docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null \
+      | grep -coE '"pause":[[:space:]]*true' || true)
+    [ "${paused:-0}" -ge 1 ] && break
+    sleep 2
+  done
+  if [ "${paused:-0}" -lt 1 ]; then
+    ko t_ha_major_upgrade_full_choreography "Patroni never confirmed pause=true after the config PATCH"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Step 3 — stop the leader. Empirical pin #1: a paused Patroni exits
+  # WITHOUT stopping postgres or releasing the leader key, so the container
+  # teardown SIGKILLs the postmaster and the volume is left "in production".
+  docker stop -t 60 "$leader" >/dev/null
+  if ! logs_contain "$leader" "Postgresql is not stopped due paused state"; then
+    ko t_ha_major_upgrade_full_choreography "paused leader stop did not log 'Postgresql is not stopped due paused state' — the pause/stop contract changed"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Step 4 — the upgrade job on the leader's volume: check, then upgrade.
+  # PGDATA must be passed explicitly: the job image inherits the official
+  # base image's PGDATA=/var/lib/postgresql/data (the volume ROOT), which
+  # the job refuses. In prod the job runs as a deployment of the service and
+  # inherits the service's own PGDATA, so this mirrors the real dispatch.
+  docker rm -f "$job_ctr" >/dev/null 2>&1 || true
+  docker run --name "$job_ctr" --label "$HA_LABEL" \
+    -e "PGDATA=${vol_root}/pgdata" \
+    -v "${leader}-vol:${vol_root}" "$job_image" check >/dev/null 2>&1
+  local rc=$?
+  local check_logs; check_logs=$(docker logs "$job_ctr" 2>&1)
+  if [ "$rc" -ne 0 ] || ! echo "$check_logs" | grep -q "Clusters are compatible"; then
+    ko t_ha_major_upgrade_full_choreography "upgrade job check failed (exit $rc)"
+    fail_dump t_ha_major_upgrade_full_choreography "$job_ctr"
+    docker rm -f "$job_ctr" >/dev/null 2>&1
+    teardown_scope "$scope"
+    return
+  fi
+  # The quiesce path must have fired — pin the "paused stop is unclean"
+  # consequence end to end (WAL replay + clean shutdown inside the job).
+  if ! echo "$check_logs" | grep -q "replaying WAL and shutting down cleanly"; then
+    ko t_ha_major_upgrade_full_choreography "job check did not quiesce an unclean cluster — expected the paused-stop SIGKILL to leave 'in production' state"
+    fail_dump t_ha_major_upgrade_full_choreography "$job_ctr"
+    docker rm -f "$job_ctr" >/dev/null 2>&1
+    teardown_scope "$scope"
+    return
+  fi
+  docker rm -f "$job_ctr" >/dev/null 2>&1
+
+  docker run --name "$job_ctr" --label "$HA_LABEL" \
+    -e "PGDATA=${vol_root}/pgdata" \
+    -v "${leader}-vol:${vol_root}" "$job_image" upgrade >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    ko t_ha_major_upgrade_full_choreography "upgrade job failed (exit $rc)"
+    fail_dump t_ha_major_upgrade_full_choreography "$job_ctr"
+    docker rm -f "$job_ctr" >/dev/null 2>&1
+    teardown_scope "$scope"
+    return
+  fi
+  docker rm -f "$job_ctr" >/dev/null 2>&1
+
+  local marker_body
+  marker_body=$(docker run --rm -v "${leader}-vol:/v" --entrypoint /bin/sh "$IMAGE" -c \
+    "cat /v/.railway-major-upgrade.json 2>/dev/null")
+  if ! echo "$marker_body" | grep -q '"phase": *"completed"'; then
+    ko t_ha_major_upgrade_full_choreography "expected a completed marker after the job, got '$marker_body'"
+    teardown_scope "$scope"
+    return
+  fi
+  local new_sysid
+  new_sysid=$(docker run --rm -v "${leader}-vol:${vol_root}" --entrypoint /bin/bash "$IMAGE" -c \
+    "/usr/lib/postgresql/${PG_VERSION}/bin/pg_controldata ${vol_root}/pgdata 2>/dev/null \
+     | awk -F: '/system identifier/ {gsub(/ /,\"\",\$2); print \$2}'")
+  if [ -z "$new_sysid" ] || [ "$new_sysid" = "$old_sysid" ]; then
+    ko t_ha_major_upgrade_full_choreography "pg_upgrade did not mint a new system identifier (old=$old_sysid new=$new_sysid)"
+    teardown_scope "$scope"
+    return
+  fi
+  # DCS still holds the OLD sysid — the exact conflict under test.
+  local dcs_sysid
+  dcs_sysid=$(docker exec "${scope}-etcd-1" etcdctl get "/service/${scope}/initialize" --print-value-only 2>/dev/null | tr -d '[:space:]')
+  if [ "$dcs_sysid" != "$old_sysid" ]; then
+    ko t_ha_major_upgrade_full_choreography "DCS initialize key changed unexpectedly during the job (was $old_sysid, now $dcs_sysid)"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Step 5 — THE EXPERIMENT: boot the upgraded leader on the new major's
+  # image WITHOUT touching DCS. Empirical pin #2: no crash-loop — Patroni
+  # tolerates the mismatch under pause but never starts postgres.
+  run_patroni_node_with_image "$scope" "$etcd_hosts" "$leader" "$IMAGE"
+  deadline=$(($(date +%s) + 120))
+  local saw_mismatch=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if logs_contain "$leader" "system ID has changed while in paused mode"; then
+      saw_mismatch=1
+      break
+    fi
+    sleep 3
+  done
+  if [ "$saw_mismatch" -ne 1 ]; then
+    ko t_ha_major_upgrade_full_choreography "upgraded leader never logged the paused-mode system-ID mismatch against the stale initialize key"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  # ... and it is genuinely wedged: Patroni is up, postgres is not.
+  if docker exec "$leader" curl -sf -o /dev/null http://localhost:8008/leader 2>/dev/null; then
+    ko t_ha_major_upgrade_full_choreography "upgraded leader reports /leader 200 against a stale initialize key — the wedge this test exists to pin did not happen"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Step 6 — the MINIMAL mitigation (empirical pin #3): delete ONLY the
+  # scope's initialize key, from inside the member container via etcd's
+  # HTTP v3 API (the interface mono's exec bridge has: curl + base64 +
+  # PATRONI_ETCD3_HOSTS; etcdctl is not in the image)...
+  if ! docker exec "$leader" sh -c '
+      b64=$(printf "/service/'"$scope"'/initialize" | base64 -w0)
+      host=$(echo "$PATRONI_ETCD3_HOSTS" | cut -d, -f1)
+      curl -sf -X POST "http://${host}/v3/kv/deleterange" \
+        -H "Content-Type: application/json" -d "{\"key\": \"${b64}\"}"
+    ' | grep -q '"deleted"'; then
+    ko t_ha_major_upgrade_full_choreography "in-container etcd HTTP delete of the initialize key failed"
+    teardown_scope "$scope"
+    return
+  fi
+  # ...then POST /restart: a paused Patroni honors an explicit restart and
+  # starts the stopped postgres.
+  if ! docker exec "$leader" curl -sf -o /dev/null -X POST -H "Content-Type: application/json" \
+      -d '{}' http://localhost:8008/restart; then
+    ko t_ha_major_upgrade_full_choreography "POST /restart on the paused upgraded leader failed"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! wait_for_node_leader "$leader" 120; then
+    ko t_ha_major_upgrade_full_choreography "upgraded leader did not take the leader lock after initialize-delete + restart"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  # The paused leader must have re-initialized the cluster identity with the
+  # NEW sysid, and /config — pause included — must have survived (this is
+  # what patronictl remove would have destroyed).
+  dcs_sysid=$(docker exec "${scope}-etcd-1" etcdctl get "/service/${scope}/initialize" --print-value-only 2>/dev/null | tr -d '[:space:]')
+  if [ "$dcs_sysid" != "$new_sysid" ]; then
+    ko t_ha_major_upgrade_full_choreography "initialize key was not re-created with the new sysid (want $new_sysid, got '$dcs_sysid')"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null \
+      | grep -qE '"pause":[[:space:]]*true'; then
+    ko t_ha_major_upgrade_full_choreography "pause flag did not survive the initialize-key mitigation — /config was damaged"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Step 7 — reseed both replicas INSIDE the paused window. Empirical pin
+  # #4 per replica: the boot wipes the cross-major pgdata (reseed marker
+  # machinery), then Patroni sits paused with the empty dir until an
+  # explicit POST /reinitialize performs the clone.
+  local expected_streaming=0
+  for r in "$r1" "$r2"; do
+    run_patroni_node_with_image "$scope" "$etcd_hosts" "$r" "$IMAGE"
+    deadline=$(($(date +%s) + 120))
+    local wiped=0
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      if logs_contain "$r" "wiping pgdata so Patroni re-clones"; then
+        wiped=1
+        break
+      fi
+      sleep 3
+    done
+    if [ "$wiped" -ne 1 ]; then
+      ko t_ha_major_upgrade_full_choreography "reseed boot on $r never wiped the cross-major pgdata"
+      fail_dump t_ha_major_upgrade_full_choreography "$r"
+      teardown_scope "$scope"
+      return
+    fi
+    deadline=$(($(date +%s) + 120))
+    local paused_empty=0
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      if logs_contain "$r" "PAUSE: running with empty data directory"; then
+        paused_empty=1
+        break
+      fi
+      sleep 3
+    done
+    if [ "$paused_empty" -ne 1 ]; then
+      ko t_ha_major_upgrade_full_choreography "$r never reported the paused empty-pgdata state — paused Patroni started a clone by itself, or the wipe left debris"
+      fail_dump t_ha_major_upgrade_full_choreography "$r"
+      teardown_scope "$scope"
+      return
+    fi
+    # The clone needs an explicit kick under pause. Retried: /reinitialize
+    # can race Patroni's startup bookkeeping right after the REST comes up.
+    local reinit_ok=0
+    for _ in 1 2 3 4 5; do
+      if docker exec "$r" curl -sf -o /dev/null -X POST -H "Content-Type: application/json" \
+          -d '{"force": true}' http://localhost:8008/reinitialize 2>/dev/null; then
+        reinit_ok=1
+        break
+      fi
+      sleep 5
+    done
+    if [ "$reinit_ok" -ne 1 ]; then
+      ko t_ha_major_upgrade_full_choreography "POST /reinitialize on paused $r kept failing"
+      fail_dump t_ha_major_upgrade_full_choreography "$r"
+      teardown_scope "$scope"
+      return
+    fi
+    expected_streaming=$((expected_streaming + 1))
+    if ! wait_for_replication "$scope" "$expected_streaming" 300; then
+      ko t_ha_major_upgrade_full_choreography "$r never came back streaming after the paused reinitialize"
+      fail_dump t_ha_major_upgrade_full_choreography "$r" "$leader"
+      teardown_scope "$scope"
+      return
+    fi
+    if docker exec "$r" test -f "$marker_path"; then
+      ko t_ha_major_upgrade_full_choreography "reseed marker still present on $r after the wipe-and-reclone"
+      teardown_scope "$scope"
+      return
+    fi
+  done
+
+  # Step 8 — resume failover, strictly confirmed like the pause.
+  docker exec "$leader" curl -sf -X PATCH -H "Content-Type: application/json" \
+    -d '{"pause":false}' http://localhost:8008/config >/dev/null
+  deadline=$(($(date +%s) + 60))
+  local resumed=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null \
+        | grep -qE '"pause":[[:space:]]*true'; then
+      resumed=1
+      break
+    fi
+    sleep 2
+  done
+  if [ "$resumed" -ne 1 ]; then
+    ko t_ha_major_upgrade_full_choreography "Patroni never confirmed the resume"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Step 9 — the whole cluster serves the new major with the seeded data.
+  for n in "$n1" "$n2" "$n3"; do
+    local got
+    got=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c \
+      "SELECT current_setting('server_version_num') || '|' || (SELECT v FROM major_upgrade_probe)" 2>/dev/null)
+    case "$got" in
+      "${PG_VERSION}"*"|seeded-on-${from_major}") ;;
+      *)
+        ko t_ha_major_upgrade_full_choreography "$n is not serving PG${PG_VERSION} with the seeded row (got '$got')"
+        fail_dump t_ha_major_upgrade_full_choreography "$n"
+        teardown_scope "$scope"
+        return
+        ;;
+    esac
+  done
+
+  # Step 10 — empirical pin #5: failover machinery actually works after the
+  # window. A switchover to a reseeded replica must complete and the old
+  # leader must rejoin as a streaming replica on the new timeline.
+  if ! docker exec "$leader" curl -sf -o /dev/null -X POST -H "Content-Type: application/json" \
+      -d "{\"leader\": \"${leader}\", \"candidate\": \"${r1}\"}" http://localhost:8008/switchover; then
+    ko t_ha_major_upgrade_full_choreography "post-resume switchover to $r1 was rejected"
+    fail_dump t_ha_major_upgrade_full_choreography "$leader" "$r1"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! wait_for_node_leader "$r1" 180; then
+    ko t_ha_major_upgrade_full_choreography "$r1 never became leader after the switchover"
+    fail_dump t_ha_major_upgrade_full_choreography "$r1" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! wait_for_replication "$scope" 2 240; then
+    ko t_ha_major_upgrade_full_choreography "cluster did not return to 2 streaming replicas after the switchover"
+    fail_dump t_ha_major_upgrade_full_choreography "$r1" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  local probe
+  probe=$(docker exec "$r1" psql -U postgres -h /var/run/postgresql -At -c \
+    "SELECT v FROM major_upgrade_probe" 2>/dev/null)
+  if [ "$probe" != "seeded-on-${from_major}" ]; then
+    ko t_ha_major_upgrade_full_choreography "new leader $r1 lost the seeded row after the switchover (got '$probe')"
+    fail_dump t_ha_major_upgrade_full_choreography "$r1"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok t_ha_major_upgrade_full_choreography
+  note "PG${from_major}→PG${PG_VERSION}: sysid ${old_sysid}→${new_sysid}; wedge observed, initialize-delete + /restart mitigated it with pause intact; both replicas reseeded under pause via /reinitialize; post-resume switchover to $r1 healthy"
+  docker rm -f "$job_ctr" >/dev/null 2>&1 || true
+  teardown_scope "$scope"
+}
+
 t_ha_pghost_pgport_unset() {
   local scope=t-pghost-${PG_VERSION}
   reset_bucket
@@ -3773,6 +4280,12 @@ ALL_TESTS=(
   t_ha_selfheal_stands_down_during_upgrade
   # reseed marker: the boot that rebuilds a replica across majors
   t_ha_reseed_marker_reclone
+  # the full major-upgrade choreography (real pg_upgrade of the leader's
+  # volume + DCS initialize-key mitigation + paused reseeds + switchover).
+  # CI runs this in its own job (see .github/workflows/e2e.yml) and excludes
+  # it from the main suite via E2E_EXCLUDE so existing job timing is
+  # untouched.
+  t_ha_major_upgrade_full_choreography
   t_ha_restore_gate_logged_on_every_node
   # boot-time reconcile self-heals a live archive_command Patroni's own
   # dynamic-config sync silently failed to apply (DCS-vs-live divergence)
@@ -3796,8 +4309,9 @@ usage() {
   cat <<EOF
 Usage: PG_VERSION=17 ./test/e2e-ha.sh [test_name ...]
 
-Without args: run all $((${#ALL_TESTS[@]})) tests in order.
-With args:    run only the named tests.
+Without args: run all $((${#ALL_TESTS[@]})) tests in order (minus E2E_EXCLUDE,
+              a space-separated list of test names to drop).
+With args:    run only the named tests (E2E_EXCLUDE is ignored).
 
 Tests:
 $(printf '  %s\n' "${ALL_TESTS[@]}")
@@ -3822,7 +4336,22 @@ ensure_minio
 if [ "$#" -gt 0 ]; then
   TESTS=("$@")
 else
-  TESTS=("${ALL_TESTS[@]}")
+  # E2E_EXCLUDE: space-separated test names dropped from the default run.
+  # Only honored when no explicit test names were given — naming a test on
+  # the command line always runs it. Used by CI to split the long-running
+  # choreography test into its own job without hiding it from local runs.
+  TESTS=()
+  for t in "${ALL_TESTS[@]}"; do
+    excluded=0
+    for x in ${E2E_EXCLUDE:-}; do
+      [ "$t" = "$x" ] && excluded=1
+    done
+    if [ "$excluded" = "1" ]; then
+      log "excluding $t (E2E_EXCLUDE)"
+    else
+      TESTS+=("$t")
+    fi
+  done
 fi
 
 for t in "${TESTS[@]}"; do

@@ -57,6 +57,9 @@ jobs:
         shell: bash
         env:
           PG_VERSION: ${{ matrix.pg_version }}
+          # The full major-upgrade choreography runs in its own job below so
+          # this job's timing is untouched; local runs still include it.
+          E2E_EXCLUDE: t_ha_major_upgrade_full_choreography
         run: |
           ./test/e2e-ha.sh 2>&1 | tee "e2e-ha-pg${PG_VERSION}.log"
           exit "${PIPESTATUS[0]}"
@@ -80,5 +83,99 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-ha-logs-pg${{ matrix.pg_version }}
+          path: failure-artifacts
+          retention-days: 14
+
+  # The full major-upgrade choreography: a real pg_upgrade of a Patroni
+  # leader's volume plus the DCS initialize-key mitigation, from-major →
+  # to-major. Separate job so the main suite's timing is untouched. The
+  # upgrade job image is built from a git build context against
+  # railwayapp-templates/postgres-ssl (no sibling checkout in this repo's
+  # CI); the harness resolves a local checkout first when one exists.
+  e2e-major-upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - from_version: 16
+            pg_version: 17
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build postgres-patroni image (target major)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./postgres-patroni/Dockerfile
+          build-args: |
+            POSTGRES_VERSION=${{ matrix.pg_version }}
+          platforms: linux/amd64
+          tags: postgres-ha-pitr:${{ matrix.pg_version }}
+          load: true
+          cache-from: type=gha,scope=patroni-pg${{ matrix.pg_version }}
+          cache-to: type=gha,scope=patroni-pg${{ matrix.pg_version }},mode=max
+
+      - name: Build postgres-patroni image (source major)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./postgres-patroni/Dockerfile
+          build-args: |
+            POSTGRES_VERSION=${{ matrix.from_version }}
+          platforms: linux/amd64
+          tags: postgres-ha-pitr:${{ matrix.from_version }}
+          load: true
+          cache-from: type=gha,scope=patroni-pg${{ matrix.from_version }}
+          cache-to: type=gha,scope=patroni-pg${{ matrix.from_version }},mode=max
+
+      - name: Build etcd image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./etcd/Dockerfile
+          platforms: linux/amd64
+          tags: postgres-ha-etcd-test:latest
+          load: true
+          cache-from: type=gha,scope=etcd
+          cache-to: type=gha,scope=etcd,mode=max
+
+      - name: Run major-upgrade choreography test
+        shell: bash
+        env:
+          PG_VERSION: ${{ matrix.pg_version }}
+          # NOTE: flip to `main` (or drop, once the harness default flips)
+          # after railwayapp-templates/postgres-ssl#113 merges.
+          UPGRADE_JOB_GIT_REF: pcs/major-upgrade-job
+        run: |
+          ./test/e2e-ha.sh t_ha_major_upgrade_full_choreography 2>&1 | tee "e2e-ha-major-upgrade-pg${PG_VERSION}.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Collect failure diagnostics
+        if: failure()
+        env:
+          PG_VERSION: ${{ matrix.pg_version }}
+        run: |
+          mkdir -p failure-artifacts
+          mv "e2e-ha-major-upgrade-pg${PG_VERSION}.log" failure-artifacts/ 2>/dev/null || true
+          docker ps -a > failure-artifacts/docker-ps.txt 2>&1 || true
+          docker volume ls > failure-artifacts/docker-volumes.txt 2>&1 || true
+          for c in $(docker ps -aq --filter "label=postgres-ha-e2e=1"); do
+            name=$(docker inspect -f '{{.Name}}' "$c" | sed 's|^/||')
+            docker logs --tail 200 "$c" > "failure-artifacts/container-${name}.log" 2>&1 || true
+          done
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-ha-major-upgrade-logs-pg${{ matrix.pg_version }}
           path: failure-artifacts
           retention-days: 14
