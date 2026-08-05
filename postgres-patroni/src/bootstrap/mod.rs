@@ -4,8 +4,10 @@
 //! - Reading credentials from Patroni config
 //! - SQL execution helpers
 
+mod collation;
 mod config;
 mod sql;
 
+pub use collation::refresh_collation_versions;
 pub use config::{read_credentials, Credentials, PATRONI_CONFIG};
 pub use sql::{run_psql, run_psql_in_db, run_psql_script};

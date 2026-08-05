@@ -10,6 +10,7 @@ use nix::sys::signal::{SigHandler, Signal};
 use nix::sys::stat::{umask, Mode};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{ForkResult, Pid};
+use postgres_patroni::bootstrap::refresh_collation_versions;
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
@@ -1348,6 +1349,79 @@ fn main() -> Result<()> {
         .block_on(async_main())
 }
 
+/// Refresh collation versions once this node is confirmed primary. Patroni's
+/// on_role_change callback only fires on an actual role *transition* — a
+/// plain container restart that leaves the same node as primary (exactly
+/// what a routine image redeploy does) never fires it at all, confirmed
+/// empirically: instrumenting on-role-change and doing a bare `docker
+/// restart` on a standing primary produced zero invocations. Any image bump
+/// (a minor version is enough — new glibc, same on-disk collation stamp)
+/// would otherwise leave the mismatch WARNING noisy indefinitely, until
+/// whatever next real failover happens to occur. This covers that gap the
+/// same way spawn_bootstrap_stanza_create covers the analogous first-boot
+/// gap for pgbackrest's repo-path marker (see the comment on that call
+/// site) — unconditional here, since collation refresh has no
+/// WAL_ARCHIVE_BUCKET gate to piggyback on.
+///
+/// Safe to double-run with an on_role_change-triggered refresh (e.g. right
+/// after an actual promotion): refresh_collation_versions's SQL already
+/// no-ops per-database once nothing is mismatched.
+fn spawn_collation_refresh() {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            let probe = tokio::process::Command::new("pg_isready")
+                .args(["-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-q"])
+                .status()
+                .await;
+            if matches!(probe, Ok(s) if s.success()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        // pg_isready above accepts connections from a replica in
+        // hot_standby mode too — wait for primary specifically, since
+        // ALTER DATABASE fails with a read-only-transaction error on a
+        // standby. A permanent replica never passes this and just times
+        // out at the deadline; it gets the fix through WAL replication
+        // once the primary refreshes, not by running this itself.
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            let out = tokio::process::Command::new("psql")
+                .args([
+                    "-U",
+                    "postgres",
+                    "-h",
+                    "/var/run/postgresql",
+                    "-tAXq",
+                    "-c",
+                    "SELECT pg_is_in_recovery()",
+                ])
+                .env_remove("PGHOST")
+                .env_remove("PGPORT")
+                .output()
+                .await;
+            let is_primary = matches!(
+                out,
+                Ok(ref o) if o.status.success()
+                    && String::from_utf8_lossy(&o.stdout).trim() == "f"
+            );
+            if is_primary {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        refresh_collation_versions();
+    });
+}
+
 async fn async_main() -> Result<()> {
     let _guard = init_logging("patroni-runner");
 
@@ -1624,6 +1698,11 @@ async fn async_main() -> Result<()> {
     // node — pgBackRest's stanza metadata is keyed on system_identifier,
     // which is identical across HA peers.
     spawn_bootstrap_stanza_create();
+
+    // Closes the on_role_change frequency gap described on
+    // spawn_collation_refresh — runs unconditionally, not just when
+    // archiving is enabled.
+    spawn_collation_refresh();
 
     // Spawn the leader-only backup watcher. Mirrors postgres-ssl
     // pgbackrest-backup-watcher.sh. Each iteration re-checks Patroni's
