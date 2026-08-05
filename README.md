@@ -395,14 +395,16 @@ docs are ambiguous about:
   inherits its variables); after the mitigated window a real switchover to a
   reseeded replica completes and bumps the timeline.
 
-> **Still unverified — the Railway-production-specific parts only:** the
-> control plane's exec transport (the reseed markers, the etcd HTTP delete and
-> the REST calls are exec'd/tunneled through Railway instead of `docker
-> exec`), the deploy pipeline (stop/repin/redeploy as Railway deployments
-> rather than `docker rm`+`run`), and the real volume lifecycle (locks,
-> snapshots, restart policies — e.g. a crash-looping member being restarted by
-> the platform mid-window). The Patroni/etcd/pg_upgrade behavior itself is
-> pinned by the e2e test above.
+> **Rollout note.** The Patroni/etcd/pg_upgrade behavior itself is pinned by
+> the e2e test above, against a real cluster. What that test can't reach is
+> Railway-specific: the control plane's real exec transport, the real deploy
+> pipeline driving stop/repin/redeploy, and the real volume lifecycle (locks,
+> snapshots, a crash-looping member being restarted by the platform
+> mid-window). That gets exercised against a real Railway cluster right after
+> this ships. **There is no one-click revert for an HA upgrade** — a failed
+> real run falls back to the manual path `revert.ts` already points to:
+> restore the pre-upgrade backup with Patroni failover paused for the whole
+> operation.
 
 ## Quick Start
 
