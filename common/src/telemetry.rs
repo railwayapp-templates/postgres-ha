@@ -127,10 +127,17 @@ pub enum TelemetryEvent {
     },
 
     /// The self-heal watcher stood down because a major upgrade owns this
-    /// volume (in-flight or reseed marker present). Emitted ONCE per
-    /// standdown episode, not per poll; a second event for the same node
-    /// means the marker was removed and later re-appeared.
-    SelfHealUpgradeStanddown { node: String },
+    /// volume (in-flight or reseed marker present). Emitted once at the start
+    /// of a standdown episode and re-emitted every few hours while it
+    /// persists — self-heal is disabled the whole time, and a marker a boot
+    /// failed to unlink can outlive any legitimate upgrade window. The
+    /// marker's phase and age distinguish a live window (young, then gone)
+    /// from stale debris (aging past hours with no workflow running).
+    SelfHealUpgradeStanddown {
+        node: String,
+        phase: String,
+        marker_age_secs: Option<u64>,
+    },
 
     /// Preflight wiped a non-empty data directory that had no `global/pg_control`
     /// — the debris a `pg_basebackup` killed mid-clone leaves behind — so Patroni
@@ -383,10 +390,18 @@ impl TelemetryEvent {
                     node, from_major, leader, to_major
                 )
             }
-            Self::SelfHealUpgradeStanddown { node } => {
+            Self::SelfHealUpgradeStanddown {
+                node,
+                phase,
+                marker_age_secs,
+            } => {
                 format!(
-                    "Self-heal watcher on {} standing down: a major upgrade owns this volume",
-                    node
+                    "Self-heal watcher on {} standing down: a major upgrade owns this volume (marker phase: {}, age: {}) — if no upgrade workflow is active, the marker is stale and must be removed to restore self-healing",
+                    node,
+                    phase,
+                    marker_age_secs
+                        .map(|s| format!("{s}s"))
+                        .unwrap_or_else(|| "unknown".to_string()),
                 )
             }
             Self::IncompleteCloneWiped { node, leader } => {

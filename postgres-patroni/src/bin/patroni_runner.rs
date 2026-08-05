@@ -27,7 +27,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Translate the tool-agnostic `WAL_ARCHIVE_*` env contract into
 /// pgBackRest's native `PGBACKREST_REPO1_S3_*` so pgBackRest reads them
@@ -529,6 +529,28 @@ fn wipe_pgdata_contents(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// A failed marker removal is more than a stale file: the self-heal watcher
+/// treats any non-completed marker as an upgrade in flight and stands down
+/// for as long as it exists, so a removal that fails in handle_reseed_marker
+/// quietly disables self-healing until some future boot manages the unlink.
+/// Boot still proceeds (the database is healthy; refusing would trade
+/// degraded self-healing for downtime), but the state must announce itself:
+/// an error log plus a telemetry event here, and the watcher's standdown
+/// event carries the marker's phase and age so the two correlate in the
+/// fleet view.
+fn report_marker_removal_failure(telemetry: &Telemetry, e: &std::io::Error, when: &str) {
+    error!(
+        error = %e,
+        "failed to remove the reseed marker {when}; the self-heal watcher stands down while it exists — if no upgrade is running, remove it manually to restore self-healing"
+    );
+    telemetry.send(TelemetryEvent::ComponentError {
+        component: "patroni-runner".to_string(),
+        error: format!("failed to remove the reseed marker {when}: {e}"),
+        context: "the leftover marker keeps the self-heal watcher standing down until it is removed"
+            .to_string(),
+    });
+}
+
 /// Consume a `reseed` upgrade marker (see `major_upgrade`'s module doc).
 ///
 /// The HA upgrade workflow writes this onto each replica's volume before it
@@ -578,7 +600,7 @@ async fn handle_reseed_marker(
             "reseed marker present but the data directory already matches the image (or a major is unknown) — consuming the marker and booting normally"
         );
         if let Err(e) = major_upgrade::remove_marker(volume_root) {
-            warn!(error = %e, "failed to remove the reseed marker; the next boot will retry");
+            report_marker_removal_failure(telemetry, &e, "on the matching-major boot");
         }
         return Ok(());
     }
@@ -615,9 +637,11 @@ async fn handle_reseed_marker(
     wipe_pgdata_contents(&config.data_dir)
         .context("Failed to wipe the data directory for the requested reseed")?;
     if let Err(e) = major_upgrade::remove_marker(volume_root) {
-        // Harmless: the next boot sees an empty pgdata (no PG_VERSION → no
-        // mismatch) and takes the consume-and-boot branch above.
-        warn!(error = %e, "failed to remove the reseed marker after the wipe");
+        // Data-safe (the next boot sees an empty pgdata — no PG_VERSION, no
+        // mismatch — and takes the consume-and-boot branch above), but NOT
+        // harmless: the leftover marker keeps the self-heal watcher standing
+        // down until a boot manages the unlink, so it must announce itself.
+        report_marker_removal_failure(telemetry, &e, "after the wipe");
     }
     telemetry.send(TelemetryEvent::MajorUpgradeReseedWiped {
         node: config.name.clone(),
@@ -1472,12 +1496,12 @@ async fn async_main() -> Result<()> {
     // otherwise reach the incomplete-clone wipe, or Patroni's own bootstrap,
     // and lose data. A `reseed` marker passes this guard on purpose — see
     // handle_reseed_marker, which resolves it right after config is built.
-    // PG_MAJOR is exported by the official postgres base image this one is
-    // built FROM, so it is the image's own major at runtime — no build arg to
-    // keep in sync. Absent (a base image that stops setting it) means the
-    // version guard abstains rather than guessing.
+    // The image's major comes from the installed server tree (see
+    // major_upgrade::image_major) — baked into the image, so a stray
+    // user-set PG_MAJOR service variable can't refuse a healthy boot.
+    // Unknown means the version guard abstains rather than guessing.
     let volume_root = volume_root();
-    let image_major = env::var("PG_MAJOR").ok();
+    let image_major = major_upgrade::image_major();
     if let Some(reason) = major_upgrade::boot_refusal_reason(
         &volume_root,
         &postgres_patroni::pgdata(),

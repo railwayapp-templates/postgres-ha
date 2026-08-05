@@ -304,6 +304,20 @@ ignores it and none of them can see the control plane:
 All three are fail-stop and loud: this image never tries to repair a mid-upgrade
 volume, because that state belongs to the upgrade workflow.
 
+The image's own major comes from the installed server tree
+(`/usr/lib/postgresql/<major>/`), not from the `PG_MAJOR` env var — the tree
+is baked into the image, while a stray user-set `PG_MAJOR` service variable
+would otherwise refuse every boot of a perfectly matched data directory. The
+env is only a fallback when the tree is ambiguous, and a disagreement is
+logged with the filesystem winning.
+
+The self-heal standdown is not a one-shot signal: the
+`POSTGRES_HA_SELF_HEAL_UPGRADE_STANDDOWN` event re-emits every 6 hours while
+the marker persists, carrying the marker's phase and age. A young marker is a
+live upgrade window; one aging past hours with no workflow running is stale
+debris (e.g. a boot-time removal that failed, reported separately as a
+`COMPONENT_ERROR`) that silently keeps self-heal disabled until it is removed.
+
 One marker phase is the exception to fail-stop, because it exists to make the
 replica rebuild possible at all: **`{"phase": "reseed"}`**, written by the HA
 workflow onto each replica's volume before it pauses failover. Boot is
@@ -325,8 +339,12 @@ new image → per-replica reseed → resume → switchover — has been exercise
 against a live 3-node Patroni 4.1.0 + etcd cluster, and is pinned permanently
 by `t_ha_major_upgrade_full_choreography` in `test/e2e-ha.sh` (it runs a real
 `pg_upgrade` of the leader's volume using postgres-ssl's job image; CI runs it
-as its own job). The load-bearing facts it settled, each of which the docs are
-ambiguous about:
+as its own job). `t_ha_major_upgrade_back_to_back` additionally chains two
+hops (15→16→17) on the same cluster and volumes: hop 2's job runs over hop
+1's `completed` marker (history, not state — overwritten at the job's own
+commit point), the replicas reseed a second time, and a row written between
+the hops survives. The load-bearing facts settled here, each of which the
+docs are ambiguous about:
 
 - **Stopping a paused member is an unclean stop by design.** Patroni logs
   `Leader key is not deleted and Postgresql is not stopped due paused state`

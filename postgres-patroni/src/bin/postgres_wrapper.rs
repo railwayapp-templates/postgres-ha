@@ -132,8 +132,10 @@ async fn main() -> Result<()> {
     // marker describes — and boot the wrong major without it. Fail-stop and
     // loud; a `reseed` marker passes (boot allowed by contract; patroni-runner
     // consumes it, and standalone Postgres refuses a cross-major data dir on
-    // its own without touching the files).
-    let image_major = env::var("PG_MAJOR").ok();
+    // its own without touching the files). The image's major comes from the
+    // installed server tree (see major_upgrade::image_major), so a stray
+    // user-set PG_MAJOR service variable can't refuse a healthy boot.
+    let image_major = major_upgrade::image_major();
     if let Some(reason) =
         major_upgrade::boot_refusal_reason(&volume_root(), &pgdata, image_major.as_deref())
     {

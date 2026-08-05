@@ -57,9 +57,9 @@ jobs:
         shell: bash
         env:
           PG_VERSION: ${{ matrix.pg_version }}
-          # The full major-upgrade choreography runs in its own job below so
-          # this job's timing is untouched; local runs still include it.
-          E2E_EXCLUDE: t_ha_major_upgrade_full_choreography
+          # The major-upgrade choreography tests run in their own job below
+          # so this job's timing is untouched; local runs still include them.
+          E2E_EXCLUDE: t_ha_major_upgrade_full_choreography t_ha_major_upgrade_back_to_back
         run: |
           ./test/e2e-ha.sh 2>&1 | tee "e2e-ha-pg${PG_VERSION}.log"
           exit "${PIPESTATUS[0]}"
@@ -102,6 +102,9 @@ jobs:
         include:
           - from_version: 16
             pg_version: 17
+            # The back-to-back test chains two hops, so it starts one major
+            # further back than the single-hop choreography.
+            chain_from_version: 15
 
     steps:
       - name: Checkout sources
@@ -136,6 +139,19 @@ jobs:
           cache-from: type=gha,scope=patroni-pg${{ matrix.from_version }}
           cache-to: type=gha,scope=patroni-pg${{ matrix.from_version }},mode=max
 
+      - name: Build postgres-patroni image (chain source major)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./postgres-patroni/Dockerfile
+          build-args: |
+            POSTGRES_VERSION=${{ matrix.chain_from_version }}
+          platforms: linux/amd64
+          tags: postgres-ha-pitr:${{ matrix.chain_from_version }}
+          load: true
+          cache-from: type=gha,scope=patroni-pg${{ matrix.chain_from_version }}
+          cache-to: type=gha,scope=patroni-pg${{ matrix.chain_from_version }},mode=max
+
       - name: Build etcd image
         uses: docker/build-push-action@v5
         with:
@@ -147,7 +163,7 @@ jobs:
           cache-from: type=gha,scope=etcd
           cache-to: type=gha,scope=etcd,mode=max
 
-      - name: Run major-upgrade choreography test
+      - name: Run major-upgrade choreography tests
         shell: bash
         env:
           PG_VERSION: ${{ matrix.pg_version }}
@@ -155,7 +171,7 @@ jobs:
           # after railwayapp-templates/postgres-ssl#113 merges.
           UPGRADE_JOB_GIT_REF: pcs/major-upgrade-job
         run: |
-          ./test/e2e-ha.sh t_ha_major_upgrade_full_choreography 2>&1 | tee "e2e-ha-major-upgrade-pg${PG_VERSION}.log"
+          ./test/e2e-ha.sh t_ha_major_upgrade_full_choreography t_ha_major_upgrade_back_to_back 2>&1 | tee "e2e-ha-major-upgrade-pg${PG_VERSION}.log"
           exit "${PIPESTATUS[0]}"
 
       - name: Collect failure diagnostics

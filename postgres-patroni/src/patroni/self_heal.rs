@@ -104,6 +104,10 @@ const PATRONI_CLUSTER_URL: &str = "http://localhost:8008/cluster";
 const PATRONI_REINIT_URL: &str = "http://localhost:8008/reinitialize";
 
 const DEFAULT_POLL_SECONDS: u64 = 10;
+/// Cadence for re-emitting the upgrade-standdown event while the marker
+/// persists. Long enough not to spam a legitimate upgrade window, short
+/// enough that a stale marker (self-heal silently disabled) keeps waving.
+const STANDDOWN_REEMIT_SECS: i64 = 6 * 3600;
 const DEFAULT_CRASH_LOOP_THRESHOLD: u32 = 3;
 const DEFAULT_RECENT_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_ACTION_BACKOFF_SECONDS: u64 = 600;
@@ -977,9 +981,12 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
     let mut start_failed_since: Option<i64> = None;
     // Dedupe the upgrade-standdown telemetry: the marker sits on the volume
     // for the whole upgrade window, so without a latch every poll would emit.
-    // One event per standdown episode; the latch clears once the marker is
-    // gone, so a later window emits again.
-    let mut upgrade_standdown_emitted = false;
+    // Epoch of the last emit; re-emits every STANDDOWN_REEMIT_SECS while the
+    // episode persists (a marker a boot failed to unlink can outlive any
+    // upgrade window by months, and self-heal is silently off the whole time
+    // — a single event at the start is too easy to lose). Cleared once the
+    // marker is gone, so a later window emits afresh.
+    let mut upgrade_standdown_last_emit: Option<i64> = None;
 
     loop {
         if let Err(e) = iteration(
@@ -992,7 +999,7 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
             &mut gave_up_emitted,
             &mut divergence_window,
             &mut start_failed_since,
-            &mut upgrade_standdown_emitted,
+            &mut upgrade_standdown_last_emit,
             &telemetry,
         )
         .await
@@ -1013,7 +1020,7 @@ async fn iteration(
     gave_up_emitted: &mut bool,
     divergence_window: &mut Option<DivergenceWindow>,
     start_failed_since: &mut Option<i64>,
-    upgrade_standdown_emitted: &mut bool,
+    upgrade_standdown_last_emit: &mut Option<i64>,
     telemetry: &Telemetry,
 ) -> Result<()> {
     let now = now_epoch();
@@ -1029,23 +1036,44 @@ async fn iteration(
     // upgraded, so the whole iteration stands down. In production choreography
     // the marker that engages this is the `reseed` marker the HA workflow
     // writes onto each replica's volume before pausing failover.
-    if major_upgrade::upgrade_in_flight(volume_root) {
+    let upgrade_marker = major_upgrade::read_marker(volume_root);
+    if upgrade_marker
+        .as_ref()
+        .is_some_and(|m| m.phase.as_deref() != Some("completed"))
+    {
         // Clear the transient dwell state so none of it accrues across the
         // unobserved window: a replica that spent the whole upgrade lagging
         // must re-earn its divergence/start-failed dwell from zero once the
         // marker is gone, not inherit a matured one and get wiped instantly.
         *divergence_window = None;
         *start_failed_since = None;
-        if !*upgrade_standdown_emitted {
-            info!("self-heal: major upgrade in progress on this volume — standing down");
+        // Re-emit on a slow cadence, with the marker's phase and age: a live
+        // upgrade window and a stale marker a boot failed to unlink (which
+        // disables self-heal indefinitely — see the runner's
+        // report_marker_removal_failure) look identical from here, and the
+        // age is what lets the fleet view tell them apart.
+        if upgrade_standdown_last_emit
+            .is_none_or(|last| now - last >= STANDDOWN_REEMIT_SECS)
+        {
+            let phase = upgrade_marker
+                .and_then(|m| m.phase)
+                .unwrap_or_else(|| "unreadable".to_string());
+            let marker_age_secs = major_upgrade::marker_age_secs(volume_root);
+            info!(
+                phase = %phase,
+                marker_age_secs = ?marker_age_secs,
+                "self-heal: major upgrade in progress on this volume — standing down"
+            );
             telemetry.send(TelemetryEvent::SelfHealUpgradeStanddown {
                 node: env::var("PATRONI_NAME").unwrap_or_else(|_| "unknown".to_string()),
+                phase,
+                marker_age_secs,
             });
-            *upgrade_standdown_emitted = true;
+            *upgrade_standdown_last_emit = Some(now);
         }
         return Ok(());
     }
-    *upgrade_standdown_emitted = false;
+    *upgrade_standdown_last_emit = None;
 
     // 1. Local Patroni status: role, state, postmaster_start_time.
     let local = match fetch_local_patroni(client).await {

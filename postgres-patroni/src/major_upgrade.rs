@@ -133,6 +133,26 @@ pub fn remove_marker(volume_root: &str) -> std::io::Result<()> {
     }
 }
 
+/// How long the marker has been sitting on the volume, from its mtime. None
+/// when the marker is absent or the clock/mtime is unusable. Observability
+/// only — never a gate: the self-heal watcher reports it so a marker that
+/// outlives any plausible upgrade window (a boot-time removal that failed,
+/// a workflow that died before its cleanup) is distinguishable from a live
+/// one without anyone guessing.
+pub fn marker_age_secs(volume_root: &str) -> Option<u64> {
+    let mtime = std::fs::metadata(marker_path(volume_root))
+        .ok()?
+        .modified()
+        .ok()?;
+    // A future mtime (clock skew) reads as age 0, not an error.
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(mtime)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+}
+
 /// The data directory's own major, read from PG_VERSION. None on a fresh
 /// volume (first init) or an unreadable file.
 pub fn data_dir_major(data_dir: &str) -> Option<String> {
@@ -140,6 +160,66 @@ pub fn data_dir_major(data_dir: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Debian postgres images install exactly one server under
+/// /usr/lib/postgresql/<major>/; that directory name is this image's major.
+const PG_LIB_DIR: &str = "/usr/lib/postgresql";
+
+/// The image's own PostgreSQL major, for the version-mismatch boot guard.
+///
+/// Filesystem first, environment second — deliberately in that order. The
+/// installed server tree under /usr/lib/postgresql is baked into the image
+/// and nothing at deploy time can change it, while `PG_MAJOR` is an env var
+/// a service variable can override: trusted alone, a stray user-set
+/// `PG_MAJOR=16` on a 17 image would refuse every boot of a perfectly
+/// matched data directory. The env is kept as a fallback for a base image
+/// that moves the install tree; a disagreement is logged and the filesystem
+/// wins. None (no tree, no env) means the version guard abstains.
+pub fn image_major() -> Option<String> {
+    let from_fs = image_major_from(PG_LIB_DIR);
+    let from_env = std::env::var("PG_MAJOR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match (from_fs, from_env) {
+        (Some(fs), Some(env)) => {
+            if fs != env {
+                tracing::warn!(
+                    filesystem = %fs,
+                    env = %env,
+                    "PG_MAJOR disagrees with the installed server tree; trusting the filesystem (a service variable can override the env, not the image contents)"
+                );
+            }
+            Some(fs)
+        }
+        (Some(fs), None) => Some(fs),
+        (None, Some(env)) => {
+            tracing::warn!(
+                pg_lib_dir = PG_LIB_DIR,
+                "no single installed server tree found; falling back to the PG_MAJOR env"
+            );
+            Some(env)
+        }
+        (None, None) => None,
+    }
+}
+
+/// The single numeric entry under `dir`, or None when there are zero or
+/// several (ambiguous — e.g. the dual-major upgrade job image, where this
+/// code never runs, but abstaining beats guessing).
+fn image_major_from(dir: &str) -> Option<String> {
+    let mut majors: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    match majors.len() {
+        1 => majors.pop(),
+        _ => None,
+    }
 }
 
 /// Why booting must not proceed, or None when it may. Both cases are
@@ -341,5 +421,41 @@ mod tests {
         assert!(read_marker(root).is_none());
         // Absent is success: nothing left to remove is the desired state.
         remove_marker(root).unwrap();
+    }
+
+    #[test]
+    fn marker_age_none_when_absent_and_zeroish_when_fresh() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        assert!(marker_age_secs(root).is_none());
+        write_marker(dir.path(), r#"{"phase":"reseed","from":"16","to":"17"}"#);
+        // Just written: age must exist and be near zero (not a stat error).
+        assert!(marker_age_secs(root).unwrap() < 60);
+    }
+
+    // The image's major comes from the single installed server tree; zero or
+    // several entries are ambiguous and must abstain, and non-numeric noise
+    // (e.g. a stray file) must not count as a major.
+    #[test]
+    fn image_major_from_single_numeric_dir() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("17")).unwrap();
+        fs::write(dir.path().join("README"), "not a major").unwrap();
+        assert_eq!(
+            image_major_from(dir.path().to_str().unwrap()).as_deref(),
+            Some("17")
+        );
+    }
+
+    #[test]
+    fn image_major_from_abstains_on_zero_or_many() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        assert!(image_major_from(root).is_none());
+        fs::create_dir(dir.path().join("16")).unwrap();
+        fs::create_dir(dir.path().join("17")).unwrap();
+        // Two majors (the dual-binary job image's layout): ambiguous, abstain.
+        assert!(image_major_from(root).is_none());
+        assert!(image_major_from("/nonexistent-path-for-test").is_none());
     }
 }
