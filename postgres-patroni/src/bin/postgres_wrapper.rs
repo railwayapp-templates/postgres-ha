@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use common::{init_logging, ConfigExt, RailwayEnv, Telemetry, TelemetryEvent};
 use postgres_patroni::{
     cert_expires_within, ensure_pg_stat_statements, is_patroni_enabled, is_valid_x509v3_cert,
-    pgdata, ssl_dir, sudo_command, EXPECTED_VOLUME_MOUNT_PATH,
+    major_upgrade, pgdata, ssl_dir, sudo_command, volume_root, EXPECTED_VOLUME_MOUNT_PATH,
 };
 use std::env;
 use std::os::unix::process::CommandExt;
@@ -122,6 +122,28 @@ async fn main() -> Result<()> {
             pgdata = %pgdata,
             "PGDATA not in expected volume"
         );
+        std::process::exit(1);
+    }
+
+    // Major-upgrade boot guard, before the mode fork so BOTH modes are
+    // covered. Patroni mode re-checks in patroni-runner, but the standalone
+    // branch below execs straight into docker-entrypoint, which would initdb
+    // an ABSENT data directory — exactly the mid-swap state an in-flight
+    // marker describes — and boot the wrong major without it. Fail-stop and
+    // loud; a `reseed` marker passes (boot allowed by contract; patroni-runner
+    // consumes it, and standalone Postgres refuses a cross-major data dir on
+    // its own without touching the files). The image's major comes from the
+    // installed server tree (see major_upgrade::image_major), so a stray
+    // user-set PG_MAJOR service variable can't refuse a healthy boot.
+    let image_major = major_upgrade::image_major();
+    if let Some(reason) =
+        major_upgrade::boot_refusal_reason(&volume_root(), &pgdata, image_major.as_deref())
+    {
+        error!("{reason}");
+        telemetry.send(TelemetryEvent::MajorUpgradeBootRefused {
+            node: String::env_or("PATRONI_NAME", "unknown"),
+            reason,
+        });
         std::process::exit(1);
     }
 

@@ -12,6 +12,7 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{ForkResult, Pid};
 use postgres_patroni::bootstrap::refresh_collation_versions;
 use postgres_patroni::health_server::{self, HealthServerConfig};
+use postgres_patroni::major_upgrade;
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
     spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
@@ -27,7 +28,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Translate the tool-agnostic `WAL_ARCHIVE_*` env contract into
 /// pgBackRest's native `PGBACKREST_REPO1_S3_*` so pgBackRest reads them
@@ -427,15 +428,26 @@ fn pgdata_is_dedicated_subdir(data_dir: &str, volume_root: &str) -> bool {
     data_dir.trim_end_matches('/') != volume_root.trim_end_matches('/')
 }
 
+/// The safety core shared by every destructive pgdata wipe in this binary
+/// (the interrupted-clone wipe and the major-upgrade reseed wipe): pgdata must
+/// be a dedicated subdir of the volume (not the volume root itself, whose
+/// siblings — bootstrap marker, sentinels, TLS certs — a wipe would destroy),
+/// and a DISTINCT member must hold the DCS leader lock. A `None` leader (no
+/// lock / etcd unreachable) or a leader that is *us* (a stale lock) blocks the
+/// wipe so we never destroy the only copy of the data.
+fn wipe_has_safe_clone_source(
+    pgdata_is_dedicated_subdir: bool,
+    leader: Option<&str>,
+    my_name: &str,
+) -> bool {
+    pgdata_is_dedicated_subdir && matches!(leader, Some(l) if l != my_name)
+}
+
 /// Pure safety predicate for the interrupted-clone wipe (unit-tested). Only
-/// wipe when: pgdata is a dedicated subdir of the volume (not the volume root
-/// itself), pg_control is absent, the dir is non-empty, and a leader is known
-/// whose name differs from ours. A `None` leader (no lock / etcd unreachable)
-/// or a leader that is *us* (a stale lock — we can't be a healthy leader
-/// without pg_control) blocks the wipe so we never destroy the only copy.
-/// `pgdata_is_dedicated_subdir` guards the non-standard `PGDATA=<volume_root>`
-/// layout, where wiping pgdata would also take out the sibling state we keep at
-/// the volume root (bootstrap marker, invalid-bucket sentinel, TLS certs).
+/// wipe when: pg_control is absent, the dir is non-empty, and
+/// [`wipe_has_safe_clone_source`] holds (dedicated pgdata subdir + a distinct
+/// member holding the DCS leader lock — a node missing pg_control cannot
+/// itself be a healthy leader).
 fn should_wipe_incomplete_clone(
     has_pg_control: bool,
     data_dir_nonempty: bool,
@@ -445,8 +457,7 @@ fn should_wipe_incomplete_clone(
 ) -> bool {
     !has_pg_control
         && data_dir_nonempty
-        && pgdata_is_dedicated_subdir
-        && matches!(leader, Some(l) if l != my_name)
+        && wipe_has_safe_clone_source(pgdata_is_dedicated_subdir, leader, my_name)
 }
 
 /// Read the current leader's member name from etcd (`/service/{scope}/leader`).
@@ -516,6 +527,129 @@ fn wipe_pgdata_contents(data_dir: &str) -> Result<()> {
             fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
     }
+    Ok(())
+}
+
+/// A failed marker removal is more than a stale file: the self-heal watcher
+/// treats any non-completed marker as an upgrade in flight and stands down
+/// for as long as it exists, so a removal that fails in handle_reseed_marker
+/// quietly disables self-healing until some future boot manages the unlink.
+/// Boot still proceeds (the database is healthy; refusing would trade
+/// degraded self-healing for downtime), but the state must announce itself:
+/// an error log plus a telemetry event here, and the watcher's standdown
+/// event carries the marker's phase and age so the two correlate in the
+/// fleet view.
+fn report_marker_removal_failure(telemetry: &Telemetry, e: &std::io::Error, when: &str) {
+    error!(
+        error = %e,
+        "failed to remove the reseed marker {when}; the self-heal watcher stands down while it exists — if no upgrade is running, remove it manually to restore self-healing"
+    );
+    telemetry.send(TelemetryEvent::ComponentError {
+        component: "patroni-runner".to_string(),
+        error: format!("failed to remove the reseed marker {when}: {e}"),
+        context: "the leftover marker keeps the self-heal watcher standing down until it is removed"
+            .to_string(),
+    });
+}
+
+/// Consume a `reseed` upgrade marker (see `major_upgrade`'s module doc).
+///
+/// The HA upgrade workflow writes this onto each replica's volume before it
+/// pauses failover: after the leader is upgraded, the replica is repinned to
+/// the new major and redeployed, and THIS boot is what rebuilds it. Streaming
+/// replication cannot cross majors, so a cross-major data directory can never
+/// rejoin the upgraded leader — it has to be wiped so Patroni takes a fresh
+/// basebackup.
+///
+///   - on-disk PG_VERSION differs from the image's major → wipe pgdata
+///     contents, but ONLY under the same safety predicate as the
+///     incomplete-clone wipe (dedicated pgdata subdir + a DISTINCT member
+///     holding the DCS leader lock — never wipe without a live clone source).
+///     Without that predicate we bail with the marker left in place, so the
+///     next boot retries once the leader is back.
+///   - PG_VERSION matches (or either major is unknown — the version guard
+///     abstains rather than guessing) → just delete the marker and boot
+///     normally. This is the rollback shape: the workflow failed before the
+///     replica was repinned and the old image boots its own data.
+///
+/// The marker is deleted AT WIPE TIME, not after the clone: an interrupted
+/// clone then presents as ordinary incomplete-clone debris on the next boot
+/// (non-empty pgdata, no pg_control, no marker) and the existing machinery
+/// re-clones it, instead of this path re-running against a half-cloned dir.
+/// The wipe itself is idempotent, so deleting the marker only after a
+/// successful wipe means an interrupted WIPE simply retries next boot.
+async fn handle_reseed_marker(
+    config: &Config,
+    volume_root: &str,
+    image_major: Option<&str>,
+    telemetry: &Telemetry,
+) -> Result<()> {
+    if !major_upgrade::reseed_requested(volume_root) {
+        return Ok(());
+    }
+
+    let on_disk = major_upgrade::data_dir_major(&config.data_dir);
+    let mismatch = matches!(
+        (on_disk.as_deref(), image_major),
+        (Some(disk), Some(image)) if disk != image
+    );
+
+    if !mismatch {
+        info!(
+            on_disk_major = ?on_disk,
+            image_major = ?image_major,
+            "reseed marker present but the data directory already matches the image (or a major is unknown) — consuming the marker and booting normally"
+        );
+        if let Err(e) = major_upgrade::remove_marker(volume_root) {
+            report_marker_removal_failure(telemetry, &e, "on the matching-major boot");
+        }
+        return Ok(());
+    }
+
+    let dedicated = pgdata_is_dedicated_subdir(&config.data_dir, volume_root);
+    let leader = if dedicated {
+        probe_cluster_leader(config).await
+    } else {
+        None
+    };
+    if !wipe_has_safe_clone_source(dedicated, leader.as_deref(), &config.name) {
+        // Marker deliberately left in place: the reseed is still owed, and the
+        // next boot retries it — the leader may be reachable by then.
+        anyhow::bail!(
+            "A replica reseed was requested (marker phase: reseed) and the data directory holds \
+             major {} against a {} image, but it is not safe to wipe without a live clone source \
+             (need pgdata as a dedicated subdir and a DISTINCT member holding the DCS leader \
+             lock; pgdata_is_dedicated_subdir={}, leader={:?}). Refusing to boot; the marker is \
+             left in place so the next boot retries.",
+            on_disk.as_deref().unwrap_or("?"),
+            image_major.unwrap_or("?"),
+            dedicated,
+            leader,
+        );
+    }
+
+    warn!(
+        data_dir = %config.data_dir,
+        on_disk_major = ?on_disk,
+        image_major = ?image_major,
+        leader = %leader.as_deref().unwrap_or("?"),
+        "Reseed marker on a cross-major data directory — wiping pgdata so Patroni re-clones from the upgraded leader"
+    );
+    wipe_pgdata_contents(&config.data_dir)
+        .context("Failed to wipe the data directory for the requested reseed")?;
+    if let Err(e) = major_upgrade::remove_marker(volume_root) {
+        // Data-safe (the next boot sees an empty pgdata — no PG_VERSION, no
+        // mismatch — and takes the consume-and-boot branch above), but NOT
+        // harmless: the leftover marker keeps the self-heal watcher standing
+        // down until a boot manages the unlink, so it must announce itself.
+        report_marker_removal_failure(telemetry, &e, "after the wipe");
+    }
+    telemetry.send(TelemetryEvent::MajorUpgradeReseedWiped {
+        node: config.name.clone(),
+        leader: leader.as_deref().unwrap_or("unknown").to_string(),
+        from_major: on_disk.unwrap_or_else(|| "?".to_string()),
+        to_major: image_major.unwrap_or("?").to_string(),
+    });
     Ok(())
 }
 
@@ -1425,6 +1559,35 @@ fn spawn_collation_refresh() {
 async fn async_main() -> Result<()> {
     let _guard = init_logging("patroni-runner");
 
+    let telemetry = Telemetry::from_env("postgres-ha");
+
+    // Major-upgrade boot guard, before ANYTHING touches the volume or the data
+    // directory — including the bucket validator's sentinel write below and the
+    // pg_hba adoption patch further down. Fail-stop by design: a marker that is
+    // not `completed` means the upgrade workflow owns this volume and the data
+    // directory may be absent or half-promoted, and a major mismatch means the
+    // tag was changed without upgrading the data files. Either one would
+    // otherwise reach the incomplete-clone wipe, or Patroni's own bootstrap,
+    // and lose data. A `reseed` marker passes this guard on purpose — see
+    // handle_reseed_marker, which resolves it right after config is built.
+    // The image's major comes from the installed server tree (see
+    // major_upgrade::image_major) — baked into the image, so a stray
+    // user-set PG_MAJOR service variable can't refuse a healthy boot.
+    // Unknown means the version guard abstains rather than guessing.
+    let volume_root = volume_root();
+    let image_major = major_upgrade::image_major();
+    if let Some(reason) = major_upgrade::boot_refusal_reason(
+        &volume_root,
+        &postgres_patroni::pgdata(),
+        image_major.as_deref(),
+    ) {
+        telemetry.send(TelemetryEvent::MajorUpgradeBootRefused {
+            node: env::var("PATRONI_NAME").unwrap_or_else(|_| "unknown".to_string()),
+            reason: reason.clone(),
+        });
+        anyhow::bail!("{reason}");
+    }
+
     // Screen WAL_ARCHIVE_BUCKET shape before translation so a junk value
     // (unresolved Railway template ref, raw bucket-id UUID, whitespace)
     // doesn't get exported as PGBACKREST_REPO1_S3_BUCKET — pgBackRest
@@ -1434,7 +1597,7 @@ async fn async_main() -> Result<()> {
     // bug. Mirrors postgres-ssl PR #57 (validate_wal_archive_bucket).
     // Pass volume_root (not PGDATA) so the sentinel survives Patroni's
     // bootstrap wipe of /pgdata on fresh volumes.
-    validate_wal_archive_bucket(&volume_root());
+    validate_wal_archive_bucket(&volume_root);
 
     // Translate the WAL_* env contract into pgBackRest-native PGBACKREST_*
     // before anything reads either set. Done first so Config::from_env() and
@@ -1445,7 +1608,6 @@ async fn async_main() -> Result<()> {
     // Capture health server config BEFORE clearing PG* env vars
     let health_config = HealthServerConfig::from_env();
 
-    let telemetry = Telemetry::from_env("postgres-ha");
     let config = Config::from_env()?;
 
     info!(
@@ -1454,8 +1616,13 @@ async fn async_main() -> Result<()> {
         "=== Patroni Runner ==="
     );
 
-    let volume_root = volume_root();
     let bootstrap_marker = format!("{}/.patroni_bootstrap_complete", volume_root);
+
+    // Consume a reseed marker before anything else reads or patches the data
+    // directory: a cross-major pgdata is wiped here (so the adoption patch and
+    // the pg_control checks below see the post-wipe state), and a matching one
+    // just sheds the marker.
+    handle_reseed_marker(&config, &volume_root, image_major.as_deref(), &telemetry).await?;
 
     // Handle data adoption from vanilla PostgreSQL
     if config.adopt_existing_data {
@@ -1489,6 +1656,17 @@ async fn async_main() -> Result<()> {
     // itself be a healthy leader). Without a distinct leader we leave the dir
     // for manual recovery rather than risk wiping the only copy.
     if !has_pg_control && data_dir_nonempty(&config.data_dir) {
+        // Redundant with the boot guard above, deliberately: this is the call
+        // that destroys data, so it states its own precondition rather than
+        // inheriting one from fifty lines earlier. A missing pg_control during
+        // an upgrade window is the EXPECTED mid-swap state, not clone debris.
+        if major_upgrade::upgrade_in_flight(&volume_root) {
+            anyhow::bail!(
+                "Refusing to wipe {} — a major version upgrade is in progress on this volume. \
+                 A missing pg_control is expected mid-upgrade and is not clone debris.",
+                config.data_dir
+            );
+        }
         let dedicated = pgdata_is_dedicated_subdir(&config.data_dir, &volume_root);
         // Skip the etcd probe entirely when pgdata is the volume root — we
         // won't wipe regardless, so there's no point asking who the leader is.
@@ -1726,8 +1904,8 @@ mod tests {
     use super::{
         build_pgbackrest_conf, build_pgbackrest_recovery_source_conf, configure_pitr_recovery,
         data_dir_nonempty, is_uuid_shape, parse_process_max, pgdata_is_dedicated_subdir,
-        should_wipe_incomplete_clone, wipe_pgdata_contents, Config, PgbackrestConfParams,
-        RecoverySourceConfParams,
+        should_wipe_incomplete_clone, wipe_has_safe_clone_source, wipe_pgdata_contents, Config,
+        PgbackrestConfParams, RecoverySourceConfParams,
     };
 
     fn test_config(data_dir: &str) -> Config {
@@ -1950,6 +2128,34 @@ mod tests {
             true,
             true,
             Some("postgres-3"),
+            "postgres-3"
+        ));
+    }
+
+    // The reseed wipe shares this predicate with the incomplete-clone wipe:
+    // both destroy pgdata, so both demand a dedicated subdir AND a distinct
+    // member holding the DCS leader lock — a live clone source.
+    #[test]
+    fn reseed_wipe_safety_requires_distinct_leader_and_dedicated_pgdata() {
+        // Safe: dedicated pgdata, someone ELSE holds the leader lock.
+        assert!(wipe_has_safe_clone_source(
+            true,
+            Some("postgres-1"),
+            "postgres-3"
+        ));
+        // No leader / etcd unreachable → no clone source, never wipe.
+        assert!(!wipe_has_safe_clone_source(true, None, "postgres-3"));
+        // The lock names US (stale lock) → never wipe our own data.
+        assert!(!wipe_has_safe_clone_source(
+            true,
+            Some("postgres-3"),
+            "postgres-3"
+        ));
+        // pgdata IS the volume root → wiping would take out the sibling state
+        // (bootstrap marker, sentinels, certs), so refuse even with a leader.
+        assert!(!wipe_has_safe_clone_source(
+            false,
+            Some("postgres-1"),
             "postgres-3"
         ));
     }

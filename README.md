@@ -290,6 +290,119 @@ retention to the next backup. The default retention (full=4, diff=14,
 weekly fulls + daily diffs) covers approximately a four-week PITR
 window before the oldest full ages out.
 
+## Major version upgrades
+
+A major upgrade is driven from outside this image: the control plane pauses
+Patroni failover, stops the leader, runs a one-shot job image carrying both
+majors' binaries against the leader's volume, repins the service image, then
+rebuilds each replica from the upgraded primary and resumes failover.
+
+While that window is open the job marks the volume with
+`.railway-major-upgrade.json` at the **volume root** (PGDATA is replaced
+wholesale by `pg_upgrade`, so a marker inside it would not survive). The image
+consults that marker in three places, because each of them destroys data if it
+ignores it and none of them can see the control plane:
+
+| Guard | Without it |
+|-------|-----------|
+| Boot refuses while the marker is not `completed` | PGDATA can be absent mid-swap; Patroni treats the member as fresh and bootstraps over it |
+| Boot refuses when `PG_VERSION` ≠ the image's major | Postgres only refuses deep into startup, and the incomplete-clone wipe may run first |
+| The self-heal watcher stands down | **A Patroni DCS pause does not stop this watcher.** A replica it reinitializes mid-upgrade wipes itself and then cannot clone at all — `pg_basebackup` refuses across majors — so it ends up empty rather than rebuilt |
+
+All three are fail-stop and loud: this image never tries to repair a mid-upgrade
+volume, because that state belongs to the upgrade workflow.
+
+The image's own major comes from the installed server tree
+(`/usr/lib/postgresql/<major>/`), not from the `PG_MAJOR` env var — the tree
+is baked into the image, while a stray user-set `PG_MAJOR` service variable
+would otherwise refuse every boot of a perfectly matched data directory. The
+env is only a fallback when the tree is ambiguous, and a disagreement is
+logged with the filesystem winning.
+
+The self-heal standdown is not a one-shot signal: the
+`POSTGRES_HA_SELF_HEAL_UPGRADE_STANDDOWN` event re-emits every 6 hours while
+the marker persists, carrying the marker's phase and age. A young marker is a
+live upgrade window; one aging past hours with no workflow running is stale
+debris (e.g. a boot-time removal that failed, reported separately as a
+`COMPONENT_ERROR`) that silently keeps self-heal disabled until it is removed.
+
+One marker phase is the exception to fail-stop, because it exists to make the
+replica rebuild possible at all: **`{"phase": "reseed"}`**, written by the HA
+workflow onto each replica's volume before it pauses failover. Boot is
+*allowed* through both guards; if the on-disk `PG_VERSION` differs from the
+image's major the runner wipes pgdata — only under the same safety predicate
+as the incomplete-clone wipe (dedicated pgdata subdir + a DISTINCT member
+holding the DCS leader lock) — and deletes the marker at wipe time, so Patroni
+re-clones the member from the upgraded leader. On a matching major the boot
+just sheds the marker (the rollback shape). Streaming replication cannot cross
+majors, so without this phase the version-mismatch guard would refuse the
+exact boot the reseed depends on. The marker also keeps the self-heal watcher
+standing down for the window, which is the production path by which that
+standdown actually engages.
+
+### Verified end to end against a real cluster
+
+The whole choreography — pause → leader `pg_upgrade` (16→17) → leader on the
+new image → per-replica reseed → resume → switchover — has been exercised
+against a live 3-node Patroni 4.1.0 + etcd cluster, and is pinned permanently
+by `t_ha_major_upgrade_full_choreography` in `test/e2e-ha.sh` (it runs a real
+`pg_upgrade` of the leader's volume using postgres-ssl's job image; CI runs it
+as its own job). `t_ha_major_upgrade_back_to_back` additionally chains two
+hops (15→16→17) on the same cluster and volumes: hop 2's job runs over hop
+1's `completed` marker (history, not state — overwritten at the job's own
+commit point), the replicas reseed a second time, and a row written between
+the hops survives. The load-bearing facts settled here, each of which the
+docs are ambiguous about:
+
+- **Stopping a paused member is an unclean stop by design.** Patroni logs
+  `Leader key is not deleted and Postgresql is not stopped due paused state`
+  and exits without stopping the postmaster, which the container teardown then
+  SIGKILLs. The upgrade job's WAL-replay quiesce is therefore the *normal*
+  path for an HA leader, not an edge case. The stale leader key simply expires
+  via its DCS lease TTL; paused replicas do not take it.
+- **The DCS `initialize` key really does hold the old system identifier, and
+  the upgraded leader really is refused — but the observed shape is a wedge,
+  not a crash.** Under pause Patroni warns `system ID has changed while in
+  paused mode. Patroni will exit when resuming unless system ID is reset:
+  <old> != <new>` and then sits at `PAUSE: postgres is not running` forever —
+  a paused Patroni never starts a stopped postgres, so the redeployed leader
+  stays up with the database down. (Unpaused, that warning becomes the fatal
+  "belongs to a different cluster" exit.)
+- **The minimal mitigation is two calls, both available from inside a member
+  container:** delete *only* `/service/<scope>/initialize` via etcd's HTTP v3
+  API (`curl -X POST http://$ETCD_HOST/v3/kv/deleterange` with the base64 key
+  — `etcdctl` is not in this image; `curl`, `base64` and `PATRONI_ETCD3_HOSTS`
+  are), then `POST /restart` to the leader's Patroni REST. A paused Patroni
+  honors the explicit restart, starts postgres, logs `PAUSE: acquired session
+  lock as a leader`, and writes a fresh `initialize` key carrying the new
+  sysid — while `/config`, **including `pause: true` and every dynamic
+  postgresql parameter, survives untouched**.
+- **`patronictl remove <scope>` is NOT an acceptable substitute** (despite
+  being the mitigation Zalando's procedure describes): verified to delete the
+  entire `/service/<scope>/` prefix including `/config`, which destroys the
+  pause flag — waking failover mid-window — and every dynamic parameter
+  (`archive_mode` etc. on PITR clusters).
+- **A paused Patroni will not clone a member on its own.** After the reseed
+  boot wipes a cross-major pgdata the member sits at `PAUSE: running with
+  empty data directory` indefinitely. `POST /reinitialize` *is* honored under
+  pause and performs the basebackup clone from the upgraded leader, so the
+  reseed walk can stay inside the paused window — but only with that explicit
+  kick per replica.
+- **Resume ordering matters and must stay last.** The old-major replicas'
+  live (paused) Patronis tolerate the new `initialize` key only *because* the
+  cluster is paused; resuming before they are rebuilt would make them exit
+  fatally on the sysid mismatch, and the restart that follows on the old image
+  would consume the reseed marker (matching-major shape), leaving the later
+  repin+redeploy refused by the version-mismatch guard.
+- Incidentals: `pg_upgrade --link` succeeds on a Patroni-managed data
+  directory (`patroni.dynamic.json`, Patroni-rendered conf and pg_hba are not
+  blockers); the job container must receive the service's `PGDATA`
+  (`…/data/pgdata`) explicitly, because the job image inherits the official
+  base image's `PGDATA=/var/lib/postgresql/data` — the volume root, which the
+  job refuses (in production the job runs as a deployment of the service and
+  inherits its variables); after the mitigated window a real switchover to a
+  reseeded replica completes and bumps the timeline.
+
 ## Quick Start
 
 ### Deploy to Railway
