@@ -1037,10 +1037,7 @@ async fn iteration(
     // the marker that engages this is the `reseed` marker the HA workflow
     // writes onto each replica's volume before pausing failover.
     let upgrade_marker = major_upgrade::read_marker(volume_root);
-    if upgrade_marker
-        .as_ref()
-        .is_some_and(|m| m.phase.as_deref() != Some("completed"))
-    {
+    if upgrade_marker.as_ref().is_some_and(|m| !m.is_completed()) {
         // Clear the transient dwell state so none of it accrues across the
         // unobserved window: a replica that spent the whole upgrade lagging
         // must re-earn its divergence/start-failed dwell from zero once the

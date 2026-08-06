@@ -44,6 +44,9 @@ pub const MARKER_FILENAME: &str = ".railway-major-upgrade.json";
 /// module doc. Boot is allowed and the runner consumes the marker.
 pub const PHASE_RESEED: &str = "reseed";
 
+/// Terminal phase: the swap is done, the target major's image may boot.
+pub const PHASE_COMPLETED: &str = "completed";
+
 #[derive(Debug, Deserialize)]
 pub struct UpgradeMarker {
     pub phase: Option<String>,
@@ -51,6 +54,15 @@ pub struct UpgradeMarker {
     pub from: Option<String>,
     #[serde(default, deserialize_with = "de_major")]
     pub to: Option<String>,
+}
+
+impl UpgradeMarker {
+    /// True once the swap is done. The one comparison every consumer of a
+    /// marker's terminal state needs, kept in one place next to PHASE_RESEED
+    /// so the two constants can't drift out of sync with each other again.
+    pub fn is_completed(&self) -> bool {
+        self.phase.as_deref() == Some(PHASE_COMPLETED)
+    }
 }
 
 /// Accept `"16"` or `16` for the marker's major fields. More than one producer
@@ -112,7 +124,7 @@ pub fn read_marker(volume_root: &str) -> Option<UpgradeMarker> {
 pub fn upgrade_in_flight(volume_root: &str) -> bool {
     match read_marker(volume_root) {
         None => false,
-        Some(marker) => marker.phase.as_deref() != Some("completed"),
+        Some(marker) => !marker.is_completed(),
     }
 }
 
@@ -245,7 +257,7 @@ pub fn boot_refusal_reason(
         if phase == PHASE_RESEED {
             return None;
         }
-        if phase != "completed" {
+        if !marker.is_completed() {
             return Some(format!(
                 "A major version upgrade is in progress on this volume (marker phase: {phase}). \
                  The database must not start until the upgrade workflow finishes or rolls back."

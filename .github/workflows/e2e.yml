@@ -60,6 +60,11 @@ jobs:
           # The major-upgrade choreography tests run in their own job below
           # so this job's timing is untouched; local runs still include them.
           E2E_EXCLUDE: t_ha_major_upgrade_full_choreography t_ha_major_upgrade_back_to_back
+          # docker/build-push-action already loaded this exact tag above via
+          # its own gha cache — the harness's always-rebuild policy exists
+          # for local iteration (where a stale image is the real risk), not
+          # for a job that just built from this very commit.
+          E2E_SKIP_BUILD: "1"
         run: |
           ./test/e2e-ha.sh 2>&1 | tee "e2e-ha-pg${PG_VERSION}.log"
           exit "${PIPESTATUS[0]}"
@@ -170,6 +175,9 @@ jobs:
           # NOTE: flip to `main` (or drop, once the harness default flips)
           # after railwayapp-templates/postgres-ssl#113 merges.
           UPGRADE_JOB_GIT_REF: pcs/major-upgrade-job
+          # Same reasoning as the main e2e job: these exact tags were just
+          # built and loaded above, from this same commit.
+          E2E_SKIP_BUILD: "1"
         run: |
           ./test/e2e-ha.sh t_ha_major_upgrade_full_choreography t_ha_major_upgrade_back_to_back 2>&1 | tee "e2e-ha-major-upgrade-pg${PG_VERSION}.log"
           exit "${PIPESTATUS[0]}"
