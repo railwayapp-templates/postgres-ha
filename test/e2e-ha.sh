@@ -3065,8 +3065,17 @@ t_ha_major_upgrade_full_choreography() {
   fi
   # The paused leader must have re-initialized the cluster identity with the
   # NEW sysid, and /config — pause included — must have survived (this is
-  # what patronictl remove would have destroyed).
-  dcs_sysid=$(docker exec "${scope}-etcd-1" etcdctl get "/service/${scope}/initialize" --print-value-only 2>/dev/null | tr -d '[:space:]')
+  # what patronictl remove would have destroyed). Taking the leader lock
+  # (what wait_for_node_leader just confirmed via /leader) and writing the
+  # initialize key are two separate DCS writes — poll instead of a one-shot
+  # read, so a brief gap between them doesn't read as a real mismatch.
+  dcs_sysid=""
+  dcs_deadline=$(($(date +%s) + 15))
+  while [ "$(date +%s)" -lt "$dcs_deadline" ]; do
+    dcs_sysid=$(docker exec "${scope}-etcd-1" etcdctl get "/service/${scope}/initialize" --print-value-only 2>/dev/null | tr -d '[:space:]')
+    [ "$dcs_sysid" = "$new_sysid" ] && break
+    sleep 1
+  done
   if [ "$dcs_sysid" != "$new_sysid" ]; then
     ko t_ha_major_upgrade_full_choreography "initialize key was not re-created with the new sysid (want $new_sysid, got '$dcs_sysid')"
     fail_dump t_ha_major_upgrade_full_choreography "$leader"
