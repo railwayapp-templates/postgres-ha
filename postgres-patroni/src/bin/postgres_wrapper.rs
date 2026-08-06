@@ -11,6 +11,7 @@ use postgres_patroni::{
     major_upgrade, pgdata, ssl_dir, sudo_command, volume_root, EXPECTED_VOLUME_MOUNT_PATH,
 };
 use std::env;
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -243,6 +244,39 @@ async fn main() -> Result<()> {
             run_init_ssl().await?;
         }
 
+        // Re-apply the ssl settings when the certificate exists but
+        // postgresql.conf doesn't reference it. The checks above are keyed on
+        // the CERTIFICATE, which lives outside PGDATA and therefore survives
+        // anything that replaces the data directory — a major upgrade
+        // promotes a freshly initdb'd PGDATA, so postgresql.conf loses
+        // `ssl = on` while server.crt is still right there. The result is a
+        // database that silently comes back with SSL off, rejecting every
+        // sslmode=require client. Keying this on the CONFIG instead self-heals
+        // that and any other path that resets postgresql.conf (mirrors
+        // postgres-ssl's wrapper.sh fix for the same bug).
+        if Path::new(&postgres_conf_file).exists() && Path::new(&server_crt).exists() {
+            let has_ssl_directive = std::fs::read_to_string(&postgres_conf_file)
+                .map(|contents| postgresql_conf_has_ssl_directive(&contents))
+                .unwrap_or(false);
+
+            if !has_ssl_directive {
+                info!(
+                    "postgresql.conf has no ssl directive but certificates exist, re-applying..."
+                );
+                let ssl_conf = format!(
+                    "ssl = on\nssl_cert_file = '{ssl_dir}/server.crt'\nssl_key_file = '{ssl_dir}/server.key'\nssl_ca_file = '{ssl_dir}/root.crt'\n"
+                );
+                let append_result = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&postgres_conf_file)
+                    .and_then(|mut f| f.write_all(ssl_conf.as_bytes()));
+                if let Err(e) = append_result {
+                    error!(error = %e, "Failed to re-apply ssl settings to postgresql.conf");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         // Ensure pg_stat_statements is configured for existing databases
         if let Err(e) = ensure_pg_stat_statements(&pgdata) {
             warn!(error = %e, "Failed to configure pg_stat_statements");
@@ -278,5 +312,51 @@ async fn main() -> Result<()> {
 
         let err = cmd.exec();
         Err(anyhow!("Failed to exec docker-entrypoint.sh: {}", err))
+    }
+}
+
+/// True if `contents` has a top-level `ssl = ...` directive (any whitespace,
+/// with or without the `=` spaced out). Deliberately does NOT match
+/// `ssl_cert_file` / `ssl_key_file` / `ssl_ca_file` — a promoted, freshly
+/// initdb'd postgresql.conf has none of the `ssl_*` lines either, but the
+/// discriminating one for "did SSL survive" is the top-level toggle.
+fn postgresql_conf_has_ssl_directive(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("ssl")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssl_directive_detected_when_present() {
+        assert!(postgresql_conf_has_ssl_directive("ssl = on\nport = 5432"));
+    }
+
+    #[test]
+    fn ssl_directive_detected_regardless_of_spacing() {
+        assert!(postgresql_conf_has_ssl_directive("ssl=on"));
+        assert!(postgresql_conf_has_ssl_directive("  ssl   =   on  "));
+    }
+
+    #[test]
+    fn ssl_directive_absent_on_freshly_initdbd_conf() {
+        assert!(!postgresql_conf_has_ssl_directive(
+            "port = 5432\nmax_connections = 100\n"
+        ));
+    }
+
+    #[test]
+    fn ssl_cert_file_alone_does_not_count_as_the_toggle() {
+        // A config could in principle carry ssl_cert_file/ssl_key_file
+        // without the top-level `ssl = on` toggle actually being set —
+        // that's not "SSL survived", it's SSL still off with stale paths.
+        assert!(!postgresql_conf_has_ssl_directive(
+            "ssl_cert_file = '/etc/ssl/server.crt'"
+        ));
     }
 }
