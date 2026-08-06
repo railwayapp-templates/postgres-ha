@@ -395,22 +395,6 @@ docs are ambiguous about:
   inherits its variables); after the mitigated window a real switchover to a
   reseeded replica completes and bumps the timeline.
 
-> **Rollout note.** The Patroni/etcd/pg_upgrade behavior itself is pinned by
-> the e2e test above, against a real cluster. What that test can't reach is
-> Railway-specific: the control plane's real exec transport, the real deploy
-> pipeline driving stop/repin/redeploy, and the real volume lifecycle (locks,
-> snapshots, a crash-looping member being restarted by the platform
-> mid-window). That gets exercised against a real Railway cluster right after
-> this ships. A *failed* upgrade is already handled by the workflow itself —
-> it resumes failover and restarts the old image on its own, no button
-> needed. **"Revert" is a separate, discretionary thing: undoing an upgrade
-> that succeeded, because you've since decided against it.** That always
-> discards every write made since the upgrade completed (it restores the
-> pre-upgrade backup), and **there is no one-click revert for an HA
-> upgrade** — doing it manually means restoring that backup with Patroni
-> failover paused for the whole operation, which `revert.ts` already points
-> operators at.
-
 ## Quick Start
 
 ### Deploy to Railway
