@@ -2531,6 +2531,179 @@ t_ha_major_mismatch_blocks_boot() {
   docker volume rm "$vol" >/dev/null 2>&1 || true
 }
 
+# The runtime's half of the job-vs-runtime mutual exclusion (missing from #92,
+# added after an adversarial review): a job dispatched against a volume whose
+# Patroni container never actually stopped must refuse instead of running
+# pg_upgrade against a live, actively-written-to data directory. This is not
+# hypothetical — the HA workflow's stopDatabaseActivity fires the stop request
+# and returns as soon as the orchestrator accepts it (there's a literal `//
+# TODO` in packages/backboard/src/controllers/deployments/deployment/stop.ts
+# about not confirming the container actually exited), so the window this
+# guards is real, not a contrived race. Mirrors postgres-ssl's
+# t_job_refused_while_runtime_live for the HA image.
+t_ha_job_refused_while_runtime_live() {
+  local tname=t_ha_job_refused_while_runtime_live
+  local scope=t-joblive-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  local n="${scope}-n1"
+  local vol="${n}-vol"
+  local other_major=$((PG_VERSION - 1))
+  local job_image="postgres-upgrade-e2e:${other_major}-${PG_VERSION}"
+
+  if ! ensure_image_for_major "$other_major" || \
+     ! ensure_upgrade_job_image "$other_major" "$PG_VERSION" "$job_image"; then
+    ko "$tname" "could not build the source-major or upgrade job image"
+    return
+  fi
+
+  docker volume rm "$vol" >/dev/null 2>&1 || true
+  new_volume "$vol"
+  # Seeded on the FROM major, not $IMAGE — the job run after the node is
+  # actually stopped needs a real cross-major upgrade to succeed at.
+  run_patroni_node_with_image "$scope" "$etcd_hosts" "$n" "postgres-ha-pitr:${other_major}"
+  if ! wait_for_node_leader "$n" 240; then
+    ko "$tname" "node never became leader"
+    fail_dump "$tname" "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+  psql_leader "$n" -c "CREATE TABLE lock_canary(id int); INSERT INTO lock_canary VALUES (1)" >/dev/null
+
+  # The job, dispatched against the SAME volume while the node above is still
+  # up — the exact shape a stop-request that hasn't landed yet leaves behind.
+  local job_out job_rc
+  job_out=$(docker run --rm --label "$HA_LABEL" \
+    -e "PGDATA=/var/lib/postgresql/data/pgdata" \
+    -v "${vol}:/var/lib/postgresql/data" "$job_image" upgrade 2>&1)
+  job_rc=$?
+  if [ "$job_rc" -eq 0 ]; then
+    ko "$tname" "job succeeded against a volume whose Patroni container is still running"
+    echo "$job_out" | tail -20
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+  if ! echo "$job_out" | grep -q "holds the upgrade lock"; then
+    ko "$tname" "job refused for the wrong reason (expected the lock message)"
+    echo "$job_out" | tail -20
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+
+  # The database must be unharmed by the refused job.
+  local canary
+  canary=$(psql_leader "$n" -tAc "SELECT count(*) FROM lock_canary" 2>/dev/null)
+  if [ "$canary" != "1" ]; then
+    ko "$tname" "database damaged by the refused job (canary count '$canary')"
+    fail_dump "$tname" "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+
+  # And once the node is actually stopped, the same job succeeds — the lock
+  # is released with the container, not leaked.
+  docker rm -f "$n" >/dev/null 2>&1
+  job_out=$(docker run --rm --label "$HA_LABEL" \
+    -e "PGDATA=/var/lib/postgresql/data/pgdata" \
+    -v "${vol}:/var/lib/postgresql/data" "$job_image" upgrade 2>&1)
+  job_rc=$?
+  if [ "$job_rc" -ne 0 ]; then
+    ko "$tname" "job failed once the node was actually stopped (rc=$job_rc)"
+    echo "$job_out" | tail -30
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+
+  ok "$tname"
+  note "job refused while the node was live (data intact); succeeded once it was actually stopped"
+  teardown_scope "$scope"
+  docker volume rm "$vol" >/dev/null 2>&1 || true
+}
+
+# The other direction of the same lock: a database deployed while an upgrade
+# job holds the volume's exclusive lock must refuse to boot rather than race
+# pg_upgrade for the data directory. Seeds a real matching-major cluster first
+# so the version/marker guards have nothing to fire on — only the lock should
+# be what refuses this boot.
+t_ha_runtime_refused_while_job_locked() {
+  local tname=t_ha_runtime_refused_while_job_locked
+  local scope=t-rtlocked-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  local n="${scope}-n1"
+  local vol="${n}-vol"
+  local other_major=$((PG_VERSION - 1))
+  local job_image="postgres-upgrade-e2e:${other_major}-${PG_VERSION}"
+
+  if ! ensure_upgrade_job_image "$other_major" "$PG_VERSION" "$job_image"; then
+    ko "$tname" "could not build the upgrade job image"
+    return
+  fi
+
+  docker volume rm "$vol" >/dev/null 2>&1 || true
+  new_volume "$vol"
+
+  RUN_NODE_VOLUME="$vol" run_patroni_node "$scope" "$etcd_hosts" "$n"
+  if ! wait_for_node_leader "$n" 240; then
+    ko "$tname" "node never became leader on first boot"
+    fail_dump "$tname" "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+  docker rm -f "$n" >/dev/null 2>&1
+
+  # Hold the exclusive lock from a sleeper container — the same shape a
+  # dispatched job holds it in (upgrade-job.sh's own take_job_lock).
+  docker run -d --name "${scope}-lockholder" --label "$HA_LABEL" \
+    -v "${vol}:/var/lib/postgresql/data" --entrypoint /bin/sh "$job_image" \
+    -c "exec 9>>/var/lib/postgresql/data/.railway-major-upgrade.lock; flock 9; sleep 60" >/dev/null
+  sleep 2
+
+  RUN_NODE_VOLUME="$vol" run_patroni_node "$scope" "$etcd_hosts" "$n"
+  local deadline=$(($(date +%s) + 60)) status=running
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status=$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null)
+    [ "$status" = "exited" ] && break
+    sleep 2
+  done
+  local boot_logs; boot_logs=$(docker logs "$n" 2>&1)
+  docker rm -f "${scope}-lockholder" >/dev/null 2>&1
+
+  if [ "$status" != "exited" ]; then
+    ko "$tname" "node kept running while the job's lock was held (status=$status)"
+    fail_dump "$tname" "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+  if ! echo "$boot_logs" | grep -q "held by another process"; then
+    ko "$tname" "node exited without naming the lock refusal"
+    echo "$boot_logs" | tail -20
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+
+  # With the lock released, the same node boots fine on the same volume.
+  RUN_NODE_VOLUME="$vol" run_patroni_node "$scope" "$etcd_hosts" "$n"
+  if ! wait_for_node_leader "$n" 240; then
+    ko "$tname" "node did not boot once the job's lock was released"
+    fail_dump "$tname" "$n"
+    teardown_scope "$scope"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    return
+  fi
+
+  ok "$tname"
+  note "boot refused while the job's exclusive lock was held; succeeded once released"
+  teardown_scope "$scope"
+  docker volume rm "$vol" >/dev/null 2>&1 || true
+}
+
 # The in-image self-heal watcher must stand down while a marker is present. It
 # is the one actor a Patroni DCS pause does not stop, and a replica it
 # reinitializes mid-upgrade cannot clone (pg_basebackup refuses across majors).
@@ -4763,6 +4936,8 @@ ALL_TESTS=(
   t_ha_pghost_pgport_unset
   t_ha_upgrade_marker_blocks_boot
   t_ha_major_mismatch_blocks_boot
+  t_ha_job_refused_while_runtime_live
+  t_ha_runtime_refused_while_job_locked
   t_ha_selfheal_stands_down_during_upgrade
   # reseed marker: the boot that rebuilds a replica across majors, and the
   # refusal when the wipe would run without a live clone source
