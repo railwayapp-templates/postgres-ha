@@ -4627,6 +4627,114 @@ t_ha_adopt_default_replica() {
   teardown_scope "$scope"
 }
 
+# The volume-upgrade lock, standalone mode — the system property, not the
+# function: the shared flock must be held for the LIFETIME of the database.
+# The wrapper stays resident holding it (an exec would close the O_CLOEXEC fd
+# and release the flock — the bug this scenario exists to catch), so the
+# job's exclusive take (same shape as upgrade-job.sh's take_job_lock) is
+# refused while the runtime lives, succeeds once it stops, and a runtime
+# deployed while a job holds the lock refuses to boot. Mirrors postgres-ssl's
+# t_job_refused_while_runtime_live.
+t_upgrade_lock_standalone_lifetime() {
+  local t=t_upgrade_lock_standalone_lifetime
+  local vol="upglock-vol-${PG_VERSION}" n="upglock-pg-${PG_VERSION}"
+  local holder="upglock-holder-${PG_VERSION}" LOCK=/v/.railway-major-upgrade.lock
+  docker rm -f "$n" "$holder" >/dev/null 2>&1 || true
+  docker volume rm -f "$vol" >/dev/null 2>&1 || true
+  docker volume create "$vol" >/dev/null
+
+  # Standalone mode: PATRONI_ENABLED unset, the wrapper hands off to
+  # docker-entrypoint. PGDATA is set to the dedicated subdir the Railway
+  # template stamps (the image itself inherits PGDATA=<volume root> from the
+  # official postgres base, and on THAT layout the first boot deliberately
+  # skips the lock — creating the lock file pre-initdb would abort initdb).
+  docker run -d --name "$n" --label "$HA_LABEL" --network "$NET" \
+    -v "$vol:/var/lib/postgresql/data" \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -e POSTGRES_PASSWORD=pgpass \
+    "$IMAGE" >/dev/null
+
+  local i ready=0
+  for i in $(seq 1 90); do
+    if docker exec "$n" pg_isready -U postgres -h localhost >/dev/null 2>&1; then
+      ready=1; break
+    fi
+    sleep 2
+  done
+  if [ "$ready" != 1 ]; then
+    ko "$t" "standalone postgres never became ready"
+    fail_dump "$t" "$n"
+    docker rm -f "$n" >/dev/null 2>&1
+    return
+  fi
+  docker exec "$n" psql -U postgres -Atc \
+    "CREATE TABLE lock_canary (id int); INSERT INTO lock_canary VALUES (1)" >/dev/null 2>&1
+
+  # 1) While the runtime lives, the job's exclusive take must be refused.
+  if docker run --rm -v "$vol:/v" --entrypoint flock "$IMAGE" -n -x "$LOCK" true 2>/dev/null; then
+    ko "$t" "exclusive flock ACQUIRED while the runtime is live — the shared lock is not held"
+    fail_dump "$t" "$n"
+    docker rm -f "$n" >/dev/null 2>&1
+    return
+  fi
+
+  # ...and the database is unharmed by the refused attempt.
+  local canary
+  canary=$(docker exec "$n" psql -U postgres -Atc "SELECT count(*) FROM lock_canary" 2>/dev/null)
+  if [ "$canary" != "1" ]; then
+    ko "$t" "database not healthy after the refused probe (canary='$canary')"
+    fail_dump "$t" "$n"
+    docker rm -f "$n" >/dev/null 2>&1
+    return
+  fi
+
+  # 2) A graceful stop must release the lock with the process — the wrapper
+  # forwards SIGTERM to its docker-entrypoint child and exits with it.
+  docker stop -t 30 "$n" >/dev/null
+  if ! docker run --rm -v "$vol:/v" --entrypoint flock "$IMAGE" -n -x "$LOCK" true 2>/dev/null; then
+    ko "$t" "exclusive flock still refused after the runtime stopped — the lock leaked"
+    docker rm -f "$n" >/dev/null 2>&1
+    return
+  fi
+  docker rm -f "$n" >/dev/null 2>&1
+
+  # 3) The other direction: a runtime deployed while a job holds the lock
+  # exclusively must refuse to boot, loudly.
+  docker run -d --name "$holder" --label "$HA_LABEL" -v "$vol:/v" \
+    --entrypoint flock "$IMAGE" -x "$LOCK" -c "sleep 300" >/dev/null
+  sleep 2
+  docker run -d --name "$n" --label "$HA_LABEL" --network "$NET" \
+    -v "$vol:/var/lib/postgresql/data" \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -e POSTGRES_PASSWORD=pgpass \
+    "$IMAGE" >/dev/null
+
+  local exited=0
+  for i in $(seq 1 30); do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$n" 2>/dev/null)" = "false" ]; then
+      exited=1; break
+    fi
+    sleep 2
+  done
+  local rc logs
+  rc=$(docker inspect -f '{{.State.ExitCode}}' "$n" 2>/dev/null)
+  logs=$(docker logs "$n" 2>&1 | tail -20)
+  docker rm -f "$n" "$holder" >/dev/null 2>&1
+  docker volume rm -f "$vol" >/dev/null 2>&1 || true
+
+  if [ "$exited" != 1 ] || [ "$rc" = "0" ]; then
+    ko "$t" "runtime did not refuse to boot while a job held the lock (exited=$exited rc=$rc)"
+    return
+  fi
+  if ! echo "$logs" | grep -q "held by another process"; then
+    ko "$t" "refusal did not name the lock; last logs: $(echo "$logs" | tail -3)"
+    return
+  fi
+
+  ok "$t"
+  note "lock held for the runtime's lifetime, released on stop, and boot refused while a job held it"
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -4685,6 +4793,7 @@ ALL_TESTS=(
   # standalone→HA conversion: wal_level preservation (logical replication)
   t_ha_adopt_preserves_logical
   t_ha_adopt_default_replica
+  t_upgrade_lock_standalone_lifetime
 )
 
 usage() {

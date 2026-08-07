@@ -36,7 +36,10 @@
 //! So every one of them consults the marker, which is on the volume and needs
 //! no network call. Fail-stop and loud beats clever recovery here.
 
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use serde::Deserialize;
+use std::fs::{File, OpenOptions};
 
 pub const MARKER_FILENAME: &str = ".railway-major-upgrade.json";
 
@@ -275,6 +278,94 @@ pub fn boot_refusal_reason(
     }
 }
 
+/// Same filename/location postgres-ssl's wrapper.sh already uses — both
+/// consume the identical upgrade-job.sh image against the same volume, and
+/// the lock is only meaningful if every runtime that might have Postgres
+/// running against this volume agrees on which file it is.
+pub const LOCK_FILENAME: &str = ".railway-major-upgrade.lock";
+
+pub fn lock_path(volume_root: &str) -> String {
+    format!("{}/{}", volume_root.trim_end_matches('/'), LOCK_FILENAME)
+}
+
+/// Take a SHARED, non-blocking flock on the volume-root lock file and hold it
+/// for as long as the returned `Flock` stays alive — drop it (or let the
+/// process exit) and the lock releases.
+///
+/// This is the runtime half of the mutual exclusion upgrade-job.sh's own
+/// exclusive flock (`take_job_lock`) depends on to catch BOTH directions of a
+/// job-vs-runtime race: the job's exclusive attempt already refuses when a
+/// shared lock is held (a job dispatched against a live database), but that
+/// only works if some runtime is actually holding one. Without this call,
+/// nothing on the postgres-ha side ever takes the shared lock, so a job
+/// dispatched against a live HA member (a control-plane bug — the
+/// orchestrator is supposed to stop the leader before dispatching, this is
+/// the backstop for when it doesn't) finds the lock file uncontended and
+/// proceeds to `pg_upgrade` a data directory Postgres is actively writing to.
+///
+/// Returns `Ok(None)` (never fails the boot) when the lock cannot be taken for
+/// a reason unrelated to a live conflict — `flock` unavailable, or the file
+/// can't be opened (permissions, missing directory). The orchestrator's own
+/// exclusion remains the first line of defense; the backstop's own absence
+/// must not become a second reason to refuse a healthy boot. Returns `Err`
+/// only when the lock is genuinely held exclusively by a job right now — the
+/// one case the caller must refuse to boot over.
+///
+/// Also `Ok(None)` — without even creating the file — when PGDATA is the
+/// volume root and holds no PG_VERSION yet: creating the lock file inside an
+/// empty PGDATA makes docker-entrypoint conclude the database already exists
+/// (it checks `ls -A`), so initdb is skipped and the first boot crash-loops
+/// over a hidden dotfile. That layout can't take an in-place upgrade anyway
+/// (no sibling slot on the volume for the new data dir). Same guard, same
+/// two reasons as postgres-ssl's wrapper.sh.
+pub fn take_volume_upgrade_lock(
+    volume_root: &str,
+    pgdata: &str,
+) -> Result<Option<Flock<File>>, String> {
+    let pgdata_is_volume_root =
+        pgdata.trim_end_matches('/') == volume_root.trim_end_matches('/');
+    if pgdata_is_volume_root {
+        let pg_version = format!("{}/PG_VERSION", pgdata.trim_end_matches('/'));
+        if !std::path::Path::new(&pg_version).exists() {
+            tracing::info!(
+                pgdata = %pgdata,
+                "PGDATA is the volume root and uninitialized — skipping the upgrade lock \
+                 so the lock file can't make docker-entrypoint skip initdb"
+            );
+            return Ok(None);
+        }
+    }
+
+    let path = lock_path(volume_root);
+    let file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                path = %path,
+                error = %e,
+                "could not open the major-upgrade lock file; continuing without the upgrade lock"
+            );
+            return Ok(None);
+        }
+    };
+    match Flock::lock(file, FlockArg::LockSharedNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_file, Errno::EWOULDBLOCK)) => Err(format!(
+            "{path} is held by another process — a major version upgrade job is currently \
+             running against this volume. The database must not start until it finishes; retry \
+             the deploy once the upgrade completes."
+        )),
+        Err((_file, errno)) => {
+            tracing::warn!(
+                path = %path,
+                error = %errno,
+                "could not take the major-upgrade lock; continuing without it"
+            );
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,4 +561,96 @@ mod tests {
         assert!(image_major_from(root).is_none());
         assert!(image_major_from("/nonexistent-path-for-test").is_none());
     }
+
+    // ---- volume upgrade lock -------------------------------------------
+
+    #[test]
+    fn lock_taken_when_uncontended() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let lock = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
+        assert!(lock.is_some());
+    }
+
+    // Two shared holders must coexist — this mirrors two runtime containers
+    // (e.g. a crash-looping restart racing the previous instance's teardown),
+    // never the job, which always takes an EXCLUSIVE lock.
+    #[test]
+    fn lock_shared_by_two_concurrent_holders() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let first = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
+        assert!(first.is_some());
+        let second = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
+        assert!(second.is_some());
+    }
+
+    // The exact scenario this function exists to catch: an upgrade job
+    // (exclusive, non-blocking — mirroring upgrade-job.sh's take_job_lock)
+    // already holds the lock, so the runtime's shared attempt must refuse
+    // instead of silently proceeding to boot Postgres over a volume mid-job.
+    #[test]
+    fn lock_refused_while_job_holds_it_exclusively() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let job_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(lock_path(root))
+            .unwrap();
+        let _job_lock = Flock::lock(job_file, FlockArg::LockExclusiveNonblock).unwrap();
+
+        let result = take_volume_upgrade_lock(root, &format!("{root}/pgdata"));
+        assert!(result.is_err(), "expected the shared lock attempt to refuse");
+        assert!(result.unwrap_err().contains("held by another process"));
+    }
+
+    // Releasing the lock (drop) must let a subsequent exclusive attempt (the
+    // job's own take) succeed — proves this isn't a leak.
+    #[test]
+    fn lock_release_on_drop_unblocks_a_later_exclusive_take() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        {
+            let _lock = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
+        } // dropped here
+
+        let job_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(lock_path(root))
+            .unwrap();
+        assert!(Flock::lock(job_file, FlockArg::LockExclusiveNonblock).is_ok());
+    }
+    // PGDATA at the volume root with no PG_VERSION = a first boot whose
+    // initdb docker-entrypoint decides by `ls -A "$PGDATA"` — creating the
+    // lock file there would make an empty database directory look non-empty,
+    // skip initdb, and crash-loop the container over a hidden dotfile. The
+    // guard must skip the lock AND leave no file behind.
+    #[test]
+    fn root_layout_first_boot_skips_lock_and_creates_no_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        let lock = take_volume_upgrade_lock(root, root).unwrap();
+        assert!(lock.is_none(), "expected the guard to skip the lock");
+        assert!(
+            !Path::new(&lock_path(root)).exists(),
+            "the guard must not create the lock file inside an empty PGDATA"
+        );
+    }
+
+    // An INITIALIZED root-layout database (PG_VERSION present) is past the
+    // initdb hazard: the lock must be taken normally — this is the legacy
+    // postgres-ssl layout the backstop still has to protect.
+    #[test]
+    fn root_layout_initialized_takes_the_lock() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(format!("{root}/PG_VERSION"), "16\n").unwrap();
+
+        let lock = take_volume_upgrade_lock(root, root).unwrap();
+        assert!(lock.is_some(), "initialized root layout must take the lock");
+    }
 }
+
