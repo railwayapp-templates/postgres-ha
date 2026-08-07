@@ -1584,7 +1584,10 @@ async fn async_main() -> Result<()> {
     // on exit either way. Checked before the marker/version guards below: if
     // a job holds the volume right now, that refusal is more informative than
     // whatever the marker happens to say mid-job.
-    let _upgrade_volume_lock = match major_upgrade::take_volume_upgrade_lock(&volume_root) {
+    let _upgrade_volume_lock = match major_upgrade::take_volume_upgrade_lock(
+        &volume_root,
+        &postgres_patroni::pgdata(),
+    ) {
         Ok(lock) => lock,
         Err(reason) => {
             telemetry.send(TelemetryEvent::MajorUpgradeBootRefused {

@@ -310,7 +310,32 @@ pub fn lock_path(volume_root: &str) -> String {
 /// must not become a second reason to refuse a healthy boot. Returns `Err`
 /// only when the lock is genuinely held exclusively by a job right now — the
 /// one case the caller must refuse to boot over.
-pub fn take_volume_upgrade_lock(volume_root: &str) -> Result<Option<Flock<File>>, String> {
+///
+/// Also `Ok(None)` — without even creating the file — when PGDATA is the
+/// volume root and holds no PG_VERSION yet: creating the lock file inside an
+/// empty PGDATA makes docker-entrypoint conclude the database already exists
+/// (it checks `ls -A`), so initdb is skipped and the first boot crash-loops
+/// over a hidden dotfile. That layout can't take an in-place upgrade anyway
+/// (no sibling slot on the volume for the new data dir). Same guard, same
+/// two reasons as postgres-ssl's wrapper.sh.
+pub fn take_volume_upgrade_lock(
+    volume_root: &str,
+    pgdata: &str,
+) -> Result<Option<Flock<File>>, String> {
+    let pgdata_is_volume_root =
+        pgdata.trim_end_matches('/') == volume_root.trim_end_matches('/');
+    if pgdata_is_volume_root {
+        let pg_version = format!("{}/PG_VERSION", pgdata.trim_end_matches('/'));
+        if !std::path::Path::new(&pg_version).exists() {
+            tracing::info!(
+                pgdata = %pgdata,
+                "PGDATA is the volume root and uninitialized — skipping the upgrade lock \
+                 so the lock file can't make docker-entrypoint skip initdb"
+            );
+            return Ok(None);
+        }
+    }
+
     let path = lock_path(volume_root);
     let file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
@@ -543,7 +568,7 @@ mod tests {
     fn lock_taken_when_uncontended() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let lock = take_volume_upgrade_lock(root).unwrap();
+        let lock = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
         assert!(lock.is_some());
     }
 
@@ -554,9 +579,9 @@ mod tests {
     fn lock_shared_by_two_concurrent_holders() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let first = take_volume_upgrade_lock(root).unwrap();
+        let first = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
         assert!(first.is_some());
-        let second = take_volume_upgrade_lock(root).unwrap();
+        let second = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
         assert!(second.is_some());
     }
 
@@ -575,7 +600,7 @@ mod tests {
             .unwrap();
         let _job_lock = Flock::lock(job_file, FlockArg::LockExclusiveNonblock).unwrap();
 
-        let result = take_volume_upgrade_lock(root);
+        let result = take_volume_upgrade_lock(root, &format!("{root}/pgdata"));
         assert!(result.is_err(), "expected the shared lock attempt to refuse");
         assert!(result.unwrap_err().contains("held by another process"));
     }
@@ -587,7 +612,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         {
-            let _lock = take_volume_upgrade_lock(root).unwrap();
+            let _lock = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
         } // dropped here
 
         let job_file = OpenOptions::new()
@@ -597,4 +622,35 @@ mod tests {
             .unwrap();
         assert!(Flock::lock(job_file, FlockArg::LockExclusiveNonblock).is_ok());
     }
+    // PGDATA at the volume root with no PG_VERSION = a first boot whose
+    // initdb docker-entrypoint decides by `ls -A "$PGDATA"` — creating the
+    // lock file there would make an empty database directory look non-empty,
+    // skip initdb, and crash-loop the container over a hidden dotfile. The
+    // guard must skip the lock AND leave no file behind.
+    #[test]
+    fn root_layout_first_boot_skips_lock_and_creates_no_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        let lock = take_volume_upgrade_lock(root, root).unwrap();
+        assert!(lock.is_none(), "expected the guard to skip the lock");
+        assert!(
+            !Path::new(&lock_path(root)).exists(),
+            "the guard must not create the lock file inside an empty PGDATA"
+        );
+    }
+
+    // An INITIALIZED root-layout database (PG_VERSION present) is past the
+    // initdb hazard: the lock must be taken normally — this is the legacy
+    // postgres-ssl layout the backstop still has to protect.
+    #[test]
+    fn root_layout_initialized_takes_the_lock() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(format!("{root}/PG_VERSION"), "16\n").unwrap();
+
+        let lock = take_volume_upgrade_lock(root, root).unwrap();
+        assert!(lock.is_some(), "initialized root layout must take the lock");
+    }
 }
+

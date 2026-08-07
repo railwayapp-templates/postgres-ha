@@ -10,11 +10,15 @@ use postgres_patroni::{
     cert_expires_within, ensure_pg_stat_statements, is_patroni_enabled, is_valid_x509v3_cert,
     major_upgrade, pgdata, ssl_dir, sudo_command, volume_root, EXPECTED_VOLUME_MOUNT_PATH,
 };
+use nix::sys::signal::{SigHandler, Signal};
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::Pid;
 use std::env;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
@@ -126,16 +130,24 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Shared, container-lifetime flock on the SAME lock file upgrade-job.sh
-    // takes exclusively for its own run (see major_upgrade::
-    // take_volume_upgrade_lock). Bound here so it lives for the rest of
-    // main() — including across the exec into patroni-runner below, which
-    // inherits the open fd (exec doesn't close it absent O_CLOEXEC), so the
-    // lock is held continuously with no gap between the two binaries. Before
-    // the mode fork, like the version guard below, so BOTH modes are covered
-    // and the standalone path (which never runs patroni-runner at all) is
-    // the one that actually depends on THIS call to hold the lock at all.
-    let _upgrade_volume_lock = match major_upgrade::take_volume_upgrade_lock(&volume_root()) {
+    // Shared flock on the SAME lock file upgrade-job.sh takes exclusively for
+    // its own run (see major_upgrade::take_volume_upgrade_lock). The fd — like
+    // every fd Rust's std opens — is O_CLOEXEC, so this lock does NOT survive
+    // an exec; what it buys each mode differs:
+    //
+    // - Patroni mode execs into patroni-runner below, releasing this lock at
+    //   the handoff. That is fine BY DESIGN: the runner re-takes it first
+    //   thing in async_main and holds it for the container's lifetime, and a
+    //   job that wins the race in the gap makes the runner refuse boot —
+    //   fail-stop in the safe direction.
+    // - Standalone mode has no second binary: the branch below stays resident
+    //   as the lock holder for as long as Postgres runs (it spawns
+    //   docker-entrypoint as a CHILD, never execs — see the comment there).
+    //
+    // Taken before the mode fork, like the version guard below, so a job
+    // holding the volume right now refuses BOTH modes with the same message.
+    let _upgrade_volume_lock =
+        match major_upgrade::take_volume_upgrade_lock(&volume_root(), &pgdata) {
         Ok(lock) => lock,
         Err(reason) => {
             error!("{reason}");
@@ -331,8 +343,74 @@ async fn main() -> Result<()> {
             cmd.stderr(Stdio::inherit());
         }
 
-        let err = cmd.exec();
-        Err(anyhow!("Failed to exec docker-entrypoint.sh: {}", err))
+        // Spawn docker-entrypoint as a CHILD and stay resident — never exec.
+        // The volume-upgrade lock's fd is O_CLOEXEC (std opens every fd that
+        // way), so an exec here would release the flock at the moment of
+        // handoff and leave the entire life of standalone Postgres
+        // unprotected against an upgrade job. Holding it from a process that
+        // stays alive is the same design postgres-ssl's wrapper.sh documents
+        // ("opened by THIS shell, which stays alive as PID 1 —
+        // docker-entrypoint.sh below is a child, not an exec").
+        //
+        // Staying resident makes this process the container's long-lived
+        // PID 1, so it also inherits every orphaned descendant; the
+        // waitpid(-1) loop reaps them. Blanket reaping is safe here for the
+        // same reason patroni_runner's mini-init argues: this process has
+        // exactly one direct child left (every earlier subprocess was awaited
+        // to completion above), so waitpid(-1) can only ever collect that
+        // child or orphans. Terminal signals forward raw to the child
+        // (async-signal-safe: atomic load + kill), and the child's exit
+        // status is propagated as ours.
+        let child = cmd
+            .spawn()
+            .context("Failed to spawn docker-entrypoint.sh")?;
+        STANDALONE_CHILD.store(child.id() as i32, Ordering::Relaxed);
+        for sig in [
+            Signal::SIGTERM,
+            Signal::SIGINT,
+            Signal::SIGQUIT,
+            Signal::SIGHUP,
+        ] {
+            // SAFETY: handler is async-signal-safe (atomic load + kill).
+            unsafe {
+                let _ = nix::sys::signal::signal(sig, SigHandler::Handler(standalone_forward));
+            }
+        }
+
+        let child_pid = Pid::from_raw(child.id() as i32);
+        loop {
+            match waitpid(Pid::from_raw(-1), None) {
+                Ok(WaitStatus::Exited(pid, code)) if pid == child_pid => {
+                    std::process::exit(code)
+                }
+                Ok(WaitStatus::Signaled(pid, sig, _)) if pid == child_pid => {
+                    std::process::exit(128 + sig as i32)
+                }
+                // An orphan reaped — the point of standing here.
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => {}
+                // No children at all: the real child is gone without us
+                // seeing its status (should not happen; don't spin on it).
+                Err(nix::errno::Errno::ECHILD) => std::process::exit(0),
+                Err(e) => {
+                    error!("standalone supervisor: waitpid failed: {e}; exiting");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// PID of the spawned docker-entrypoint child, for the standalone
+/// supervisor's signal-forwarding handler. Written exactly once, before the
+/// handlers are installed. Mirrors patroni_runner's MINI_INIT_CHILD.
+static STANDALONE_CHILD: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn standalone_forward(sig: nix::libc::c_int) {
+    let pid = STANDALONE_CHILD.load(Ordering::Relaxed);
+    if pid > 0 {
+        // Async-signal-safe: raw kill only.
+        unsafe { nix::libc::kill(pid, sig) };
     }
 }
 
