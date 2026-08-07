@@ -126,6 +126,27 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // Shared, container-lifetime flock on the SAME lock file upgrade-job.sh
+    // takes exclusively for its own run (see major_upgrade::
+    // take_volume_upgrade_lock). Bound here so it lives for the rest of
+    // main() — including across the exec into patroni-runner below, which
+    // inherits the open fd (exec doesn't close it absent O_CLOEXEC), so the
+    // lock is held continuously with no gap between the two binaries. Before
+    // the mode fork, like the version guard below, so BOTH modes are covered
+    // and the standalone path (which never runs patroni-runner at all) is
+    // the one that actually depends on THIS call to hold the lock at all.
+    let _upgrade_volume_lock = match major_upgrade::take_volume_upgrade_lock(&volume_root()) {
+        Ok(lock) => lock,
+        Err(reason) => {
+            error!("{reason}");
+            telemetry.send(TelemetryEvent::MajorUpgradeBootRefused {
+                node: String::env_or("PATRONI_NAME", "unknown"),
+                reason,
+            });
+            std::process::exit(1);
+        }
+    };
+
     // Major-upgrade boot guard, before the mode fork so BOTH modes are
     // covered. Patroni mode re-checks in patroni-runner, but the standalone
     // branch below execs straight into docker-entrypoint, which would initdb

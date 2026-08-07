@@ -1575,6 +1575,26 @@ async fn async_main() -> Result<()> {
     // user-set PG_MAJOR service variable can't refuse a healthy boot.
     // Unknown means the version guard abstains rather than guessing.
     let volume_root = volume_root();
+
+    // Shared, container-lifetime flock on the SAME lock file upgrade-job.sh
+    // takes exclusively for its own run (see major_upgrade::
+    // take_volume_upgrade_lock). Bound to `_upgrade_volume_lock` so it lives
+    // for the rest of this function — i.e. for as long as this process is
+    // running Patroni/Postgres against the volume — and releases automatically
+    // on exit either way. Checked before the marker/version guards below: if
+    // a job holds the volume right now, that refusal is more informative than
+    // whatever the marker happens to say mid-job.
+    let _upgrade_volume_lock = match major_upgrade::take_volume_upgrade_lock(&volume_root) {
+        Ok(lock) => lock,
+        Err(reason) => {
+            telemetry.send(TelemetryEvent::MajorUpgradeBootRefused {
+                node: env::var("PATRONI_NAME").unwrap_or_else(|_| "unknown".to_string()),
+                reason: reason.clone(),
+            });
+            anyhow::bail!("{reason}");
+        }
+    };
+
     let image_major = major_upgrade::image_major();
     if let Some(reason) = major_upgrade::boot_refusal_reason(
         &volume_root,
