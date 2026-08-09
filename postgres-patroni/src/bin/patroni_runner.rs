@@ -1852,9 +1852,12 @@ async fn async_main() -> Result<()> {
     // Without this, container environments may create files too permissive for PostgreSQL
     umask(Mode::from_bits_truncate(0o077));
 
-    // Start health server for HAProxy health checks
-    // This runs independently and queries PostgreSQL directly for primary/replica status
-    let _health_handle = health_server::start(health_config).await?;
+    // Start health server for HAProxy health checks, supervised — HAProxy
+    // builds BOTH backends from its /primary and /replica answers, so it must
+    // outlive any single bind/serve failure or panic instead of dying with
+    // its (previously discarded) task handle.
+    // It runs independently and queries PostgreSQL directly for primary/replica status
+    health_server::spawn(health_config, telemetry.clone());
 
     // Start Patroni and run monitoring loop
     let child = start_patroni().await?;
