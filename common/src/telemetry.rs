@@ -528,6 +528,11 @@ pub struct Telemetry {
     environment_id: String,
     service_id: String,
     component: String,
+    /// Off-Railway (local dev, the e2e harness) telemetry is a no-op: the
+    /// default endpoint is production backboard, and test events with empty
+    /// resource ids are pure noise there. Same gate as redis-ha (#21) and
+    /// mysql-ha.
+    enabled: bool,
 }
 
 impl Telemetry {
@@ -538,6 +543,9 @@ impl Telemetry {
             .build()
             .unwrap_or_else(|_| Client::new());
 
+        let enabled = RailwayEnv::is_railway();
+        info!(component, enabled, "telemetry initialized");
+
         Self {
             client: Arc::new(client),
             endpoint: RailwayEnv::graphql_endpoint(),
@@ -545,49 +553,208 @@ impl Telemetry {
             environment_id: RailwayEnv::environment_id(),
             service_id: RailwayEnv::service_id(),
             component: component.to_string(),
+            enabled,
         }
     }
 
-    /// Send a telemetry event synchronously.
-    ///
-    /// Blocks until the event is sent. Errors are logged but do not affect the caller.
-    pub fn send(&self, event: TelemetryEvent) {
-        let event_type = event.event_type();
-        let message = event.message();
-        let metadata = serde_json::to_string(&event).unwrap_or_default();
-
-        info!(event = %event_type, "{}", message);
-
-        let payload = json!({
+    /// The GraphQL request body. Split out so a test can pin the contract —
+    /// the shape is what broke silently in redis-ha's history (a mutation
+    /// backboard never served, rejected on every send with nobody noticing).
+    fn build_payload(&self, event: &TelemetryEvent) -> serde_json::Value {
+        json!({
             "query": "mutation telemetrySend($input: TelemetrySendInput!) { telemetrySend(input: $input) }",
             "variables": {
                 "input": {
-                    "command": event_type,
-                    "error": message,
-                    "stacktrace": metadata,
+                    "command": event.event_type(),
+                    "error": event.message(),
+                    "stacktrace": serde_json::to_string(&event).unwrap_or_default(),
                     "projectId": self.project_id,
                     "environmentId": self.environment_id,
                     "serviceId": self.service_id,
                     "version": self.component
                 }
             }
-        });
+        })
+    }
 
-        match self.client
-            .post(&self.endpoint)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-        {
-            Ok(resp) if resp.status().is_success() => {
-                // Success - no action needed
-            }
-            Ok(resp) => {
-                warn!("Telemetry got status {}", resp.status());
-            }
-            Err(e) => {
-                warn!("Telemetry send failed: {}", e);
+    /// Send a telemetry event synchronously.
+    ///
+    /// Blocks until the event is sent. Errors are logged but do not affect
+    /// the caller. The first event a node sends is ~100ms into the
+    /// container's life, when egress isn't ready yet — one delayed retry
+    /// clears that startup race (only TRANSPORT errors retry; a rejection is
+    /// deterministic and retrying it just doubles the noise). A GraphQL
+    /// rejection arrives as HTTP 200 with an `errors` array, so the status
+    /// alone can't tell success from rejection — `classify` reads the body.
+    pub fn send(&self, event: TelemetryEvent) {
+        let event_type = event.event_type();
+        info!(event = %event_type, "{}", event.message());
+
+        if !self.enabled {
+            tracing::debug!(event = %event_type, "telemetry disabled off-Railway");
+            return;
+        }
+        let payload = self.build_payload(&event);
+
+        for attempt in 1..=SEND_ATTEMPTS {
+            match self
+                .client
+                .post(&self.endpoint)
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().unwrap_or_default();
+                    match classify(status.as_u16(), &body) {
+                        SendOutcome::Sent => {
+                            info!(event = %event_type, attempt, "telemetry sent")
+                        }
+                        SendOutcome::Rejected(why) => {
+                            warn!(event = %event_type, %status, reason = %why, body = %truncate(&body), "telemetry rejected")
+                        }
+                    }
+                    return;
+                }
+                Err(e) if attempt < SEND_ATTEMPTS => {
+                    warn!(event = %event_type, attempt, error = %e, "telemetry send failed, retrying");
+                    std::thread::sleep(RETRY_DELAY);
+                }
+                Err(e) => {
+                    warn!(event = %event_type, attempt, error = %e, "telemetry send failed")
+                }
             }
         }
+    }
+}
+
+/// One retry: the failure this exists for is a startup race, not a flaky
+/// endpoint, and `send` blocks the caller.
+const SEND_ATTEMPTS: u32 = 2;
+const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    Sent,
+    Rejected(&'static str),
+}
+
+/// A GraphQL error is a 200 with an `errors` array, so the status alone
+/// cannot tell success from a rejected request.
+fn classify(status: u16, body: &str) -> SendOutcome {
+    if !(200..300).contains(&status) {
+        return SendOutcome::Rejected("http status");
+    }
+    if body.contains("\"errors\"") {
+        return SendOutcome::Rejected("graphql errors");
+    }
+    SendOutcome::Sent
+}
+
+/// Keep a rejection body loggable without dumping a whole HTML error page.
+/// The cut backs up to a char boundary — slicing a multi-byte character in
+/// half panics, and a panic in the error-reporting path is the worst place
+/// to have one.
+fn truncate(body: &str) -> String {
+    const MAX: usize = 300;
+    if body.len() <= MAX {
+        return body.to_string();
+    }
+    let mut end = MAX;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &body[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn telemetry_for_tests() -> Telemetry {
+        Telemetry {
+            client: Arc::new(Client::builder().build().unwrap()),
+            endpoint: "http://localhost:0/graphql/internal".to_string(),
+            project_id: "proj-1".to_string(),
+            environment_id: "env-1".to_string(),
+            service_id: "svc-1".to_string(),
+            component: "postgres-patroni".to_string(),
+            enabled: true,
+        }
+    }
+
+    /// Pin the mutation backboard actually serves — an image calling a
+    /// nonexistent mutation has every event silently rejected when only the
+    /// transport result is checked (redis-ha lived that for months).
+    #[test]
+    fn payload_targets_the_mutation_backboard_serves() {
+        let telemetry = telemetry_for_tests();
+        let event = TelemetryEvent::ComponentError {
+            component: "postgres-patroni".into(),
+            error: "boom".into(),
+            context: "startup".into(),
+        };
+        let payload = telemetry.build_payload(&event);
+        let query = payload["query"].as_str().unwrap();
+        assert!(query.contains("telemetrySend("));
+        assert!(query.contains("$input: TelemetrySendInput!"));
+
+        let input = &payload["variables"]["input"];
+        for field in ["command", "error", "stacktrace"] {
+            assert!(!input[field].as_str().unwrap().is_empty(), "{field} empty");
+        }
+        assert_eq!(input["projectId"], "proj-1");
+        assert_eq!(input["serviceId"], "svc-1");
+    }
+
+    /// The exact confusion that hid a broken contract in redis-ha: GraphQL
+    /// answers a rejected request with HTTP 200 and an `errors` array.
+    #[test]
+    fn a_200_with_graphql_errors_is_a_rejection() {
+        assert_eq!(
+            classify(200, r#"{"errors":[{"message":"Cannot query field"}]}"#),
+            SendOutcome::Rejected("graphql errors")
+        );
+        assert_eq!(
+            classify(200, r#"{"data":{"telemetrySend":true}}"#),
+            SendOutcome::Sent
+        );
+        assert_eq!(classify(400, "bad request"), SendOutcome::Rejected("http status"));
+    }
+
+    /// A body that merely mentions the word must not be read as a rejection.
+    #[test]
+    fn success_bodies_are_not_misread_as_rejections() {
+        assert_eq!(
+            classify(200, r#"{"data":{"telemetrySend":true},"note":"no errors here"}"#),
+            SendOutcome::Sent
+        );
+    }
+
+    /// Retries exist for the boot-time egress race only, and `send` blocks
+    /// callers — so the budget stays at one retry.
+    #[test]
+    fn retry_budget_stays_bounded() {
+        assert_eq!(SEND_ATTEMPTS, 2);
+        assert!(RETRY_DELAY <= Duration::from_secs(3));
+    }
+
+    #[test]
+    fn truncate_keeps_bodies_loggable() {
+        assert_eq!(truncate("short"), "short");
+        let long = "x".repeat(400);
+        let out = truncate(&long);
+        assert!(out.len() < 400 && out.ends_with('…'));
+    }
+
+    /// A multi-byte character straddling the cut must not panic the
+    /// error-reporting path (str slicing panics off a char boundary).
+    #[test]
+    fn truncate_never_splits_a_multibyte_character() {
+        let body = format!("{}日本語のエラー", "x".repeat(299));
+        assert!(truncate(&body).ends_with('…'));
+        let body = "é".repeat(400);
+        assert!(truncate(&body).ends_with('…'));
     }
 }
