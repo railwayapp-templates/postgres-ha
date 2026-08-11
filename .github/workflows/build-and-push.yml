@@ -1,9 +1,12 @@
 name: Build and Push Docker Images
 
 on:
-  # Run weekly on Mondays at midnight UTC
+  # Run daily at midnight UTC. Daily (not weekly) keeps the floating tags
+  # fresh: Postgres patch releases, base-image security fixes, and wrapper
+  # changes reach :14–:18 (and etcd/haproxy) within a day instead of up to a
+  # week. The changes filter plus registry build cache keep no-op runs cheap.
   schedule:
-    - cron: '0 0 * * 1'
+    - cron: '0 0 * * *'
   # Allow manual trigger
   workflow_dispatch:
   # Build on push to main
