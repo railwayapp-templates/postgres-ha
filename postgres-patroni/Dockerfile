@@ -54,12 +54,16 @@ FROM postgres:${POSTGRES_IMAGE_TAG} AS ha
 ARG PATRONI_VERSION=4.1.0
 
 ARG POSTGRES_VERSION
-# Bumped by CI once per scheduled run: upstream never re-mints a superseded
-# patch tag, so without this the apt/pip layers of a pinned old minor would
-# stay build-cached forever and OS/security updates would never reach it.
+# CI passes its content key here (see the build workflow's content gate):
+# the value only changes when the repo code, the upstream base, or Debian's
+# pending-security-fix set moved, so this layer re-runs exactly when there is
+# something to pick up — and stays byte-cached (stable digest) otherwise.
+# Upstream never re-mints a superseded patch tag, so the apt-get upgrade
+# below is the only way OS security updates reach a pinned old minor.
 ARG APT_REFRESH=none
-RUN echo "apt refresh stamp: ${APT_REFRESH}" \
-    && apt-get update && apt-get install -y --no-install-recommends \
+RUN echo "refresh key: ${APT_REFRESH}" \
+    && apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
     openssl \
     sudo \
     python3 \
