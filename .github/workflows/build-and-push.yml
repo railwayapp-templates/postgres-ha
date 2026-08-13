@@ -5,6 +5,9 @@ on:
   # fresh: Postgres patch releases, base-image security fixes, and wrapper
   # changes reach :14–:18 (and etcd/haproxy) within a day instead of up to a
   # week. The changes filter plus registry build cache keep no-op runs cheap.
+  # Every published per-minor tag (:16.12, :18.3, ...) is rebuilt on the same
+  # cadence — see discover-postgres-minors — so a cluster PINNED to an old
+  # minor keeps receiving wrapper fixes and CVE-refreshed layers too.
   schedule:
     - cron: '0 0 * * *'
   # Allow manual trigger
@@ -173,9 +176,84 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/haproxy-rust-binaries:latest
           cache-to: type=inline
 
-  # Build postgres-patroni for AMD64 (depends only on amd64 rust binaries)
+  # Which postgres minors to build. Two sources, unioned:
+  #   1. every per-minor tag already published on ghcr — the PINNABLE surface.
+  #      Upstream never re-mints a superseded patch tag, so a cluster pinned
+  #      to :16.12 only receives wrapper fixes and CVE-refreshed layers if WE
+  #      keep rebuilding that tag (the same reason redis-ha/mysql-ha build
+  #      every minor series continuously);
+  #   2. the newest upstream minor of every supported major, so a fresh patch
+  #      release enters the set the day it ships.
+  # Fails closed: a registry listing error or an unresolvable major aborts
+  # the run rather than silently building a shrunken set.
+  discover-postgres-minors:
+    needs: changes
+    if: ${{ needs.changes.outputs.postgres == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+    steps:
+      - name: Discover minors to build
+        id: discover
+        run: |
+          set -euo pipefail
+
+          SUPPORTED_MAJORS="14 15 16 17 18"
+
+          # Newest upstream minor per supported major, via the Docker
+          # Registry v2 API (registry-1.docker.io) — the Hub website API
+          # hard-blocks shared GitHub runner IPs with persistent 403s.
+          HUB_TOKEN=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/postgres:pull" \
+            | jq -r .token)
+          [ -n "$HUB_TOKEN" ] && [ "$HUB_TOKEN" != "null" ]
+          UPSTREAM_MINORS=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -H "Authorization: Bearer $HUB_TOKEN" \
+            "https://registry-1.docker.io/v2/library/postgres/tags/list?n=10000" \
+            | jq -r '.tags[]' | grep -E '^[0-9]+\.[0-9]+$')
+
+          # Every per-minor tag we have ever published (anonymous pull token —
+          # the package is public).
+          GHCR_TOKEN=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://ghcr.io/token?scope=repository:${{ github.repository }}/postgres-patroni:pull" \
+            | jq -r .token)
+          [ -n "$GHCR_TOKEN" ] && [ "$GHCR_TOKEN" != "null" ]
+          PUBLISHED_MINORS=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -H "Authorization: Bearer $GHCR_TOKEN" \
+            "https://ghcr.io/v2/${{ github.repository }}/postgres-patroni/tags/list?n=10000" \
+            | jq -r '.tags[]' | grep -E '^[0-9]+\.[0-9]+$' || true)
+
+          INCLUDE="[]"
+          for MAJOR in $SUPPORTED_MAJORS; do
+            LATEST=$(printf '%s\n' "$UPSTREAM_MINORS" | grep -E "^${MAJOR}\.[0-9]+$" | sort -V | tail -1)
+            if [ -z "$LATEST" ]; then
+              echo "::error::no upstream minor resolved for major ${MAJOR} — refusing to shrink the build set"
+              exit 1
+            fi
+            MINORS=$( { printf '%s\n' "$PUBLISHED_MINORS" | grep -E "^${MAJOR}\.[0-9]+$" || true; echo "$LATEST"; } | sort -uV)
+            for MINOR in $MINORS; do
+              IS_LATEST=$([ "$MINOR" = "$LATEST" ] && echo true || echo false)
+              INCLUDE=$(jq -c --arg major "$MAJOR" --arg minor "$MINOR" --argjson latest "$IS_LATEST" \
+                '. + [{major: $major, minor: $minor, latest: $latest}]' <<<"$INCLUDE")
+            done
+          done
+
+          # Published minors outside the supported majors stay frozen on
+          # purpose (e.g. a tag from a since-retired major) — say so instead
+          # of dropping them silently.
+          printf '%s\n' "$PUBLISHED_MINORS" \
+            | grep -vE "^($(echo $SUPPORTED_MAJORS | tr ' ' '|'))\." \
+            | sed 's/^/::warning::published minor tag outside supported majors, NOT rebuilt: /' || true
+
+          COUNT=$(jq 'length' <<<"$INCLUDE")
+          echo "building ${COUNT} minors: $(jq -r '[.[].minor] | join(", ")' <<<"$INCLUDE")"
+          echo "matrix=$(jq -c '{include: .}' <<<"$INCLUDE")" >> "$GITHUB_OUTPUT"
+
+  # Build postgres-patroni for AMD64 (depends only on amd64 rust binaries).
+  # One job per discovered minor: the minor tag is always pushed; the major
+  # tag (and :latest) rides along on whichever minor is that major's newest.
   build-postgres-patroni-amd64:
-    needs: [changes, build-rust-binaries-postgres-amd64]
+    needs: [changes, build-rust-binaries-postgres-amd64, discover-postgres-minors]
     if: ${{ needs.changes.outputs.postgres == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
@@ -183,21 +261,14 @@ jobs:
       packages: write
 
     strategy:
-      matrix:
-        postgres_major: [14, 15, 16, 17, 18]
+      # A single minor failing to build must not cancel the backfill of the
+      # rest of the pinnable surface.
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-postgres-minors.outputs.matrix) }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Get PostgreSQL minor version
-        id: pg_version
-        run: |
-          cd postgres-patroni
-          chmod +x get-postgres-version.sh
-          MINOR_VERSION=$(./get-postgres-version.sh ${{ matrix.postgres_major }})
-          echo "minor_version=${MINOR_VERSION}" >> $GITHUB_OUTPUT
-          echo "Building PostgreSQL ${MINOR_VERSION} for amd64"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -209,9 +280,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get short SHA
+      - name: Get short SHA and apt refresh stamp
         id: sha
-        run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+        run: |
+          echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+          # Daily stamp: busts the apt/pip layers once a day so OS/security
+          # updates reach minors whose upstream base is frozen (see the
+          # APT_REFRESH arg in the Dockerfile).
+          echo "stamp=$(date -u +%F)" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image for amd64
         uses: docker/build-push-action@v5
@@ -222,16 +298,18 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            POSTGRES_VERSION=${{ matrix.postgres_major }}
+            POSTGRES_VERSION=${{ matrix.major }}
+            POSTGRES_IMAGE_TAG=${{ matrix.minor }}
+            APT_REFRESH=${{ steps.sha.outputs.stamp }}
           build-contexts: |
             rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/postgres-rust-binaries:latest
           tags: |
-            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.postgres_major }}${{ env.BETA_SUFFIX }}
-            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.postgres_major }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
-            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ steps.pg_version.outputs.minor_version }}${{ env.BETA_SUFFIX }}
-            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ steps.pg_version.outputs.minor_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
-            ${{ matrix.postgres_major == env.LATEST_POSTGRES_MAJOR && format('{0}/postgres-patroni:latest{1}', env.IMAGE_PREFIX, env.BETA_SUFFIX) || '' }}
-          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.postgres_major }}
+            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.minor }}${{ env.BETA_SUFFIX }}
+            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.minor }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
+            ${{ matrix.latest && format('{0}/postgres-patroni:{1}{2}', env.IMAGE_PREFIX, matrix.major, env.BETA_SUFFIX) || '' }}
+            ${{ matrix.latest && format('{0}/postgres-patroni:{1}-{2}{3}', env.IMAGE_PREFIX, matrix.major, steps.sha.outputs.short, env.BETA_SUFFIX) || '' }}
+            ${{ matrix.latest && matrix.major == env.LATEST_POSTGRES_MAJOR && format('{0}/postgres-patroni:latest{1}', env.IMAGE_PREFIX, env.BETA_SUFFIX) || '' }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.minor }}
           cache-to: type=inline
 
   # Build etcd for AMD64 (depends only on amd64 etcd rust binaries)
