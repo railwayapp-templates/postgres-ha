@@ -35,9 +35,17 @@ FROM haproxy:${HAPROXY_VERSION}-alpine
 
 USER root
 
+# CI passes its content key here (see the build workflow's content gate):
+# the value only changes when the repo code, the upstream base, or alpine's
+# pending-security-fix set moved, so this layer re-runs exactly when there is
+# something to pick up — and stays byte-cached (stable digest) otherwise.
+ARG PKG_REFRESH=none
+
 # Install postgresql-client and bash for Railway's Database UI to work via SSH tunnel
 # (bash is required because the UI runs: bash +H -c 'psql ...')
-RUN apk add --no-cache postgresql-client bash
+RUN echo "refresh key: ${PKG_REFRESH}" \
+    && apk upgrade --no-cache \
+    && apk add --no-cache postgresql-client bash
 
 # Copy Rust binary
 COPY --from=rust-binaries --chmod=755 /haproxy-entrypoint /entrypoint
