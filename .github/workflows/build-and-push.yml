@@ -335,6 +335,11 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Push only the immutable sha tag here; the resolvable tags (:X.Y and,
+      # for the newest minor, :X / :latest) are minted below AFTER the
+      # bundled-version guard, so a build that bundles the wrong minor can
+      # never reach a tag the platform pins — the same guard redis-ha and
+      # mysql-ha already run.
       - name: Build and push Docker image for amd64
         if: steps.gate.outputs.changed == 'true'
         uses: docker/build-push-action@v5
@@ -353,13 +358,42 @@ jobs:
           build-contexts: |
             rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/postgres-rust-binaries:latest
           tags: |
-            ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.minor }}${{ env.BETA_SUFFIX }}
             ${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.minor }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
-            ${{ matrix.latest && format('{0}/postgres-patroni:{1}{2}', env.IMAGE_PREFIX, matrix.major, env.BETA_SUFFIX) || '' }}
-            ${{ matrix.latest && format('{0}/postgres-patroni:{1}-{2}{3}', env.IMAGE_PREFIX, matrix.major, steps.sha.outputs.short, env.BETA_SUFFIX) || '' }}
-            ${{ matrix.latest && matrix.major == env.LATEST_POSTGRES_MAJOR && format('{0}/postgres-patroni:latest{1}', env.IMAGE_PREFIX, env.BETA_SUFFIX) || '' }}
           cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/postgres-patroni:${{ matrix.minor }}
           cache-to: type=inline
+
+      # The tag IS the compatibility contract (a pin to :16.12 trusts that
+      # the image bundles Postgres 16.12), so refuse to publish a build
+      # whose bundled server is anything else rather than poison the tag —
+      # exactly what an unheld apt-get upgrade did once: PGDG always carries
+      # the major's newest minor, so the upgrade silently replaced the
+      # pinned server packages.
+      - name: Verify the bundled minor matches the matrix entry, then publish
+        if: steps.gate.outputs.changed == 'true'
+        run: |
+          IMG="${{ env.IMAGE_PREFIX }}/postgres-patroni"
+          img="$IMG:${{ matrix.minor }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
+          version=$(docker run --rm --entrypoint postgres "$img" --version)
+          echo "bundled: $version"
+          minor=$(echo "$version" | sed -nE 's/.*\(PostgreSQL\) ([0-9]+\.[0-9]+).*/\1/p')
+          if [ -z "$minor" ]; then
+            echo "could not parse a major.minor out of postgres --version" >&2
+            exit 1
+          fi
+          if [ "$minor" != "${{ matrix.minor }}" ]; then
+            echo "bundled minor $minor does not match matrix entry ${{ matrix.minor }}" >&2
+            exit 1
+          fi
+
+          tags="-t $IMG:${{ matrix.minor }}${{ env.BETA_SUFFIX }}"
+          if [ "${{ matrix.latest }}" = "true" ]; then
+            tags="$tags -t $IMG:${{ matrix.major }}${{ env.BETA_SUFFIX }}"
+            tags="$tags -t $IMG:${{ matrix.major }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
+            if [ "${{ matrix.major }}" = "${{ env.LATEST_POSTGRES_MAJOR }}" ]; then
+              tags="$tags -t $IMG:latest${{ env.BETA_SUFFIX }}"
+            fi
+          fi
+          docker buildx imagetools create $tags "$img"
 
       # Unchanged image: keep the per-commit pin tags and the major/latest
       # pointers current WITHOUT minting a new digest — imagetools create

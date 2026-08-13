@@ -61,7 +61,13 @@ ARG POSTGRES_VERSION
 # Upstream never re-mints a superseded patch tag, so the apt-get upgrade
 # below is the only way OS security updates reach a pinned old minor.
 ARG APT_REFRESH=none
+# apt-mark hold: the OS upgrade must never touch the packages that define
+# the bundled Postgres minor — PGDG's repo always carries the major's NEWEST
+# minor, so an unheld `apt-get upgrade` silently turns a pinned :16.12 image
+# into one that bundles 16.14, poisoning the tag's contract. Everything else
+# (glibc, openssl, libpq, ...) upgrades freely.
 RUN echo "refresh key: ${APT_REFRESH}" \
+    && apt-mark hold "postgresql-${POSTGRES_VERSION}" "postgresql-client-${POSTGRES_VERSION}" \
     && apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
     openssl \
@@ -71,6 +77,7 @@ RUN echo "refresh key: ${APT_REFRESH}" \
     curl \
     pgbackrest \
     postgresql-${POSTGRES_VERSION}-pgvector \
+    && apt-mark unhold "postgresql-${POSTGRES_VERSION}" "postgresql-client-${POSTGRES_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 # Allow postgres user to execute specific commands as root
