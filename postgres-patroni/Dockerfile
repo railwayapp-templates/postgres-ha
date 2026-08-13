@@ -10,6 +10,14 @@
 
 ARG POSTGRES_VERSION=18
 
+# Exact upstream tag to build FROM. Defaults to the (floating) major, so
+# every existing caller is unchanged; the per-minor CI builds pass e.g.
+# 16.12 so an already-published minor tag keeps being rebuilt from exactly
+# that upstream patch while still receiving new wrapper binaries and
+# refreshed apt/pip layers. POSTGRES_VERSION stays the MAJOR either way —
+# apt package names (postgresql-<major>-pgvector) are per-major only.
+ARG POSTGRES_IMAGE_TAG=${POSTGRES_VERSION}
+
 # ============================================================
 # Rust builder stage: Compile all Rust binaries (local builds)
 # ============================================================
@@ -41,12 +49,17 @@ COPY --from=rust-builder-local-output / /
 # ============================================================
 # Final stage: PostgreSQL with Patroni HA
 # ============================================================
-FROM postgres:${POSTGRES_VERSION} AS ha
+FROM postgres:${POSTGRES_IMAGE_TAG} AS ha
 
 ARG PATRONI_VERSION=4.1.0
 
 ARG POSTGRES_VERSION
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Bumped by CI once per scheduled run: upstream never re-mints a superseded
+# patch tag, so without this the apt/pip layers of a pinned old minor would
+# stay build-cached forever and OS/security updates would never reach it.
+ARG APT_REFRESH=none
+RUN echo "apt refresh stamp: ${APT_REFRESH}" \
+    && apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     sudo \
     python3 \
