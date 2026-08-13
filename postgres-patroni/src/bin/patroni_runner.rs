@@ -1576,6 +1576,17 @@ async fn async_main() -> Result<()> {
     // Unknown means the version guard abstains rather than guessing.
     let volume_root = volume_root();
 
+    // At most one node container runs against this volume at a time: wait
+    // for a previous container to release it before anything below touches
+    // the data directory (see volume_lock for the overlap rationale, and why
+    // the lock file is shared with the standalone postgres-ssl image). Bound
+    // for the rest of this function, same lifetime idiom as the upgrade lock
+    // below. Fail-stop on timeout — the restart policy retries the boot.
+    let _runtime_volume_lock = postgres_patroni::volume_lock::acquire_volume_runtime_lock(
+        &volume_root,
+        &postgres_patroni::pgdata(),
+    )?;
+
     // Shared, container-lifetime flock on the SAME lock file upgrade-job.sh
     // takes exclusively for its own run (see major_upgrade::
     // take_volume_upgrade_lock). Bound to `_upgrade_volume_lock` so it lives

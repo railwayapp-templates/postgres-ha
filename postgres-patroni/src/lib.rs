@@ -13,6 +13,7 @@ mod paths;
 pub mod patroni;
 pub mod pgbackrest;
 mod ssl;
+pub mod volume_lock;
 
 // Re-export path utilities
 pub use paths::{pgdata, ssl_dir, volume_root, EXPECTED_VOLUME_MOUNT_PATH};
