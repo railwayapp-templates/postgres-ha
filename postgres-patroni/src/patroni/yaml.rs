@@ -7,6 +7,23 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tracing::info;
 
+/// Escape a value for interpolation inside a double-quoted YAML scalar.
+///
+/// The credentials and app-database name rendered into patroni.yml are
+/// user-supplied; a `"` or `\` in a password spliced raw into `"{…}"` breaks
+/// the YAML (Patroni refuses the whole config) or silently truncates the
+/// value. Double-quoted YAML scalars take C-style escapes, so escaping the
+/// backslash, the quote, and the line-breaking controls round-trips every
+/// such value — `bootstrap::read_credentials` parses the same file back with
+/// serde_yaml and sees the original bytes.
+fn yaml_escape_double_quoted(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 /// Generate Patroni YAML configuration.
 ///
 /// `wal_level` is the level seeded into `bootstrap.dcs.postgresql.parameters`.
@@ -168,18 +185,18 @@ postgresql:
     on_role_change: /usr/local/bin/on-role-change
   authentication:
     replication:
-      username: "{repl_user}"
-      password: "{repl_pass}"
+      username: "{repl_user_dq}"
+      password: "{repl_pass_dq}"
     superuser:
-      username: "{superuser}"
-      password: "{superuser_pass}"
+      username: "{superuser_dq}"
+      password: "{superuser_pass_dq}"
     rewind:
-      username: "{superuser}"
-      password: "{superuser_pass}"
+      username: "{superuser_dq}"
+      password: "{superuser_pass_dq}"
   app_user:
-    username: "{app_user}"
-    password: "{app_pass}"
-    database: "{app_db}"
+    username: "{app_user_dq}"
+    password: "{app_pass_dq}"
+    database: "{app_db_dq}"
   parameters:
     unix_socket_directories: /var/run/postgresql
     ssl: "on"
@@ -194,13 +211,18 @@ postgresql:
         ttl = config.ttl,
         loop_wait = config.loop_wait,
         retry_timeout = config.retry_timeout,
+        // Raw occurrences (initdb username, pg_hba lines) are unquoted YAML
+        // scalars / hba tokens with their own syntax; the `_dq` variants are
+        // the ones rendered inside "…" and carry the double-quote escaping.
         superuser = config.superuser,
-        superuser_pass = config.superuser_pass,
         repl_user = config.repl_user,
-        repl_pass = config.repl_pass,
-        app_user = config.app_user,
-        app_pass = config.app_pass,
-        app_db = config.app_db,
+        superuser_dq = yaml_escape_double_quoted(&config.superuser),
+        superuser_pass_dq = yaml_escape_double_quoted(&config.superuser_pass),
+        repl_user_dq = yaml_escape_double_quoted(&config.repl_user),
+        repl_pass_dq = yaml_escape_double_quoted(&config.repl_pass),
+        app_user_dq = yaml_escape_double_quoted(&config.app_user),
+        app_pass_dq = yaml_escape_double_quoted(&config.app_pass),
+        app_db_dq = yaml_escape_double_quoted(&config.app_db),
         data_dir = config.data_dir,
         certs_dir = config.certs_dir,
         synchronous_mode = config.synchronous_mode,
@@ -378,5 +400,59 @@ mod tests {
         cfg.basebackup_max_rate = "64M".into();
         let yaml = generate_patroni_config(&cfg, "replica");
         assert!(yaml.contains("  basebackup:\n    max-rate: 64M\n    checkpoint: fast\n"));
+    }
+
+    #[test]
+    fn yaml_escape_handles_quotes_backslashes_and_controls() {
+        assert_eq!(yaml_escape_double_quoted("plain"), "plain");
+        assert_eq!(yaml_escape_double_quoted("pa\"ss"), "pa\\\"ss");
+        assert_eq!(yaml_escape_double_quoted(r"back\slash"), r"back\\slash");
+        // Backslash escaped first, so an already-escaped-looking input
+        // doesn't collapse: \" becomes \\\" (literal backslash + quote).
+        assert_eq!(yaml_escape_double_quoted("a\\\"b"), "a\\\\\\\"b");
+        assert_eq!(yaml_escape_double_quoted("li\nne"), "li\\nne");
+        assert_eq!(yaml_escape_double_quoted("ta\tb\rcr"), "ta\\tb\\rcr");
+    }
+
+    #[test]
+    fn hostile_credentials_round_trip_through_the_rendered_yaml() {
+        // The exact failure mode being fixed: a password with a `"` or `\`
+        // spliced raw into the double-quoted scalar broke patroni.yml (or
+        // truncated the value). The rendered YAML must parse, and
+        // serde_yaml — the same parser bootstrap::read_credentials uses on
+        // this very file — must hand back the original bytes.
+        let mut cfg = test_config(Some("bucket"));
+        cfg.superuser_pass = r#"su"per\pass"#.into();
+        cfg.repl_pass = r#"re"pl\\pass'"#.into();
+        cfg.app_user = r#"app"user"#.into();
+        cfg.app_pass = "app\\pass\"with$all'of\\\"it".into();
+        cfg.app_db = r#"my"db"#.into();
+
+        let yaml = generate_patroni_config(&cfg, "replica");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&yaml).expect("rendered patroni.yml must stay parseable");
+
+        let get = |path: &[&str]| -> String {
+            let mut v = &parsed;
+            for key in path {
+                v = v.get(key).unwrap_or_else(|| panic!("missing key {key}"));
+            }
+            v.as_str().expect("scalar").to_string()
+        };
+        assert_eq!(
+            get(&["postgresql", "authentication", "superuser", "password"]),
+            cfg.superuser_pass
+        );
+        assert_eq!(
+            get(&["postgresql", "authentication", "rewind", "password"]),
+            cfg.superuser_pass
+        );
+        assert_eq!(
+            get(&["postgresql", "authentication", "replication", "password"]),
+            cfg.repl_pass
+        );
+        assert_eq!(get(&["postgresql", "app_user", "username"]), cfg.app_user);
+        assert_eq!(get(&["postgresql", "app_user", "password"]), cfg.app_pass);
+        assert_eq!(get(&["postgresql", "app_user", "database"]), cfg.app_db);
     }
 }

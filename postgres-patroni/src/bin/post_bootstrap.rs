@@ -7,7 +7,8 @@
 use anyhow::{Context, Result};
 use common::{init_logging, Telemetry, TelemetryEvent};
 use postgres_patroni::bootstrap::{
-    read_credentials, run_psql, run_psql_in_db, run_psql_script, PATRONI_CONFIG,
+    dollar_quote_tag, quote_ident, quote_literal, read_credentials, run_psql, run_psql_in_db,
+    run_psql_script, PATRONI_CONFIG,
 };
 use postgres_patroni::volume_root;
 use std::env;
@@ -64,63 +65,80 @@ fn main() -> Result<()> {
 
     info!(superuser = %creds.superuser, "Setting up users");
 
+    // Every credential below is spliced as a properly quoted SQL literal
+    // (quote_literal: ' doubled, wrapped in '…'), and the DO bodies use a
+    // dollar-quote tag chosen to appear in none of the values. Raw splicing
+    // used to mean a password containing a quote (or `$$`) terminated the
+    // literal — or the DO body itself — early: bootstrap aborted, and the
+    // failing statement, password included, landed in the server log via
+    // log_min_error_statement. RAISE NOTICE takes the names as % arguments
+    // for the same reason.
+    let tag = dollar_quote_tag(&[
+        &creds.superuser,
+        &creds.superuser_pass,
+        &creds.repl_user,
+        &creds.repl_pass,
+        &creds.app_user,
+        &creds.app_pass,
+    ]);
     let sql = format!(
         r#"
 SET password_encryption = 'scram-sha-256';
 
-DO $$
+DO {tag}
 BEGIN
-    EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', '{superuser}', '{superuser_pass}');
-    RAISE NOTICE 'Set password for superuser: {superuser}';
+    EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', {superuser}, {superuser_pass});
+    RAISE NOTICE 'Set password for superuser: %', {superuser};
 END
-$$;
+{tag};
 
-DO $$
+DO {tag}
 BEGIN
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{repl_user}') THEN
-        EXECUTE format('CREATE ROLE %I WITH REPLICATION LOGIN PASSWORD %L', '{repl_user}', '{repl_pass}');
-        RAISE NOTICE 'Created replication user: {repl_user}';
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {repl_user}) THEN
+        EXECUTE format('CREATE ROLE %I WITH REPLICATION LOGIN PASSWORD %L', {repl_user}, {repl_pass});
+        RAISE NOTICE 'Created replication user: %', {repl_user};
     ELSE
-        EXECUTE format('ALTER ROLE %I WITH REPLICATION LOGIN PASSWORD %L', '{repl_user}', '{repl_pass}');
-        RAISE NOTICE 'Updated replication user: {repl_user}';
+        EXECUTE format('ALTER ROLE %I WITH REPLICATION LOGIN PASSWORD %L', {repl_user}, {repl_pass});
+        RAISE NOTICE 'Updated replication user: %', {repl_user};
     END IF;
 END
-$$;
+{tag};
 
-DO $$
+DO {tag}
 BEGIN
-    IF '{app_user}' = '{superuser}' THEN
+    IF {app_user} = {superuser} THEN
         RAISE NOTICE 'App user same as superuser, skipping';
-    ELSIF '{app_user}' = '' OR '{app_pass}' = '' THEN
+    ELSIF {app_user} = '' OR {app_pass} = '' THEN
         RAISE NOTICE 'App user not configured, skipping';
-    ELSIF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{app_user}') THEN
-        EXECUTE format('CREATE ROLE %I WITH LOGIN PASSWORD %L', '{app_user}', '{app_pass}');
-        RAISE NOTICE 'Created app user: {app_user}';
+    ELSIF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {app_user}) THEN
+        EXECUTE format('CREATE ROLE %I WITH LOGIN PASSWORD %L', {app_user}, {app_pass});
+        RAISE NOTICE 'Created app user: %', {app_user};
     ELSE
-        EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', '{app_user}', '{app_pass}');
-        RAISE NOTICE 'Updated app user: {app_user}';
+        EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', {app_user}, {app_pass});
+        RAISE NOTICE 'Updated app user: %', {app_user};
     END IF;
 END
-$$;
+{tag};
 
-DO $$
+DO {tag}
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'postgres') THEN
-        EXECUTE format('CREATE ROLE postgres WITH SUPERUSER LOGIN PASSWORD %L', '{superuser_pass}');
+        EXECUTE format('CREATE ROLE postgres WITH SUPERUSER LOGIN PASSWORD %L', {superuser_pass});
         RAISE NOTICE 'Created postgres superuser for compatibility';
     ELSE
         ALTER ROLE postgres WITH SUPERUSER;
         RAISE NOTICE 'Ensured postgres has superuser privileges';
     END IF;
 END
-$$;
+{tag};
 "#,
-        superuser = creds.superuser,
-        superuser_pass = creds.superuser_pass,
-        repl_user = creds.repl_user,
-        repl_pass = creds.repl_pass,
-        app_user = creds.app_user,
-        app_pass = creds.app_pass,
+        tag = tag,
+        superuser = quote_literal(&creds.superuser),
+        superuser_pass = quote_literal(&creds.superuser_pass),
+        repl_user = quote_literal(&creds.repl_user),
+        repl_pass = quote_literal(&creds.repl_pass),
+        app_user = quote_literal(&creds.app_user),
+        app_pass = quote_literal(&creds.app_pass),
     );
 
     if let Err(e) = run_psql_script(&creds.superuser, &sql) {
@@ -140,8 +158,8 @@ $$;
         let db_exists = run_psql(
             &creds.superuser,
             &format!(
-                "SELECT 1 FROM pg_database WHERE datname = '{}'",
-                creds.app_db
+                "SELECT 1 FROM pg_database WHERE datname = {}",
+                quote_literal(&creds.app_db)
             ),
         )?;
 
@@ -149,21 +167,23 @@ $$;
             info!(database = %creds.app_db, "Creating app database");
             run_psql(
                 &creds.superuser,
-                &format!("CREATE DATABASE \"{}\"", creds.app_db),
+                &format!("CREATE DATABASE {}", quote_ident(&creds.app_db)),
             )?;
         }
 
         if !creds.app_user.is_empty() && creds.app_user != creds.superuser {
+            let grant_tag = dollar_quote_tag(&[&creds.app_db, &creds.app_user]);
             let grant_sql = format!(
                 r#"
-DO $$
+DO {tag}
 BEGIN
-    EXECUTE format('GRANT ALL PRIVILEGES ON DATABASE %I TO %I', '{db}', '{user}');
+    EXECUTE format('GRANT ALL PRIVILEGES ON DATABASE %I TO %I', {db}, {user});
 END
-$$;
+{tag};
 "#,
-                db = creds.app_db,
-                user = creds.app_user,
+                tag = grant_tag,
+                db = quote_literal(&creds.app_db),
+                user = quote_literal(&creds.app_user),
             );
             run_psql_script(&creds.superuser, &grant_sql)?;
         }
