@@ -39,9 +39,16 @@ impl Config {
             check_interval: String::env_or("HAPROXY_CHECK_INTERVAL", "3s"),
             check_fastinter: String::env_or("HAPROXY_CHECK_FASTINTER", "500ms"),
             check_downinter: String::env_or("HAPROXY_CHECK_DOWNINTER", "500ms"),
-            health_port_override: std::env::var("HAPROXY_HEALTH_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok()),
+            health_port_override: match std::env::var("HAPROXY_HEALTH_PORT") {
+                // The override exists because of "Patroni REST API blocking
+                // issues" — a typo'd value silently dropping it would point
+                // every health check at the Patroni port the override was
+                // created to avoid. Fail loud on a malformed value instead.
+                Ok(raw) => Some(raw.parse::<u16>().context(format!(
+                    "HAPROXY_HEALTH_PORT={raw} is not a valid port"
+                ))?),
+                Err(_) => None,
+            },
         })
     }
 }

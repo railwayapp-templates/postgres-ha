@@ -117,18 +117,21 @@ fn check_backend_health(client: &reqwest::blocking::Client) -> Result<BackendHea
     let mut down_replicas = Vec::new();
 
     // HAProxy CSV format: pxname,svname,status,...
-    // pxname is column 0, svname is column 1, status is column 17
+    // pxname is column 0, svname is column 1, status is column 17.
+    // A server mid-rise reports "UP 1/3" (check count so far), not "UP" —
+    // an exact match counts a replica coming up as down and emits false
+    // down_replica alerts for the whole rise window.
     for line in body.lines() {
         let parts: Vec<&str> = line.split(',').collect();
         if parts.len() > 17 && parts[1] != "BACKEND" {
             match parts[0] {
                 "postgresql_primary_backend" => {
-                    if parts[17] == "UP" {
+                    if parts[17].starts_with("UP") {
                         primary += 1;
                     }
                 }
                 "postgresql_replicas_backend" => {
-                    if parts[17] == "UP" {
+                    if parts[17].starts_with("UP") {
                         replica += 1;
                     } else {
                         down_replicas.push(parts[1].to_string());
