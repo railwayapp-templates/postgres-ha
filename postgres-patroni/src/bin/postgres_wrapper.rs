@@ -8,7 +8,8 @@ use anyhow::{anyhow, Context, Result};
 use common::{init_logging, ConfigExt, RailwayEnv, Telemetry, TelemetryEvent};
 use postgres_patroni::{
     cert_expires_within, ensure_pg_stat_statements, is_patroni_enabled, is_valid_x509v3_cert,
-    major_upgrade, pgdata, ssl_dir, sudo_command, volume_root, EXPECTED_VOLUME_MOUNT_PATH,
+    major_upgrade, pgdata, ssl_dir, sudo_command, volume_lock, volume_root,
+    EXPECTED_VOLUME_MOUNT_PATH,
 };
 use nix::sys::signal::{SigHandler, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
@@ -241,6 +242,49 @@ async fn main() -> Result<()> {
 
         Err(anyhow!("Failed to exec patroni-runner: {}", err))
     } else {
+        // At most one node container runs against this volume at a time.
+        // Patroni mode takes this exclusive runtime lock first thing in
+        // patroni-runner (the exec above hands off to it); standalone mode
+        // has no second binary, so take it HERE and hold it from this
+        // resident supervisor for the life of standalone Postgres — the same
+        // stay-alive design the shared upgrade lock above documents. Without
+        // it, two overlapping containers (a redeploy, or an instance restart
+        // during host maintenance) can run two postmasters against one
+        // PGDATA: postmaster.pid's pid/shmem interlocks are namespace-local
+        // and cannot see the other container's postmaster (see volume_lock's
+        // module doc). Taken before anything below mutates PGDATA (ssl
+        // re-apply, standby.signal removal). Timeout fails CLOSED — the
+        // restart policy retries the boot; an unopenable lock file or the
+        // legacy PGDATA-at-the-volume-root first-init layout degrades open
+        // inside acquire_volume_runtime_lock itself.
+        let _runtime_volume_lock =
+            match volume_lock::acquire_volume_runtime_lock(&volume_root(), &pgdata) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    let reason = format!("{e:#}");
+                    error!("{reason}");
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "postgres-wrapper".to_string(),
+                        error: reason,
+                        context: "standalone runtime volume lock".to_string(),
+                    });
+                    std::process::exit(1);
+                }
+            };
+
+        // A staged point-in-time recovery must finish under the mode that
+        // staged it. Fail-stop BEFORE any conf handling below so a
+        // mid-staged-PITR volume is never touched, let alone blind-booted.
+        if let Some(reason) = staged_pitr_refusal(&pgdata) {
+            error!("{reason}");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "postgres-wrapper".to_string(),
+                error: reason,
+                context: "standalone boot refused: staged PITR has not completed".to_string(),
+            });
+            std::process::exit(1);
+        }
+
         let ssl_dir = ssl_dir();
         let server_crt = format!("{}/server.crt", ssl_dir);
 
@@ -414,6 +458,37 @@ extern "C" fn standalone_forward(sig: nix::libc::c_int) {
     }
 }
 
+/// Refuse to boot standalone over a mid-staged point-in-time recovery.
+///
+/// patroni-runner stages PITR by writing `{pgdata}/recovery.signal` plus a
+/// managed recovery block in postgresql.auto.conf; Postgres removes the
+/// signal only when the replay reaches its target and promotes. If the
+/// signal is still present when the service is reverted to standalone, the
+/// replay never finished — booting docker-entrypoint over it would start
+/// Postgres in archive recovery against half-configured recovery state (the
+/// staged restore_command points at a recovery-source conf only
+/// patroni-runner renders), a mid-restore database at best and a boot loop
+/// at worst. Which way out is right is the OPERATOR's call, not this
+/// wrapper's — so fail-stop naming the file, never silently delete it.
+///
+/// Returns the refusal message when `recovery.signal` exists, `None`
+/// otherwise. (`standby.signal` stays wrapper-handled below: removing it is
+/// the safe, intended promotion of a reverted replica.)
+fn staged_pitr_refusal(pgdata: &str) -> Option<String> {
+    let recovery_signal = format!("{pgdata}/recovery.signal");
+    if !Path::new(&recovery_signal).exists() {
+        return None;
+    }
+    Some(format!(
+        "{recovery_signal} exists: a point-in-time recovery staged in HA mode has not completed \
+         on this volume. Refusing to boot standalone over it. Either (1) re-enable HA \
+         (PATRONI_ENABLED=true) and let the PITR replay finish and promote, or (2) if you are \
+         certain the recovery should be abandoned, remove {recovery_signal} (and the \
+         '# managed by pgbackrest-recovery' block in postgresql.auto.conf) yourself, then \
+         redeploy."
+    ))
+}
+
 /// True if `contents` has a top-level `ssl = ...` directive (any whitespace,
 /// with or without the `=` spaced out). Deliberately does NOT match
 /// `ssl_cert_file` / `ssl_key_file` / `ssl_ca_file` — a promoted, freshly
@@ -457,5 +532,35 @@ mod tests {
         assert!(!postgresql_conf_has_ssl_directive(
             "ssl_cert_file = '/etc/ssl/server.crt'"
         ));
+    }
+
+    #[test]
+    fn no_recovery_signal_means_no_refusal() {
+        let dir = std::env::temp_dir().join(format!("pitr_refusal_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A reverted replica's standby.signal alone must NOT refuse the boot —
+        // removing it is the wrapper's intended promotion path.
+        std::fs::write(dir.join("standby.signal"), "").unwrap();
+
+        assert!(staged_pitr_refusal(dir.to_str().unwrap()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_signal_refuses_and_names_the_file_and_both_ways_out() {
+        let dir = std::env::temp_dir().join(format!("pitr_refusal_some_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("recovery.signal"), "").unwrap();
+
+        let reason = staged_pitr_refusal(dir.to_str().unwrap())
+            .expect("a present recovery.signal must refuse the standalone boot");
+        assert!(reason.contains("recovery.signal"));
+        assert!(reason.contains("PATRONI_ENABLED=true"));
+        assert!(reason.contains("remove"));
+        // The signal file must survive the refusal — never silently deleted.
+        assert!(dir.join("recovery.signal").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
