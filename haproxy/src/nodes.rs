@@ -29,12 +29,25 @@ pub fn parse_nodes(postgres_nodes: &str) -> Result<Vec<PostgresNode>> {
 
             let host = parts[0].to_string();
             let name = host.split('.').next().unwrap_or(&host).to_string();
+            let pg_port = parts[1].to_string();
+            let health_port = parts[2].to_string();
+            // Fail fast at boot on non-numeric ports (a stray letter, a
+            // truncated entry) instead of rendering an haproxy config whose
+            // every check fails at runtime for no visible reason.
+            for (label, port) in [("pg port", &pg_port), ("health port", &health_port)] {
+                if port.parse::<u16>().is_err() {
+                    return Err(anyhow!(
+                        "Invalid {label} '{port}' in node format: {}. Expected numeric ports (hostname:pgport:healthport)",
+                        node
+                    ));
+                }
+            }
 
             Ok(PostgresNode {
                 name,
                 host,
-                pg_port: parts[1].to_string(),
-                health_port: parts[2].to_string(),
+                pg_port,
+                health_port,
             })
         })
         .collect()
