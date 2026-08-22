@@ -1036,6 +1036,84 @@ fn build_pgbackrest_recovery_source_conf(params: &RecoverySourceConfParams) -> S
     )
 }
 
+/// Marker comment that opens the recovery block this binary manages in
+/// postgresql.auto.conf. [`build_pitr_managed_block`] writes it and
+/// [`strip_pitr_managed_block`] removes it — the two are deliberately
+/// symmetric so the block has at most one live copy and is gone once a
+/// restore completes.
+const PITR_MANAGED_MARKER: &str = "# managed by pgbackrest-recovery (patroni-runner)";
+
+/// GUC names that belong to the managed block. Stripping removes every one
+/// of these that follows the marker — including BOTH recovery-target types,
+/// so a target-type change across retries (time → xid) can never leave the
+/// stale GUC behind (Postgres refuses to start with "multiple recovery
+/// targets specified", an unrecoverable boot-loop).
+const PITR_MANAGED_KEYS: [&str; 4] = [
+    "restore_command",
+    "recovery_target_time",
+    "recovery_target_xid",
+    "recovery_target_action",
+];
+
+/// Render the managed recovery block, leading separator included. Inputs are
+/// already single-quote-escaped by the caller.
+fn build_pitr_managed_block(
+    target_param: &str,
+    escaped_target: &str,
+    escaped_restore: &str,
+) -> String {
+    format!(
+        "\n{PITR_MANAGED_MARKER}\n\
+         restore_command = '{escaped_restore}'\n\
+         {target_param} = '{escaped_target}'\n\
+         recovery_target_action = 'promote'\n",
+    )
+}
+
+/// Remove every managed recovery block from `contents`: each marker line,
+/// the managed-key lines that follow it, and the blank separator line the
+/// writer put before it. Handles multiple accumulated copies (the raw-append
+/// bug this symmetry fixes left duplicates on already-deployed volumes) and
+/// blocks whose target type differs from the current one. Everything else —
+/// user-set GUCs included — passes through untouched.
+fn strip_pitr_managed_block(contents: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut lines = contents.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() == PITR_MANAGED_MARKER {
+            if out.last().is_some_and(|l| l.trim().is_empty()) {
+                out.pop();
+            }
+            while lines.peek().is_some_and(|l| {
+                let l = l.trim_start();
+                PITR_MANAGED_KEYS.iter().any(|key| l.starts_with(key))
+            }) {
+                lines.next();
+            }
+            continue;
+        }
+        out.push(line);
+    }
+    let mut result = out.join("\n");
+    if !result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
+/// Strip the managed recovery block from the file at `auto_conf_path`.
+/// No-op when the file or the marker is absent.
+fn strip_pitr_managed_block_from_file(auto_conf_path: &str) -> std::io::Result<()> {
+    if !Path::new(auto_conf_path).exists() {
+        return Ok(());
+    }
+    let contents = fs::read_to_string(auto_conf_path)?;
+    if !contents.contains(PITR_MANAGED_MARKER) {
+        return Ok(());
+    }
+    fs::write(auto_conf_path, strip_pitr_managed_block(&contents))
+}
+
 /// Stage PITR replay before Patroni starts Postgres.
 ///
 /// When `POSTGRES_RECOVERY_TARGET_TIME` (or `_XID`) is set, writes
@@ -1069,21 +1147,24 @@ fn build_pgbackrest_recovery_source_conf(params: &RecoverySourceConfParams) -> S
 ///
 /// A failed replay (bad target, missing WAL, bad creds) leaves
 /// `.pitr_staging` behind WITHOUT `.pitr_configured` — the operator can fix
-/// env vars and restart, and the next boot will re-stage cleanly.
+/// env vars and restart, and the next boot will re-stage cleanly. Re-staging
+/// REPLACES the managed recovery block in postgresql.auto.conf rather than
+/// appending a second copy, and the done-marker stamp strips it entirely, so
+/// the block has at most one live copy and no residue outlives a successful
+/// promote (see [`build_pitr_managed_block`] / [`strip_pitr_managed_block`]).
 ///
 /// Source-path divergence detection is gone: under the new-service restore
 /// design, the restored cluster has its own bucket (`WAL_ARCHIVE_*`) and
 /// reads from the source's bucket via the distinct `WAL_RECOVER_FROM_*`
 /// repo, so no shared write path exists to corrupt.
 fn configure_pitr_recovery(config: &Config) -> Result<()> {
-    use std::io::Write;
-
     let data_dir = &config.data_dir;
     let staging = format!("{data_dir}/.pitr_staging");
     let done = format!("{data_dir}/.pitr_configured");
     let signal = format!("{data_dir}/recovery.signal");
     let pg_version = format!("{data_dir}/PG_VERSION");
     let restored_marker = format!("{data_dir}/.pgbackrest_restored");
+    let auto_conf_path = format!("{data_dir}/postgresql.auto.conf");
 
     // Pick the recovery target type. xid wins over time when both are set —
     // see fn-doc above. Caller already gated on at least one being Some.
@@ -1129,6 +1210,18 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
     if Path::new(&staging).exists() && !Path::new(&signal).exists() {
         let _ = fs::remove_file(&staging);
         fs::write(&done, "").context("Failed to write PITR done marker")?;
+        // The managed recovery block has done its job — strip it so no
+        // restore_command / recovery_target residue outlives the promote.
+        // Best-effort (the restore IS complete either way), but loud: a
+        // leftover block would be re-stripped on the next staging, and until
+        // then it sits inert in postgresql.auto.conf.
+        if let Err(e) = strip_pitr_managed_block_from_file(&auto_conf_path) {
+            warn!(
+                error = %e,
+                path = %auto_conf_path,
+                "pgbackrest: failed to strip the managed recovery block after promote"
+            );
+        }
         info!("pgbackrest: previous PITR replay completed; marker written");
         return Ok(());
     }
@@ -1142,20 +1235,26 @@ fn configure_pitr_recovery(config: &Config) -> Result<()> {
     let escaped_target = target_value.replace('\'', "''");
     let escaped_restore = restore_cmd.replace('\'', "''");
 
-    let auto_conf_path = format!("{data_dir}/postgresql.auto.conf");
-    let addition = format!(
-        "\n# managed by pgbackrest-recovery (patroni-runner)\n\
-         restore_command = '{escaped_restore}'\n\
-         {target_param} = '{escaped_target}'\n\
-         recovery_target_action = 'promote'\n",
-    );
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&auto_conf_path)
-        .context("Failed to open postgresql.auto.conf")?;
-    f.write_all(addition.as_bytes())
-        .context("Failed to append recovery settings")?;
+    // Strip any previous managed block before appending the fresh one. This
+    // path runs on EVERY boot while recovery.signal persists (a failed
+    // replay leaves both the signal and the block behind), so a raw append
+    // accumulated duplicates — and a target-type change across retries
+    // (time → xid) left BOTH recovery_target GUCs set, which Postgres
+    // refuses outright ("multiple recovery targets specified"): an
+    // unrecoverable boot-loop. Lifecycle: at most one live copy, removed on
+    // completion (see the done-marker branch above).
+    let existing = if Path::new(&auto_conf_path).exists() {
+        fs::read_to_string(&auto_conf_path).context("Failed to read postgresql.auto.conf")?
+    } else {
+        String::new()
+    };
+    let mut new_contents = strip_pitr_managed_block(&existing);
+    new_contents.push_str(&build_pitr_managed_block(
+        target_param,
+        &escaped_target,
+        &escaped_restore,
+    ));
+    fs::write(&auto_conf_path, new_contents).context("Failed to write recovery settings")?;
 
     // The recovery-source conf runs archive-get in async mode, which needs
     // the spool dir. `spawn_bootstrap_stanza_create` only mkdirs it after
@@ -1939,10 +2038,11 @@ async fn async_main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pgbackrest_conf, build_pgbackrest_recovery_source_conf, configure_pitr_recovery,
-        data_dir_nonempty, is_uuid_shape, parse_process_max, pgdata_is_dedicated_subdir,
-        should_wipe_incomplete_clone, wipe_has_safe_clone_source, wipe_pgdata_contents, Config,
-        PgbackrestConfParams, RecoverySourceConfParams,
+        build_pgbackrest_conf, build_pgbackrest_recovery_source_conf, build_pitr_managed_block,
+        configure_pitr_recovery, data_dir_nonempty, is_uuid_shape, parse_process_max,
+        pgdata_is_dedicated_subdir, should_wipe_incomplete_clone, strip_pitr_managed_block,
+        wipe_has_safe_clone_source, wipe_pgdata_contents, Config, PgbackrestConfParams,
+        RecoverySourceConfParams, PITR_MANAGED_MARKER,
     };
 
     fn test_config(data_dir: &str) -> Config {
@@ -2090,6 +2190,118 @@ mod tests {
         let auto_conf = std::fs::read_to_string(dir.join("postgresql.auto.conf")).unwrap();
         assert!(auto_conf.contains("restore_command"));
         assert!(auto_conf.contains("recovery_target_time"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_block_write_and_strip_are_symmetric() {
+        let user_content = "shared_buffers = '128MB'\nwork_mem = '4MB'\n";
+        let block = build_pitr_managed_block("recovery_target_time", "2026-01-01", "cmd");
+        let combined = format!("{user_content}{block}");
+        assert_eq!(strip_pitr_managed_block(&combined), user_content);
+        // No marker → contents pass through untouched.
+        assert_eq!(strip_pitr_managed_block(user_content), user_content);
+        // Nothing but the block → empty file, not a stray blank line.
+        assert_eq!(strip_pitr_managed_block(&block), "");
+    }
+
+    #[test]
+    fn strip_removes_accumulated_duplicates_and_both_target_types() {
+        // The raw-append bug left volumes in the wild with several copies,
+        // possibly of DIFFERENT target types. One strip must clear them all —
+        // a surviving stale recovery_target_time next to a fresh
+        // recovery_target_xid makes Postgres refuse to start.
+        let mut contents = String::from("max_connections = 100\n");
+        contents.push_str(&build_pitr_managed_block(
+            "recovery_target_time",
+            "2026-01-01T00:00:00Z",
+            "cmd",
+        ));
+        contents.push_str(&build_pitr_managed_block(
+            "recovery_target_xid",
+            "12345",
+            "cmd",
+        ));
+        contents.push_str(&build_pitr_managed_block(
+            "recovery_target_time",
+            "2026-02-02T00:00:00Z",
+            "cmd",
+        ));
+
+        let stripped = strip_pitr_managed_block(&contents);
+        assert_eq!(stripped, "max_connections = 100\n");
+    }
+
+    #[test]
+    fn strip_leaves_user_owned_recovery_settings_alone() {
+        // Only lines FOLLOWING our marker are managed; a user's own
+        // restore_command elsewhere in the file must survive.
+        let contents = format!(
+            "restore_command = 'cp /archive/%f %p'\n{}",
+            build_pitr_managed_block("recovery_target_time", "2026-01-01", "cmd")
+        );
+        assert_eq!(
+            strip_pitr_managed_block(&contents),
+            "restore_command = 'cp /archive/%f %p'\n"
+        );
+    }
+
+    #[test]
+    fn restaging_replaces_the_managed_block_instead_of_accumulating() {
+        let dir = std::env::temp_dir().join(format!("pitr_restage_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = test_config(dir.to_str().unwrap());
+        config.wal_recover_from_bucket = Some("source-bucket".into());
+        config.pitr_target_time = Some("2026-01-01T00:00:00Z".into());
+
+        // First boot stages; the replay "fails" (recovery.signal persists),
+        // and the retry boot comes back with the target CHANGED to xid —
+        // the picker clamped it down to lastCommittedTxnAt.
+        configure_pitr_recovery(&config).unwrap();
+        config.pitr_target_xid = Some("987654".into());
+        configure_pitr_recovery(&config).unwrap();
+
+        let auto_conf = std::fs::read_to_string(dir.join("postgresql.auto.conf")).unwrap();
+        assert_eq!(
+            auto_conf.matches(PITR_MANAGED_MARKER).count(),
+            1,
+            "exactly one managed block must survive a re-stage:\n{auto_conf}"
+        );
+        assert!(auto_conf.contains("recovery_target_xid = '987654'"));
+        assert!(
+            !auto_conf.contains("recovery_target_time"),
+            "the stale target type must be gone — postgres refuses multiple recovery targets:\n{auto_conf}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completed_replay_stamps_done_and_strips_the_managed_block() {
+        let dir = std::env::temp_dir().join(format!("pitr_done_strip_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = test_config(dir.to_str().unwrap());
+        config.wal_recover_from_bucket = Some("source-bucket".into());
+        config.pitr_target_time = Some("2026-01-01T00:00:00Z".into());
+
+        // Stage, then simulate a successful replay: Postgres consumes
+        // recovery.signal on promote.
+        configure_pitr_recovery(&config).unwrap();
+        std::fs::remove_file(dir.join("recovery.signal")).unwrap();
+        configure_pitr_recovery(&config).unwrap();
+
+        assert!(dir.join(".pitr_configured").exists());
+        assert!(!dir.join(".pitr_staging").exists());
+        let auto_conf = std::fs::read_to_string(dir.join("postgresql.auto.conf")).unwrap();
+        assert!(
+            !auto_conf.contains(PITR_MANAGED_MARKER) && !auto_conf.contains("restore_command"),
+            "no recovery residue may outlive a successful promote:\n{auto_conf}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
