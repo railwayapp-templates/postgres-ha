@@ -9,14 +9,36 @@ use crate::cluster::{
 use crate::config::{get_leader_endpoint, parse_initial_cluster, peer_to_client_url, Config};
 use anyhow::{anyhow, Result};
 use common::{etcdctl, etcdctl_probe, Telemetry, TelemetryEvent};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+/// Only a definite NotFound is "no marker". `Path::exists()` returns false
+/// on EACCES/EIO, which would treat a member we cannot inspect as
+/// incomplete bootstrap and wipe it. Any other metadata error is present.
+pub(crate) fn bootstrap_marker_present(path: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == ErrorKind::NotFound => false,
+        Err(e) => {
+            warn!(
+                error = %e,
+                path,
+                "could not stat bootstrap marker; treating as present"
+            );
+            true
+        }
+    }
+}
+
 /// Check if any other peer has a healthy cluster (for recovery detection)
-pub async fn check_existing_cluster(initial_cluster: &str, my_name: &str) -> Result<Option<String>> {
+pub async fn check_existing_cluster(
+    initial_cluster: &str,
+    my_name: &str,
+) -> Result<Option<String>> {
     info!("Checking for existing cluster on other peers...");
 
     let cluster = parse_initial_cluster(initial_cluster)?;
@@ -28,8 +50,12 @@ pub async fn check_existing_cluster(initial_cluster: &str, my_name: &str) -> Res
         let client_endpoint = peer_to_client_url(peer_url);
         info!(peer = %name, endpoint = %client_endpoint, "Checking peer");
 
-        if etcdctl_probe(&["endpoint", "health", &format!("--endpoints={}", client_endpoint)])
-            .await?
+        if etcdctl_probe(&[
+            "endpoint",
+            "health",
+            &format!("--endpoints={}", client_endpoint),
+        ])
+        .await?
         {
             info!(peer = %name, "Found healthy cluster");
             return Ok(Some(client_endpoint));
@@ -66,8 +92,12 @@ pub async fn wait_for_any_healthy_peer(
             }
 
             let client_endpoint = peer_to_client_url(peer_url);
-            if etcdctl_probe(&["endpoint", "health", &format!("--endpoints={}", client_endpoint)])
-                .await?
+            if etcdctl_probe(&[
+                "endpoint",
+                "health",
+                &format!("--endpoints={}", client_endpoint),
+            ])
+            .await?
             {
                 info!(peer = %name, "Found healthy peer");
                 return Ok((name.clone(), client_endpoint));
@@ -95,7 +125,7 @@ pub async fn clean_stale_data(config: &Config, telemetry: &Telemetry) -> Result<
     }
 
     let has_data = has_local_data(&config.data_dir).await?;
-    let marker_exists = Path::new(&config.bootstrap_marker()).exists();
+    let marker_exists = bootstrap_marker_present(&config.bootstrap_marker());
 
     if has_data && !marker_exists {
         info!("Found stale data from incomplete bootstrap - cleaning");
@@ -193,7 +223,7 @@ pub async fn monitor_and_mark_bootstrap(
             }
 
             let marker_path = config.bootstrap_marker();
-            if !Path::new(&marker_path).exists() && (!joined_as_learner || promoted) {
+            if !bootstrap_marker_present(&marker_path) && (!joined_as_learner || promoted) {
                 if let Err(e) = fs::write(&marker_path, "1").await {
                     telemetry.send(TelemetryEvent::ComponentError {
                         component: "etcd".to_string(),
@@ -222,7 +252,7 @@ pub async fn bootstrap_as_leader(
     config: &Config,
     telemetry: &Telemetry,
 ) -> Result<Option<BootstrapParams>> {
-    let marker_exists = Path::new(&config.bootstrap_marker()).exists();
+    let marker_exists = bootstrap_marker_present(&config.bootstrap_marker());
     let cluster = parse_initial_cluster(&config.initial_cluster)?;
 
     if marker_exists {
@@ -233,10 +263,31 @@ pub async fn bootstrap_as_leader(
         }));
     }
 
-    // Check for recovery scenario - existing cluster on other peers
-    if let Some(existing_endpoint) =
-        check_existing_cluster(&config.initial_cluster, &config.etcd_name).await?
-    {
+    // Check for recovery scenario - existing cluster on other peers.
+    // A single miss is not enough: a rolling restart of the designated
+    // leader can land here while the existing cluster is still coming up,
+    // and `state=new` would mint a second cluster id. Probe a few more
+    // times when the declared topology has peers; first-time deploys still
+    // bootstrap as new once the probes miss.
+    let mut existing_endpoint =
+        check_existing_cluster(&config.initial_cluster, &config.etcd_name).await?;
+    if existing_endpoint.is_none() && cluster.len() > 1 {
+        const EXTRA_PROBES: u32 = 5;
+        for i in 1..=EXTRA_PROBES {
+            warn!(
+                attempt = i,
+                extra = EXTRA_PROBES,
+                "no healthy peer yet; not bootstrapping a new cluster"
+            );
+            sleep(config.peer_check_interval).await;
+            existing_endpoint =
+                check_existing_cluster(&config.initial_cluster, &config.etcd_name).await?;
+            if existing_endpoint.is_some() {
+                break;
+            }
+        }
+    }
+    if let Some(existing_endpoint) = existing_endpoint {
         info!("RECOVERY MODE: Found existing cluster");
 
         telemetry.send(TelemetryEvent::EtcdRecoveryMode {
@@ -247,7 +298,14 @@ pub async fn bootstrap_as_leader(
         // Use the node's own advertise URL directly instead of looking up in initial_cluster
         let my_peer_url = &config.initial_advertise_peer_urls;
 
-        if let Err(e) = remove_stale_self(&existing_endpoint, &config.etcd_name, my_peer_url, telemetry).await {
+        if let Err(e) = remove_stale_self(
+            &existing_endpoint,
+            &config.etcd_name,
+            my_peer_url,
+            telemetry,
+        )
+        .await
+        {
             warn!(error = %e, "Failed to remove stale self, continuing anyway");
         }
 
@@ -328,7 +386,7 @@ pub async fn bootstrap_as_follower(
     bootstrap_leader: &str,
     telemetry: &Telemetry,
 ) -> Result<Option<BootstrapParams>> {
-    let marker_exists = Path::new(&config.bootstrap_marker()).exists();
+    let marker_exists = bootstrap_marker_present(&config.bootstrap_marker());
 
     if marker_exists {
         return Ok(Some(BootstrapParams {
@@ -339,14 +397,13 @@ pub async fn bootstrap_as_follower(
     }
 
     // Wait for a healthy peer
-    let (healthy_peer, endpoint) =
-        match wait_for_any_healthy_peer(config, bootstrap_leader).await {
-            Ok(result) => result,
-            Err(e) => {
-                warn!(error = %e, "Failed to find healthy peer");
-                return Ok(None); // Signal retry needed
-            }
-        };
+    let (healthy_peer, endpoint) = match wait_for_any_healthy_peer(config, bootstrap_leader).await {
+        Ok(result) => result,
+        Err(e) => {
+            warn!(error = %e, "Failed to find healthy peer");
+            return Ok(None); // Signal retry needed
+        }
+    };
 
     match add_self_to_cluster(config, &healthy_peer, &endpoint, telemetry).await {
         Ok(cluster_str) => {
@@ -414,7 +471,9 @@ async fn move_leader_away(config: &Config) -> Result<()> {
             info!(target = %m.name, "Leadership transferred");
             Ok(())
         }
-        None => Err(anyhow!("No voting follower available to transfer leadership to")),
+        None => Err(anyhow!(
+            "No voting follower available to transfer leadership to"
+        )),
     }
 }
 
@@ -532,5 +591,27 @@ pub async fn local_liveness_watchdog(config: Config, telemetry: Telemetry) {
             grace_secs = LIVENESS_UNHEALTHY_GRACE.as_secs(),
             "Local etcd not serving; will exit for restart if it does not recover"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_marker_is_absent() {
+        assert!(!bootstrap_marker_present(
+            "/no/such/etcd-data/.bootstrap_complete"
+        ));
+    }
+
+    #[test]
+    fn existing_marker_is_present() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("etcd-bootstrap-marker-test-{}", std::process::id()));
+        std::fs::write(&path, "1").unwrap();
+        let present = bootstrap_marker_present(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(present);
     }
 }

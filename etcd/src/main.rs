@@ -22,8 +22,8 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use bootstrap::{
-    bootstrap_as_follower, bootstrap_as_leader, check_existing_cluster, clean_stale_data,
-    defrag_loop, local_liveness_watchdog, monitor_and_mark_bootstrap,
+    bootstrap_as_follower, bootstrap_as_leader, bootstrap_marker_present, check_existing_cluster,
+    clean_stale_data, defrag_loop, local_liveness_watchdog, monitor_and_mark_bootstrap,
 };
 use cluster::{clear_directory, has_local_data, start_etcd};
 use config::{get_bootstrap_leader, Config};
@@ -139,9 +139,8 @@ async fn main() -> Result<()> {
 
         let defrag_config = Config::from_env()?;
         let defrag_telemetry = telemetry.clone();
-        let defrag_handle = tokio::spawn(async move {
-            defrag_loop(defrag_config, defrag_telemetry).await
-        });
+        let defrag_handle =
+            tokio::spawn(async move { defrag_loop(defrag_config, defrag_telemetry).await });
 
         // Long-lived watchdog over the LOCAL etcd endpoint: crashes the container if
         // this node's etcd stops serving while still running, so a wedged "zombie"
@@ -173,7 +172,7 @@ async fn main() -> Result<()> {
         info!(exit_code = ?exit_code, "etcd exited");
 
         // Handle incomplete bootstrap
-        let marker_exists = Path::new(&config.bootstrap_marker()).exists();
+        let marker_exists = bootstrap_marker_present(&config.bootstrap_marker());
         let has_data = has_local_data(&config.data_dir).await?;
         if !marker_exists && has_data {
             info!("Bootstrap incomplete - cleaning data");
@@ -212,7 +211,8 @@ async fn main() -> Result<()> {
                             let _ = fs::remove_file(&config.bootstrap_marker()).await;
                             telemetry.send(TelemetryEvent::EtcdDataDirWiped {
                                 node: config.etcd_name.clone(),
-                                reason: "raft log corrupted/truncated; quorum intact on peers".to_string(),
+                                reason: "raft log corrupted/truncated; quorum intact on peers"
+                                    .to_string(),
                             });
                         }
                         Err(e) => {
@@ -274,9 +274,13 @@ mod tests {
 
     #[test]
     fn ignores_unrelated_lines() {
-        assert!(!is_raft_corruption_line("etcd 19ef95a6820cd674 became follower at term 15"));
+        assert!(!is_raft_corruption_line(
+            "etcd 19ef95a6820cd674 became follower at term 15"
+        ));
         assert!(!is_raft_corruption_line("slow fdatasync took 2.9s"));
         // "tocommit" without the range phrase is a normal commit-advance log line.
-        assert!(!is_raft_corruption_line("raft.node: tocommit advanced to 12345"));
+        assert!(!is_raft_corruption_line(
+            "raft.node: tocommit advanced to 12345"
+        ));
     }
 }
