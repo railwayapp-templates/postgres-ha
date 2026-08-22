@@ -10,4 +10,6 @@ mod sql;
 
 pub use collation::refresh_collation_versions;
 pub use config::{read_credentials, Credentials, PATRONI_CONFIG};
-pub use sql::{run_psql, run_psql_in_db, run_psql_script};
+pub use sql::{
+    dollar_quote_tag, quote_ident, quote_literal, run_psql, run_psql_in_db, run_psql_script,
+};
