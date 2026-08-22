@@ -2660,7 +2660,7 @@ t_ha_runtime_refused_while_job_locked() {
   # dispatched job holds it in (upgrade-job.sh's own take_job_lock).
   docker run -d --name "${scope}-lockholder" --label "$HA_LABEL" \
     -v "${vol}:/var/lib/postgresql/data" --entrypoint /bin/sh "$job_image" \
-    -c "exec 9>>/var/lib/postgresql/data/.railway-major-upgrade.lock; flock 9; sleep 60" >/dev/null
+    -c "exec 9>>/var/lib/postgresql/data/.railway-volume.lock; flock 9; sleep 60" >/dev/null
   sleep 2
 
   RUN_NODE_VOLUME="$vol" run_patroni_node "$scope" "$etcd_hosts" "$n"
@@ -4811,7 +4811,7 @@ t_ha_adopt_default_replica() {
 t_upgrade_lock_standalone_lifetime() {
   local t=t_upgrade_lock_standalone_lifetime
   local vol="upglock-vol-${PG_VERSION}" n="upglock-pg-${PG_VERSION}"
-  local holder="upglock-holder-${PG_VERSION}" LOCK=/v/.railway-major-upgrade.lock
+  local holder="upglock-holder-${PG_VERSION}" LOCK=/v/.railway-volume.lock
   docker rm -f "$n" "$holder" >/dev/null 2>&1 || true
   docker volume rm -f "$vol" >/dev/null 2>&1 || true
   docker volume create "$vol" >/dev/null

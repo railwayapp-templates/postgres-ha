@@ -282,10 +282,45 @@ pub fn boot_refusal_reason(
 /// consume the identical upgrade-job.sh image against the same volume, and
 /// the lock is only meaningful if every runtime that might have Postgres
 /// running against this volume agrees on which file it is.
-pub const LOCK_FILENAME: &str = ".railway-major-upgrade.lock";
+pub const LOCK_FILENAME: &str = ".railway-volume.lock";
+
+/// Pre-rename name (postgres-ssl renamed in lockstep): a name that reads as
+/// an event marker, on a file every boot created, kept being cited during
+/// data-loss forensics as evidence that an automatic major upgrade had run.
+/// Builds from before the rename still rendezvous here, so it is locked
+/// (shared, below) whenever it exists — but never created again.
+pub const LEGACY_LOCK_FILENAME: &str = ".railway-major-upgrade.lock";
+
+/// One-time note written into an otherwise-empty lock file: bare lock files
+/// keep getting read as event markers during forensics on a dead volume.
+const LOCK_FILE_NOTE: &str = "Advisory flock rendezvous between the Postgres container and Railway maintenance \
+jobs.\nCreated on every boot; its presence is not a record of any upgrade or other event.\n";
+const LEGACY_LOCK_FILE_NOTE: &str = "Legacy name of .railway-volume.lock (see that file). Older image builds create \
+this\nfile on EVERY boot; its presence is not evidence that a major version upgrade ran.\n";
 
 pub fn lock_path(volume_root: &str) -> String {
     format!("{}/{}", volume_root.trim_end_matches('/'), LOCK_FILENAME)
+}
+
+pub fn legacy_lock_path(volume_root: &str) -> String {
+    format!("{}/{}", volume_root.trim_end_matches('/'), LEGACY_LOCK_FILENAME)
+}
+
+/// Write `note` into the file at `path` if it is currently empty. Best-effort
+/// (the note is documentation, never worth failing a boot over), and safe
+/// under the advisory flock we hold — flocks don't gate writes.
+fn write_note_if_empty(path: &str, note: &str) {
+    let len = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(_) => return,
+    };
+    if len != 0 {
+        return;
+    }
+    if let Ok(mut f) = OpenOptions::new().append(true).open(path) {
+        use std::io::Write;
+        let _ = f.write_all(note.as_bytes());
+    }
 }
 
 /// Take a SHARED, non-blocking flock on the volume-root lock file and hold it
@@ -303,25 +338,34 @@ pub fn lock_path(volume_root: &str) -> String {
 /// the backstop for when it doesn't) finds the lock file uncontended and
 /// proceeds to `pg_upgrade` a data directory Postgres is actively writing to.
 ///
-/// Returns `Ok(None)` (never fails the boot) when the lock cannot be taken for
-/// a reason unrelated to a live conflict — `flock` unavailable, or the file
-/// can't be opened (permissions, missing directory). The orchestrator's own
-/// exclusion remains the first line of defense; the backstop's own absence
-/// must not become a second reason to refuse a healthy boot. Returns `Err`
-/// only when the lock is genuinely held exclusively by a job right now — the
-/// one case the caller must refuse to boot over.
+/// Returns `Ok` with the held locks — possibly empty, never failing the boot —
+/// when a lock cannot be taken for a reason unrelated to a live conflict:
+/// `flock` unavailable, or a file can't be opened (permissions, missing
+/// directory). The orchestrator's own exclusion remains the first line of
+/// defense; the backstop's own absence must not become a second reason to
+/// refuse a healthy boot. Returns `Err` only when a lock is genuinely held
+/// exclusively by a job right now — the one case the caller must refuse to
+/// boot over.
 ///
-/// Also `Ok(None)` — without even creating the file — when PGDATA is the
+/// Also `Ok` (empty) — without even creating a file — when PGDATA is the
 /// volume root and holds no PG_VERSION yet: creating the lock file inside an
 /// empty PGDATA makes docker-entrypoint conclude the database already exists
 /// (it checks `ls -A`), so initdb is skipped and the first boot crash-loops
 /// over a hidden dotfile. That layout can't take an in-place upgrade anyway
 /// (no sibling slot on the volume for the new data dir). Same guard, same
 /// two reasons as postgres-ssl's wrapper.sh.
+///
+/// Locks up to TWO files during the rename transition: the canonical
+/// `LOCK_FILENAME` (created as before), and `LEGACY_LOCK_FILENAME` whenever
+/// it already exists — builds from before the rename rendezvous only there,
+/// and the exclusion is only real if this runtime contends where they look.
+/// The legacy file is never created here (not fabricating it on every boot
+/// is the point of the rename) and never unlinked (deleting an flock
+/// rendezvous splits racers across inodes).
 pub fn take_volume_upgrade_lock(
     volume_root: &str,
     pgdata: &str,
-) -> Result<Option<Flock<File>>, String> {
+) -> Result<Vec<Flock<File>>, String> {
     let pgdata_is_volume_root =
         pgdata.trim_end_matches('/') == volume_root.trim_end_matches('/');
     if pgdata_is_volume_root {
@@ -332,38 +376,78 @@ pub fn take_volume_upgrade_lock(
                 "PGDATA is the volume root and uninitialized — skipping the upgrade lock \
                  so the lock file can't make docker-entrypoint skip initdb"
             );
-            return Ok(None);
+            return Ok(Vec::new());
         }
     }
 
+    let mut locks = Vec::new();
+
     let path = lock_path(volume_root);
-    let file = match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(f) => f,
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => match Flock::lock(file, FlockArg::LockSharedNonblock) {
+            Ok(lock) => {
+                write_note_if_empty(&path, LOCK_FILE_NOTE);
+                locks.push(lock);
+            }
+            Err((_file, Errno::EWOULDBLOCK)) => {
+                return Err(format!(
+                    "{path} is held by another process — a major version upgrade job is currently \
+                     running against this volume. The database must not start until it finishes; \
+                     retry the deploy once the upgrade completes."
+                ));
+            }
+            Err((_file, errno)) => {
+                tracing::warn!(
+                    path = %path,
+                    error = %errno,
+                    "could not take the upgrade lock; continuing without it"
+                );
+            }
+        },
         Err(e) => {
             tracing::warn!(
                 path = %path,
                 error = %e,
-                "could not open the major-upgrade lock file; continuing without the upgrade lock"
+                "could not open the upgrade lock file; continuing without the upgrade lock"
             );
-            return Ok(None);
-        }
-    };
-    match Flock::lock(file, FlockArg::LockSharedNonblock) {
-        Ok(lock) => Ok(Some(lock)),
-        Err((_file, Errno::EWOULDBLOCK)) => Err(format!(
-            "{path} is held by another process — a major version upgrade job is currently \
-             running against this volume. The database must not start until it finishes; retry \
-             the deploy once the upgrade completes."
-        )),
-        Err((_file, errno)) => {
-            tracing::warn!(
-                path = %path,
-                error = %errno,
-                "could not take the major-upgrade lock; continuing without it"
-            );
-            Ok(None)
         }
     }
+
+    let legacy = legacy_lock_path(volume_root);
+    match OpenOptions::new().append(true).open(&legacy) {
+        Ok(file) => match Flock::lock(file, FlockArg::LockSharedNonblock) {
+            Ok(lock) => {
+                write_note_if_empty(&legacy, LEGACY_LOCK_FILE_NOTE);
+                locks.push(lock);
+            }
+            Err((_file, Errno::EWOULDBLOCK)) => {
+                return Err(format!(
+                    "{legacy} is held by another process — a major version upgrade job is currently \
+                     running against this volume. The database must not start until it finishes; \
+                     retry the deploy once the upgrade completes."
+                ));
+            }
+            Err((_file, errno)) => {
+                tracing::warn!(
+                    path = %legacy,
+                    error = %errno,
+                    "could not take the legacy upgrade lock; continuing without it"
+                );
+            }
+        },
+        // Never booted a pre-rename build (or the file was hand-deleted):
+        // no pre-rename peer to exclude, and we deliberately don't create it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                path = %legacy,
+                error = %e,
+                "could not open the legacy upgrade lock file; continuing without it"
+            );
+        }
+    }
+
+    Ok(locks)
 }
 
 #[cfg(test)]
@@ -568,8 +652,8 @@ mod tests {
     fn lock_taken_when_uncontended() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let lock = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
-        assert!(lock.is_some());
+        let locks = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
+        assert!(!locks.is_empty());
     }
 
     // Two shared holders must coexist — this mirrors two runtime containers
@@ -580,9 +664,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let first = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
-        assert!(first.is_some());
+        assert!(!first.is_empty());
         let second = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
-        assert!(second.is_some());
+        assert!(!second.is_empty());
     }
 
     // The exact scenario this function exists to catch: an upgrade job
@@ -603,6 +687,65 @@ mod tests {
         let result = take_volume_upgrade_lock(root, &format!("{root}/pgdata"));
         assert!(result.is_err(), "expected the shared lock attempt to refuse");
         assert!(result.unwrap_err().contains("held by another process"));
+    }
+
+    // Rename-transition contract: a job built BEFORE the rename holds the
+    // legacy path exclusively — this runtime must still refuse to boot.
+    #[test]
+    fn legacy_lock_refused_while_old_job_holds_it_exclusively() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let job_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(legacy_lock_path(root))
+            .unwrap();
+        let _job_lock = Flock::lock(job_file, FlockArg::LockExclusiveNonblock).unwrap();
+
+        let result = take_volume_upgrade_lock(root, &format!("{root}/pgdata"));
+        assert!(result.is_err(), "expected the legacy lock attempt to refuse");
+        assert!(result.unwrap_err().contains("held by another process"));
+    }
+
+    // The other half of the transition: the legacy file is locked only when
+    // it already exists — a boot must never fabricate it (the name reading
+    // as upgrade evidence on every volume is what the rename removes).
+    #[test]
+    fn legacy_lock_file_never_created_by_a_boot() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        let locks = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
+        assert_eq!(locks.len(), 1, "only the canonical lock should be held");
+        assert!(Path::new(&lock_path(root)).exists());
+        assert!(
+            !Path::new(&legacy_lock_path(root)).exists(),
+            "a boot must never create the legacy lock file"
+        );
+    }
+
+    // And when the legacy file DOES exist (any pre-rename boot created it),
+    // both files are held shared, so either rendezvous excludes a job.
+    #[test]
+    fn legacy_lock_held_alongside_canonical_when_present() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(legacy_lock_path(root), "").unwrap();
+
+        let locks = take_volume_upgrade_lock(root, &format!("{root}/pgdata")).unwrap();
+        assert_eq!(locks.len(), 2, "both lock files should be held");
+
+        for path in [lock_path(root), legacy_lock_path(root)] {
+            let job_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            assert!(
+                Flock::lock(job_file, FlockArg::LockExclusiveNonblock).is_err(),
+                "an exclusive take on {path} should be refused while the boot holds it shared"
+            );
+        }
     }
 
     // Releasing the lock (drop) must let a subsequent exclusive attempt (the
@@ -632,11 +775,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
 
-        let lock = take_volume_upgrade_lock(root, root).unwrap();
-        assert!(lock.is_none(), "expected the guard to skip the lock");
+        let locks = take_volume_upgrade_lock(root, root).unwrap();
+        assert!(locks.is_empty(), "expected the guard to skip the lock");
         assert!(
             !Path::new(&lock_path(root)).exists(),
             "the guard must not create the lock file inside an empty PGDATA"
+        );
+        assert!(
+            !Path::new(&legacy_lock_path(root)).exists(),
+            "the guard must not create the legacy lock file either"
         );
     }
 
@@ -649,8 +796,8 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         fs::write(format!("{root}/PG_VERSION"), "16\n").unwrap();
 
-        let lock = take_volume_upgrade_lock(root, root).unwrap();
-        assert!(lock.is_some(), "initialized root layout must take the lock");
+        let locks = take_volume_upgrade_lock(root, root).unwrap();
+        assert!(!locks.is_empty(), "initialized root layout must take the lock");
     }
 }
 
