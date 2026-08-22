@@ -56,7 +56,11 @@ pub fn run_monitoring_loop(
 
         // Check backend health (single request for both primary and replica)
         match check_backend_health(&client) {
-            Ok(BackendHealth { primary, replica, down_replicas }) => {
+            Ok(BackendHealth {
+                primary,
+                replica,
+                down_replicas,
+            }) => {
                 // Handle primary backend
                 if primary == 0 {
                     if !no_primary_alerted {
@@ -118,9 +122,13 @@ fn check_backend_health(client: &reqwest::blocking::Client) -> Result<BackendHea
 
     // HAProxy CSV format: pxname,svname,status,...
     // pxname is column 0, svname is column 1, status is column 17.
-    // A server mid-rise reports "UP 1/3" (check count so far), not "UP" —
-    // an exact match counts a replica coming up as down and emits false
-    // down_replica alerts for the whole rise window.
+    // Transitional statuses (haproxy stats-proxy.c, srv_hlt_st): a server
+    // that is UP but failing checks reports "UP n/m" (up, going down); a
+    // server that is DOWN but passing checks reports "DOWN n/m" (down,
+    // going up). starts_with("UP") therefore counts exactly the set
+    // HAProxy still routes to. A mid-rise server is still down for
+    // routing, so it stays in down_replicas — its raw status is attached
+    // to the alert so a rising replica reads as recovering, not dead.
     for line in body.lines() {
         let parts: Vec<&str> = line.split(',').collect();
         if parts.len() > 17 && parts[1] != "BACKEND" {
@@ -134,7 +142,7 @@ fn check_backend_health(client: &reqwest::blocking::Client) -> Result<BackendHea
                     if parts[17].starts_with("UP") {
                         replica += 1;
                     } else {
-                        down_replicas.push(parts[1].to_string());
+                        down_replicas.push(format!("{} ({})", parts[1], parts[17]));
                     }
                 }
                 _ => {}
@@ -142,5 +150,9 @@ fn check_backend_health(client: &reqwest::blocking::Client) -> Result<BackendHea
         }
     }
 
-    Ok(BackendHealth { primary, replica, down_replicas })
+    Ok(BackendHealth {
+        primary,
+        replica,
+        down_replicas,
+    })
 }
