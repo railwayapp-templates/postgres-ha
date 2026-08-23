@@ -479,10 +479,13 @@ async fn move_leader_away(config: &Config) -> Result<()> {
 
 /// Periodic defragmentation loop. Runs as a background task after bootstrap completes.
 pub async fn defrag_loop(config: Config, telemetry: Telemetry) {
-    // Wait for bootstrap to complete before the first defrag
+    // Wait for bootstrap to complete before the first defrag. Same marker
+    // semantics as everywhere else: a marker we cannot stat counts as present
+    // (defrag is further gated on a local health probe below, so proceeding
+    // on a sick volume is safe — the probe fails and defrag is skipped).
     let marker_path = config.bootstrap_marker();
     loop {
-        if Path::new(&marker_path).exists() {
+        if bootstrap_marker_present(&marker_path) {
             break;
         }
         sleep(Duration::from_secs(10)).await;
@@ -612,6 +615,32 @@ mod tests {
         std::fs::write(&path, "1").unwrap();
         let present = bootstrap_marker_present(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);
+        assert!(present);
+    }
+
+    /// The load-bearing branch: a marker that exists but cannot be stat'd
+    /// (EACCES via an unsearchable parent directory) must read as PRESENT,
+    /// not absent — absent is what triggers the data wipe. Under root the
+    /// stat succeeds instead (permissions are bypassed), which still reads
+    /// as present, so the assertion holds either way.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_marker_is_treated_as_present() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "etcd-bootstrap-marker-denied-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".bootstrap_complete");
+        std::fs::write(&marker, "1").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let present = bootstrap_marker_present(marker.to_str().unwrap());
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(present);
     }
 }
