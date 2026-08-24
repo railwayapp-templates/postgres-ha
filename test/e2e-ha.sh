@@ -1921,6 +1921,22 @@ t_ha_replica_selfheals_via_restore_command() {
   wait_for_replication "$scope" 2 240 || { ko t_ha_replica_selfheals_via_restore_command "replicas didn't stream"; teardown_scope "$scope"; return; }
   wait_for_stanza_create "$leader" 90 || { ko t_ha_replica_selfheals_via_restore_command "no stanza-create"; teardown_scope "$scope"; return; }
 
+  # This cluster sets no POSTGRES_MAX_SLOT_WAL_KEEP_SIZE, so the derived
+  # sizing must have applied end-to-end: the effective GUC is a positive
+  # bound, not PG's unlimited default. (H11b can't check this — it pins the
+  # cap.) The exact value depends on the host's disk, so assert boundedness,
+  # not a number.
+  local derived_cap
+  derived_cap=$(psql_leader "$leader" -At -c \
+    "SELECT setting FROM pg_settings WHERE name='max_slot_wal_keep_size'" 2>/dev/null)
+  case "$derived_cap" in
+    ''|0|*[!0-9]*)  # empty, zero, "-1", or non-numeric — all mean "not applied"
+      ko t_ha_replica_selfheals_via_restore_command "derived max_slot_wal_keep_size not applied (effective: '${derived_cap:-unreadable}')"
+      teardown_scope "$scope"; return
+      ;;
+  esac
+  note "derived max_slot_wal_keep_size active: ${derived_cap}MB"
+
   local replica=""
   for n in "$n1" "$n2" "$n3"; do
     if [ "$n" != "$leader" ]; then replica="$n"; break; fi
@@ -2068,8 +2084,8 @@ t_ha_slot_recovery_recreates_invalidated_slot() {
   local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
   # Tiny fixed cap so a modest churn invalidates the stopped member's slot;
   # 5s watcher poll so recovery lands inside the test window. The explicit
-  # override also exercises the reconciler's "leave an operator-pinned cap
-  # alone" path.
+  # override also exercises the reconciler's converge-to-pin path (asserted
+  # at the end of this test).
   # shellcheck disable=SC2046
   read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" \
     $(archive_env_fast_watcher) \
@@ -2154,8 +2170,30 @@ t_ha_slot_recovery_recreates_invalidated_slot() {
     teardown_scope "$scope"; return
   fi
 
+  # Reconciler converge-to-pin: drift the effective GUC away from the
+  # operator pin by hand (ALTER SYSTEM outranks the rendered config — the
+  # exact channel a stale/inherited auto.conf entry would use) and the
+  # watcher must converge it back to the pinned 32MB. This exercises the
+  # whole live-reconcile mechanism end-to-end: read effective value from
+  # pg_settings, ALTER SYSTEM, pg_reload_conf.
+  psql_leader "$leader" -c "ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'" >/dev/null 2>&1
+  psql_leader "$leader" -c "SELECT pg_reload_conf()" >/dev/null 2>&1
+  local converged=0 conv_deadline=$(($(date +%s) + 90))
+  while [ "$(date +%s)" -lt "$conv_deadline" ]; do
+    local eff
+    eff=$(psql_leader "$leader" -At -c \
+      "SELECT setting FROM pg_settings WHERE name='max_slot_wal_keep_size'" 2>/dev/null)
+    if [ "$eff" = "32" ]; then converged=1; break; fi
+    sleep 3
+  done
+  if [ "$converged" != "1" ]; then
+    ko t_ha_slot_recovery_recreates_invalidated_slot "watcher never converged the drifted cap back to the 32MB pin"
+    fail_dump t_ha_slot_recovery_recreates_invalidated_slot "$leader"
+    teardown_scope "$scope"; return
+  fi
+
   ok t_ha_slot_recovery_recreates_invalidated_slot
-  note "cap invalidated the lagging slot (leader survived), watcher dropped it, Patroni recreated it, replica re-streamed (wal_status now '${final_status}')"
+  note "cap invalidated the lagging slot (leader survived), watcher dropped it, Patroni recreated it, replica re-streamed (wal_status now '${final_status}'); drifted cap re-converged to the 32MB pin"
   teardown_scope "$scope"
 }
 

@@ -1640,12 +1640,14 @@ async fn async_main() -> Result<()> {
     // on leaders. Honors SELF_HEAL_DISABLED=1 as a kill switch.
     spawn_self_heal_watcher(volume_root.clone(), telemetry.clone());
 
-    // Spawn the leader-only slot-recovery watcher. Recreates replication slots
-    // PostgreSQL invalidated when they breached max_slot_wal_keep_size (Patroni
-    // 4.1.0 neither notices nor repairs these), and keeps the cap sized to the
-    // leader's live free space. Without it the disk-fill cap would trade a loud
-    // leader PANIC for a silently un-streamable, un-promotable replica. No-op on
-    // replicas; each iteration re-checks /leader.
+    // Spawn the slot-recovery watcher. On the leader it recreates replication
+    // slots PostgreSQL invalidated when they breached max_slot_wal_keep_size
+    // (Patroni 4.1.0 neither notices nor repairs these) — without that, the
+    // disk-fill cap would trade a loud leader PANIC for a silently
+    // un-streamable, un-promotable replica. On every node it keeps the cap
+    // sized to the node's own live free space via ALTER SYSTEM (local param
+    // outranks DCS, so DCS patches can't do it — see slot_recovery.rs). Honors
+    // SLOT_RECOVERY_DISABLED=1 as a kill switch.
     spawn_slot_recovery_watcher(volume_root.clone());
 
     run_monitoring_loop(&config, child, &telemetry).await

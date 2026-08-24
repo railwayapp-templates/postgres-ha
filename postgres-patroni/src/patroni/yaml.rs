@@ -93,10 +93,15 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // leader. It lives in the LOCAL parameters, not bootstrap.dcs: the value is
     // derived from this node's own volume, every member can become leader, and
     // bootstrap.dcs only seeds DCS at cluster genesis — existing clusters (the
-    // ones already at risk) would never pick it up. DCS still wins if an
-    // operator sets it there. PGC_SIGHUP, so a reload applies it. See
-    // Config::resolve_max_slot_wal_keep_size for the sizing and the failure it
-    // prevents.
+    // ones already at risk) would never pick it up. NOTE the flip side: for a
+    // non-CMDLINE_OPTIONS parameter like this one, Patroni's local config takes
+    // precedence over DCS (`_build_effective_configuration`), so a DCS-side
+    // value can never override this line — the supported override is
+    // POSTGRES_MAX_SLOT_WAL_KEEP_SIZE, and live re-sizing happens via the
+    // slot-recovery watcher's ALTER SYSTEM path (slot_recovery.rs), whose
+    // auto.conf entry outranks this rendered value. PGC_SIGHUP, so a reload
+    // applies it. See Config::resolve_max_slot_wal_keep_size for the sizing
+    // and the failure it prevents.
     let pgbackrest_local_params = if config.wal_archive_bucket.is_some() {
         "    archive_mode: \"on\"\n    track_commit_timestamp: \"on\"\n    restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n".to_string()
     } else {

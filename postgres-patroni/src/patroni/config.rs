@@ -129,6 +129,17 @@ const SLOT_KEEP_FREE_PCT_NO_ARCHIVE: u64 = 75;
 /// unbounded default wearing a hat. (An earlier 1 GiB floor did exactly that on
 /// the fleet's 500 MB volumes: 1 GiB > the whole disk, so the slot could never
 /// be invalidated and the leader could still fill up.)
+///
+/// Honest limit of what a sub-128 MiB cap buys: Patroni's `CMDLINE_OPTIONS`
+/// pins `wal_keep_size = 128MB` (this repo never overrides it), and PostgreSQL
+/// only invalidates a slot when the WAL it pins is actually being removed —
+/// `wal_keep_size` holds the newest 128 MB back from removal regardless of
+/// slots. The effective invalidation horizon is therefore
+/// `max(cap, wal_keep_size)`: on the 500 MB volumes the slot trips at ~128 MB
+/// retained (~27% of the volume), not at this floor. Still bounded, and still
+/// far better than unlimited; shrinking `wal_keep_size` for small volumes is a
+/// separate decision with its own trade-off (slotless standby catch-up window)
+/// deliberately not taken here.
 const SLOT_KEEP_FLOOR_MIB: u64 = 64;
 
 /// Resolve `max_slot_wal_keep_size` from this node's volume size.
@@ -267,22 +278,37 @@ pub(crate) fn slot_keep_operator_override() -> Option<String> {
         .filter(|s| !s.is_empty() && is_valid_slot_keep_size(s))
 }
 
-/// Accept `-1` (explicitly unlimited) or a positive PG size string. PG's size
-/// units are powers of 1024 and a bare integer means MB for this GUC, so bare
-/// digits are safe here — unlike `POSTGRES_BASEBACKUP_MAX_RATE`, where a bare
-/// value silently means kB/s.
+/// Accept `-1` (explicitly unlimited) or a PG size string of at least 1 MB.
+/// PG's size units are powers of 1024 and a bare integer means MB for this
+/// GUC, so bare digits are safe here — unlike `POSTGRES_BASEBACKUP_MAX_RATE`,
+/// where a bare value silently means kB/s.
+///
+/// The ≥1 MB requirement is not cosmetic: PG converts a setting to this GUC's
+/// MB base unit by rounding, so a sub-1MB value like `512kB` would land as
+/// **0** — a distinct PG mode that retains no WAL for slots at all and
+/// invalidates them on routine churn (see `derive_slot_keep_mib`'s `.max(1)`,
+/// which guards the derived path against the same value).
 fn is_valid_slot_keep_size(v: &str) -> bool {
     if v == "-1" {
         return true;
     }
-    let digits = v
-        .strip_suffix("kB")
-        .or_else(|| v.strip_suffix("MB"))
-        .or_else(|| v.strip_suffix("GB"))
-        .or_else(|| v.strip_suffix("TB"))
-        .unwrap_or(v)
-        .trim();
-    digits.parse::<u64>().is_ok_and(|n| n > 0)
+    let (digits, kib_per_unit) = if let Some(n) = v.strip_suffix("kB") {
+        (n, 1u64)
+    } else if let Some(n) = v.strip_suffix("MB") {
+        (n, 1024)
+    } else if let Some(n) = v.strip_suffix("GB") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = v.strip_suffix("TB") {
+        (n, 1024 * 1024 * 1024)
+    } else {
+        (v, 1024) // bare = MB for this GUC
+    };
+    digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(kib_per_unit))
+        .is_some_and(|kib| kib >= 1024)
 }
 
 /// `(total, available)` for the filesystem holding `path`, in MiB. `(0, 0)` when
@@ -559,11 +585,19 @@ mod tests {
             resolve_max_slot_wal_keep_size(Some("4096".into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
             "4096"
         );
+        // kB is fine at ≥1 MB (PG's base unit for this GUC).
+        assert_eq!(
+            resolve_max_slot_wal_keep_size(Some("1024kB".into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
+            "1024kB"
+        );
     }
 
     #[test]
     fn slot_keep_size_rejects_junk_override_and_derives_instead() {
-        for junk in ["0", "abc", "-5", "12MiB", ""] {
+        // "512kB" and "1000kB" would round to 0 in PG's MB base unit — the
+        // "retain no WAL for slots" mode the validator exists to keep out;
+        // "1024kB" (exactly 1 MB) stays acceptable.
+        for junk in ["0", "abc", "-5", "12MiB", "", "512kB", "1000kB", "0MB", "0GB"] {
             assert_eq!(
                 resolve_max_slot_wal_keep_size(Some(junk.into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
                 format!("{}MB", TWO_TB_FREE_MIB / 2),
