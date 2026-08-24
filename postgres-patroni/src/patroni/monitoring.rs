@@ -2,7 +2,8 @@
 //!
 //! Handles the monitoring loop, signal handling, and health check management.
 
-use super::{check_health, self_heal, Config};
+use super::{check_health, exit_history, self_heal, Config};
+use crate::volume_root;
 use common::{ConfigExt, Telemetry, TelemetryEvent};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -128,6 +129,10 @@ pub async fn run_monitoring_loop(
     let mut startup_elapsed = 0u64;
     let mut volume_baseline = volume_used_bytes(&config.data_dir);
     let mut last_xlog_pos: Option<i64> = None;
+    // Whether Patroni's local REST answered at least once this lifetime — the
+    // exit diagnostics' discriminator between "wedged pre-REST" (reinit/wipe
+    // territory) and "was up, then degraded".
+    let mut rest_ever_answered = false;
     // One forced reinitialize per container start. A replica that stalls before
     // ever becoming healthy is usually wedged in a way a restart can't fix — see
     // try_reinitialize_stalled_replica. We try a reinitialize once instead of
@@ -153,8 +158,10 @@ pub async fn run_monitoring_loop(
     // Resolved once per loop entry (not per-tick): the dwell only matters at
     // the moment of the reinit decision, and re-reading the env every 5s tick
     // buys nothing since it can't change under a running process.
-    let wal_archive_stall_confirm_secs =
-        u64::env_parse("WAL_ARCHIVE_STALL_CONFIRM_SECONDS", WAL_ARCHIVE_STALL_CONFIRM_SECS);
+    let wal_archive_stall_confirm_secs = u64::env_parse(
+        "WAL_ARCHIVE_STALL_CONFIRM_SECONDS",
+        WAL_ARCHIVE_STALL_CONFIRM_SECS,
+    );
     // The Stalled branch's immediate-fire assumption (see the const doc comment
     // above) only holds when max_startup_timeout comfortably exceeds the dwell.
     // Nothing else enforces that relationship, so surface it loudly rather than
@@ -198,10 +205,24 @@ pub async fn run_monitoring_loop(
                     process: "patroni".to_string(),
                     exit_code: status.ok().and_then(|s| s.code()),
                 });
+                // A patroni that dies during startup can die again within a
+                // second of the next boot — without a persistent backoff the
+                // container loop hammers at ~1.5s/cycle indefinitely
+                // (observed 17h+/34.8k events, 2026-08-24).
+                exit_history::record_recovery_exit(
+                    &volume_root(),
+                    &config.data_dir,
+                    "patroni-died-startup",
+                    Some(rest_ever_answered),
+                )
+                .await;
                 std::process::exit(1);
             }
             _ = sleep(Duration::from_secs(5)) => {
                 let healthy = check_health(config.health_check_timeout).await;
+                if healthy {
+                    rest_ever_answered = true;
+                }
 
                 let used = volume_used_bytes(&config.data_dir);
                 let volume_grew = volume_progressed(&mut volume_baseline, used);
@@ -217,6 +238,8 @@ pub async fn run_monitoring_loop(
                 };
                 let lsn_advanced = xlog_advanced(last_xlog_pos, xlog_pos);
                 if xlog_pos.is_some() {
+                    // The xlog endpoint answering IS the REST answering.
+                    rest_ever_answered = true;
                     last_xlog_pos = xlog_pos;
                 }
 
@@ -305,6 +328,19 @@ pub async fn run_monitoring_loop(
                         let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
                         sleep(Duration::from_secs(2)).await;
                         let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGKILL);
+                        // Persistent exit record + diagnostics: this loop
+                        // paces at max_startup_timeout per lap (never rapid),
+                        // but rest_ever_answered=false here is the signature of a
+                        // pre-REST wedge — patroni alive, REST never bound, no
+                        // progress — and the consecutive-exit count makes the
+                        // wedge's age readable from one log line.
+                        exit_history::record_recovery_exit(
+                            &volume_root(),
+                            &config.data_dir,
+                            "startup-stalled",
+                            Some(rest_ever_answered),
+                        )
+                        .await;
                         std::process::exit(1);
                     }
                     StartupTick::Waiting => {
@@ -415,6 +451,13 @@ pub async fn run_monitoring_loop(
                     process: "patroni".to_string(),
                     exit_code: status.ok().and_then(|s| s.code()),
                 });
+                exit_history::record_recovery_exit(
+                    &volume_root(),
+                    &config.data_dir,
+                    "patroni-died",
+                    Some(true),
+                )
+                .await;
                 std::process::exit(1);
             }
             _ = sleep(Duration::from_secs(config.health_check_interval)) => {
@@ -437,6 +480,13 @@ pub async fn run_monitoring_loop(
                         let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGTERM);
                         sleep(Duration::from_secs(2)).await;
                         let _ = kill(Pid::from_raw(patroni_pid as i32), Signal::SIGKILL);
+                        exit_history::record_recovery_exit(
+                            &volume_root(),
+                            &config.data_dir,
+                            "health-failures-exhausted",
+                            Some(true),
+                        )
+                        .await;
                         std::process::exit(1);
                     }
                 }
@@ -856,15 +906,30 @@ mod tests {
         // so a positive verdict is final on its own. confirm_secs is
         // irrelevant on this branch — pass a nonzero value to prove it's
         // ignored, not just coincidentally zero.
-        assert!(wal_reinit_confirmed(false, None, 30, WAL_ARCHIVE_STALL_CONFIRM_SECS));
-        assert!(wal_reinit_confirmed(false, Some(30), 30, WAL_ARCHIVE_STALL_CONFIRM_SECS));
+        assert!(wal_reinit_confirmed(
+            false,
+            None,
+            30,
+            WAL_ARCHIVE_STALL_CONFIRM_SECS
+        ));
+        assert!(wal_reinit_confirmed(
+            false,
+            Some(30),
+            30,
+            WAL_ARCHIVE_STALL_CONFIRM_SECS
+        ));
     }
 
     #[test]
     fn wal_reinit_waits_out_archive_stall_dwell() {
         // First positive verdict arms at t=30; on an archiving cluster the
         // wipe waits until the zero-progress stall outlives the dwell.
-        assert!(!wal_reinit_confirmed(true, Some(30), 30, WAL_ARCHIVE_STALL_CONFIRM_SECS));
+        assert!(!wal_reinit_confirmed(
+            true,
+            Some(30),
+            30,
+            WAL_ARCHIVE_STALL_CONFIRM_SECS
+        ));
         assert!(!wal_reinit_confirmed(
             true,
             Some(30),
@@ -883,7 +948,12 @@ mod tests {
     fn wal_reinit_never_fires_unarmed_on_archiving_cluster() {
         // Defensive: however long the stall, a verdict that was never armed
         // (progress reset the episode) doesn't wipe.
-        assert!(!wal_reinit_confirmed(true, None, 9_999, WAL_ARCHIVE_STALL_CONFIRM_SECS));
+        assert!(!wal_reinit_confirmed(
+            true,
+            None,
+            9_999,
+            WAL_ARCHIVE_STALL_CONFIRM_SECS
+        ));
     }
 
     #[test]
@@ -915,8 +985,16 @@ mod tests {
     fn dwell_warning_silent_without_archive_regardless_of_timeout() {
         // Non-archiving clusters never consult the dwell at all — no
         // relationship to warn about, even with a tiny max_startup_timeout.
-        assert!(!archive_stall_dwell_exceeds_startup_timeout(false, 0, WAL_ARCHIVE_STALL_CONFIRM_SECS));
-        assert!(!archive_stall_dwell_exceeds_startup_timeout(false, 9_999, WAL_ARCHIVE_STALL_CONFIRM_SECS));
+        assert!(!archive_stall_dwell_exceeds_startup_timeout(
+            false,
+            0,
+            WAL_ARCHIVE_STALL_CONFIRM_SECS
+        ));
+        assert!(!archive_stall_dwell_exceeds_startup_timeout(
+            false,
+            9_999,
+            WAL_ARCHIVE_STALL_CONFIRM_SECS
+        ));
     }
 
     #[test]
@@ -931,7 +1009,9 @@ mod tests {
         // matches the dwell exactly, so the Waiting path's guarantee still
         // holds at the boundary.
         assert!(!archive_stall_dwell_exceeds_startup_timeout(true, 300, 300));
-        assert!(!archive_stall_dwell_exceeds_startup_timeout(true, 1800, 300));
+        assert!(!archive_stall_dwell_exceeds_startup_timeout(
+            true, 1800, 300
+        ));
     }
 
     #[test]
