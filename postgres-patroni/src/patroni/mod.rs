@@ -8,6 +8,7 @@
 
 mod backup_watcher;
 mod config;
+mod exit_history;
 mod health;
 mod monitoring;
 mod reconcile;
