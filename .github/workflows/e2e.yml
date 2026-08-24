@@ -60,13 +60,6 @@ jobs:
           # The major-upgrade choreography tests run in their own job below
           # so this job's timing is untouched; local runs still include them.
           E2E_EXCLUDE: t_ha_major_upgrade_full_choreography t_ha_major_upgrade_back_to_back
-          # The upgrade-lock rename ships in lockstep with postgres-ssl#127:
-          # this runtime rendezvouses on .railway-volume.lock, so the job
-          # image must too (t_ha_job_refused_while_runtime_live pairs them
-          # on a fresh volume, where the legacy-path fallback has no file to
-          # bind to). Flip to `main` (or drop — that's the harness default)
-          # once postgres-ssl#127 merges and its branch is deleted.
-          UPGRADE_JOB_GIT_REF: pcs/rename-upgrade-lock
           # docker/build-push-action already loaded this exact tag above via
           # its own gha cache — the harness's always-rebuild policy exists
           # for local iteration (where a stale image is the real risk), not
@@ -179,11 +172,6 @@ jobs:
         shell: bash
         env:
           PG_VERSION: ${{ matrix.pg_version }}
-          # Same pin as the main e2e job above: the job image must carry the
-          # postgres-ssl#127 lock rename this runtime ships. Flip to `main`
-          # (or drop — that's the harness default) once postgres-ssl#127
-          # merges and its branch is deleted.
-          UPGRADE_JOB_GIT_REF: pcs/rename-upgrade-lock
           # Same reasoning as the main e2e job: these exact tags were just
           # built and loaded above, from this same commit.
           E2E_SKIP_BUILD: "1"
