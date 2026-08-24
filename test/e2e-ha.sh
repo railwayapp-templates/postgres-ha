@@ -206,9 +206,9 @@ ensure_image_for_major() {
 #      repo's CI can build the job image without the sibling checkout.
 #      BuildKit resolves -f inside the remote context (verified: the git
 #      context build produces a digest identical to the local build).
-# NOTE: UPGRADE_JOB_GIT_REF defaults to the postgres-ssl PR branch that
-# carries Dockerfile.upgrade (pcs/major-upgrade-job). Flip the default to
-# `main` once railwayapp-templates/postgres-ssl#113 merges.
+# UPGRADE_JOB_GIT_REF defaults to `main`; CI pins it to a postgres-ssl PR
+# branch while a lockstep change (like the upgrade-lock rename of
+# railwayapp-templates/postgres-ssl#127) is still unmerged there.
 ensure_upgrade_job_image() {
   local from="$1" to="$2" tag="$3"
   if [ "${E2E_SKIP_BUILD:-0}" = "1" ] && docker image inspect "$tag" >/dev/null 2>&1; then
@@ -223,7 +223,7 @@ ensure_upgrade_job_image() {
       -f "$dir/Dockerfile.upgrade" -t "$tag" "$dir" >/dev/null
     return $?
   done
-  local ref="${UPGRADE_JOB_GIT_REF:-pcs/major-upgrade-job}"
+  local ref="${UPGRADE_JOB_GIT_REF:-main}"
   log "building $tag from git context railwayapp-templates/postgres-ssl#${ref}"
   docker build -q --build-arg FROM_VERSION="$from" --build-arg TO_VERSION="$to" \
     -f Dockerfile.upgrade -t "$tag" \
@@ -3024,7 +3024,7 @@ t_ha_major_upgrade_full_choreography() {
     return
   fi
   if ! ensure_upgrade_job_image "$from_major" "$PG_VERSION" "$job_image"; then
-    ko t_ha_major_upgrade_full_choreography "could not build the upgrade job image ($job_image) from a local postgres-ssl checkout or the git context (UPGRADE_JOB_GIT_REF=${UPGRADE_JOB_GIT_REF:-pcs/major-upgrade-job})"
+    ko t_ha_major_upgrade_full_choreography "could not build the upgrade job image ($job_image) from a local postgres-ssl checkout or the git context (UPGRADE_JOB_GIT_REF=${UPGRADE_JOB_GIT_REF:-main})"
     return
   fi
 
@@ -3630,7 +3630,7 @@ t_ha_major_upgrade_back_to_back() {
   fi
   if ! ensure_upgrade_job_image "$from" "$mid" "$job1" || \
      ! ensure_upgrade_job_image "$mid" "$to" "$job2"; then
-    ko "$tname" "could not build the upgrade job images (UPGRADE_JOB_GIT_REF=${UPGRADE_JOB_GIT_REF:-pcs/major-upgrade-job})"
+    ko "$tname" "could not build the upgrade job images (UPGRADE_JOB_GIT_REF=${UPGRADE_JOB_GIT_REF:-main})"
     return
   fi
 
