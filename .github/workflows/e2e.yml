@@ -172,9 +172,6 @@ jobs:
         shell: bash
         env:
           PG_VERSION: ${{ matrix.pg_version }}
-          # NOTE: flip to `main` (or drop, once the harness default flips)
-          # after railwayapp-templates/postgres-ssl#113 merges.
-          UPGRADE_JOB_GIT_REF: pcs/major-upgrade-job
           # Same reasoning as the main e2e job: these exact tags were just
           # built and loaded above, from this same commit.
           E2E_SKIP_BUILD: "1"
