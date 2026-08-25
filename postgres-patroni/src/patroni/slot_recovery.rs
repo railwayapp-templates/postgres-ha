@@ -56,22 +56,28 @@
 //!    a supported override and will be re-converged once it drifts past the
 //!    hysteresis band.
 //!
-//! `SLOT_RECOVERY_DISABLED=1` is the operator kill switch (the watcher never
-//! spawns), mirroring `SELF_HEAL_DISABLED`.
+//! `SLOT_RECOVERY_DISABLED=1` is the operator kill switch. It disables slot
+//! repair, renders the boot-time cap as unlimited, and runs a small one-shot
+//! neutralizer that overwrites any stale cap previously persisted in
+//! `postgresql.auto.conf`. Disabling repair while leaving the cap active would
+//! recreate the one-way-door failure described above.
 
 use super::config::{
-    derive_slot_keep_mib, slot_keep_operator_override, volume_total_and_free_mib,
+    derive_slot_keep_mib, slot_keep_operator_override, slot_recovery_disabled,
+    volume_total_and_free_mib,
 };
 use super::reconcile::{local_node_is_leader, wait_for_patroni_rest, PATRONI_REST};
 use super::Config;
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
 const DEFAULT_POLL_SECONDS: u64 = 60;
+const DEFAULT_REPAIR_BACKOFF_SECONDS: u64 = 900;
 
 /// Only rewrite the cap when it moves by more than this fraction of the current
 /// value, so ordinary disk churn (temp files, a checkpoint) doesn't trigger a
@@ -79,20 +85,15 @@ const DEFAULT_POLL_SECONDS: u64 = 60;
 /// it within a poll or two.
 const CAP_REPATCH_HYSTERESIS_PCT: u64 = 10;
 
-/// True when the operator kill switch `SLOT_RECOVERY_DISABLED=1` is set — the
-/// watcher never spawns. This loop drops replication slots on production
-/// primaries and rewrites a live GUC; if it ever misbehaves, the off switch
-/// must not require shipping a new image. Mirrors `SELF_HEAL_DISABLED`.
-fn disabled() -> bool {
-    std::env::var("SLOT_RECOVERY_DISABLED").ok().as_deref() == Some("1")
-}
-
 /// Spawn the slot-recovery watcher. Mirrors the self-heal watcher's
 /// respawn shape: an outer loop wraps `run` in `spawn` so a panic surfaces as a
 /// `JoinError` and respawns rather than taking down patroni-runner.
 pub fn spawn(volume_root: String) {
-    if disabled() {
-        warn!("slot-recovery: SLOT_RECOVERY_DISABLED=1 — watcher not spawned");
+    if slot_recovery_disabled() {
+        warn!(
+            "slot-recovery: SLOT_RECOVERY_DISABLED=1 — slot repair disabled; neutralizing the effective WAL-retention cap"
+        );
+        spawn_disabled_cap_neutralizer();
         return;
     }
 
@@ -102,9 +103,15 @@ pub fn spawn(volume_root: String) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_POLL_SECONDS)
         .max(1);
+    let repair_backoff_secs = std::env::var("SLOT_RECOVERY_REPAIR_BACKOFF_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_REPAIR_BACKOFF_SECONDS)
+        .max(1);
 
     info!(
         poll_secs,
+        repair_backoff_secs,
         volume_root = %volume_root,
         "slot-recovery: starting watcher (slot repair on the leader, cap reconcile on every node)"
     );
@@ -112,10 +119,13 @@ pub fn spawn(volume_root: String) {
     tokio::spawn(async move {
         loop {
             let vr = volume_root.clone();
-            let h = tokio::task::spawn(async move { run(vr, poll_secs).await });
+            let h =
+                tokio::task::spawn(async move { run(vr, poll_secs, repair_backoff_secs).await });
             match h.await {
                 Ok(Ok(())) => warn!("slot-recovery: run loop returned cleanly — respawning in 5s"),
-                Ok(Err(e)) => warn!(error = %e, "slot-recovery: run loop errored — respawning in 5s"),
+                Ok(Err(e)) => {
+                    warn!(error = %e, "slot-recovery: run loop errored — respawning in 5s")
+                }
                 Err(e) if e.is_panic() => {
                     warn!(panic = ?e, "slot-recovery: run loop panicked — respawning in 5s")
                 }
@@ -126,7 +136,39 @@ pub fn spawn(volume_root: String) {
     });
 }
 
-async fn run(volume_root: String, poll_secs: u64) -> Result<()> {
+/// A cap written through ALTER SYSTEM outranks the generated Patroni YAML and
+/// survives restarts.  The emergency switch therefore needs an active cleanup
+/// step; merely rendering `-1` would leave the old auto.conf value effective.
+fn spawn_disabled_cap_neutralizer() {
+    tokio::spawn(async move {
+        loop {
+            match neutralize_disabled_cap().await {
+                Ok(()) => return,
+                Err(e) => warn!(
+                    error = %e,
+                    "slot-recovery: failed to neutralize cap while disabled — retrying in 5s"
+                ),
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+async fn neutralize_disabled_cap() -> Result<()> {
+    let config = Config::from_env().context("load config for disabled slot-recovery cleanup")?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("build reqwest client")?;
+    wait_for_patroni_rest(&client).await?;
+    if current_effective_cap_mib(&config.superuser).await != Some(None) {
+        alter_system_set_cap(&config.superuser, "-1").await?;
+    }
+    info!("slot-recovery: effective max_slot_wal_keep_size is unlimited while disabled");
+    Ok(())
+}
+
+async fn run(volume_root: String, poll_secs: u64, repair_backoff_secs: u64) -> Result<()> {
     let config = Config::from_env().context("load config for slot-recovery")?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -134,6 +176,7 @@ async fn run(volume_root: String, poll_secs: u64) -> Result<()> {
         .context("build reqwest client")?;
 
     wait_for_patroni_rest(&client).await?;
+    let mut last_repairs = HashMap::new();
 
     loop {
         // Slot repair is leader-only: member slots live on the primary, and
@@ -141,7 +184,14 @@ async fn run(volume_root: String, poll_secs: u64) -> Result<()> {
         // new leader picks the work up within one poll after failover, and an
         // ex-leader drops it just as fast.
         if local_node_is_leader(&client).await {
-            if let Err(e) = recreate_lost_slots(&client, &config.superuser).await {
+            if let Err(e) = recreate_lost_slots(
+                &client,
+                &config.superuser,
+                &mut last_repairs,
+                Duration::from_secs(repair_backoff_secs),
+            )
+            .await
+            {
                 warn!(error = %e, "slot-recovery: recreate-lost-slots iteration errored (continuing)");
             }
         }
@@ -160,7 +210,12 @@ async fn run(volume_root: String, poll_secs: u64) -> Result<()> {
 // 1. Recreate invalidated slots
 // ====================================================================
 
-async fn recreate_lost_slots(client: &reqwest::Client, superuser: &str) -> Result<()> {
+async fn recreate_lost_slots(
+    client: &reqwest::Client,
+    superuser: &str,
+    last_repairs: &mut HashMap<String, Instant>,
+    repair_backoff: Duration,
+) -> Result<()> {
     let lost = query_lost_physical_slots(superuser).await?;
     if lost.is_empty() {
         return Ok(());
@@ -184,15 +239,36 @@ async fn recreate_lost_slots(client: &reqwest::Client, superuser: &str) -> Resul
             info!(slot = %slot, "slot-recovery: lost slot is not a cluster member slot — leaving it for the operator");
             continue;
         }
-        match drop_replication_slot(superuser, &slot).await {
-            Ok(()) => info!(
+        if repair_is_backed_off(
+            last_repairs.get(&slot).copied(),
+            Instant::now(),
+            repair_backoff,
+        ) {
+            warn!(
                 slot = %slot,
-                "slot-recovery: dropped invalidated member slot; Patroni will recreate it and the standby will resume streaming"
-            ),
-            Err(e) => warn!(slot = %slot, error = %e, "slot-recovery: failed to drop invalidated slot"),
+                backoff_secs = repair_backoff.as_secs(),
+                "slot-recovery: lost member slot was repaired recently — suppressing a recreate loop"
+            );
+            continue;
+        }
+        match drop_replication_slot(superuser, &slot).await {
+            Ok(()) => {
+                last_repairs.insert(slot.clone(), Instant::now());
+                info!(
+                    slot = %slot,
+                    "slot-recovery: dropped invalidated member slot; Patroni will recreate it and the standby will resume streaming"
+                )
+            }
+            Err(e) => {
+                warn!(slot = %slot, error = %e, "slot-recovery: failed to drop invalidated slot")
+            }
         }
     }
     Ok(())
+}
+
+fn repair_is_backed_off(last: Option<Instant>, now: Instant, backoff: Duration) -> bool {
+    last.is_some_and(|last| now.saturating_duration_since(last) < backoff)
 }
 
 /// Names of physical slots PostgreSQL has invalidated and that no backend holds.
@@ -537,5 +613,22 @@ mod tests {
     fn repatch_triggers_on_real_growth() {
         // Leader's data grew; free space shrank; cap should fall materially.
         assert!(should_repatch_cap(Some(387_000), 250_000, 10));
+    }
+
+    #[test]
+    fn repair_backoff_suppresses_recreate_loops() {
+        let now = Instant::now();
+        let backoff = Duration::from_secs(900);
+        assert!(!repair_is_backed_off(None, now, backoff));
+        assert!(repair_is_backed_off(
+            Some(now - Duration::from_secs(899)),
+            now,
+            backoff
+        ));
+        assert!(!repair_is_backed_off(
+            Some(now - Duration::from_secs(900)),
+            now,
+            backoff
+        ));
     }
 }

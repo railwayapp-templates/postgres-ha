@@ -230,6 +230,25 @@ fn resolve_max_slot_wal_keep_size(
     }
 }
 
+fn resolve_startup_slot_keep_size(
+    disabled: bool,
+    env_value: Option<String>,
+    volume_total_mib: u64,
+    volume_free_mib: u64,
+    archiving_enabled: bool,
+) -> String {
+    if disabled {
+        "-1".to_string()
+    } else {
+        resolve_max_slot_wal_keep_size(
+            env_value,
+            volume_total_mib,
+            volume_free_mib,
+            archiving_enabled,
+        )
+    }
+}
+
 /// The numeric cap in MiB, or `None` when the volume can't be measured (caller
 /// renders that as `-1`, unlimited). Split out from
 /// [`resolve_max_slot_wal_keep_size`] so the leader-side reconciler can
@@ -266,6 +285,14 @@ pub(crate) fn derive_slot_keep_mib(
             .min(by_total)
             .max(1),
     )
+}
+
+/// Master emergency stop for slot retention management.  This must disable
+/// both halves of the feature: repairing invalidated slots *and* imposing the
+/// cap that can invalidate them.  Disabling only the repair loop recreates the
+/// one-way-door failure this feature exists to prevent.
+pub(crate) fn slot_recovery_disabled() -> bool {
+    env::var("SLOT_RECOVERY_DISABLED").ok().as_deref() == Some("1")
 }
 
 /// The operator's `POSTGRES_MAX_SLOT_WAL_KEEP_SIZE`, if set to a valid value.
@@ -374,7 +401,10 @@ impl Config {
 
         let wal_archive_bucket = env::var("WAL_ARCHIVE_BUCKET").ok().filter(|s| !s.is_empty());
         let (volume_total_mib, volume_free_mib) = volume_total_and_free_mib(&crate::volume_root());
-        let max_slot_wal_keep_size = resolve_max_slot_wal_keep_size(
+        // The runtime neutralizer also removes any stronger value left in
+        // postgresql.auto.conf by an earlier ALTER SYSTEM reconcile.
+        let max_slot_wal_keep_size = resolve_startup_slot_keep_size(
+            slot_recovery_disabled(),
             env::var("POSTGRES_MAX_SLOT_WAL_KEEP_SIZE").ok(),
             volume_total_mib,
             volume_free_mib,
@@ -436,8 +466,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_basebackup_max_rate, resolve_max_slot_wal_keep_size, SLOT_KEEP_FLOOR_MIB,
-        SLOT_KEEP_TOTAL_PCT,
+        resolve_basebackup_max_rate, resolve_max_slot_wal_keep_size,
+        resolve_startup_slot_keep_size, SLOT_KEEP_FLOOR_MIB, SLOT_KEEP_TOTAL_PCT,
     };
 
     /// The rampmetrics-api geometry that PANICked on 2026-07-10: a 2 TB volume
@@ -590,6 +620,22 @@ mod tests {
             resolve_max_slot_wal_keep_size(Some("1024kB".into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
             "1024kB"
         );
+    }
+
+    #[test]
+    fn slot_recovery_kill_switch_wins_over_operator_pin_and_derived_cap() {
+        for env_value in [None, Some("512GB".to_string()), Some("-1".to_string())] {
+            assert_eq!(
+                resolve_startup_slot_keep_size(
+                    true,
+                    env_value,
+                    TWO_TB_MIB,
+                    TWO_TB_FREE_MIB,
+                    true,
+                ),
+                "-1"
+            );
+        }
     }
 
     #[test]
