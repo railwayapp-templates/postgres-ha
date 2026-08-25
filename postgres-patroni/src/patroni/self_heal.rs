@@ -43,8 +43,8 @@
 //!    silent-divergence dwell window above is shared with a replica that
 //!    never diverges onto a stale timeline at all: it stays on the SAME
 //!    timeline as the leader, Patroni keeps logging "no action ... following
-//!    a leader", yet the WAL cursor (`received_location`/`replayed_location`)
-//!    never moves because Postgres is stuck replaying a corrupt or
+//!    a leader", yet the replay cursor (`replayed_location`) never moves
+//!    because Postgres is stuck replaying a corrupt or
 //!    incomplete local WAL segment (`record with incorrect prev-link`,
 //!    `invalid resource manager ID`, repeating `waiting for WAL to become
 //!    available at <same LSN>` every few seconds, forever). No postmaster
@@ -533,18 +533,18 @@ fn stalled_same_timeline_replay(s: &SelfHealInputs) -> Option<i64> {
 }
 
 /// One poll's progress fingerprint for an actively-diverged replica: the local
-/// timeline and the replication cursor (highest of received/replayed WAL
-/// position). Together these are *every* axis on which a healthy replica can
-/// make forward progress — a timeline switch as it crosses a switchpoint, or a
-/// climbing WAL position as it streams/replays. A wedged replica advances
-/// neither.
+/// timeline and the replay cursor. `received_location` is deliberately not
+/// part of this fingerprint: a replica wedged on a corrupt local WAL record can
+/// keep receiving newer WAL while `replayed_location` stays frozen. Treating
+/// the received cursor as replay progress would reset the dwell on every poll
+/// and permanently hide exactly the replay stall this watcher exists to catch.
 #[derive(Debug, Clone, Copy)]
 struct DivergenceObs {
     local_tl: i64,
-    /// Highest of `received_location`/`replayed_location` from `/patroni`'s
-    /// `xlog`. `None` when Patroni reported no cursor — treated as "cannot
-    /// prove a stall", which restarts the window rather than risk wiping a node
-    /// that might be progressing unseen.
+    /// `replayed_location` from `/patroni`'s `xlog`. `None` when Patroni
+    /// reported no replay cursor — treated as "cannot prove a stall", which
+    /// restarts the window rather than risk wiping a node that might be
+    /// progressing unseen.
     progress: Option<i64>,
     /// The leader's own WAL position this poll (from `/cluster`), independent
     /// of the local node's progress. Used only to prove the same-timeline
@@ -1287,9 +1287,7 @@ async fn iteration(
         // disables self-heal indefinitely — see the runner's
         // report_marker_removal_failure) look identical from here, and the
         // age is what lets the fleet view tell them apart.
-        if upgrade_standdown_last_emit
-            .is_none_or(|last| now - last >= STANDDOWN_REEMIT_SECS)
-        {
+        if upgrade_standdown_last_emit.is_none_or(|last| now - last >= STANDDOWN_REEMIT_SECS) {
             let phase = upgrade_marker
                 .and_then(|m| m.phase)
                 .unwrap_or_else(|| "unreadable".to_string());
@@ -1368,7 +1366,7 @@ async fn iteration(
     // applies, so this same window also matures for a replica stuck on the
     // SAME timeline as the leader (the WAL-replay-stall case), which a
     // min_gap-gated observation would never see in the first place. Any
-    // forward progress (timeline switch or WAL cursor advance) restarts the
+    // forward progress (timeline switch or replay-cursor advance) restarts the
     // clock — a node replaying across a gap is catching up, not wedged — and
     // any ineligible observation (caught up, mid-clone, leader unknown, role
     // unclear) clears it. `decide_self_heal` re-examines the timeline gap at
@@ -1389,9 +1387,11 @@ async fn iteration(
         .map(|t| now.saturating_sub(t).max(0) as u64)
         .unwrap_or(0);
 
-    // Highest WAL position Patroni reports for this node — the axis (besides the
-    // timeline) on which a catching-up replica makes visible progress.
-    let local_progress = local.xlog.and_then(|x| x.highest_location());
+    // Only replay progress proves that recovery is consuming WAL. The receive
+    // cursor may keep advancing while replay is wedged on a corrupt local
+    // record, so including it here would continuously reset the dwell and make
+    // the same-timeline stall detector blind to its target failure mode.
+    let local_progress = local.xlog.and_then(Xlog::replay_progress);
     // A single missed leader-timeline read (a transient `/cluster` blip) would
     // otherwise force `current_obs` to `None` below and clear the whole dwell
     // window — paying for one flaky poll with a full re-accrual (up to
@@ -1619,6 +1619,13 @@ struct Xlog {
 }
 
 impl Xlog {
+    /// Replay progress for a replica. This intentionally ignores
+    /// `received_location`: WAL can continue arriving while redo is frozen on
+    /// a corrupt record, so receipt is not evidence of recovery progress.
+    fn replay_progress(self) -> Option<i64> {
+        self.replayed_location
+    }
+
     /// Highest position observed across all reported cursors — the most
     /// generous "is it progressing" reading, so any advance on any of them
     /// resets the dwell.
@@ -1786,10 +1793,7 @@ async fn confirm_timeline_divergence(
     if !leader.reachable {
         return false;
     }
-    if progress_advanced_past(
-        local.xlog.and_then(|x| x.highest_location()),
-        frozen_progress,
-    ) {
+    if progress_advanced_past(local.xlog.and_then(Xlog::replay_progress), frozen_progress) {
         return false;
     }
     timeline_divergence_present(
@@ -1814,8 +1818,8 @@ const REPLAY_STALL_RECHECK_DELAY_SECS: u64 = 5;
 /// Independent fresh-read re-check for the same-timeline replay-stall
 /// trigger, mirroring [`confirm_timeline_divergence`]. Re-verifies the
 /// structural conditions (replica, healthy state, leader reachable, timelines
-/// known and exactly equal) on a brand-new poll, plus that the local cursor
-/// hasn't advanced past `frozen_progress` since the dwell window's baseline,
+/// known and exactly equal) on a brand-new poll, plus that the local replay
+/// cursor hasn't advanced past `frozen_progress` since the dwell baseline,
 /// rather than re-proving the dwell itself was frozen for its whole duration
 /// or that the leader genuinely advanced during it — the multi-poll accrual
 /// already established both; this just guards against acting on a single
@@ -1838,7 +1842,7 @@ async fn confirm_replay_stall(
     if !leader.reachable {
         return false;
     }
-    let first_progress = local.xlog.and_then(|x| x.highest_location());
+    let first_progress = local.xlog.and_then(Xlog::replay_progress);
     if progress_advanced_past(first_progress, frozen_progress) {
         return false;
     }
@@ -1855,7 +1859,7 @@ async fn confirm_replay_stall(
     let Ok(recheck_local) = fetch_local_patroni(client).await else {
         return false;
     };
-    let second_progress = recheck_local.xlog.and_then(|x| x.highest_location());
+    let second_progress = recheck_local.xlog.and_then(Xlog::replay_progress);
     !progress_advanced_past(second_progress, first_progress)
 }
 
@@ -2453,6 +2457,20 @@ mod tests {
         assert!(!progress_advanced_past(None, Some(100)));
         assert!(!progress_advanced_past(Some(100), None));
         assert!(!progress_advanced_past(None, None));
+    }
+
+    #[test]
+    fn replica_progress_ignores_received_wal_ahead_of_frozen_replay() {
+        // Regression guard for the same-timeline corruption shape: the
+        // walreceiver can keep filling pg_wal while redo remains pinned to the
+        // bad record. Using the highest cursor here would report 900 and reset
+        // the stall window even though replay is still frozen at 100.
+        let xlog = Xlog {
+            location: None,
+            received_location: Some(900),
+            replayed_location: Some(100),
+        };
+        assert_eq!(xlog.replay_progress(), Some(100));
     }
 
     // Sentinel leader timeline held constant across every poll in tests that
