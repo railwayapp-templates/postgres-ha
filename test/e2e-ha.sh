@@ -3973,12 +3973,34 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
 
   local leader; leader=$(wait_for_leader "$scope" 180) || { ko t_ha_disabled_pitr_preserves_operator_archive_pin "no leader"; teardown_scope "$scope"; return; }
 
+  # Pin and restart a REPLICA, never the leader. Restarting the leader
+  # hands the lock to a replica (Patroni releases it on graceful shutdown),
+  # and whenever the ex-leader's shutdown checkpoint landed past the
+  # promotion point it rejoins through pg_rewind — which copies the NEW
+  # primary's postgresql.auto.conf over its own and erases the pin for a
+  # reason that has nothing to do with the disable-path reset under test.
+  # Seen in CI on 2026-08-24 (run 32764408584): "Lock owner: …-pg-3; I am
+  # …-pg-1" → "running pg_rewind from …-pg-3" → pin gone, while reconcile
+  # itself logged "DCS archive config already matches env-driven intent".
+  # The disable-path branch runs on every node's boot regardless of role,
+  # and ALTER SYSTEM writes auto.conf without WAL, so a replica exercises
+  # exactly the same code with no leadership race in the way.
+  local target=""
+  for n in "$n1" "$n2" "$n3"; do
+    if [ "$n" != "$leader" ]; then target=$n; break; fi
+  done
+  if [ -z "$target" ]; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "no replica to pin — leader=$leader nodes=$n1 $n2 $n3"
+    teardown_scope "$scope"
+    return
+  fi
+
   local pgdata=/var/lib/postgresql/data/pgdata
   local auto_conf=$pgdata/postgresql.auto.conf
   local sentinel=$pgdata/.railway_forced_archive_gucs
 
-  log "setting an operator archive_command on $leader via ALTER SYSTEM (no sentinel, PITR disabled)"
-  docker exec -u postgres "$leader" psql -c "ALTER SYSTEM SET archive_command = '/bin/true';" -c "SELECT pg_reload_conf();" >/dev/null
+  log "setting an operator archive_command on replica $target via ALTER SYSTEM (no sentinel, PITR disabled; leader=$leader)"
+  docker exec -u postgres "$target" psql -c "ALTER SYSTEM SET archive_command = '/bin/true';" -c "SELECT pg_reload_conf();" >/dev/null
   sleep 2
   # archive_mode stays 'off' on this cluster for the test's whole
   # lifetime (WAL_ARCHIVE_BUCKET was never set), and Postgres's own
@@ -3986,14 +4008,14 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
   # "(disabled)" via SHOW/current_setting()/pg_settings.setting whenever
   # archive_mode is off — checked auto.conf directly instead, which is
   # exactly what archive_gucs_pinned_in_auto_conf itself reads.
-  if ! docker exec "$leader" grep -q "^archive_command = '/bin/true'" "$auto_conf"; then
+  if ! docker exec "$target" grep -q "^archive_command = '/bin/true'" "$auto_conf"; then
     ko t_ha_disabled_pitr_preserves_operator_archive_pin "failed to set operator pin for the test; auto.conf missing the pin"
-    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$leader"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$target"
     teardown_scope "$scope"
     return
   fi
 
-  if docker exec "$leader" test -f "$sentinel"; then
+  if docker exec "$target" test -f "$sentinel"; then
     ko t_ha_disabled_pitr_preserves_operator_archive_pin "sentinel unexpectedly present before restart — test setup invalid"
     teardown_scope "$scope"
     return
@@ -4001,12 +4023,12 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
 
   # Restart re-runs patroni-runner's startup sequence, including the
   # disable-path reset. With no sentinel, it must leave the pin alone.
-  log "restarting $leader to re-trigger the boot-time reconcile pass"
-  docker restart "$leader" >/dev/null
+  log "restarting $target to re-trigger the boot-time reconcile pass"
+  docker restart "$target" >/dev/null
 
   local deadline=$(($(date +%s) + 120)) settled=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker exec -u postgres "$leader" psql -tAc "SELECT 1;" >/dev/null 2>&1; then
+    if docker exec -u postgres "$target" psql -tAc "SELECT 1;" >/dev/null 2>&1; then
       settled=1
       break
     fi
@@ -4015,7 +4037,7 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
 
   if [ "$settled" != "1" ]; then
     ko t_ha_disabled_pitr_preserves_operator_archive_pin "postgres never came back up within 120s of restart"
-    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$leader"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$target"
     teardown_scope "$scope"
     return
   fi
@@ -4023,22 +4045,32 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
   # no-poll) disable-path branch before asserting on its outcome.
   sleep 5
 
-  if ! docker exec "$leader" grep -q "^archive_command = '/bin/true'" "$auto_conf"; then
-    ko t_ha_disabled_pitr_preserves_operator_archive_pin "operator's archive_command pin was reset — disable-path reset must not touch a pin without our sentinel"
-    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$leader"
+  # Guard the premise before the assertion: a rewind on the restarted node
+  # would replace auto.conf wholesale and turn a pin loss into a false
+  # reconcile bug — name that case if it ever happens on a replica.
+  if docker logs "$target" 2>&1 | grep -q "running pg_rewind"; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "restarted replica $target ran pg_rewind — auto.conf was replaced, the pin check below cannot attribute a loss to reconcile"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$target"
     teardown_scope "$scope"
     return
   fi
 
-  if ! docker logs "$leader" 2>&1 | grep -c "operator-set, leaving in place" >/dev/null; then
+  if ! docker exec "$target" grep -q "^archive_command = '/bin/true'" "$auto_conf"; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "operator's archive_command pin was reset — disable-path reset must not touch a pin without our sentinel"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$target"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if ! docker logs "$target" 2>&1 | grep -c "operator-set, leaving in place" >/dev/null; then
     ko t_ha_disabled_pitr_preserves_operator_archive_pin "pin survived but the diagnostic log line never fired — check reconcile's sentinel-gate actually ran"
-    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$leader"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$target"
     teardown_scope "$scope"
     return
   fi
 
   ok t_ha_disabled_pitr_preserves_operator_archive_pin
-  note "operator pin survived the disable-path reset with no sentinel present"
+  note "operator pin on replica $target survived the disable-path reset with no sentinel present"
   teardown_scope "$scope"
 }
 
