@@ -3995,6 +3995,19 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
     return
   fi
 
+  # wait_for_leader only confirms the LEADER is up — the target replica can
+  # still be mid-basebackup with no postmaster (no unix socket yet) the
+  # instant the leader wins the race. Wait for both replicas to be streaming
+  # before touching either one. Seen in CI 2026-08-25 (run 32806119071):
+  # "psql: error: connection to server on socket
+  # \"/var/run/postgresql/.s.PGSQL.5432\" failed: No such file or directory"
+  # — pg-2 was still 2s from finishing its own basebackup.
+  if ! wait_for_replication "$scope" 2 180; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "replicas never finished streaming before the pin attempt"
+    teardown_scope "$scope"
+    return
+  fi
+
   local pgdata=/var/lib/postgresql/data/pgdata
   local auto_conf=$pgdata/postgresql.auto.conf
   local sentinel=$pgdata/.railway_forced_archive_gucs
