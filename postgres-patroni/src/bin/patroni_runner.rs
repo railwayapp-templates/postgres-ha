@@ -14,9 +14,9 @@ use postgres_patroni::bootstrap::refresh_collation_versions;
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::major_upgrade;
 use postgres_patroni::patroni::{
-    generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
-    spawn_backup_watcher, spawn_self_heal_watcher, spawn_slot_recovery_watcher,
-    update_pg_hba_for_replication, Config,
+    apply_credential_pin, credentials_from_env_requested, generate_patroni_config,
+    reconcile_pgbackrest_archive_config, run_monitoring_loop, spawn_backup_watcher,
+    spawn_self_heal_watcher, spawn_slot_recovery_watcher, update_pg_hba_for_replication, Config,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
@@ -1742,7 +1742,7 @@ async fn async_main() -> Result<()> {
     // Capture health server config BEFORE clearing PG* env vars
     let health_config = HealthServerConfig::from_env();
 
-    let config = Config::from_env()?;
+    let mut config = Config::from_env()?;
 
     info!(
         node = %config.name,
@@ -1777,6 +1777,21 @@ async fn async_main() -> Result<()> {
     } else {
         info!("No PostgreSQL data found");
     }
+
+    // On a volume that already carries a bootstrapped cluster, the passwords
+    // its roles were created with win over the variables: Patroni never
+    // re-syncs role passwords, so rendering drifted variables into patroni.yml
+    // would only break replication/rewind against the leader (see
+    // patroni::credential_pin). Must run before generate_patroni_config and
+    // before anything else reads config.*_pass.
+    let has_cluster_data = has_pg_control && has_marker;
+    let pin_outcome = apply_credential_pin(
+        &mut config,
+        has_cluster_data,
+        credentials_from_env_requested(),
+        &telemetry,
+    );
+    info!(outcome = ?pin_outcome, "credential pin reconciled");
 
     // Recover the debris of an interrupted clone. A non-empty data directory
     // with NO pg_control is what a pg_basebackup killed mid-stream leaves
@@ -1984,7 +1999,12 @@ async fn async_main() -> Result<()> {
     // failure or Patroni startup race during bulk deployments cannot
     // permanently leave archive_mode unset. Does not abort patroni-runner.
     {
-        let reconcile_config = Config::from_env()?;
+        let mut reconcile_config = Config::from_env()?;
+        // Same pinned credentials as the main config (see credential_pin) —
+        // a second from_env() would resurrect drifted variables.
+        reconcile_config.superuser_pass = config.superuser_pass.clone();
+        reconcile_config.repl_pass = config.repl_pass.clone();
+        reconcile_config.app_pass = config.app_pass.clone();
         let reconcile_telemetry = telemetry.clone();
         tokio::spawn(async move {
             let mut delay = Duration::from_secs(10);

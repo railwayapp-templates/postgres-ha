@@ -4272,6 +4272,105 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
   teardown_scope "$scope"
 }
 
+# Editing POSTGRES_PASSWORD (and the PATRONI_*_PASSWORD references that follow
+# it) and redeploying must NOT rotate the passwords the roles carry. Patroni
+# creates the roles once, at bootstrap, and never re-syncs their passwords —
+# but patroni.yml (so pgpass, rewind creds, every wrapper PGPASSWORD) is
+# re-rendered from env on every boot. Without the credential pin a redeploy
+# after the edit half-applies: the leader's roles keep the old password while
+# every restarted node's pgpass carries the new one, replicas can't
+# authenticate to the primary and the cluster degrades to a lone leader
+# (prod cron harness, 2026-08-25 00:03Z). The platform's variable editor
+# promises the opposite ("changes the variable without updating the actual
+# database password"); redis-ha and mysql-ha already pin. This proves the
+# Postgres pin: replication survives the edit, the old password still
+# authenticates over TCP, the edited one does not, and every node says so.
+t_ha_password_variable_edit_does_not_rotate() {
+  local scope=t-pwpin-${PG_VERSION}
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
+
+  local leader; leader=$(wait_for_leader "$scope" 180) || { ko t_ha_password_variable_edit_does_not_rotate "no leader"; teardown_scope "$scope"; return; }
+  if ! wait_for_replication "$scope" 2 240 >/dev/null 2>&1; then
+    ko t_ha_password_variable_edit_does_not_rotate "replicas never streamed before the edit — test setup invalid"
+    fail_dump t_ha_password_variable_edit_does_not_rotate "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # Password-authenticated TCP connection: the local socket is `trust`, TCP is
+  # scram-sha-256, so only this exercises the role's actual password.
+  tcp_auth_ok() {
+    docker exec "$1" psql \
+      "host=127.0.0.1 port=5432 user=postgres password=$2 dbname=postgres connect_timeout=5" \
+      -tAc "SELECT 1" 2>/dev/null | grep -qx 1
+  }
+
+  local pin=/var/lib/postgresql/data/pgdata/.railway_credentials
+  if ! docker exec "$leader" test -f "$pin"; then
+    ko t_ha_password_variable_edit_does_not_rotate "post-bootstrap left no credential pin at $pin"
+    fail_dump t_ha_password_variable_edit_does_not_rotate "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! tcp_auth_ok "$leader" test; then
+    ko t_ha_password_variable_edit_does_not_rotate "bootstrap password does not authenticate over TCP before the edit — test setup invalid"
+    fail_dump t_ha_password_variable_edit_does_not_rotate "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  # "Edit the variable and redeploy": every node comes back with rotated
+  # values in all three password variables (docker -e: the later flag wins).
+  log "recreating all 3 nodes with rotated password variables"
+  for n in "$n1" "$n2" "$n3"; do
+    run_patroni_node "$scope" "$etcd_hosts" "$n" \
+      -e "POSTGRES_PASSWORD=rotated-app" \
+      -e "PATRONI_SUPERUSER_PASSWORD=rotated-su" \
+      -e "PATRONI_REPLICATION_PASSWORD=rotated-repl"
+  done
+
+  leader=$(wait_for_leader "$scope" 240) || {
+    ko t_ha_password_variable_edit_does_not_rotate "no leader after the variable edit"
+    fail_dump t_ha_password_variable_edit_does_not_rotate "$n1"
+    teardown_scope "$scope"
+    return
+  }
+  if ! wait_for_replication "$scope" 2 240 >/dev/null 2>&1; then
+    ko t_ha_password_variable_edit_does_not_rotate "replication did not recover after the variable edit — replicas cannot authenticate to the leader (pin not honored)"
+    fail_dump t_ha_password_variable_edit_does_not_rotate "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  if ! tcp_auth_ok "$leader" test; then
+    ko t_ha_password_variable_edit_does_not_rotate "the bootstrap password stopped authenticating — the edit rotated the role"
+    fail_dump t_ha_password_variable_edit_does_not_rotate "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  if tcp_auth_ok "$leader" rotated-su; then
+    ko t_ha_password_variable_edit_does_not_rotate "the edited password authenticates — pin contract broken"
+    fail_dump t_ha_password_variable_edit_does_not_rotate "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  for n in "$n1" "$n2" "$n3"; do
+    if ! docker logs "$n" 2>&1 | grep -q "keeping the pinned credentials"; then
+      ko t_ha_password_variable_edit_does_not_rotate "$n never logged the credential drift — check apply_credential_pin ran on every node"
+      fail_dump t_ha_password_variable_edit_does_not_rotate "$n"
+      teardown_scope "$scope"
+      return
+    fi
+  done
+
+  ok t_ha_password_variable_edit_does_not_rotate
+  note "leader=$leader; replication streaming after the edit, bootstrap password still valid, edited one refused, drift logged on all 3 nodes"
+  teardown_scope "$scope"
+}
+
 # H7. Failover handoff: kill the leader, new leader is elected, NEW
 # leader's watcher takes over within one poll cycle. Archive head
 # keeps growing without gap. The marquee HA test.
@@ -5190,6 +5289,9 @@ ALL_TESTS=(
   # disable-path pin reset must not touch an operator's own ALTER SYSTEM
   # archive_command when PITR was never enabled (no forced-GUCs sentinel)
   t_ha_disabled_pitr_preserves_operator_archive_pin
+  # editing the password variables and redeploying keeps the roles' passwords
+  # (credential pin) — replication survives, the edit is a no-op
+  t_ha_password_variable_edit_does_not_rotate
   t_ha_failover_watcher_handoff
   # catalog-history adoption on promotion (S3 catalog fix)
   t_ha_failover_adopts_catalog_history

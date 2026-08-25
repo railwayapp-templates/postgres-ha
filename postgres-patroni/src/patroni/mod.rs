@@ -8,6 +8,7 @@
 
 mod backup_watcher;
 mod config;
+mod credential_pin;
 mod exit_history;
 mod health;
 mod monitoring;
@@ -18,6 +19,10 @@ mod yaml;
 
 pub use backup_watcher::spawn as spawn_backup_watcher;
 pub use config::Config;
+pub use credential_pin::{
+    apply_credential_pin, credentials_from_env_requested, read_credential_pin,
+    write_credential_pin, PinOutcome, PinnedCredentials, CREDENTIAL_PIN_FILE,
+};
 pub use health::check_health;
 pub use monitoring::run_monitoring_loop;
 pub use reconcile::reconcile_pgbackrest_archive_config;
