@@ -4701,9 +4701,15 @@ _seed_standalone_pgdata() {
     -v "${vol}:/var/lib/postgresql/data" \
     "postgres:${PG_VERSION}" \
     -c "wal_level=${wlvl}" -c max_replication_slots=10 -c max_wal_senders=10 >/dev/null
+  # Probe over TCP, never the socket. The official entrypoint runs initdb
+  # and its init scripts against a temporary server started with
+  # listen_addresses='', which a socket-side pg_isready accepts as ready —
+  # so the CREATE ROLE below can land on that server's fast shutdown
+  # ("the database system is shutting down") instead of the real one.
+  # Only the final postmaster listens on TCP, so this can't go green early.
   local up=0 _i
-  for _i in $(seq 1 60); do
-    if docker exec "$name" pg_isready -U postgres -q >/dev/null 2>&1; then up=1; break; fi
+  for _i in $(seq 1 120); do
+    if docker exec "$name" pg_isready -U postgres -h localhost -q >/dev/null 2>&1; then up=1; break; fi
     sleep 1
   done
   if [ "$up" != 1 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; return 1; fi
