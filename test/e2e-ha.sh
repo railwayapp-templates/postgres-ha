@@ -1920,13 +1920,27 @@ t_ha_archive_disable_clears_restore_command() {
   # (this harness's own boot order never produces one on its own — see
   # comment above). Same value already active via the local fallback,
   # so this doesn't change current behavior, only DCS's dynamic config.
-  docker exec "$leader" curl -sf -X PATCH -H "Content-Type: application/json" \
-    -d '{"postgresql":{"parameters":{"restore_command":"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p"}}}' \
-    "http://localhost:8008/config" >/dev/null 2>&1
-  local cfg_seeded
-  cfg_seeded=$(docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null)
-  if ! echo "$cfg_seeded" | grep -q '"restore_command"'; then
-    ko t_ha_archive_disable_clears_restore_command "failed to seed a DCS-level restore_command to test clearing against: $cfg_seeded"
+  #
+  # Seeded in a poll, re-read every round: Patroni's PATCH /config is a
+  # compare-and-swap on the config version, and this image runs its own
+  # DCS writers alongside the test — the per-boot archive reconcile (whose
+  # supervisor retries indefinitely, explicitly for "a transient etcd CAS
+  # failure") and the watcher's repo-path broadcast. A single shot that
+  # loses the CAS 409s, and discarding curl's status left the failure
+  # showing only the config the value was missing from, never why.
+  local seed_status="" cfg_seeded="" seeded=0
+  local seed_deadline=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$seed_deadline" ]; do
+    seed_status=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' \
+      -X PATCH -H "Content-Type: application/json" \
+      -d '{"postgresql":{"parameters":{"restore_command":"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p"}}}' \
+      "http://localhost:8008/config" 2>/dev/null)
+    cfg_seeded=$(docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null)
+    if echo "$cfg_seeded" | grep -q '"restore_command"'; then seeded=1; break; fi
+    sleep 2
+  done
+  if [ "$seeded" != 1 ]; then
+    ko t_ha_archive_disable_clears_restore_command "failed to seed a DCS-level restore_command to test clearing against (last PATCH HTTP ${seed_status:-none}): $cfg_seeded"
     teardown_scope "$scope"
     return
   fi
