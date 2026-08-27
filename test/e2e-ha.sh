@@ -3972,6 +3972,7 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
   read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
 
   local leader; leader=$(wait_for_leader "$scope" 180) || { ko t_ha_disabled_pitr_preserves_operator_archive_pin "no leader"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_disabled_pitr_preserves_operator_archive_pin "replicas didn't stream"; teardown_scope "$scope"; return; }
 
   # Pin and restart a REPLICA, never the leader. Restarting the leader
   # hands the lock to a replica (Patroni releases it on graceful shutdown),
