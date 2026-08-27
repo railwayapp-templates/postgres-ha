@@ -4940,6 +4940,84 @@ t_upgrade_lock_standalone_lifetime() {
   note "lock held for the runtime's lifetime, released on stop, and boot refused while a job held it"
 }
 
+# A member whose identity the cluster has removed must wipe its orphaned data
+# dir and re-join as a fresh learner — REGARDLESS of the refusing etcd run's
+# exit code. etcd v3.6's removed-member stop exits 0 or 1 depending on an
+# internal shutdown race (both shapes observed in production on the same
+# node), and the 0-exit shape used to end the wrapper through the clean-exit
+# branch: a dead-but-SUCCESS zombie the wipe recovery never reached. The
+# recovery must complete within one wrapper lifetime — no container restart
+# happens here, so a wrapper that exits instead of recovering fails the wait.
+t_etcd_removed_member_wipe_rejoin() {
+  local t="t_etcd_removed_member_wipe_rejoin"
+  local prefix="rmv"
+  local n1="${prefix}-etcd-1" n2="${prefix}-etcd-2" n3="${prefix}-etcd-3"
+  local hosts
+  hosts=$(setup_etcd_cluster "$prefix")
+  log "etcd cluster up ($hosts)"
+
+  local members
+  members=$(docker exec "$n1" etcdctl member list 2>/dev/null)
+  if [ "$(echo "$members" | grep -c 'started')" != "3" ]; then
+    ko "$t" "etcd cluster never reached 3 started members"
+    fail_dump "$t" "$n1" "$n2" "$n3"
+    return
+  fi
+
+  docker exec "$n1" etcdctl put rmv-canary survives >/dev/null 2>&1
+
+  # Remove n3's member id — the exact production failure: the removal lives
+  # in the PEERS' raft state, so n3's local dir is orphaned from here on and
+  # every restart on it is refused identically.
+  local m3
+  m3=$(docker exec "$n1" etcdctl member list | awk -F', ' -v n="$n3" '$3==n {print $1}')
+  if [ -z "$m3" ]; then
+    ko "$t" "could not resolve $n3's member id"
+    fail_dump "$t" "$n1"
+    return
+  fi
+  docker exec "$n1" etcdctl member remove "$m3" >/dev/null 2>&1
+
+  local deadline=$(($(date +%s) + 180)) recovered=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    members=$(docker exec "$n1" etcdctl member list 2>/dev/null)
+    if [ "$(echo "$members" | grep -c 'started')" = "3" ] \
+      && [ "$(echo "$members" | grep -cE ', true$')" = "0" ] \
+      && [ "$(echo "$members" | grep -c "$n3")" = "1" ]; then
+      recovered=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$recovered" != 1 ]; then
+    ko "$t" "removed member never wiped + re-joined as a voting member"
+    fail_dump "$t" "$n3" "$n1"
+    return
+  fi
+
+  # The recovery must have gone through the guarded wipe (peer-quorum check),
+  # not some other path, and the keyspace must be intact via the re-joined
+  # node.
+  if ! logs_contain "$n3" "wiping data dir to re-clone as a fresh member"; then
+    ko "$t" "re-joined without the guarded wipe path (wipe log line missing)"
+    fail_dump "$t" "$n3"
+    return
+  fi
+  local canary
+  canary=$(docker exec "$n1" etcdctl get rmv-canary --print-value-only \
+    --endpoints="http://${n3}:2379" 2>/dev/null)
+  if ! assert_eq "$canary" "survives" "canary readable via the re-joined member"; then
+    ko "$t" "data not intact via re-joined member"
+    fail_dump "$t" "$n3"
+    return
+  fi
+
+  ok "$t"
+  note "member removed → refusal detected → quorum-guarded wipe → learner re-join → promoted; canary intact"
+
+  for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1; done
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -5001,6 +5079,9 @@ ALL_TESTS=(
   t_ha_adopt_preserves_logical
   t_ha_adopt_default_replica
   t_upgrade_lock_standalone_lifetime
+  # etcd wrapper: removed-member refusal wipes + re-joins within one wrapper
+  # lifetime, whichever exit code the refusing run produced
+  t_etcd_removed_member_wipe_rejoin
 )
 
 usage() {

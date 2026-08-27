@@ -52,6 +52,22 @@ fn is_removed_member_line(line: &str) -> bool {
         || line.contains("data-dir used by this member must be removed")
 }
 
+/// Whether an etcd exit ends supervision as a clean shutdown.
+///
+/// The exit CODE alone cannot decide this: etcd's graceful stop after
+/// discovering its member was removed exits 0 whenever etcdmain's `<-stopped`
+/// branch wins the shutdown race (`osutil.Exit(0)`, etcdmain/etcd.go) and 1
+/// when a listener error wins — nondeterministic per start, both shapes
+/// observed on the same node. Taking a 0-exit refusal as a clean exit ends
+/// supervision with the data dir still orphaned: the container dies as a
+/// SUCCESS zombie that no in-wrapper recovery ever reaches. A run that hit an
+/// unrecoverable-data-dir line is therefore never clean, whatever the exit
+/// code. (Raft corruption is a panic and cannot exit 0; it is gated the same
+/// way so every detected class behaves identically.)
+fn exit_is_clean(exited_ok: bool, was_corrupt: bool, was_removed_member: bool) -> bool {
+    exited_ok && !was_corrupt && !was_removed_member
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _guard = init_logging("etcd");
@@ -182,13 +198,16 @@ async fn main() -> Result<()> {
         let was_corrupt = corruption_detected.load(Ordering::Relaxed);
         let was_removed_member = removed_member_detected.load(Ordering::Relaxed);
 
-        if status.success() {
+        if exit_is_clean(status.success(), was_corrupt, was_removed_member) {
             info!("etcd exited cleanly");
             return Ok(());
         }
 
         let exit_code = status.code();
         info!(exit_code = ?exit_code, "etcd exited");
+        if status.success() {
+            warn!("etcd exited 0 after an unrecoverable-data-dir refusal - staying up so recovery can run");
+        }
 
         // Handle incomplete bootstrap
         let marker_exists = bootstrap_marker_present(&config.bootstrap_marker());
@@ -276,7 +295,34 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_raft_corruption_line, is_removed_member_line};
+    use super::{exit_is_clean, is_raft_corruption_line, is_removed_member_line};
+
+    #[test]
+    fn clean_exit_without_flags_ends_supervision() {
+        assert!(exit_is_clean(true, false, false));
+    }
+
+    #[test]
+    fn removed_member_refusal_is_never_a_clean_exit() {
+        // etcd v3.6 exits 0 on the graceful removed-member stop whenever
+        // etcdmain's <-stopped branch wins the shutdown race (observed on
+        // onyx-staging/etcd-2 alongside exit-1 runs of the same refusal).
+        // Supervision must not end on it, or the node dies as a SUCCESS
+        // zombie with the wipe recovery unreachable.
+        assert!(!exit_is_clean(true, false, true));
+        assert!(!exit_is_clean(false, false, true));
+    }
+
+    #[test]
+    fn corrupt_run_is_never_a_clean_exit() {
+        assert!(!exit_is_clean(true, true, false));
+        assert!(!exit_is_clean(false, true, false));
+    }
+
+    #[test]
+    fn nonzero_exit_is_not_clean() {
+        assert!(!exit_is_clean(false, false, false));
+    }
 
     #[test]
     fn matches_removed_member_refusals() {
