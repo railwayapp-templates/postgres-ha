@@ -217,16 +217,48 @@ jobs:
             "https://registry-1.docker.io/v2/library/postgres/tags/list?n=10000" \
             | jq -r '.tags[]' | grep -E '^[0-9]+\.[0-9]+$')
 
+          # GHCR caps tags/list at 1000 rows per page and this package
+          # already holds more than that (every build also pushes a
+          # :minor-shortsha tag), so a single-page read silently loses
+          # whatever falls past the first page. Insertion order puts the
+          # NEWEST minors there — today they stay covered only because the
+          # upstream-LATEST union re-adds them, and the day a newer minor
+          # ships, the superseded one would silently freeze: exactly the
+          # regression this job exists to prevent. Follow the RFC-5988 Link
+          # header to exhaustion instead. Fails closed like the other
+          # sources: a broken page read aborts the run rather than
+          # shrinking the rebuild set.
+          list_ghcr_tags() { # $1 = package path (owner/name[/sub])
+            local token page url
+            token=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+              "https://ghcr.io/token?scope=repository:$1:pull" | jq -r .token)
+            [ -n "$token" ] && [ "$token" != "null" ]
+            url="https://ghcr.io/v2/$1/tags/list?n=1000"
+            while [ -n "$url" ]; do
+              page=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+                -D /tmp/ghcr-page-headers -H "Authorization: Bearer $token" "$url")
+              printf '%s\n' "$page" | jq -r '.tags[]?'
+              url=$(grep -i '^link:' /tmp/ghcr-page-headers | tr -d '\r' \
+                | sed -n 's/.*<\([^>]*\)>; *rel="next".*/\1/p')
+              [ -n "$url" ] && url="https://ghcr.io${url}"
+            done
+          }
+
           # Every per-minor tag we have ever published (anonymous pull token —
           # the package is public).
-          GHCR_TOKEN=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
-            "https://ghcr.io/token?scope=repository:${{ github.repository }}/postgres-patroni:pull" \
-            | jq -r .token)
-          [ -n "$GHCR_TOKEN" ] && [ "$GHCR_TOKEN" != "null" ]
-          PUBLISHED_MINORS=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
-            -H "Authorization: Bearer $GHCR_TOKEN" \
-            "https://ghcr.io/v2/${{ github.repository }}/postgres-patroni/tags/list?n=10000" \
-            | jq -r '.tags[]' | grep -E '^[0-9]+\.[0-9]+$' || true)
+          PUBLISHED_MINORS=$(list_ghcr_tags "${{ github.repository }}/postgres-patroni" \
+            | grep -E '^[0-9]+\.[0-9]+$' || true)
+
+          # Every per-minor tag the standalone postgres-ssl image publishes.
+          # HA conversion adopts a standalone pinned to :X.Y as the cluster
+          # root, and the tag is the compatibility contract — a minor that
+          # exists on postgres-ssl but not here is a conversion that cannot
+          # preserve the customer's pin. Mirroring its published set keeps
+          # the two pinnable surfaces identical without hand-maintaining a
+          # list; the SUPPORTED_MAJORS filter below still applies, so a
+          # major retired here (e.g. 13) never resurrects off the ssl side.
+          SSL_MINORS=$(list_ghcr_tags "railwayapp-templates/postgres-ssl" \
+            | grep -E '^[0-9]+\.[0-9]+$' || true)
 
           INCLUDE="[]"
           for MAJOR in $SUPPORTED_MAJORS; do
@@ -235,7 +267,7 @@ jobs:
               echo "::error::no upstream minor resolved for major ${MAJOR} — refusing to shrink the build set"
               exit 1
             fi
-            MINORS=$( { printf '%s\n' "$PUBLISHED_MINORS" | grep -E "^${MAJOR}\.[0-9]+$" || true; echo "$LATEST"; } | sort -uV)
+            MINORS=$( { printf '%s\n' "$PUBLISHED_MINORS" "$SSL_MINORS" | grep -E "^${MAJOR}\.[0-9]+$" || true; echo "$LATEST"; } | sort -uV)
             for MINOR in $MINORS; do
               IS_LATEST=$([ "$MINOR" = "$LATEST" ] && echo true || echo false)
               INCLUDE=$(jq -c --arg major "$MAJOR" --arg minor "$MINOR" --argjson latest "$IS_LATEST" \
