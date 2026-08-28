@@ -503,6 +503,26 @@ wait_for_node_leader() {
   return 1
 }
 
+# Wait for ONE named node to report itself a healthy Patroni replica.
+# Patroni answers /replica 200 only once the node has finished
+# bootstrapping and is running as a standby, so this is the point past
+# which it will not re-basebackup and wipe PGDATA under a test.
+wait_for_node_replica() {
+  local n="$1" timeout_secs="${2:-240}"
+  local deadline=$(($(date +%s) + timeout_secs))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec "$n" curl -sf -o /dev/null -w '%{http_code}' \
+       http://localhost:8008/replica 2>/dev/null | grep -q "^200$"; then
+      return 0
+    fi
+    if [ "$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null)" = "exited" ]; then
+      return 1
+    fi
+    sleep 3
+  done
+  return 1
+}
+
 # Wait for one of the 3 nodes to become Patroni leader. Returns the
 # leader container name on stdout, or non-zero if no leader inside the
 # timeout. Uses the local /leader endpoint on each node.
@@ -555,6 +575,21 @@ wait_for_replication() {
     streaming=$(docker exec "$leader" curl -sf http://localhost:8008/cluster 2>/dev/null \
       | grep -oE '"state":[[:space:]]*"streaming"' | wc -l | tr -d ' ')
     if [ "${streaming:-0}" -ge "$expected" ]; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+# Wait for one node's own postmaster to accept local connections.
+# A cluster-level leader wait says nothing about a given replica: it can
+# still be running basebackup, with no socket in /var/run/postgresql yet.
+wait_for_pg_accepting() {
+  local n="$1" timeout_secs="${2:-120}"
+  local deadline=$(($(date +%s) + timeout_secs))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec -u postgres "$n" psql -tAc "SELECT 1;" >/dev/null 2>&1; then
       return 0
     fi
     sleep 3
@@ -3999,8 +4034,31 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
   local auto_conf=$pgdata/postgresql.auto.conf
   local sentinel=$pgdata/.railway_forced_archive_gucs
 
+  # wait_for_leader returns the moment ONE node holds the lock, which on a
+  # cold cluster is well before the replicas finish bootstrapping — the
+  # target here is typically still running basebackup, with no socket to
+  # connect to. Seen in CI on 2026-08-27 (run 33093818364) and 2026-08-28
+  # (run 33139937503): psql hit "No such file or directory" on the socket
+  # ~1s before the replica's postmaster started, the ALTER SYSTEM never
+  # landed, and the test reported the missing pin as its own setup failure.
+  # Gate on Patroni's own standby state rather than a bare socket: a
+  # replica that is still deciding could re-basebackup and take the pin
+  # with it, which would read as the reset bug this test exists to catch.
+  if ! wait_for_node_replica "$target" 240; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "replica $target never reached a healthy standby state within 240s of cluster start"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$target"
+    teardown_scope "$scope"
+    return
+  fi
+
   log "setting an operator archive_command on replica $target via ALTER SYSTEM (no sentinel, PITR disabled; leader=$leader)"
-  docker exec -u postgres "$target" psql -c "ALTER SYSTEM SET archive_command = '/bin/true';" -c "SELECT pg_reload_conf();" >/dev/null
+  if ! docker exec -u postgres "$target" psql -v ON_ERROR_STOP=1 \
+       -c "ALTER SYSTEM SET archive_command = '/bin/true';" -c "SELECT pg_reload_conf();" >/dev/null; then
+    ko t_ha_disabled_pitr_preserves_operator_archive_pin "ALTER SYSTEM on replica $target failed outright"
+    fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$target"
+    teardown_scope "$scope"
+    return
+  fi
   sleep 2
   # archive_mode stays 'off' on this cluster for the test's whole
   # lifetime (WAL_ARCHIVE_BUCKET was never set), and Postgres's own
@@ -4026,16 +4084,7 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
   log "restarting $target to re-trigger the boot-time reconcile pass"
   docker restart "$target" >/dev/null
 
-  local deadline=$(($(date +%s) + 120)) settled=0
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker exec -u postgres "$target" psql -tAc "SELECT 1;" >/dev/null 2>&1; then
-      settled=1
-      break
-    fi
-    sleep 3
-  done
-
-  if [ "$settled" != "1" ]; then
+  if ! wait_for_pg_accepting "$target" 120; then
     ko t_ha_disabled_pitr_preserves_operator_archive_pin "postgres never came back up within 120s of restart"
     fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$target"
     teardown_scope "$scope"
