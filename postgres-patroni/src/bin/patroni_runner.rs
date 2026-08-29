@@ -449,6 +449,64 @@ fn wipe_has_safe_clone_source(
 /// [`wipe_has_safe_clone_source`] holds (dedicated pgdata subdir + a distinct
 /// member holding the DCS leader lock — a node missing pg_control cannot
 /// itself be a healthy leader).
+/// How many times the incomplete-clone wipe may fire on one volume before it
+/// stops. The wipe exists to unwedge a clone that was interrupted once; a clone
+/// that is interrupted every single time is not being unwedged by it, and each
+/// extra pass destroys the partial data again for nothing. Three is enough to
+/// ride out transient interruptions (a stacker blip, a leader failover mid-clone)
+/// while still bounding the loop.
+const MAX_CLONE_WIPE_ATTEMPTS: u32 = 3;
+
+/// Ledger of incomplete-clone wipes, kept at the VOLUME ROOT rather than inside
+/// pgdata — the wipe empties pgdata, so a counter stored in there would reset
+/// itself on every pass and could never bound anything.
+fn clone_wipe_ledger_path(volume_root: &str) -> String {
+    format!("{}/.railway_clone_wipe_attempts", volume_root)
+}
+
+/// Wipes recorded so far. An unreadable or malformed ledger reads as 0: the gate
+/// may only ever *block* a destructive action, so when in doubt it must not be
+/// the thing that stops a legitimate first recovery.
+fn read_clone_wipe_attempts(volume_root: &str) -> u32 {
+    fs::read_to_string(clone_wipe_ledger_path(volume_root))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Best-effort: a ledger we cannot write is not a reason to refuse recovery, so
+/// failures are logged and swallowed rather than propagated.
+fn record_clone_wipe_attempt(volume_root: &str, attempts: u32) {
+    let path = clone_wipe_ledger_path(volume_root);
+    if let Err(e) = fs::write(&path, attempts.to_string()) {
+        warn!(path = %path, error = %e, "Failed to record clone-wipe attempt; the wipe cap may not hold");
+    }
+}
+
+/// Called once a complete clone is observed (pg_control present). The volume is
+/// healthy, so the previous wipes did their job and must not count against a
+/// future, unrelated interruption.
+fn clear_clone_wipe_attempts(volume_root: &str) {
+    let path = clone_wipe_ledger_path(volume_root);
+    if Path::new(&path).exists() {
+        if let Err(e) = fs::remove_file(&path) {
+            warn!(path = %path, error = %e, "Failed to clear the clone-wipe ledger");
+        } else {
+            info!("Complete clone present — cleared the clone-wipe ledger");
+        }
+    }
+}
+
+/// Free bytes on the filesystem holding `path`, for diagnosis only — never a
+/// gate. Estimating whether a clone "fits" would need the leader's on-disk size,
+/// which this process cannot see before Patroni starts; the attempt ledger above
+/// bounds the loop empirically instead, and this number tells the reader whether
+/// capacity was why.
+fn available_bytes(path: &str) -> Option<u64> {
+    let stat = nix::sys::statvfs::statvfs(Path::new(path)).ok()?;
+    Some(stat.blocks_available() as u64 * stat.fragment_size() as u64)
+}
+
 fn should_wipe_incomplete_clone(
     has_pg_control: bool,
     data_dir_nonempty: bool,
@@ -1804,6 +1862,13 @@ async fn async_main() -> Result<()> {
     // never wipe the primary's own data (a node missing pg_control cannot
     // itself be a healthy leader). Without a distinct leader we leave the dir
     // for manual recovery rather than risk wiping the only copy.
+    if has_pg_control {
+        // A complete clone is on disk, so whatever interrupted the previous ones is
+        // over. Clearing here (rather than never) keeps the cap scoped to one
+        // episode: a future, unrelated interruption gets its own full budget.
+        clear_clone_wipe_attempts(&volume_root);
+    }
+
     if !has_pg_control && data_dir_nonempty(&config.data_dir) {
         // Redundant with the boot guard above, deliberately: this is the call
         // that destroys data, so it states its own precondition rather than
@@ -1824,18 +1889,47 @@ async fn async_main() -> Result<()> {
         } else {
             None
         };
-        if should_wipe_incomplete_clone(
+        let prior_wipes = read_clone_wipe_attempts(&volume_root);
+        let safe_to_wipe = should_wipe_incomplete_clone(
             has_pg_control,
             true,
             dedicated,
             leader.as_deref(),
             &config.name,
-        ) {
+        );
+        if safe_to_wipe && prior_wipes >= MAX_CLONE_WIPE_ATTEMPTS {
+            // Every wipe so far has been followed by another incomplete clone, so
+            // the interruption is not transient and wiping again would destroy the
+            // partial data for nothing — while also re-arming the same loop. The
+            // usual cause is capacity (a replica volume smaller than the primary,
+            // or one that has filled up), which no amount of re-cloning fixes.
+            // Leave the directory intact and make the reason legible instead.
+            let free = available_bytes(&volume_root);
+            warn!(
+                data_dir = %config.data_dir,
+                attempts = prior_wipes,
+                available_bytes = ?free,
+                "Incomplete clone detected, but {} previous wipes already failed to complete a clone — refusing to wipe again (usually a volume too small for the primary, or full)",
+                prior_wipes
+            );
+            telemetry.send(TelemetryEvent::IncompleteCloneWipeCapped {
+                node: config.name.clone(),
+                attempts: prior_wipes,
+                available_bytes: free,
+            });
+        } else if safe_to_wipe {
             warn!(
                 data_dir = %config.data_dir,
                 leader = %leader.as_deref().unwrap_or("?"),
+                attempt = prior_wipes + 1,
+                max_attempts = MAX_CLONE_WIPE_ATTEMPTS,
                 "Incomplete clone detected (non-empty pgdata, missing pg_control) — wiping so Patroni re-clones from the leader"
             );
+            // Record BEFORE the destructive call: a wipe that starts and then dies
+            // (OOM, SIGKILL, the container going away mid-remove) still consumed an
+            // attempt, and a ledger written afterwards would miss exactly the
+            // crash-looping case the cap exists to bound.
+            record_clone_wipe_attempt(&volume_root, prior_wipes + 1);
             wipe_pgdata_contents(&config.data_dir)
                 .context("Failed to wipe incomplete-clone data directory")?;
             // Surface the recovery so the fleet monitor can see it fire (and spot
@@ -2071,8 +2165,10 @@ mod tests {
     use super::{
         build_pgbackrest_conf, build_pgbackrest_recovery_source_conf, build_pitr_managed_block,
         configure_pitr_recovery, data_dir_nonempty, is_uuid_shape, parse_process_max,
-        pgdata_is_dedicated_subdir, should_wipe_incomplete_clone, strip_pitr_managed_block,
-        wipe_has_safe_clone_source, wipe_pgdata_contents, Config, PgbackrestConfParams,
+        available_bytes, clear_clone_wipe_attempts, clone_wipe_ledger_path,
+        pgdata_is_dedicated_subdir, read_clone_wipe_attempts, record_clone_wipe_attempt,
+        should_wipe_incomplete_clone, strip_pitr_managed_block, wipe_has_safe_clone_source,
+        wipe_pgdata_contents, Config, PgbackrestConfParams, MAX_CLONE_WIPE_ATTEMPTS,
         RecoverySourceConfParams, PITR_MANAGED_MARKER,
     };
 
@@ -2556,4 +2652,58 @@ mod tests {
         // Looks UUID-ish but isn't 8-4-4-4-12.
         assert!(!is_uuid_shape("121ccc45-0912-457e-8dc0"));
     }
+
+    #[test]
+    fn clone_wipe_ledger_counts_up_and_clears() {
+        let vol = tempfile::tempdir().unwrap();
+        let root = vol.path().to_str().unwrap();
+
+        // No ledger yet: a first wipe must always be allowed.
+        assert_eq!(read_clone_wipe_attempts(root), 0);
+
+        record_clone_wipe_attempt(root, 1);
+        assert_eq!(read_clone_wipe_attempts(root), 1);
+        record_clone_wipe_attempt(root, 3);
+        assert_eq!(read_clone_wipe_attempts(root), 3);
+        assert!(read_clone_wipe_attempts(root) >= MAX_CLONE_WIPE_ATTEMPTS);
+
+        clear_clone_wipe_attempts(root);
+        assert_eq!(read_clone_wipe_attempts(root), 0);
+        // Clearing an already-absent ledger must not panic or recreate it.
+        clear_clone_wipe_attempts(root);
+        assert!(!std::path::Path::new(&clone_wipe_ledger_path(root)).exists());
+    }
+
+    #[test]
+    fn clone_wipe_ledger_lives_outside_pgdata() {
+        // The wipe empties pgdata, so a ledger stored in there would reset itself
+        // every pass and could never bound the loop.
+        let ledger = clone_wipe_ledger_path("/var/lib/postgresql/data");
+        assert_eq!(ledger, "/var/lib/postgresql/data/.railway_clone_wipe_attempts");
+        assert!(!ledger.contains("/pgdata/"));
+    }
+
+    #[test]
+    fn unreadable_ledger_reads_as_zero_so_it_never_blocks_a_first_recovery() {
+        let vol = tempfile::tempdir().unwrap();
+        let root = vol.path().to_str().unwrap();
+        // A corrupt/garbage ledger must fail OPEN: the gate may only ever block a
+        // destructive action, never be the reason a legitimate recovery is skipped.
+        std::fs::write(clone_wipe_ledger_path(root), "not-a-number").unwrap();
+        assert_eq!(read_clone_wipe_attempts(root), 0);
+        std::fs::write(clone_wipe_ledger_path(root), "").unwrap();
+        assert_eq!(read_clone_wipe_attempts(root), 0);
+    }
+
+    #[test]
+    fn available_bytes_reads_a_real_filesystem_and_tolerates_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = available_bytes(dir.path().to_str().unwrap());
+        assert!(free.is_some(), "statvfs should succeed on a real temp dir");
+        assert!(free.unwrap() > 0);
+        // Diagnosis only — a path we cannot stat must return None, never panic,
+        // because it is reported alongside the cap, not used to gate it.
+        assert!(available_bytes("/nonexistent-path-for-test").is_none());
+    }
+
 }
