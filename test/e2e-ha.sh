@@ -4331,6 +4331,25 @@ t_ha_password_variable_edit_does_not_rotate() {
       -e "PATRONI_REPLICATION_PASSWORD=rotated-repl"
   done
 
+  # `run_patroni_node` is `docker run -d`: it returns before Patroni is up,
+  # and neither wait below is a readiness gate on its own. The DCS keys the
+  # pre-restart members wrote outlive their containers (ttl 45s), so
+  # /leader answers 200 and /cluster still reports those members as
+  # "streaming" while no postmaster is running. Seen in CI on 2026-08-29
+  # (run 33232038597): the leader logged "Postgresql is not running" 460ms
+  # before the TCP check below reported the role as rotated — the harness
+  # reading its own restart window as the bug this test exists to catch.
+  # Gate on every node's own postmaster so both waits, and the password
+  # assertions after them, read live state.
+  for n in "$n1" "$n2" "$n3"; do
+    if ! wait_for_pg_accepting "$n" 240; then
+      ko t_ha_password_variable_edit_does_not_rotate "$n never accepted connections after the variable edit"
+      fail_dump t_ha_password_variable_edit_does_not_rotate "$n"
+      teardown_scope "$scope"
+      return
+    fi
+  done
+
   leader=$(wait_for_leader "$scope" 240) || {
     ko t_ha_password_variable_edit_does_not_rotate "no leader after the variable edit"
     fail_dump t_ha_password_variable_edit_does_not_rotate "$n1"
