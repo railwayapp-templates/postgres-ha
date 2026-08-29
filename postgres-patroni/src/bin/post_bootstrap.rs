@@ -10,7 +10,8 @@ use postgres_patroni::bootstrap::{
     dollar_quote_tag, quote_ident, quote_literal, read_credentials, run_psql, run_psql_in_db,
     run_psql_script, PATRONI_CONFIG,
 };
-use postgres_patroni::volume_root;
+use postgres_patroni::patroni::{write_credential_pin, PinnedCredentials};
+use postgres_patroni::{pgdata, volume_root};
 use std::env;
 use std::path::Path;
 use std::time::Instant;
@@ -149,6 +150,28 @@ END
             phase: "create_users".to_string(),
         });
         std::process::exit(1);
+    }
+
+    // Pin the passwords the roles were just created with, beside the data they
+    // protect: later boots keep them when the variables drift (Patroni never
+    // re-syncs role passwords), and clones inherit the pin with the data. A
+    // failed write is not fatal — the runner adopts the variables as the pin on
+    // the next boot, which at that point still equal these values.
+    let pin_dir = if creds.data_dir.is_empty() {
+        pgdata()
+    } else {
+        creds.data_dir.clone()
+    };
+    match write_credential_pin(
+        &pin_dir,
+        &PinnedCredentials {
+            superuser_pass: creds.superuser_pass.clone(),
+            repl_pass: creds.repl_pass.clone(),
+            app_pass: creds.app_pass.clone(),
+        },
+    ) {
+        Ok(()) => info!(data_dir = %pin_dir, "Pinned the bootstrap credentials"),
+        Err(e) => warn!(error = %e, data_dir = %pin_dir, "Failed to write the credential pin"),
     }
 
     // Create app database if configured

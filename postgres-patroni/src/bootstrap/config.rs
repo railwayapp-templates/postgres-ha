@@ -20,6 +20,11 @@ struct PostgresqlConfig {
     authentication: Authentication,
     #[serde(default)]
     app_user: AppUser,
+    /// PGDATA as Patroni sees it — post-bootstrap runs without the
+    /// environment, so this is the only trustworthy source for the data dir
+    /// (where the credential pin lives).
+    #[serde(default)]
+    data_dir: String,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +60,8 @@ pub struct Credentials {
     pub app_user: String,
     pub app_pass: String,
     pub app_db: String,
+    /// `postgresql.data_dir` from the rendered config (empty if absent).
+    pub data_dir: String,
 }
 
 /// Read credentials from the Patroni config file
@@ -74,5 +81,6 @@ pub fn read_credentials() -> Result<Credentials> {
         app_user: pg.app_user.username,
         app_pass: pg.app_user.password,
         app_db: pg.app_user.database,
+        data_dir: pg.data_dir,
     })
 }
