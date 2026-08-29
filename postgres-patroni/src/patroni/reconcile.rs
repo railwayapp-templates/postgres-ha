@@ -42,7 +42,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-const PATRONI_REST: &str = "http://localhost:8008";
+pub(crate) const PATRONI_REST: &str = "http://localhost:8008";
 const EXPECTED_ARCHIVE_MODE: &str = "on";
 const EXPECTED_ARCHIVE_COMMAND: &str = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
 // Bounded poll before concluding Patroni's own dynamic-config sync missed
@@ -66,7 +66,7 @@ const LIVE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// Wait for Patroni's REST API to respond before reconciling. Patroni starts
 /// shortly after `patroni-runner` spawns it, but there's a startup window
 /// (config load, etcd connect, leader election) before `/config` answers.
-async fn wait_for_patroni_rest(client: &reqwest::Client) -> Result<()> {
+pub(crate) async fn wait_for_patroni_rest(client: &reqwest::Client) -> Result<()> {
     let max_wait = Duration::from_secs(120);
     let poll_interval = Duration::from_secs(2);
     let start = std::time::Instant::now();
@@ -224,7 +224,7 @@ async fn show_restore_command() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-async fn local_node_is_leader(client: &reqwest::Client) -> bool {
+pub(crate) async fn local_node_is_leader(client: &reqwest::Client) -> bool {
     client
         .get(format!("{PATRONI_REST}/leader"))
         .send()
@@ -1014,7 +1014,7 @@ pub async fn reconcile_pgbackrest_archive_config(
     Ok(())
 }
 
-async fn send_patch(client: &reqwest::Client, patch: &Value) -> Result<()> {
+pub(crate) async fn send_patch(client: &reqwest::Client, patch: &Value) -> Result<()> {
     let resp = client
         .patch(format!("{PATRONI_REST}/config"))
         .json(patch)

@@ -15,7 +15,8 @@ use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::major_upgrade;
 use postgres_patroni::patroni::{
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
-    spawn_backup_watcher, spawn_self_heal_watcher, update_pg_hba_for_replication, Config,
+    spawn_backup_watcher, spawn_self_heal_watcher, spawn_slot_recovery_watcher,
+    update_pg_hba_for_replication, Config,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
@@ -2032,6 +2033,16 @@ async fn async_main() -> Result<()> {
     // on leaders. Honors SELF_HEAL_DISABLED=1 as a kill switch.
     spawn_self_heal_watcher(volume_root.clone(), telemetry.clone());
 
+    // Spawn the slot-recovery watcher. On the leader it recreates replication
+    // slots PostgreSQL invalidated when they breached max_slot_wal_keep_size
+    // (Patroni 4.1.0 neither notices nor repairs these) — without that, the
+    // disk-fill cap would trade a loud leader PANIC for a silently
+    // un-streamable, un-promotable replica. On every node it keeps the cap
+    // sized to the node's own live free space via ALTER SYSTEM (local param
+    // outranks DCS, so DCS patches can't do it — see slot_recovery.rs). Honors
+    // SLOT_RECOVERY_DISABLED=1 as a kill switch.
+    spawn_slot_recovery_watcher(volume_root.clone());
+
     run_monitoring_loop(&config, child, &telemetry).await
 }
 
@@ -2077,6 +2088,7 @@ mod tests {
             pitr_target_xid: None,
             archive_timeout_secs: 60,
             basebackup_max_rate: "20M".into(),
+            max_slot_wal_keep_size: "512000MB".into(),
         }
     }
 
