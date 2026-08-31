@@ -1263,7 +1263,16 @@ t_retention_expire_cascades_to_wal() {
     psql_leader "$leader" -c "INSERT INTO t VALUES ($i); SELECT pg_switch_wal();" >/dev/null
     sleep 1
   done
-  wait_for_watcher_backup "$leader" full 120 || { ko t_retention_expire_cascades_to_wal "no initial full"; teardown_scope "$scope"; return; }
+  # Dump the leader on this bail like the assertions further down already do.
+  # This one has failed intermittently on main (2026-08-31, run 33435692019)
+  # and on #116, and because it captured nothing there was no way to tell a
+  # watcher that never fired from one that fired late or errored.
+  wait_for_watcher_backup "$leader" full 120 || {
+    ko t_retention_expire_cascades_to_wal "no initial full"
+    fail_dump t_retention_expire_cascades_to_wal "$leader"
+    teardown_scope "$scope"
+    return
+  }
 
   for i in 6 7 8; do
     psql_leader "$leader" -c "INSERT INTO t VALUES ($i); SELECT pg_switch_wal();" >/dev/null
