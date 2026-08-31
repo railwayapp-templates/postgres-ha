@@ -147,6 +147,14 @@ pub enum TelemetryEvent {
     /// failing (e.g. a replica volume smaller than the primary).
     IncompleteCloneWiped { node: String, leader: String },
 
+    /// The incomplete-clone wipe refused to run because it has already run
+    /// `max_attempts` times on this volume without ever producing a complete
+    /// clone. Wiping again would destroy the partial data for nothing and hide
+    /// the real cause, which is almost always capacity: a replica volume too
+    /// small for the primary, or one that has filled up. Carries the volume's
+    /// free space so the reader can tell those apart without a shell.
+    IncompleteCloneWipeCapped { node: String, attempts: u32, available_bytes: Option<u64> },
+
     /// Live `archive_command`/`archive_timeout` on this node diverged from
     /// what DCS says they should be, and the divergence doesn't look like
     /// Patroni's own apply-race (see reconcile.rs) — the live value isn't
@@ -272,6 +280,7 @@ impl TelemetryEvent {
             Self::MajorUpgradeReseedWiped { .. } => "POSTGRES_HA_MAJOR_UPGRADE_RESEED_WIPED",
             Self::SelfHealUpgradeStanddown { .. } => "POSTGRES_HA_SELF_HEAL_UPGRADE_STANDDOWN",
             Self::IncompleteCloneWiped { .. } => "POSTGRES_HA_INCOMPLETE_CLONE_WIPED",
+            Self::IncompleteCloneWipeCapped { .. } => "POSTGRES_HA_INCOMPLETE_CLONE_WIPE_CAPPED",
             Self::ArchiveConfigDrifted { .. } => "POSTGRES_HA_ARCHIVE_CONFIG_DRIFTED",
             Self::ArchiveConfigForced { .. } => "POSTGRES_HA_ARCHIVE_CONFIG_FORCED",
             Self::EtcdBootstrap { .. } => "ETCD_CLUSTER_BOOTSTRAP",
@@ -408,6 +417,16 @@ impl TelemetryEvent {
                 format!(
                     "Wiped incomplete-clone data dir on {} (non-empty, missing pg_control) — re-cloning from leader {}",
                     node, leader
+                )
+            }
+            Self::IncompleteCloneWipeCapped { node, attempts, available_bytes } => {
+                let free = match available_bytes {
+                    Some(b) => format!("{:.2} GB free", *b as f64 / 1024.0 / 1024.0 / 1024.0),
+                    None => "free space unknown".to_string(),
+                };
+                format!(
+                    "Refusing to wipe the incomplete clone on {} — {} wipes already failed to produce a complete clone ({}). Almost always a volume too small for the primary, or full.",
+                    node, attempts, free
                 )
             }
             Self::ArchiveConfigDrifted {
