@@ -47,6 +47,22 @@ ok()   { echo "${G}PASS${N} $*"; PASS=$((PASS+1)); }
 ko()   { echo "${R}FAIL${N} $*"; FAIL=$((FAIL+1)); FAILED_TESTS+=("$1"); }
 note() { echo "  ${Y}note:${N} $*"; }
 
+# logs_match <container> <extended-regex> — true when the container's log
+# contains the pattern.
+#
+# Deliberately not `docker logs ... | grep -q`: grep -q exits at its first
+# match, which SIGPIPEs `docker logs` while it is still writing, and under the
+# `set -o pipefail` at the top of this file the pipeline then reports 141 — a
+# match read as a miss. It bites hardest on the container with the most log
+# volume, which is normally the leader, i.e. exactly the node these assertions
+# care about. Reading the log into a variable first leaves no producer to kill,
+# so the result is decided by grep alone.
+logs_match() {
+  local container="$1" pattern="$2" logs
+  logs="$(docker logs "$container" 2>&1)" || return 1
+  grep -qE -- "$pattern" <<<"$logs"
+}
+
 # Capture failure detail; called from `assert_*` helpers and `ko`.
 fail_dump() {
   local label="$1"; shift
@@ -2631,7 +2647,7 @@ t_ha_upgrade_marker_blocks_boot() {
     docker volume rm "$vol" >/dev/null 2>&1 || true
     return
   fi
-  if ! docker logs "$n" 2>&1 | grep -q "upgrade is in progress"; then
+  if ! logs_match "$n" "upgrade is in progress"; then
     ko t_ha_upgrade_marker_blocks_boot "exited without naming the upgrade marker"
     fail_dump t_ha_upgrade_marker_blocks_boot "$n"
     teardown_scope "$scope"
@@ -2692,7 +2708,7 @@ t_ha_major_mismatch_blocks_boot() {
     docker volume rm "$vol" >/dev/null 2>&1 || true
     return
   fi
-  if ! docker logs "$n" 2>&1 | grep -q "holds major version $other_major"; then
+  if ! logs_match "$n" "holds major version $other_major"; then
     ko t_ha_major_mismatch_blocks_boot "exited without naming the on-disk major"
     fail_dump t_ha_major_mismatch_blocks_boot "$n"
     teardown_scope "$scope"
@@ -2922,7 +2938,7 @@ t_ha_selfheal_stands_down_during_upgrade() {
 
   local deadline=$(($(date +%s) + 90)) saw_standdown=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$replica" 2>&1 | grep -q "standing down"; then
+    if logs_match "$replica" "standing down"; then
       saw_standdown=1
       break
     fi
@@ -2936,7 +2952,7 @@ t_ha_selfheal_stands_down_during_upgrade() {
     return
   fi
   # It must not have reinitialized anything while standing down.
-  if docker logs "$replica" 2>&1 | grep -qE "self-heal: (reinitializ|force)"; then
+  if logs_match "$replica" "self-heal: (reinitializ|force)"; then
     ko t_ha_selfheal_stands_down_during_upgrade "watcher reinitialized during the upgrade window"
     fail_dump t_ha_selfheal_stands_down_during_upgrade "$replica"
     teardown_scope "$scope"
@@ -3122,7 +3138,7 @@ t_ha_reseed_wipe_unsafe_without_leader() {
     docker volume rm "$vol" >/dev/null 2>&1 || true
     return
   fi
-  if ! docker logs "$n" 2>&1 | grep -q "not safe to wipe"; then
+  if ! logs_match "$n" "not safe to wipe"; then
     ko "$tname" "exited without naming the unsafe-wipe refusal"
     fail_dump "$tname" "$n"
     teardown_scope "$scope"
@@ -4246,7 +4262,7 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
   # Guard the premise before the assertion: a rewind on the restarted node
   # would replace auto.conf wholesale and turn a pin loss into a false
   # reconcile bug — name that case if it ever happens on a replica.
-  if docker logs "$target" 2>&1 | grep -q "running pg_rewind"; then
+  if logs_match "$target" "running pg_rewind"; then
     ko t_ha_disabled_pitr_preserves_operator_archive_pin "restarted replica $target ran pg_rewind — auto.conf was replaced, the pin check below cannot attribute a loss to reconcile"
     fail_dump t_ha_disabled_pitr_preserves_operator_archive_pin "$target"
     teardown_scope "$scope"
@@ -4299,11 +4315,21 @@ t_ha_password_variable_edit_does_not_rotate() {
     return
   fi
 
-  # Password-authenticated TCP connection: the local socket is `trust`, TCP is
-  # scram-sha-256, so only this exercises the role's actual password.
+  # Password-authenticated TCP connection, probed from a PEER container.
+  #
+  # Loopback is not password-authenticated here: pg_hba is first-match-wins,
+  # and initdb's own `host all all 127.0.0.1/32 trust` sits well above the
+  # scram rules Patroni appends, so a connection to 127.0.0.1 authenticates
+  # with ANY password — a wrong one, or an empty one. A probe from another
+  # container matches `hostssl all all 0.0.0.0/0 scram-sha-256` instead,
+  # which is the rule that actually exercises the role's password.
   tcp_auth_ok() {
-    docker exec "$1" psql \
-      "host=127.0.0.1 port=5432 user=postgres password=$2 dbname=postgres connect_timeout=5" \
+    local target="$1" pw="$2" probe="" c
+    for c in "$n1" "$n2" "$n3"; do
+      if [ "$c" != "$target" ]; then probe="$c"; break; fi
+    done
+    docker exec "$probe" psql \
+      "host=$target port=5432 user=postgres password=$pw dbname=postgres connect_timeout=5" \
       -tAc "SELECT 1" 2>/dev/null | grep -qx 1
   }
 
@@ -4377,7 +4403,7 @@ t_ha_password_variable_edit_does_not_rotate() {
   fi
 
   for n in "$n1" "$n2" "$n3"; do
-    if ! docker logs "$n" 2>&1 | grep -q "keeping the pinned credentials"; then
+    if ! logs_match "$n" "keeping the pinned credentials"; then
       ko t_ha_password_variable_edit_does_not_rotate "$n never logged the credential drift — check apply_credential_pin ran on every node"
       fail_dump t_ha_password_variable_edit_does_not_rotate "$n"
       teardown_scope "$scope"
