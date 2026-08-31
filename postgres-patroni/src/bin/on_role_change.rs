@@ -7,7 +7,7 @@
 //! for security reasons, so we read the node name from the config file instead.
 
 use common::{init_logging, Telemetry, TelemetryEvent};
-use postgres_patroni::bootstrap::refresh_collation_versions;
+use postgres_patroni::bootstrap::{reconcile_pg_stat_statements, refresh_collation_versions};
 use postgres_patroni::pgbackrest::derive_pgbackrest_repo_path;
 use postgres_patroni::pgdata;
 use std::env;
@@ -64,6 +64,14 @@ fn main() {
             }
 
             refresh_collation_versions();
+
+            // A promoted node may carry a pg_stat_statements that lags what
+            // the image ships (e.g. it booted as a replica during a rolling
+            // update, so the boot-time reconcile skipped it and no primary
+            // ever ran the update). Reconcile on promotion, same
+            // frequency-gap reasoning as refresh_collation_versions above;
+            // no-ops once versions match.
+            reconcile_pg_stat_statements();
 
             TelemetryEvent::PostgresFailover {
                 node,
