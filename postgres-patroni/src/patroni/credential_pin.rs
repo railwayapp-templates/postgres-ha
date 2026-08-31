@@ -142,7 +142,17 @@ pub fn apply_credential_pin(
     credentials_from_env: bool,
     telemetry: &Telemetry,
 ) -> PinOutcome {
-    if !has_cluster_data {
+    // The pin lives inside PGDATA so that clones inherit it, but
+    // `has_cluster_data` is keyed on the volume-root bootstrap marker, which
+    // `post_bootstrap` writes only on the node that bootstrapped the cluster.
+    // A replica seeded by pg_basebackup therefore carries the pin and never
+    // the marker, and would read as a fresh volume on every boot. An existing
+    // pin is itself proof this volume carries a cluster, so honor it whatever
+    // the marker says; the marker still gates ADOPTING the variables onto a
+    // volume that has no pin yet.
+    let existing_pin = read_credential_pin(&config.data_dir);
+
+    if !has_cluster_data && existing_pin.is_none() {
         return PinOutcome::FreshVolume;
     }
 
@@ -160,7 +170,7 @@ pub fn apply_credential_pin(
         return PinOutcome::RepinnedFromEnv;
     }
 
-    let Some(pinned) = read_credential_pin(&config.data_dir) else {
+    let Some(pinned) = existing_pin else {
         // An existing cluster that predates the pin: its variables are, by
         // construction, the credentials it runs with (nothing else ever set
         // them) — adopt them.
@@ -298,6 +308,39 @@ mod tests {
         );
         assert_eq!(config.superuser_pass, "su-env");
         assert_eq!(read_credential_pin(data_dir), None);
+    }
+
+    #[test]
+    fn replica_without_the_bootstrap_marker_still_honors_its_pin() {
+        // post_bootstrap writes the volume-root marker only on the node that
+        // bootstrapped the cluster, so a basebackup-seeded replica boots with
+        // has_cluster_data = false for the life of the volume — while carrying
+        // the pin its clone copied out of the leader's PGDATA. The pin has to
+        // win there too, or the replica renders drifted variables into its
+        // pgpass and cannot authenticate to the leader.
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let pinned = PinnedCredentials {
+            superuser_pass: "su-active".into(),
+            repl_pass: "repl-active".into(),
+            app_pass: "app-active".into(),
+        };
+        write_credential_pin(data_dir, &pinned).unwrap();
+
+        let mut config = config_at(data_dir);
+        let outcome = apply_credential_pin(&mut config, false, false, &telemetry());
+        assert_eq!(
+            outcome,
+            PinOutcome::KeptPinned(vec![
+                "PATRONI_SUPERUSER_PASSWORD",
+                "PATRONI_REPLICATION_PASSWORD",
+                "POSTGRES_PASSWORD",
+            ])
+        );
+        assert_eq!(config.superuser_pass, "su-active");
+        assert_eq!(config.repl_pass, "repl-active");
+        assert_eq!(config.app_pass, "app-active");
+        assert_eq!(read_credential_pin(data_dir), Some(pinned));
     }
 
     #[test]

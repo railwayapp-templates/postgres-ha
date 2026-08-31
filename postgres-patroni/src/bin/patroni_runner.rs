@@ -654,9 +654,24 @@ async fn handle_reseed_marker(
     Ok(())
 }
 
-async fn start_patroni() -> Result<tokio::process::Child> {
+/// Patroni's own configuration loader gives `PATRONI_*` environment variables
+/// priority over the config file, so it is not enough to render the pinned
+/// credentials into patroni.yml: Patroni would read the drifted
+/// `PATRONI_REPLICATION_PASSWORD` / `PATRONI_SUPERUSER_PASSWORD` straight out
+/// of the environment, override the file, and write the drifted replication
+/// password into its pgpass — which is what `primary_conninfo` authenticates
+/// with. The replicas then fail to authenticate against a leader whose roles
+/// still carry the pinned password, which is exactly the outage the pin
+/// exists to prevent.
+///
+/// Hand Patroni the same values the config file already carries, so the two
+/// sources agree whatever the variables say. `config` here is post-pin, so on
+/// a fresh volume these are the variables themselves and this is a no-op.
+async fn start_patroni(config: &Config) -> Result<tokio::process::Child> {
     let child = Command::new("patroni")
         .arg("/etc/patroni/patroni.yml")
+        .env("PATRONI_REPLICATION_PASSWORD", &config.repl_pass)
+        .env("PATRONI_SUPERUSER_PASSWORD", &config.superuser_pass)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -2010,7 +2025,7 @@ async fn async_main() -> Result<()> {
     health_server::spawn(health_config, telemetry.clone());
 
     // Start Patroni and run monitoring loop
-    let child = start_patroni().await?;
+    let child = start_patroni(&config).await?;
 
     // Spawn a DCS reconcile task that retries indefinitely with exponential
     // backoff until it succeeds. This waits for Patroni's REST API to come up,
