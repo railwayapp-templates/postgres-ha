@@ -1955,13 +1955,27 @@ t_ha_archive_disable_clears_restore_command() {
   # (this harness's own boot order never produces one on its own — see
   # comment above). Same value already active via the local fallback,
   # so this doesn't change current behavior, only DCS's dynamic config.
-  docker exec "$leader" curl -sf -X PATCH -H "Content-Type: application/json" \
-    -d '{"postgresql":{"parameters":{"restore_command":"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p"}}}' \
-    "http://localhost:8008/config" >/dev/null 2>&1
-  local cfg_seeded
-  cfg_seeded=$(docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null)
-  if ! echo "$cfg_seeded" | grep -q '"restore_command"'; then
-    ko t_ha_archive_disable_clears_restore_command "failed to seed a DCS-level restore_command to test clearing against: $cfg_seeded"
+  #
+  # Seeded in a poll, re-read every round: Patroni's PATCH /config is a
+  # compare-and-swap on the config version, and this image runs its own
+  # DCS writers alongside the test — the per-boot archive reconcile (whose
+  # supervisor retries indefinitely, explicitly for "a transient etcd CAS
+  # failure") and the watcher's repo-path broadcast. A single shot that
+  # loses the CAS 409s, and discarding curl's status left the failure
+  # showing only the config the value was missing from, never why.
+  local seed_status="" cfg_seeded="" seeded=0
+  local seed_deadline=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$seed_deadline" ]; do
+    seed_status=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' \
+      -X PATCH -H "Content-Type: application/json" \
+      -d '{"postgresql":{"parameters":{"restore_command":"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p"}}}' \
+      "http://localhost:8008/config" 2>/dev/null)
+    cfg_seeded=$(docker exec "$leader" curl -sf http://localhost:8008/config 2>/dev/null)
+    if echo "$cfg_seeded" | grep -q '"restore_command"'; then seeded=1; break; fi
+    sleep 2
+  done
+  if [ "$seeded" != 1 ]; then
+    ko t_ha_archive_disable_clears_restore_command "failed to seed a DCS-level restore_command to test clearing against (last PATCH HTTP ${seed_status:-none}): $cfg_seeded"
     teardown_scope "$scope"
     return
   fi
@@ -4156,6 +4170,7 @@ t_ha_disabled_pitr_preserves_operator_archive_pin() {
   read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
 
   local leader; leader=$(wait_for_leader "$scope" 180) || { ko t_ha_disabled_pitr_preserves_operator_archive_pin "no leader"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko t_ha_disabled_pitr_preserves_operator_archive_pin "replicas didn't stream"; teardown_scope "$scope"; return; }
 
   # Pin and restart a REPLICA, never the leader. Restarting the leader
   # hands the lock to a replica (Patroni releases it on graceful shutdown),
@@ -5016,9 +5031,15 @@ _seed_standalone_pgdata() {
     -v "${vol}:/var/lib/postgresql/data" \
     "postgres:${PG_VERSION}" \
     -c "wal_level=${wlvl}" -c max_replication_slots=10 -c max_wal_senders=10 >/dev/null
+  # Probe over TCP, never the socket. The official entrypoint runs initdb
+  # and its init scripts against a temporary server started with
+  # listen_addresses='', which a socket-side pg_isready accepts as ready —
+  # so the CREATE ROLE below can land on that server's fast shutdown
+  # ("the database system is shutting down") instead of the real one.
+  # Only the final postmaster listens on TCP, so this can't go green early.
   local up=0 _i
-  for _i in $(seq 1 60); do
-    if docker exec "$name" pg_isready -U postgres -q >/dev/null 2>&1; then up=1; break; fi
+  for _i in $(seq 1 120); do
+    if docker exec "$name" pg_isready -U postgres -h localhost -q >/dev/null 2>&1; then up=1; break; fi
     sleep 1
   done
   if [ "$up" != 1 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; return 1; fi
@@ -5256,6 +5277,84 @@ t_upgrade_lock_standalone_lifetime() {
   note "lock held for the runtime's lifetime, released on stop, and boot refused while a job held it"
 }
 
+# A member whose identity the cluster has removed must wipe its orphaned data
+# dir and re-join as a fresh learner — REGARDLESS of the refusing etcd run's
+# exit code. etcd v3.6's removed-member stop exits 0 or 1 depending on an
+# internal shutdown race (both shapes observed in production on the same
+# node), and the 0-exit shape used to end the wrapper through the clean-exit
+# branch: a dead-but-SUCCESS zombie the wipe recovery never reached. The
+# recovery must complete within one wrapper lifetime — no container restart
+# happens here, so a wrapper that exits instead of recovering fails the wait.
+t_etcd_removed_member_wipe_rejoin() {
+  local t="t_etcd_removed_member_wipe_rejoin"
+  local prefix="rmv"
+  local n1="${prefix}-etcd-1" n2="${prefix}-etcd-2" n3="${prefix}-etcd-3"
+  local hosts
+  hosts=$(setup_etcd_cluster "$prefix")
+  log "etcd cluster up ($hosts)"
+
+  local members
+  members=$(docker exec "$n1" etcdctl member list 2>/dev/null)
+  if [ "$(echo "$members" | grep -c 'started')" != "3" ]; then
+    ko "$t" "etcd cluster never reached 3 started members"
+    fail_dump "$t" "$n1" "$n2" "$n3"
+    return
+  fi
+
+  docker exec "$n1" etcdctl put rmv-canary survives >/dev/null 2>&1
+
+  # Remove n3's member id — the exact production failure: the removal lives
+  # in the PEERS' raft state, so n3's local dir is orphaned from here on and
+  # every restart on it is refused identically.
+  local m3
+  m3=$(docker exec "$n1" etcdctl member list | awk -F', ' -v n="$n3" '$3==n {print $1}')
+  if [ -z "$m3" ]; then
+    ko "$t" "could not resolve $n3's member id"
+    fail_dump "$t" "$n1"
+    return
+  fi
+  docker exec "$n1" etcdctl member remove "$m3" >/dev/null 2>&1
+
+  local deadline=$(($(date +%s) + 180)) recovered=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    members=$(docker exec "$n1" etcdctl member list 2>/dev/null)
+    if [ "$(echo "$members" | grep -c 'started')" = "3" ] \
+      && [ "$(echo "$members" | grep -cE ', true$')" = "0" ] \
+      && [ "$(echo "$members" | grep -c "$n3")" = "1" ]; then
+      recovered=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$recovered" != 1 ]; then
+    ko "$t" "removed member never wiped + re-joined as a voting member"
+    fail_dump "$t" "$n3" "$n1"
+    return
+  fi
+
+  # The recovery must have gone through the guarded wipe (peer-quorum check),
+  # not some other path, and the keyspace must be intact via the re-joined
+  # node.
+  if ! logs_contain "$n3" "wiping data dir to re-clone as a fresh member"; then
+    ko "$t" "re-joined without the guarded wipe path (wipe log line missing)"
+    fail_dump "$t" "$n3"
+    return
+  fi
+  local canary
+  canary=$(docker exec "$n1" etcdctl get rmv-canary --print-value-only \
+    --endpoints="http://${n3}:2379" 2>/dev/null)
+  if ! assert_eq "$canary" "survives" "canary readable via the re-joined member"; then
+    ko "$t" "data not intact via re-joined member"
+    fail_dump "$t" "$n3"
+    return
+  fi
+
+  ok "$t"
+  note "member removed → refusal detected → quorum-guarded wipe → learner re-join → promoted; canary intact"
+
+  for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1; done
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -5322,6 +5421,9 @@ ALL_TESTS=(
   t_ha_adopt_preserves_logical
   t_ha_adopt_default_replica
   t_upgrade_lock_standalone_lifetime
+  # etcd wrapper: removed-member refusal wipes + re-joins within one wrapper
+  # lifetime, whichever exit code the refusing run produced
+  t_etcd_removed_member_wipe_rejoin
 )
 
 usage() {

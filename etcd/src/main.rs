@@ -39,6 +39,35 @@ fn is_raft_corruption_line(line: &str) -> bool {
         || line.contains("Was the raft log corrupted, truncated, or lost?")
 }
 
+/// etcd refuses to serve when the local data dir carries a member identity the
+/// cluster has removed ("the member has been permanently removed from the
+/// cluster" / "data-dir used by this member must be removed"). The removal is
+/// recorded in the peers' raft state, so restarting on the same dir fails
+/// identically every time — the same forever-loop as WAL corruption, with the
+/// same recovery (wipe, then re-join as a fresh learner). Observed 2026-08-26
+/// on onyx-staging/etcd-2 and onyx-prod/etcd-3: exit 1 every retry while the
+/// platform's sick-etcd self-heal redeployed the same volume to no effect.
+fn is_removed_member_line(line: &str) -> bool {
+    line.contains("the member has been permanently removed from the cluster")
+        || line.contains("data-dir used by this member must be removed")
+}
+
+/// Whether an etcd exit ends supervision as a clean shutdown.
+///
+/// The exit CODE alone cannot decide this: etcd's graceful stop after
+/// discovering its member was removed exits 0 whenever etcdmain's `<-stopped`
+/// branch wins the shutdown race (`osutil.Exit(0)`, etcdmain/etcd.go) and 1
+/// when a listener error wins — nondeterministic per start, both shapes
+/// observed on the same node. Taking a 0-exit refusal as a clean exit ends
+/// supervision with the data dir still orphaned: the container dies as a
+/// SUCCESS zombie that no in-wrapper recovery ever reaches. A run that hit an
+/// unrecoverable-data-dir line is therefore never clean, whatever the exit
+/// code. (Raft corruption is a panic and cannot exit 0; it is gated the same
+/// way so every detected class behaves identically.)
+fn exit_is_clean(exited_ok: bool, was_corrupt: bool, was_removed_member: bool) -> bool {
+    exited_ok && !was_corrupt && !was_removed_member
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _guard = init_logging("etcd");
@@ -110,14 +139,19 @@ async fn main() -> Result<()> {
         // while watching for the unrecoverable raft-log corruption panic. The
         // reader must keep draining or etcd would block on a full stderr pipe.
         let corruption_detected = Arc::new(AtomicBool::new(false));
+        let removed_member_detected = Arc::new(AtomicBool::new(false));
         let stderr_reader = child.stderr.take().map(|stderr| {
-            let flag = Arc::clone(&corruption_detected);
+            let corrupt_flag = Arc::clone(&corruption_detected);
+            let removed_flag = Arc::clone(&removed_member_detected);
             tokio::spawn(async move {
                 let mut stderr_out = tokio::io::stderr();
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if is_raft_corruption_line(&line) {
-                        flag.store(true, Ordering::Relaxed);
+                        corrupt_flag.store(true, Ordering::Relaxed);
+                    }
+                    if is_removed_member_line(&line) {
+                        removed_flag.store(true, Ordering::Relaxed);
                     }
                     // Tee to our stderr so etcd's logs still reach the container.
                     let _ = stderr_out.write_all(format!("{}\n", line).as_bytes()).await;
@@ -162,14 +196,18 @@ async fn main() -> Result<()> {
             let _ = reader.await;
         }
         let was_corrupt = corruption_detected.load(Ordering::Relaxed);
+        let was_removed_member = removed_member_detected.load(Ordering::Relaxed);
 
-        if status.success() {
+        if exit_is_clean(status.success(), was_corrupt, was_removed_member) {
             info!("etcd exited cleanly");
             return Ok(());
         }
 
         let exit_code = status.code();
         info!(exit_code = ?exit_code, "etcd exited");
+        if status.success() {
+            warn!("etcd exited 0 after an unrecoverable-data-dir refusal - staying up so recovery can run");
+        }
 
         // Handle incomplete bootstrap
         let marker_exists = bootstrap_marker_present(&config.bootstrap_marker());
@@ -191,17 +229,24 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-        } else if marker_exists && was_corrupt {
-            // A fully-bootstrapped member whose raft WAL is corrupt panics on every
-            // start, so retrying the same data dir loops until max_retries → CRASHED.
+        } else if marker_exists && (was_corrupt || was_removed_member) {
+            // A fully-bootstrapped member whose data dir is unrecoverable — raft
+            // WAL corrupt, or the member identity in the dir was removed from the
+            // cluster — fails identically on every start, so retrying the same
+            // data dir loops until max_retries → CRASHED.
             // etcd is built for this: a follower can be wiped and re-cloned as long
             // as the rest of the cluster has quorum. Only act when a healthy peer
             // cluster exists (never wipe the last copy of the data), then drop the
             // marker + wipe — the next iteration takes the existing volume-loss
             // recovery path (remove stale member → re-add as learner → re-sync).
+            let reason = if was_corrupt {
+                "raft log corrupted/truncated; quorum intact on peers"
+            } else {
+                "member removed from cluster; local data dir orphaned; quorum intact on peers"
+            };
             match check_existing_cluster(&config.initial_cluster, &config.etcd_name).await {
                 Ok(Some(_)) => {
-                    warn!("etcd raft log corruption with a healthy peer cluster - wiping data dir to re-clone as a fresh member");
+                    warn!(reason, "etcd data dir unrecoverable with a healthy peer cluster - wiping data dir to re-clone as a fresh member");
                     // Clear data FIRST; remove marker only on success. If clear fails,
                     // marker + data are preserved and we retry detection next cycle. If
                     // clear succeeds but remove fails, the stale marker is left with an
@@ -211,15 +256,14 @@ async fn main() -> Result<()> {
                             let _ = fs::remove_file(&config.bootstrap_marker()).await;
                             telemetry.send(TelemetryEvent::EtcdDataDirWiped {
                                 node: config.etcd_name.clone(),
-                                reason: "raft log corrupted/truncated; quorum intact on peers"
-                                    .to_string(),
+                                reason: reason.to_string(),
                             });
                         }
                         Err(e) => {
                             telemetry.send(TelemetryEvent::ComponentError {
                                 component: "etcd".to_string(),
                                 error: e.to_string(),
-                                context: "wiping corrupt etcd data dir".to_string(),
+                                context: "wiping unrecoverable etcd data dir".to_string(),
                             });
                         }
                     }
@@ -228,10 +272,10 @@ async fn main() -> Result<()> {
                     // No healthy peer to re-clone from — wiping could destroy the
                     // only surviving copy. Preserve and keep retrying; this is a
                     // manual-intervention situation (the wider cluster is down too).
-                    warn!("etcd raft log corruption but NO healthy peer cluster - preserving data (manual intervention needed)");
+                    warn!(reason, "etcd data dir unrecoverable but NO healthy peer cluster - preserving data (manual intervention needed)");
                 }
                 Err(e) => {
-                    warn!(error = %e, "etcd raft log corruption: failed to probe peers - preserving data this cycle");
+                    warn!(error = %e, reason, "etcd data dir unrecoverable: failed to probe peers - preserving data this cycle");
                 }
             }
         } else if marker_exists {
@@ -251,7 +295,57 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_raft_corruption_line;
+    use super::{exit_is_clean, is_raft_corruption_line, is_removed_member_line};
+
+    #[test]
+    fn clean_exit_without_flags_ends_supervision() {
+        assert!(exit_is_clean(true, false, false));
+    }
+
+    #[test]
+    fn removed_member_refusal_is_never_a_clean_exit() {
+        // etcd v3.6 exits 0 on the graceful removed-member stop whenever
+        // etcdmain's <-stopped branch wins the shutdown race (observed on
+        // onyx-staging/etcd-2 alongside exit-1 runs of the same refusal).
+        // Supervision must not end on it, or the node dies as a SUCCESS
+        // zombie with the wipe recovery unreachable.
+        assert!(!exit_is_clean(true, false, true));
+        assert!(!exit_is_clean(false, false, true));
+    }
+
+    #[test]
+    fn corrupt_run_is_never_a_clean_exit() {
+        assert!(!exit_is_clean(true, true, false));
+        assert!(!exit_is_clean(false, true, false));
+    }
+
+    #[test]
+    fn nonzero_exit_is_not_clean() {
+        assert!(!exit_is_clean(false, false, false));
+    }
+
+    #[test]
+    fn matches_removed_member_refusals() {
+        // The two shapes etcd prints when the local dir carries a removed
+        // member's identity (observed onyx-staging/etcd-2, 2026-08-26).
+        assert!(is_removed_member_line(
+            "data-dir used by this member must be removed"
+        ));
+        assert!(is_removed_member_line(
+            "the member has been permanently removed from the cluster"
+        ));
+    }
+
+    #[test]
+    fn removed_member_matcher_ignores_membership_churn_lines() {
+        assert!(!is_removed_member_line("ignore already removed member"));
+        assert!(!is_removed_member_line(
+            "skipped attributes update of removed member"
+        ));
+        assert!(!is_removed_member_line(
+            "removing member 83132ee335828269 from cluster"
+        ));
+    }
 
     #[test]
     fn matches_tocommit_out_of_range_panic() {
