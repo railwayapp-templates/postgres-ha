@@ -10,7 +10,7 @@ use nix::sys::signal::{SigHandler, Signal};
 use nix::sys::stat::{umask, Mode};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{ForkResult, Pid};
-use postgres_patroni::bootstrap::refresh_collation_versions;
+use postgres_patroni::bootstrap::{reconcile_pg_stat_statements, refresh_collation_versions};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::major_upgrade;
 use postgres_patroni::patroni::{
@@ -1602,57 +1602,81 @@ fn main() -> Result<()> {
 /// no-ops per-database once nothing is mismatched.
 fn spawn_collation_refresh() {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            let probe = tokio::process::Command::new("pg_isready")
-                .args(["-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-q"])
-                .status()
-                .await;
-            if matches!(probe, Ok(s) if s.success()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        if wait_until_local_primary(Duration::from_secs(600)).await {
+            refresh_collation_versions();
         }
+    });
+}
 
-        // pg_isready above accepts connections from a replica in
-        // hot_standby mode too — wait for primary specifically, since
-        // ALTER DATABASE fails with a read-only-transaction error on a
-        // standby. A permanent replica never passes this and just times
-        // out at the deadline; it gets the fix through WAL replication
-        // once the primary refreshes, not by running this itself.
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            let out = tokio::process::Command::new("psql")
-                .args([
-                    "-U",
-                    "postgres",
-                    "-h",
-                    "/var/run/postgresql",
-                    "-tAXq",
-                    "-c",
-                    "SELECT pg_is_in_recovery()",
-                ])
-                .env_remove("PGHOST")
-                .env_remove("PGPORT")
-                .output()
-                .await;
-            let is_primary = matches!(
-                out,
-                Ok(ref o) if o.status.success()
-                    && String::from_utf8_lossy(&o.stdout).trim() == "f"
-            );
-            if is_primary {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+/// Wait until the local postgres both answers connections AND reports
+/// primary (`pg_is_in_recovery() = false`), or until `budget` elapses.
+/// Returns false on timeout.
+///
+/// pg_isready alone accepts connections from a replica in hot_standby mode
+/// too — the second loop waits for primary specifically, since the callers
+/// run DDL (ALTER DATABASE / ALTER EXTENSION) that fails with a
+/// read-only-transaction error on a standby. A permanent replica never
+/// passes it and just times out at the deadline; it gets the callers' fixes
+/// through WAL replication once the primary runs them, not by running them
+/// itself.
+async fn wait_until_local_primary(budget: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
         }
+        let probe = tokio::process::Command::new("pg_isready")
+            .args(["-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-q"])
+            .status()
+            .await;
+        if matches!(probe, Ok(s) if s.success()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 
-        refresh_collation_versions();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        let out = tokio::process::Command::new("psql")
+            .args([
+                "-U",
+                "postgres",
+                "-h",
+                "/var/run/postgresql",
+                "-tAXq",
+                "-c",
+                "SELECT pg_is_in_recovery()",
+            ])
+            .env_remove("PGHOST")
+            .env_remove("PGPORT")
+            .output()
+            .await;
+        let is_primary = matches!(
+            out,
+            Ok(ref o) if o.status.success()
+                && String::from_utf8_lossy(&o.stdout).trim() == "f"
+        );
+        if is_primary {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Boot-time pg_stat_statements reconcile (see bootstrap::extensions for the
+/// full rationale): pg_upgrade preserves the extension's SQL-level version
+/// and nothing else ever updates it, so upgraded clusters drift behind what
+/// the image ships while the dashboard's Stats tab queries one view shape
+/// fleet-wide. Primary-only, same gating as spawn_collation_refresh; safe to
+/// double-run with the on_role_change-triggered reconcile — it no-ops once
+/// versions match.
+fn spawn_extension_reconcile() {
+    tokio::spawn(async move {
+        if wait_until_local_primary(Duration::from_secs(600)).await {
+            reconcile_pg_stat_statements();
+        }
     });
 }
 
@@ -2038,6 +2062,10 @@ async fn async_main() -> Result<()> {
     // spawn_collation_refresh — runs unconditionally, not just when
     // archiving is enabled.
     spawn_collation_refresh();
+
+    // Same boot trigger for the pg_stat_statements version reconcile — and
+    // the same on_role_change frequency-gap coverage on promotion.
+    spawn_extension_reconcile();
 
     // Spawn the leader-only backup watcher. Mirrors postgres-ssl
     // pgbackrest-backup-watcher.sh. Each iteration re-checks Patroni's
