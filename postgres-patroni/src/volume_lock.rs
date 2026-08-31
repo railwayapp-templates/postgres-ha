@@ -34,22 +34,41 @@ use tracing::{info, warn};
 const RUNTIME_LOCK_FILE: &str = ".railway-postgres-runtime.lock";
 const DEFAULT_WAIT_SECS: u64 = 300;
 
+/// How the lock attempt ended.
+///
+/// The three outcomes used to collapse into one `Ok(None)`, which made a boot
+/// that silently lost its overlap protection indistinguishable at the caller
+/// from one that deliberately abstained — the difference surviving only as a
+/// warn line nobody alerts on. Splitting them lets the runner keep the
+/// documented fail-open boot AND report the lost invariant, the way
+/// redis-ha (`c70a5bb`) and mysql-ha (`ef31edb`) already do.
+pub enum VolumeLockOutcome {
+    /// The exclusive flock is held; bind it for the process's lifetime.
+    Held(Flock<File>),
+    /// The legacy PGDATA-at-the-volume-root layout on first init: creating a
+    /// lock file here would make docker-entrypoint skip initdb. A deliberate
+    /// abstain on an empty volume — there is no data to protect yet, and
+    /// nothing to report.
+    SkippedForFirstInit,
+    /// The lock could not be taken for a reason that is not contention: the
+    /// lock file would not open (read-only mount, ENOSPC, permissions), or
+    /// flock failed with something other than EWOULDBLOCK. The boot continues
+    /// — refusing to start over a bad lock file is a worse failure than the
+    /// overlap it guards against — but this container has NO overlap
+    /// protection, and the caller must say so.
+    FailedOpen { reason: String },
+}
+
 /// Acquire the exclusive volume runtime lock, waiting up to
 /// `RUNTIME_LOCK_WAIT_SECONDS` (default 300) for a previous holder.
 ///
-/// Returns the lock to be bound for the caller's lifetime (mirrors
-/// `major_upgrade::take_volume_upgrade_lock`'s shape). `Ok(None)` means the
-/// guard degraded fail-open (unopenable lock file, non-EWOULDBLOCK flock
-/// error, or the legacy PGDATA-at-the-volume-root first-init layout where a
-/// lock file would make docker-entrypoint skip initdb). A timeout waiting on
-/// a live holder fails CLOSED: two nodes on one PGDATA is the outcome that
-/// must not happen.
-pub fn acquire_volume_runtime_lock(
-    volume_root: &str,
-    pgdata: &str,
-) -> Result<Option<Flock<File>>> {
-    let pgdata_is_volume_root =
-        pgdata.trim_end_matches('/') == volume_root.trim_end_matches('/');
+/// `Held` carries the lock to be bound for the caller's lifetime (mirrors
+/// `major_upgrade::take_volume_upgrade_lock`'s shape). A timeout waiting on a
+/// live holder fails CLOSED: two nodes on one PGDATA is the outcome that must
+/// not happen. Everything else fails OPEN, distinguished by outcome so the
+/// runner can tell an abstain from a degradation.
+pub fn acquire_volume_runtime_lock(volume_root: &str, pgdata: &str) -> Result<VolumeLockOutcome> {
+    let pgdata_is_volume_root = pgdata.trim_end_matches('/') == volume_root.trim_end_matches('/');
     if pgdata_is_volume_root {
         let pg_version = format!("{}/PG_VERSION", pgdata.trim_end_matches('/'));
         if !Path::new(&pg_version).exists() {
@@ -58,7 +77,7 @@ pub fn acquire_volume_runtime_lock(
                 "PGDATA is the volume root and uninitialized — skipping the runtime lock \
                  so the lock file can't make docker-entrypoint skip initdb"
             );
-            return Ok(None);
+            return Ok(VolumeLockOutcome::SkippedForFirstInit);
         }
     }
 
@@ -69,7 +88,7 @@ pub fn acquire_volume_runtime_lock(
     acquire_with_wait(volume_root, wait_secs)
 }
 
-fn acquire_with_wait(volume_root: &str, wait_secs: u64) -> Result<Option<Flock<File>>> {
+fn acquire_with_wait(volume_root: &str, wait_secs: u64) -> Result<VolumeLockOutcome> {
     let path = Path::new(volume_root).join(RUNTIME_LOCK_FILE);
     let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
@@ -79,7 +98,9 @@ fn acquire_with_wait(volume_root: &str, wait_secs: u64) -> Result<Option<Flock<F
                 error = %err,
                 "could not open the runtime lock file; continuing without the volume lock"
             );
-            return Ok(None);
+            return Ok(VolumeLockOutcome::FailedOpen {
+                reason: format!("could not open {}: {err}", path.display()),
+            });
         }
     };
 
@@ -91,7 +112,7 @@ fn acquire_with_wait(volume_root: &str, wait_secs: u64) -> Result<Option<Flock<F
                 if waited {
                     info!("previous container released the volume; continuing boot");
                 }
-                return Ok(Some(lock));
+                return Ok(VolumeLockOutcome::Held(lock));
             }
             Err((returned, Errno::EWOULDBLOCK)) => {
                 if !waited {
@@ -117,7 +138,9 @@ fn acquire_with_wait(volume_root: &str, wait_secs: u64) -> Result<Option<Flock<F
                     error = %errno,
                     "could not take the runtime lock; continuing without it"
                 );
-                return Ok(None);
+                return Ok(VolumeLockOutcome::FailedOpen {
+                    reason: format!("flock on {} failed: {errno}", path.display()),
+                });
             }
         }
     }
@@ -140,9 +163,11 @@ mod tests {
         let dir = tmp_dir("basic");
         let dir_str = dir.to_str().unwrap();
 
-        let held = acquire_with_wait(dir_str, 1)
-            .expect("uncontended acquire should succeed")
-            .expect("should hold the lock");
+        let held = match acquire_with_wait(dir_str, 1).expect("uncontended acquire should succeed")
+        {
+            VolumeLockOutcome::Held(lock) => lock,
+            other => panic!("expected Held, got {}", outcome_name(&other)),
+        };
 
         let probe = OpenOptions::new()
             .create(true)
@@ -177,9 +202,13 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_secs(2));
 
         drop(held);
-        acquire_with_wait(dir_str, 1)
-            .expect("acquire after release should succeed")
-            .expect("should hold the lock");
+        assert!(
+            matches!(
+                acquire_with_wait(dir_str, 1).expect("acquire after release should succeed"),
+                VolumeLockOutcome::Held(_)
+            ),
+            "the lock is retakeable once the previous holder releases it"
+        );
     }
 
     #[test]
@@ -189,7 +218,10 @@ mod tests {
         // PGDATA == volume root with no PG_VERSION: first init of the legacy
         // layout — the guard must abstain entirely (no lock file created).
         let result = acquire_volume_runtime_lock(dir_str, dir_str).unwrap();
-        assert!(result.is_none());
+        assert!(
+            matches!(result, VolumeLockOutcome::SkippedForFirstInit),
+            "a deliberate abstain must not read as a degradation — nothing to report"
+        );
         assert!(!dir.join(RUNTIME_LOCK_FILE).exists());
     }
 
@@ -197,9 +229,51 @@ mod tests {
     fn missing_directory_fails_open() {
         let dir = std::env::temp_dir().join(format!("pg-rt-lock-missing-{}", std::process::id()));
         let pgdata = dir.join("pgdata");
-        let result =
-            acquire_volume_runtime_lock(dir.to_str().unwrap(), pgdata.to_str().unwrap())
-                .expect("unopenable lock file must fail open, not fail the boot");
-        assert!(result.is_none());
+        let result = acquire_volume_runtime_lock(dir.to_str().unwrap(), pgdata.to_str().unwrap())
+            .expect("unopenable lock file must fail open, not fail the boot");
+        match result {
+            // Fails OPEN (the boot continues) but as a DEGRADATION, distinct
+            // from the abstain above: this container has no overlap
+            // protection and the runner turns this into a ComponentError.
+            VolumeLockOutcome::FailedOpen { reason } => {
+                assert!(
+                    reason.contains(RUNTIME_LOCK_FILE),
+                    "reason names the file: {reason}"
+                );
+            }
+            other => panic!("expected FailedOpen, got {}", outcome_name(&other)),
+        }
+    }
+
+    fn outcome_name(outcome: &VolumeLockOutcome) -> &'static str {
+        match outcome {
+            VolumeLockOutcome::Held(_) => "Held",
+            VolumeLockOutcome::SkippedForFirstInit => "SkippedForFirstInit",
+            VolumeLockOutcome::FailedOpen { .. } => "FailedOpen",
+        }
+    }
+
+    #[test]
+    fn an_abstain_and_a_degradation_are_not_the_same_outcome() {
+        // The point of the whole change: both continue the boot, but only one
+        // means "this container has no overlap protection". Collapsed into
+        // Ok(None), the caller could not tell them apart and the lost
+        // invariant never left the container's stdout.
+        let legacy = tmp_dir("distinct-abstain");
+        let legacy_str = legacy.to_str().unwrap();
+        let abstain = acquire_volume_runtime_lock(legacy_str, legacy_str).unwrap();
+
+        let broken = std::env::temp_dir().join(format!(
+            "pg-rt-lock-distinct-missing-{}",
+            std::process::id()
+        ));
+        let broken_pgdata = broken.join("pgdata");
+        let degraded =
+            acquire_volume_runtime_lock(broken.to_str().unwrap(), broken_pgdata.to_str().unwrap())
+                .unwrap();
+
+        assert_eq!(outcome_name(&abstain), "SkippedForFirstInit");
+        assert_eq!(outcome_name(&degraded), "FailedOpen");
+        std::fs::remove_dir_all(&legacy).ok();
     }
 }
