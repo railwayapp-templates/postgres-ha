@@ -1779,10 +1779,32 @@ async fn async_main() -> Result<()> {
     // the lock file is shared with the standalone postgres-ssl image). Bound
     // for the rest of this function, same lifetime idiom as the upgrade lock
     // below. Fail-stop on timeout — the restart policy retries the boot.
-    let _runtime_volume_lock = postgres_patroni::volume_lock::acquire_volume_runtime_lock(
+    // A degraded outcome keeps the boot going (see volume_lock) but must not
+    // pass silently: without the lock this container has no overlap protection
+    // at all, on a volume whose PGDATA a second postmaster may already be
+    // writing to. Report it the way redis-ha and mysql-ha report theirs.
+    let _runtime_volume_lock = match postgres_patroni::volume_lock::acquire_volume_runtime_lock(
         &volume_root,
         &postgres_patroni::pgdata(),
-    )?;
+    )? {
+        postgres_patroni::volume_lock::VolumeLockOutcome::Held(lock) => Some(lock),
+        postgres_patroni::volume_lock::VolumeLockOutcome::SkippedForFirstInit => None,
+        postgres_patroni::volume_lock::VolumeLockOutcome::FailedOpen { reason } => {
+            let error = format!(
+                "{reason}; booting WITHOUT the volume lock — if a previous container is still \
+                 alive on this volume, two postmasters may now touch the same PGDATA. This also \
+                 drops the interlock shared with the standalone postgres-ssl image, so a \
+                 standalone<->HA conversion overlapping on this volume is unserialized."
+            );
+            error!("{error}");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "volume-lock".to_string(),
+                error,
+                context: "startup".to_string(),
+            });
+            None
+        }
+    };
 
     // Shared, container-lifetime flock on the SAME lock file upgrade-job.sh
     // takes exclusively for its own run (see major_upgrade::
