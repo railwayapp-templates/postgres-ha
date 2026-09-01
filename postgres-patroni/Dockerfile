@@ -53,6 +53,17 @@ FROM postgres:${POSTGRES_IMAGE_TAG} AS ha
 
 ARG PATRONI_VERSION=4.1.0
 
+# Extension packages are PINNED: the volume keeps each extension's SQL
+# catalog at install-time version while the image carries the .so, and these
+# tags rebuild daily for CVE freshness (APT_REFRESH below) - an unpinned
+# package would let pgdg move the binaries under every existing catalog on
+# the next rebuild, with no compatibility gate anywhere. Bumps are a
+# deliberate one-line change here, mirrored in postgres-ssl. If the pin ever
+# rotates out of the pgdg pool the daily rebuild fails loudly - a human
+# decides, never a nightly accident. (Fallback source if needed:
+# apt-archive.postgresql.org.)
+ARG PGVECTOR_PKG_VERSION=0.8.6-1.pgdg13+1
+
 ARG POSTGRES_VERSION
 # CI passes its content key here (see the build workflow's content gate):
 # the value only changes when the repo code, the upstream base, or Debian's
@@ -76,7 +87,7 @@ RUN echo "refresh key: ${APT_REFRESH}" \
     python3-pip \
     curl \
     pgbackrest \
-    postgresql-${POSTGRES_VERSION}-pgvector \
+    postgresql-${POSTGRES_VERSION}-pgvector=${PGVECTOR_PKG_VERSION} \
     && apt-mark unhold "postgresql-${POSTGRES_VERSION}" "postgresql-client-${POSTGRES_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
