@@ -53,6 +53,21 @@ FROM postgres:${POSTGRES_IMAGE_TAG} AS ha
 
 ARG PATRONI_VERSION=4.1.0
 
+# Extension packages are pinned AT THE MINOR (mirrors postgres-ssl): the
+# volume keeps each extension's SQL catalog at install-time version while
+# the image carries the .so, and these tags rebuild daily (APT_REFRESH
+# below) - an unpinned package would let pgdg move the binaries a whole
+# minor (where catalog/.so compatibility actually breaks) under every
+# existing catalog overnight, with no gate anywhere. PATCH releases and
+# Debian packaging revisions float freely: they are the bugfix/CVE stream
+# and upstream keeps them catalog-compatible (verified empirically
+# 0.8.4->0.8.6). A MINOR bump is the deliberate act: the scheduled bump
+# workflow opens a one-line PR moving this ARG, gated by the extension
+# compat matrix (old catalogs under the candidate .so). If pgdg ever
+# prunes the whole minor from the pool, the daily rebuild fails loudly -
+# a human decides, never a nightly accident.
+ARG PGVECTOR_PKG_VERSION=0.8.*
+
 ARG POSTGRES_VERSION
 # CI passes its content key here (see the build workflow's content gate):
 # the value only changes when the repo code, the upstream base, or Debian's
@@ -76,7 +91,7 @@ RUN echo "refresh key: ${APT_REFRESH}" \
     python3-pip \
     curl \
     pgbackrest \
-    postgresql-${POSTGRES_VERSION}-pgvector \
+    "postgresql-${POSTGRES_VERSION}-pgvector=${PGVECTOR_PKG_VERSION}" \
     && apt-mark unhold "postgresql-${POSTGRES_VERSION}" "postgresql-client-${POSTGRES_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
