@@ -273,6 +273,12 @@ pub struct SelfHealInputs {
     /// unmeasurable (mirrors `DivergenceObs::progress`'s "cannot prove a
     /// stall" stance for the local cursor).
     pub leader_advanced_during_stall: bool,
+    /// Whether WAL replay is administratively paused on this node
+    /// (`pg_is_wal_replay_paused()`, via `/patroni`'s `xlog.paused`). A paused
+    /// replica freezes its replay cursor on purpose, so it is never eligible
+    /// for the frozen-progress reinit paths — wiping it would destroy a
+    /// healthy node an operator deliberately paused.
+    pub replay_paused: bool,
     /// Seconds Patroni has continuously reported this node's state as
     /// "start failed". Resets to `0` the instant the state changes. The
     /// dwell gate prevents a single transient "start failed" observation
@@ -420,6 +426,8 @@ pub fn decide_self_heal(s: &SelfHealInputs) -> SelfHealAction {
 /// 2. Patroni reports us healthy (`running`/`streaming`) — never mid-clone
 ///    (`creating replica`/`starting`), where a lower timeline is expected.
 /// 3. Both timelines are known.
+/// 4. WAL replay is not administratively paused — a paused cursor is frozen
+///    by design (see [`Xlog::paused`]) and proves nothing about health.
 ///
 /// Returns `(local_timeline, leader_timeline)` when eligible, else `None`.
 fn replay_tracking_eligible(
@@ -427,11 +435,15 @@ fn replay_tracking_eligible(
     patroni_state: &str,
     local_timeline: Option<i64>,
     leader_timeline: Option<i64>,
+    replay_paused: bool,
 ) -> Option<(i64, i64)> {
     if !matches!(role, Role::Replica) {
         return None;
     }
     if patroni_state != "running" && patroni_state != "streaming" {
+        return None;
+    }
+    if replay_paused {
         return None;
     }
     let local = local_timeline?;
@@ -451,10 +463,16 @@ fn timeline_divergence_present(
     patroni_state: &str,
     local_timeline: Option<i64>,
     leader_timeline: Option<i64>,
+    replay_paused: bool,
     min_gap: i64,
 ) -> Option<(i64, i64)> {
-    let (local, leader) =
-        replay_tracking_eligible(role, patroni_state, local_timeline, leader_timeline)?;
+    let (local, leader) = replay_tracking_eligible(
+        role,
+        patroni_state,
+        local_timeline,
+        leader_timeline,
+        replay_paused,
+    )?;
     if leader.saturating_sub(local) < min_gap {
         return None;
     }
@@ -482,6 +500,7 @@ fn stalled_timeline_divergence(s: &SelfHealInputs) -> Option<(i64, i64)> {
         &s.patroni_state,
         s.local_timeline,
         s.leader_timeline,
+        s.replay_paused,
         s.thresholds.divergence_min_gap,
     )
 }
@@ -525,6 +544,7 @@ fn stalled_same_timeline_replay(s: &SelfHealInputs) -> Option<i64> {
         &s.patroni_state,
         s.local_timeline,
         s.leader_timeline,
+        s.replay_paused,
     )?;
     if local != leader {
         return None;
@@ -588,6 +608,14 @@ struct DivergenceWindow {
     /// firing `TimelineDivergence` on a replica that has been behind the real
     /// (new) leader for seconds, not minutes.
     leader_tl_at_open: i64,
+    /// Consecutive polls, ending at the current one, on which the leader was
+    /// unmeasurable (unreachable, or timeline unknown). One such poll holds
+    /// the window — a transient `/cluster` blip shouldn't cost the accrued
+    /// dwell — and a second consecutive one clears it, so leader-dark time
+    /// can never silently mature the dwell into a wipe that fires the moment
+    /// the leader returns (see [`hold_window_through_leader_miss`]). Reset to
+    /// `0` by every poll that measured the leader.
+    leader_miss_streak: u8,
 }
 
 /// Advance the divergence dwell window given this poll's observation, so the
@@ -650,6 +678,9 @@ fn accrue_divergence_window(
             return Some(DivergenceWindow {
                 leader_progress_at_open,
                 leader_advanced,
+                // The caller only accrues on polls that measured the leader,
+                // so reaching here always resets the miss tolerance.
+                leader_miss_streak: 0,
                 ..w
             });
         }
@@ -661,22 +692,32 @@ fn accrue_divergence_window(
         leader_progress_at_open: obs.leader_progress,
         leader_advanced: false,
         leader_tl_at_open: obs.leader_tl,
+        leader_miss_streak: 0,
     })
 }
 
-/// The leader timeline to feed into this poll's dwell-window accrual: this
-/// poll's own reading (`fresh`) when available, else the existing window's
-/// baseline (`leader_tl_at_open`) as a stand-in. A real reading always wins
-/// over the fallback, including one that differs from the baseline — that
-/// case still reaches `accrue_divergence_window`, whose `leader_tl_frozen`
-/// check (exact equality) resets the window on it exactly as before. This
-/// only softens the case where the leader probe couldn't measure anything
-/// at all this poll, so a single transient miss doesn't cost the whole dwell.
-fn leader_timeline_for_accrual(
-    fresh: Option<i64>,
-    window: Option<&DivergenceWindow>,
-) -> Option<i64> {
-    fresh.or_else(|| window.map(|w| w.leader_tl_at_open))
+/// Advance the dwell window on a poll where the leader was unmeasurable —
+/// unreachable, or its timeline unknown — so leader-dark time can never
+/// mature a wipe. The first consecutive such poll HOLDS the window unchanged
+/// (a single transient `/cluster`/health blip shouldn't cost an accrued
+/// dwell); a second consecutive one CLEARS it. Without this bound, a
+/// dwell-length leader outage on a quiet cluster accrues the whole outage
+/// against replicas whose cursors are frozen only because there is nothing
+/// to replicate from, and the latch fires on the first poll after the leader
+/// returns — on every replica at once, since nothing coordinates them —
+/// leaving only the confirm double-read between that and a cluster-wide
+/// clone storm at the exact moment the cluster is recovering. A window also
+/// never OPENS on an unmeasurable poll: the caller only calls
+/// [`accrue_divergence_window`] on polls that measured the leader.
+fn hold_window_through_leader_miss(window: Option<DivergenceWindow>) -> Option<DivergenceWindow> {
+    let w = window?;
+    if w.leader_miss_streak >= 1 {
+        return None;
+    }
+    Some(DivergenceWindow {
+        leader_miss_streak: w.leader_miss_streak + 1,
+        ..w
+    })
 }
 
 // ====================================================================
@@ -1368,8 +1409,9 @@ async fn iteration(
     // min_gap-gated observation would never see in the first place. Any
     // forward progress (timeline switch or replay-cursor advance) restarts the
     // clock — a node replaying across a gap is catching up, not wedged — and
-    // any ineligible observation (caught up, mid-clone, leader unknown, role
-    // unclear) clears it. `decide_self_heal` re-examines the timeline gap at
+    // any ineligible observation (caught up, mid-clone, replay paused, role
+    // unclear) clears it, while an unmeasurable leader holds it through one
+    // poll and clears it on the second. `decide_self_heal` re-examines the timeline gap at
     // fire time to pick cross-timeline divergence vs same-timeline stall, each
     // gated on its own (different) dwell threshold.
     let patroni_state = local.state.clone().unwrap_or_default();
@@ -1392,29 +1434,35 @@ async fn iteration(
     // record, so including it here would continuously reset the dwell and make
     // the same-timeline stall detector blind to its target failure mode.
     let local_progress = local.xlog.and_then(Xlog::replay_progress);
-    // A single missed leader-timeline read (a transient `/cluster` blip) would
-    // otherwise force `current_obs` to `None` below and clear the whole dwell
-    // window — paying for one flaky poll with a full re-accrual (up to
-    // `wal_stall_dwell_secs`, several minutes, before a real stall can fire
-    // again). For accrual purposes only, fall back via
-    // `leader_timeline_for_accrual` to the window's existing leader-timeline
-    // baseline so a single miss holds the window rather than wiping it. This
-    // does NOT affect the decision snapshot below —
-    // `SelfHealInputs::leader_timeline` stays this poll's real (possibly
-    // `None`) reading, so a reinit can only ever fire on a poll that actually
-    // measured the leader.
-    let leader_tl_for_accrual =
-        leader_timeline_for_accrual(leader_timeline, divergence_window.as_ref());
-    let current_obs =
-        replay_tracking_eligible(role, &patroni_state, local_timeline, leader_tl_for_accrual).map(
-            |(local_tl, leader_tl)| DivergenceObs {
-                local_tl,
-                progress: local_progress,
-                leader_progress: leader.progress,
-                leader_tl,
-            },
-        );
-    *divergence_window = accrue_divergence_window(current_obs, *divergence_window, now);
+    let replay_paused = local.xlog.is_some_and(Xlog::replay_paused);
+    // Dwell time only advances on polls that actually measured the leader:
+    // reachable AND timeline known. An unmeasurable poll holds an open window
+    // through one consecutive miss and clears it on the second
+    // (`hold_window_through_leader_miss`) — a transient blip doesn't cost the
+    // accrued dwell, but a real leader outage can never mature the window
+    // against replicas whose cursors are frozen only because there is nothing
+    // to replicate from. The decision snapshot below still carries this
+    // poll's real (possibly `None`) `leader_timeline` and `leader_reachable`,
+    // so a reinit can only ever fire on a poll that measured the leader.
+    let leader_measurable = leader_reachable && leader_timeline.is_some();
+    *divergence_window = if leader_measurable {
+        let current_obs = replay_tracking_eligible(
+            role,
+            &patroni_state,
+            local_timeline,
+            leader_timeline,
+            replay_paused,
+        )
+        .map(|(local_tl, leader_tl)| DivergenceObs {
+            local_tl,
+            progress: local_progress,
+            leader_progress: leader.progress,
+            leader_tl,
+        });
+        accrue_divergence_window(current_obs, *divergence_window, now)
+    } else {
+        hold_window_through_leader_miss(*divergence_window)
+    };
     let diverged_for_secs = divergence_window
         .map(|w| now.saturating_sub(w.since).max(0) as u64)
         .unwrap_or(0);
@@ -1466,6 +1514,7 @@ async fn iteration(
         leader_timeline,
         diverged_for_secs,
         leader_advanced_during_stall,
+        replay_paused,
         start_failed_for_secs,
         last_action_at,
         action_attempts_in_window,
@@ -1616,6 +1665,12 @@ struct Xlog {
     location: Option<i64>,
     received_location: Option<i64>,
     replayed_location: Option<i64>,
+    /// `pg_is_wal_replay_paused()`, as Patroni reports it on replicas. A
+    /// paused replica freezes its replay cursor BY DESIGN — an operator's
+    /// `pg_wal_replay_pause()`, or a recovery conflict under
+    /// `max_standby_streaming_delay = -1` — so its frozen cursor proves
+    /// nothing about health and must never count toward a reinit.
+    paused: Option<bool>,
 }
 
 impl Xlog {
@@ -1624,6 +1679,11 @@ impl Xlog {
     /// a corrupt record, so receipt is not evidence of recovery progress.
     fn replay_progress(self) -> Option<i64> {
         self.replayed_location
+    }
+
+    /// True when Patroni reports WAL replay as administratively paused.
+    fn replay_paused(self) -> bool {
+        self.paused == Some(true)
     }
 
     /// Highest position observed across all reported cursors — the most
@@ -1768,6 +1828,18 @@ fn progress_advanced_past(fresh: Option<i64>, frozen_progress: Option<i64>) -> b
     matches!((frozen_progress, fresh), (Some(opened_at), Some(cur)) if cur > opened_at)
 }
 
+/// `true` only when BOTH readings are measurable and the fresh one has not
+/// advanced past the baseline. The complement of [`progress_advanced_past`]
+/// on measurable pairs, but deliberately opposite on an unmeasurable side:
+/// `progress_advanced_past` treats `None` as "cannot prove an advance" (so a
+/// flaky read never resets a dwell), while this treats `None` as "cannot
+/// prove a stall" (so a wipe never proceeds on one). Used by
+/// [`confirm_replay_stall`], where the frozen cursor is the entire evidence
+/// for the reinit — there is no structural timeline gap backing it up.
+fn cursor_measurably_frozen(baseline: Option<i64>, fresh: Option<i64>) -> bool {
+    matches!((baseline, fresh), (Some(base), Some(cur)) if cur <= base)
+}
+
 /// Independent re-confirmation of a timeline divergence taken immediately
 /// before the destructive reinit. Does its own fresh reads of `/patroni`
 /// (local) and `/cluster` (leader) — not the snapshot the decision was made
@@ -1801,6 +1873,7 @@ async fn confirm_timeline_divergence(
         &local.state.unwrap_or_default(),
         local.timeline,
         leader.timeline,
+        local.xlog.is_some_and(Xlog::replay_paused),
         cfg.thresholds.divergence_min_gap,
     )
     .is_some()
@@ -1830,6 +1903,12 @@ const REPLAY_STALL_RECHECK_DELAY_SECS: u64 = 5;
 /// only rule out a stale poll, not a replica whose walreceiver reconnects
 /// between this function's own first read and the reinit that would follow
 /// it — the exact shape of an asymmetric-partition heal landing mid-recheck.
+///
+/// Every cursor involved (dwell baseline, first read, second read) must be
+/// MEASURABLE, and replay must not be paused, or the confirm aborts — with no
+/// structural timeline gap backing this trigger, an unmeasurable cursor
+/// cannot prove the stall that justifies a destructive wipe
+/// (see [`cursor_measurably_frozen`]).
 async fn confirm_replay_stall(
     client: &reqwest::Client,
     cfg: &WatcherConfig,
@@ -1843,7 +1922,12 @@ async fn confirm_replay_stall(
         return false;
     }
     let first_progress = local.xlog.and_then(Xlog::replay_progress);
-    if progress_advanced_past(first_progress, frozen_progress) {
+    // Unlike the cross-timeline confirm — where the structural gap is
+    // evidence on its own — the frozen cursor IS the entire case here, so
+    // every cursor in the chain (the dwell baseline, this fresh read, and the
+    // delayed re-read below) must be measurable and non-advancing. `None`
+    // anywhere means "cannot prove a stall": abort rather than wipe.
+    if !cursor_measurably_frozen(frozen_progress, first_progress) {
         return false;
     }
     match replay_tracking_eligible(
@@ -1851,6 +1935,7 @@ async fn confirm_replay_stall(
         &local.state.unwrap_or_default(),
         local.timeline,
         leader.timeline,
+        local.xlog.is_some_and(Xlog::replay_paused),
     ) {
         Some((l, r)) if l == r => {}
         _ => return false,
@@ -1859,8 +1944,11 @@ async fn confirm_replay_stall(
     let Ok(recheck_local) = fetch_local_patroni(client).await else {
         return false;
     };
+    if recheck_local.xlog.is_some_and(Xlog::replay_paused) {
+        return false;
+    }
     let second_progress = recheck_local.xlog.and_then(Xlog::replay_progress);
-    !progress_advanced_past(second_progress, first_progress)
+    cursor_measurably_frozen(first_progress, second_progress)
 }
 
 async fn issue_reinitialize(client: &reqwest::Client) -> Result<()> {
@@ -1990,6 +2078,7 @@ mod tests {
             leader_timeline: None,
             diverged_for_secs: 0,
             leader_advanced_during_stall: false,
+            replay_paused: false,
             start_failed_for_secs: 0,
             last_action_at: None,
             action_attempts_in_window: 0,
@@ -2423,10 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn leader_timeline_for_accrual_falls_back_to_window_baseline_on_a_missed_read() {
-        // Regression pin for the flaky-poll blind spot: a single transient
-        // `/cluster` miss (fresh = None) must not itself wipe the window —
-        // it should fall back to the existing baseline as a stand-in.
+    fn window_survives_one_unmeasurable_leader_poll_and_clears_on_the_second() {
         let w = DivergenceWindow {
             since: 1_000,
             local_tl: 3,
@@ -2434,14 +2520,59 @@ mod tests {
             leader_progress_at_open: Some(500),
             leader_advanced: false,
             leader_tl_at_open: 7,
+            leader_miss_streak: 0,
         };
-        assert_eq!(leader_timeline_for_accrual(None, Some(&w)), Some(7));
-        // A real reading always wins over the fallback, even one that
-        // differs from the baseline — that case still reaches
-        // `accrue_divergence_window`, which resets on the mismatch itself.
-        assert_eq!(leader_timeline_for_accrual(Some(9), Some(&w)), Some(9));
-        // No window open yet and nothing fresh → nothing to fall back to.
-        assert_eq!(leader_timeline_for_accrual(None, None), None);
+        // First unmeasurable-leader poll: window held as-is (same baseline,
+        // same `since` — no re-open, no accrual reset), streak recorded.
+        let held = hold_window_through_leader_miss(Some(w)).unwrap();
+        assert_eq!(held.since, 1_000);
+        assert_eq!(held.leader_tl_at_open, 7);
+        assert_eq!(held.leader_miss_streak, 1);
+        // Second consecutive one: cleared — leader-dark time never matures
+        // a dwell (regression pin for the leader-outage clone-storm hole).
+        assert!(hold_window_through_leader_miss(Some(held)).is_none());
+        // No window open → nothing to hold.
+        assert!(hold_window_through_leader_miss(None).is_none());
+    }
+
+    #[test]
+    fn measurable_poll_resets_the_leader_miss_tolerance() {
+        let w0 = accrue_divergence_window(obs(3, Some(100)), None, 1_000).unwrap();
+        let held = hold_window_through_leader_miss(Some(w0)).unwrap();
+        assert_eq!(held.leader_miss_streak, 1);
+        // A fully-frozen measurable poll keeps the window AND re-arms the
+        // one-miss tolerance.
+        let w1 = accrue_divergence_window(obs(3, Some(100)), Some(held), 1_060).unwrap();
+        assert_eq!(w1.since, 1_000);
+        assert_eq!(w1.leader_miss_streak, 0);
+        assert!(hold_window_through_leader_miss(Some(w1)).is_some());
+    }
+
+    #[test]
+    fn cursor_measurably_frozen_requires_both_readings() {
+        assert!(cursor_measurably_frozen(Some(100), Some(100)));
+        assert!(cursor_measurably_frozen(Some(100), Some(99)));
+        assert!(!cursor_measurably_frozen(Some(100), Some(101)));
+        // Unmeasurable on either side can never prove a stall — the wipe
+        // must abort (unlike `progress_advanced_past`, where `None` merely
+        // fails to prove an advance).
+        assert!(!cursor_measurably_frozen(None, Some(100)));
+        assert!(!cursor_measurably_frozen(Some(100), None));
+        assert!(!cursor_measurably_frozen(None, None));
+    }
+
+    #[test]
+    fn paused_replay_is_ineligible_for_both_frozen_progress_triggers() {
+        // A paused replica freezes its cursor by design: with replay paused,
+        // neither the same-timeline stall nor the cross-timeline divergence
+        // may fire, no matter how mature the dwell looks.
+        let mut s = same_timeline_stalled();
+        s.replay_paused = true;
+        assert_eq!(decide_self_heal(&s), SelfHealAction::NoOp);
+
+        let mut d = diverged();
+        d.replay_paused = true;
+        assert_eq!(decide_self_heal(&d), SelfHealAction::NoOp);
     }
 
     #[test]
@@ -2469,6 +2600,7 @@ mod tests {
             location: None,
             received_location: Some(900),
             replayed_location: Some(100),
+            paused: None,
         };
         assert_eq!(xlog.replay_progress(), Some(100));
     }
