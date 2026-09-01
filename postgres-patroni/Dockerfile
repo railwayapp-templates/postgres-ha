@@ -60,9 +60,13 @@ ARG PATRONI_VERSION=4.1.0
 # the next rebuild, with no compatibility gate anywhere. Bumps are a
 # deliberate one-line change here, mirrored in postgres-ssl. If the pin ever
 # rotates out of the pgdg pool the daily rebuild fails loudly - a human
-# decides, never a nightly accident. (Fallback source if needed:
-# apt-archive.postgresql.org.)
-ARG PGVECTOR_PKG_VERSION=0.8.6-1.pgdg13+1
+# decides, never a nightly accident. The pin freezes the UPSTREAM version
+# only; the Debian packaging revision (-N.pgdgXX+N) floats via the glob,
+# so pgdg re-packaging churn never breaks a rebuild. Bumps arrive through
+# the scheduled bump workflow: it opens a PR moving this ARG, and that
+# PR's CI must pass the extension compat matrix (old catalogs under the
+# candidate .so) before it can merge.
+ARG PGVECTOR_PKG_VERSION=0.8.6-*
 
 ARG POSTGRES_VERSION
 # CI passes its content key here (see the build workflow's content gate):
@@ -87,7 +91,7 @@ RUN echo "refresh key: ${APT_REFRESH}" \
     python3-pip \
     curl \
     pgbackrest \
-    postgresql-${POSTGRES_VERSION}-pgvector=${PGVECTOR_PKG_VERSION} \
+    "postgresql-${POSTGRES_VERSION}-pgvector=${PGVECTOR_PKG_VERSION}" \
     && apt-mark unhold "postgresql-${POSTGRES_VERSION}" "postgresql-client-${POSTGRES_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
