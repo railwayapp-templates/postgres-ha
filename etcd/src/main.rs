@@ -13,11 +13,17 @@ mod config;
 
 use anyhow::{Context, Result};
 use common::{init_logging, Telemetry, TelemetryEvent};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -68,6 +74,85 @@ fn exit_is_clean(exited_ok: bool, was_corrupt: bool, was_removed_member: bool) -
     exited_ok && !was_corrupt && !was_removed_member
 }
 
+/// Publish the first stop signal the container runtime sends.
+///
+/// This binary is PID 1 in the etcd image (`ENTRYPOINT ["/entrypoint"]`), and
+/// a container stop delivers exactly one signal, to PID 1. A PID 1 that has
+/// installed no handler drops it — so until this listener existed every
+/// `stop`/`restart` of an etcd member sat through the whole grace period and
+/// ended in SIGKILL: no leadership hand-off, no clean raft close, a hard exit
+/// on every redeploy (measured on the published image: 16s, exit 137, no
+/// shutdown line in etcd's own log). The supervisor selects on the returned
+/// receiver wherever it waits, forwards the stop to etcd, and exits with etcd's
+/// own status.
+fn spawn_stop_listener() -> watch::Receiver<Option<Signal>> {
+    let (tx, rx) = watch::channel(None);
+    tokio::spawn(async move {
+        let (mut term, mut int, mut quit, mut hup) = match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::quit()),
+            signal(SignalKind::hangup()),
+        ) {
+            (Ok(term), Ok(int), Ok(quit), Ok(hup)) => (term, int, quit, hup),
+            _ => {
+                error!("Failed to install stop-signal handlers; a stop will fall through to the runtime's kill");
+                return;
+            }
+        };
+        let sig = tokio::select! {
+            _ = term.recv() => Signal::SIGTERM,
+            _ = int.recv() => Signal::SIGINT,
+            _ = quit.recv() => Signal::SIGQUIT,
+            _ = hup.recv() => Signal::SIGHUP,
+        };
+        let _ = tx.send(Some(sig));
+    });
+    rx
+}
+
+/// Resolve once a stop has been requested. Never resolves when the listener
+/// could not be installed, which leaves the supervisor's pre-existing
+/// behaviour untouched.
+async fn stop_requested(rx: &mut watch::Receiver<Option<Signal>>) -> Signal {
+    loop {
+        if let Some(sig) = *rx.borrow_and_update() {
+            return sig;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Sleep, returning early with the signal if a stop is requested meanwhile.
+async fn sleep_or_stop(
+    duration: Duration,
+    rx: &mut watch::Receiver<Option<Signal>>,
+) -> Option<Signal> {
+    tokio::select! {
+        _ = sleep(duration) => None,
+        sig = stop_requested(rx) => Some(sig),
+    }
+}
+
+/// Exit code for a requested stop, mirroring etcd's own exit status.
+///
+/// etcd's interrupt handler runs its shutdown (leadership hand-off, "closed
+/// etcd server") and then re-raises the very signal it received with the
+/// default disposition, so a graceful stop ends as a death by the forwarded
+/// signal — not as exit 0. That is the clean outcome here and is reported as
+/// 0. Any other status is passed through: etcd's own code when it exited, the
+/// conventional 128+N when some other signal killed it.
+fn exit_code_for(code: Option<i32>, signal: Option<i32>, forwarded: i32) -> i32 {
+    match (code, signal) {
+        (Some(code), _) => code,
+        (None, Some(signal)) if signal == forwarded => 0,
+        (None, Some(signal)) => 128 + signal,
+        (None, None) => 1,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _guard = init_logging("etcd");
@@ -91,15 +176,29 @@ async fn main() -> Result<()> {
         "Cluster bootstrap"
     );
 
+    let mut stop_rx = spawn_stop_listener();
+
     let mut attempt = 1;
     while attempt <= config.max_retries {
         info!(attempt, max = config.max_retries, "Starting etcd");
 
-        // Determine bootstrap parameters based on role
-        let bootstrap_result = if is_leader {
-            bootstrap_as_leader(&config, &telemetry).await
-        } else {
-            bootstrap_as_follower(&config, &bootstrap_leader, &telemetry).await
+        // Determine bootstrap parameters based on role. A stop that lands
+        // while we are still negotiating (a follower can wait minutes for the
+        // leader) has nothing to clean up: exit at once rather than letting the
+        // runtime's grace period expire into SIGKILL.
+        let bootstrap = async {
+            if is_leader {
+                bootstrap_as_leader(&config, &telemetry).await
+            } else {
+                bootstrap_as_follower(&config, &bootstrap_leader, &telemetry).await
+            }
+        };
+        let bootstrap_result = tokio::select! {
+            result = bootstrap => result,
+            sig = stop_requested(&mut stop_rx) => {
+                info!(signal = ?sig, "Stop requested before etcd started; exiting");
+                return Ok(());
+            }
         };
 
         let params = match bootstrap_result {
@@ -115,7 +214,10 @@ async fn main() -> Result<()> {
                     });
                 }
                 attempt += 1;
-                sleep(config.retry_delay).await;
+                if let Some(sig) = sleep_or_stop(config.retry_delay, &mut stop_rx).await {
+                    info!(signal = ?sig, "Stop requested while waiting to retry; exiting");
+                    return Ok(());
+                }
                 continue;
             }
             Err(e) => {
@@ -127,7 +229,10 @@ async fn main() -> Result<()> {
                     error: e.to_string(),
                 });
                 attempt += 1;
-                sleep(config.retry_delay).await;
+                if let Some(sig) = sleep_or_stop(config.retry_delay, &mut stop_rx).await {
+                    info!(signal = ?sig, "Stop requested while waiting to retry; exiting");
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -186,7 +291,29 @@ async fn main() -> Result<()> {
             local_liveness_watchdog(watchdog_config, watchdog_telemetry).await
         });
 
-        let status = child.wait().await?;
+        let mut stop_signal = None;
+        let status = tokio::select! {
+            status = child.wait() => status?,
+            sig = stop_requested(&mut stop_rx) => {
+                // etcd handles SIGTERM itself: it hands leadership off when it
+                // holds it, closes raft and its listeners, and exits 0. Every
+                // stop signal is forwarded as SIGTERM — SIGQUIT would make the
+                // Go runtime dump goroutines and die non-zero instead.
+                info!(signal = ?sig, pid = ?child.id(), "Stop requested; forwarding SIGTERM to etcd for a graceful shutdown");
+                stop_signal = Some(sig);
+                // The liveness watchdog crashes the container when the local
+                // endpoint stops answering — exactly what a graceful stop looks
+                // like from outside. Cancel the side tasks before etcd goes
+                // down so none of them turns a requested stop into an exit(1).
+                monitor_handle.abort();
+                defrag_handle.abort();
+                watchdog_handle.abort();
+                if let Some(pid) = child.id() {
+                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                }
+                child.wait().await?
+            }
+        };
         monitor_handle.abort();
         defrag_handle.abort();
         watchdog_handle.abort();
@@ -197,6 +324,14 @@ async fn main() -> Result<()> {
         }
         let was_corrupt = corruption_detected.load(Ordering::Relaxed);
         let was_removed_member = removed_member_detected.load(Ordering::Relaxed);
+
+        if let Some(sig) = stop_signal {
+            // A requested stop ends supervision with etcd's own status — never
+            // a retry, whatever the run's log said before the signal arrived.
+            let code = exit_code_for(status.code(), status.signal(), Signal::SIGTERM as i32);
+            info!(signal = ?sig, exit_code = code, "etcd stopped on request");
+            std::process::exit(code);
+        }
 
         if exit_is_clean(status.success(), was_corrupt, was_removed_member) {
             info!("etcd exited cleanly");
@@ -285,7 +420,10 @@ async fn main() -> Result<()> {
         attempt += 1;
         if attempt <= config.max_retries {
             info!(delay = ?config.retry_delay, "Retrying");
-            sleep(config.retry_delay).await;
+            if let Some(sig) = sleep_or_stop(config.retry_delay, &mut stop_rx).await {
+                info!(signal = ?sig, "Stop requested while waiting to retry; exiting");
+                return Ok(());
+            }
         }
     }
 
@@ -295,11 +433,26 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_is_clean, is_raft_corruption_line, is_removed_member_line};
+    use super::{exit_code_for, exit_is_clean, is_raft_corruption_line, is_removed_member_line};
 
     #[test]
     fn clean_exit_without_flags_ends_supervision() {
         assert!(exit_is_clean(true, false, false));
+    }
+
+    #[test]
+    fn requested_stop_exit_code_mirrors_etcd() {
+        const SIGTERM: i32 = 15;
+        // etcd's graceful stop ends by re-raising the forwarded SIGTERM after
+        // "closed etcd server" — the clean outcome, reported as 0.
+        assert_eq!(exit_code_for(None, Some(SIGTERM), SIGTERM), 0);
+        // An explicit exit code is passed through unchanged.
+        assert_eq!(exit_code_for(Some(0), None, SIGTERM), 0);
+        assert_eq!(exit_code_for(Some(2), None, SIGTERM), 2);
+        // Killed by some OTHER signal: conventional 128+N (SIGKILL = 9 -> 137).
+        assert_eq!(exit_code_for(None, Some(9), SIGTERM), 137);
+        // Neither known: never report success we cannot vouch for.
+        assert_eq!(exit_code_for(None, None, SIGTERM), 1);
     }
 
     #[test]

@@ -2,15 +2,37 @@
 //!
 //! Monitors HAProxy backend health and emits telemetry when no primary is available.
 
+use crate::signals;
 use anyhow::Result;
 use common::{Telemetry, TelemetryEvent};
-use std::process::Child;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, ExitStatus};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 const STATS_URL: &str = "http://localhost:8404/stats;csv";
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the loop looks for haproxy's exit between health checks. Short
+/// on purpose: after a forwarded stop signal, haproxy's exit is what ends the
+/// container, and the runtime's grace period is 10s — noticing it up to a
+/// whole CHECK_INTERVAL late would eat most of that budget.
+const EXIT_POLL: Duration = Duration::from_millis(200);
+
+/// End the entrypoint with haproxy's own exit status.
+fn exit_after_haproxy(status: ExitStatus) -> ! {
+    let code = signals::exit_code_for(status.code(), status.signal());
+    if signals::stop_requested() {
+        info!(
+            ?status,
+            exit_code = code,
+            "HAProxy exited after the requested stop"
+        );
+    } else {
+        error!(?status, exit_code = code, "HAProxy exited unexpectedly");
+    }
+    std::process::exit(code);
+}
 
 /// Run the monitoring loop for HAProxy
 ///
@@ -29,8 +51,7 @@ pub fn run_monitoring_loop(
     if single_node_mode {
         info!("Single node mode: skipping backend health monitoring");
         let status = child.wait()?;
-        error!(?status, "HAProxy exited");
-        std::process::exit(status.code().unwrap_or(1));
+        exit_after_haproxy(status);
     }
 
     let client = reqwest::blocking::Client::builder()
@@ -41,17 +62,27 @@ pub fn run_monitoring_loop(
     let mut no_replica_alerted = false;
 
     loop {
-        // Check if HAProxy is still running
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                error!(?status, "HAProxy exited unexpectedly");
-                std::process::exit(status.code().unwrap_or(1));
+        // Wait out the check interval in short slices, watching for haproxy's
+        // exit the whole time (thread::sleep is not interrupted by the signal
+        // handler — it resumes after EINTR — so a single long sleep would
+        // delay noticing the exit that follows a forwarded stop).
+        let next_check = Instant::now() + CHECK_INTERVAL;
+        while Instant::now() < next_check {
+            match child.try_wait() {
+                Ok(Some(status)) => exit_after_haproxy(status),
+                Ok(None) => {} // Still running
+                Err(e) => {
+                    error!(error = %e, "Failed to check HAProxy status");
+                    std::process::exit(1);
+                }
             }
-            Ok(None) => {} // Still running
-            Err(e) => {
-                error!(error = %e, "Failed to check HAProxy status");
-                std::process::exit(1);
-            }
+            thread::sleep(EXIT_POLL);
+        }
+
+        // Once a stop has been relayed the stats socket is going away with
+        // haproxy; a failed health check then is shutdown, not an alert.
+        if signals::stop_requested() {
+            continue;
         }
 
         // Check backend health (single request for both primary and replica)
@@ -100,8 +131,6 @@ pub fn run_monitoring_loop(
                 warn!(error = %e, "Failed to check backend health");
             }
         }
-
-        thread::sleep(CHECK_INTERVAL);
     }
 }
 
