@@ -706,6 +706,40 @@ count_backups_of_type() {
   " 2>/dev/null | tail -1
 }
 
+# Wait for the cluster to actually HOLD a full backup, by either signal:
+# the watcher's own "backup completed backup_type=full" line, or a full
+# present in the pgbackrest catalog.
+#
+# The catalog arm is what makes this robust. The watcher logs the type it
+# REQUESTED, not the type pgbackrest produced, and pgbackrest silently
+# promotes a diff when no prior backup exists ("no prior backup exists,
+# diff backup has been changed to full"). So when the initial full fails
+# once — e.g. a loaded runner blowing the 60s archive-push timeout — and
+# gap-recovery then anchors with a diff, the catalog gains a real full
+# while the watcher only ever logged backup_type=diff. Waiting on the log
+# alone failed there (run 33778339933, "no initial full") even though the
+# full the test needs existed. Use this for the PRECONDITION "a full must
+# exist before the scenario starts"; tests whose subject is the watcher's
+# own full-taking behavior keep asserting on the log line directly.
+wait_for_initial_full() {
+  local container="$1" deadline_secs="${2:-120}"
+  local deadline=$(($(date +%s) + deadline_secs))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$(count_watcher_backup_logs "$container" full)" -gt 0 ]; then
+      return 0
+    fi
+    # count_backups_of_type returns empty (not 0) if the docker exec itself
+    # fails, so default before the numeric test rather than letting bash
+    # error out on an empty operand.
+    local catalog_fulls; catalog_fulls=$(count_backups_of_type "$container" full)
+    if [ "${catalog_fulls:-0}" -gt 0 ]; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
 # Take a manual backup on the leader. Used by retention tests to
 # avoid waiting for periodic cadence.
 take_pgbackrest_backup() {
@@ -848,11 +882,19 @@ t_archiving_boot() {
   assert_contains "$archive_command" "pgbackrest-archive-push-wrapper.sh" "archive_command" \
     || { ko t_archiving_boot ""; teardown_scope "$scope"; return; }
 
-  # Force a WAL switch and verify a segment lands in MinIO.
+  # Force a WAL switch and verify a segment lands in MinIO. archive_command
+  # runs pgbackrest with --archive-async, so the switch only hands the segment
+  # to the spool: the push itself lands whenever the async worker gets to it.
+  # A fixed sleep sampled the bucket exactly once and failed on a loaded runner
+  # that had not drained the spool yet (run 33778339933, "got 0"); poll to the
+  # same deadline every other archive wait in this suite uses instead.
   psql_leader "$leader" -c "CREATE TABLE t(id int); INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
-  sleep 5
-  local wal_count
-  wal_count=$(count_archived_wal_segments)
+  local wal_count=0 wal_deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$wal_deadline" ]; do
+    wal_count=$(count_archived_wal_segments)
+    [ "${wal_count:-0}" -ge 1 ] && break
+    sleep 3
+  done
   if [ "${wal_count:-0}" -lt 1 ]; then
     ko t_archiving_boot "expected ≥1 WAL segment in bucket; got $wal_count"
     fail_dump t_archiving_boot "$leader"
@@ -894,7 +936,7 @@ t_pitr_happy_path() {
   # Wait for initial full to land via the watcher.
   psql_leader "$leader" -c "CREATE TABLE pitrtest(id int, marker text, ts timestamptz default now());" >/dev/null
   psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
-  if ! wait_for_watcher_backup "$leader" full 120; then
+  if ! wait_for_initial_full "$leader" 120; then
     ko t_pitr_happy_path "no initial full from watcher"
     fail_dump t_pitr_happy_path "$leader"
     teardown_scope "$scope"
@@ -1225,7 +1267,7 @@ t_retention_expires_old_fulls() {
   wait_for_stanza_create "$leader" 90 || { ko t_retention_expires_old_fulls "no stanza-create"; teardown_scope "$scope"; return; }
 
   psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$leader" full 120 || { ko t_retention_expires_old_fulls "no initial full"; teardown_scope "$scope"; return; }
+  wait_for_initial_full "$leader" 120 || { ko t_retention_expires_old_fulls "no initial full"; teardown_scope "$scope"; return; }
 
   for i in 2 3; do
     take_pgbackrest_backup "$leader" full || { ko t_retention_expires_old_fulls "manual full #$i failed"; teardown_scope "$scope"; return; }
@@ -1267,7 +1309,7 @@ t_retention_expire_cascades_to_wal() {
   # This one has failed intermittently on main (2026-08-31, run 33435692019)
   # and on #116, and because it captured nothing there was no way to tell a
   # watcher that never fired from one that fired late or errored.
-  wait_for_watcher_backup "$leader" full 120 || {
+  wait_for_initial_full "$leader" 120 || {
     ko t_retention_expire_cascades_to_wal "no initial full"
     fail_dump t_retention_expire_cascades_to_wal "$leader"
     teardown_scope "$scope"
@@ -1404,7 +1446,7 @@ t_ha_replica_watcher_no_op() {
   wait_for_stanza_create "$leader" 90 || { ko t_ha_replica_watcher_no_op "no stanza-create"; teardown_scope "$scope"; return; }
 
   psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$leader" full 120 || { ko t_ha_replica_watcher_no_op "no initial full on leader"; fail_dump t_ha_replica_watcher_no_op "$leader"; teardown_scope "$scope"; return; }
+  wait_for_initial_full "$leader" 120 || { ko t_ha_replica_watcher_no_op "no initial full on leader"; fail_dump t_ha_replica_watcher_no_op "$leader"; teardown_scope "$scope"; return; }
 
   # Replicas: each must have logged "iteration skipped (not patroni leader)" at least once.
   local skipped_total=0
@@ -1562,7 +1604,7 @@ t_ha_recovery_source_conf_isolation() {
 
   psql_leader "$leader" -c "CREATE TABLE rt(id int, marker text);" >/dev/null
   psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$leader" full 120 || { ko t_ha_recovery_source_conf_isolation "no initial full"; teardown_scope "$scope"; return; }
+  wait_for_initial_full "$leader" 120 || { ko t_ha_recovery_source_conf_isolation "no initial full"; teardown_scope "$scope"; return; }
 
   psql_leader "$leader" -c "INSERT INTO rt VALUES (1,'before');" >/dev/null
   sleep 2
@@ -1749,7 +1791,7 @@ t_ha_replica_reseed_pgbackrest() {
   wait_for_stanza_create "$leader" 90 || { ko t_ha_replica_reseed_pgbackrest "no stanza-create"; teardown_scope "$scope"; return; }
 
   psql_leader "$leader" -c "CREATE TABLE reseed(id int, v text); INSERT INTO reseed VALUES (1,'seeded'); SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$leader" full 120 || { ko t_ha_replica_reseed_pgbackrest "no initial full backup"; teardown_scope "$scope"; return; }
+  wait_for_initial_full "$leader" 120 || { ko t_ha_replica_reseed_pgbackrest "no initial full backup"; teardown_scope "$scope"; return; }
 
   # The wiped replica discovers the per-cluster repo path from Patroni
   # DCS; wait for the leader's watcher to publish it there.
@@ -2112,7 +2154,7 @@ t_ha_replica_selfheals_via_restore_command() {
   done
 
   psql_leader "$leader" -c "CREATE TABLE churn(id int, v text);" >/dev/null
-  wait_for_watcher_backup "$leader" full 120 || { ko t_ha_replica_selfheals_via_restore_command "no initial full backup"; teardown_scope "$scope"; return; }
+  wait_for_initial_full "$leader" 120 || { ko t_ha_replica_selfheals_via_restore_command "no initial full backup"; teardown_scope "$scope"; return; }
 
   # Corrupt the replica's on-disk marker BEFORE the outage, while it's
   # still up — proves the DCS fallback actually ran on recovery, not
@@ -2540,9 +2582,20 @@ t_ha_wal_archive_stall_dwell_gates_reinit() {
   logs_contain "$replica" "startup self-heal: forced reinitialize" && reinit_early=1
 
   # Trigger: the dwell-gated decision itself. The confirming probe lands
-  # on backoff ~76s after the first verdict (measured locally), so 240s is
-  # a comfortable margin on a loaded CI runner.
-  local fired=0 fire_deadline=$(($(date +%s) + 240))
+  # on backoff ~76s after the first verdict (measured locally).
+  #
+  # That 76s is 76s of ACCRUED ZERO PROGRESS, not wall clock: the monitor
+  # probes at startup_elapsed 30s then 90s, and startup_elapsed counts only
+  # Waiting ticks. A single Progressing tick resets both the counter and
+  # the probe backoff to zero, so the node has to re-accrue the whole 90s
+  # from scratch. The wedged replica here crash-loops postgres against the
+  # connectivity breaker, and each cycle can nudge the volume high-water
+  # mark up — one such nudge costs a full re-accrual. 240s covered zero
+  # resets and went red on two loaded runners (runs 33764885733 and
+  # 33778339933) while the same commit passed on a faster one; 480s covers
+  # a few. The loop exits the moment the line appears, so a healthy run
+  # pays nothing for the wider bound.
+  local fired=0 fire_deadline=$(($(date +%s) + 480))
   while [ "$(date +%s)" -lt "$fire_deadline" ]; do
     if logs_contain "$replica" "startup self-heal: forced reinitialize"; then fired=1; break; fi
     sleep 5
@@ -2592,6 +2645,15 @@ t_ha_wal_archive_stall_dwell_gates_reinit() {
   fi
   if [ "$fired" != "1" ]; then
     ko t_ha_wal_archive_stall_dwell_gates_reinit "reinitialize was never triggered even after the dwell elapsed — safety net did not fire"
+    # The startup monitor's own accrual trace, which fail_dump's --tail 200
+    # loses under the archive-get retry spam. These lines are what separate
+    # "the counter kept resetting" (progress blips — widen the window or the
+    # topology is wrong) from "it accrued but the probe never confirmed"
+    # (a real gate bug), and without them the failure is unactionable.
+    echo "${R}--- startup monitor trace (${replica}) ---${N}" >&2
+    docker logs "$replica" 2>&1 | _strip_ansi \
+      | grep -E "Still waiting for Patroni|Startup making progress|WAL-too-old|deferring reinitialize|startup self-heal|connectivity breaker" \
+      | tail -60 | sed 's/^/    /' >&2
     fail_dump t_ha_wal_archive_stall_dwell_gates_reinit "$replica" "$leader"
     teardown_scope "$scope"
     return
@@ -4456,7 +4518,7 @@ t_ha_failover_watcher_handoff() {
 
   psql_leader "$leader1" -c "CREATE TABLE failover(id int);" >/dev/null
   psql_leader "$leader1" -c "INSERT INTO failover VALUES (1); SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$leader1" full 120 || { ko t_ha_failover_watcher_handoff "no initial full on leader1"; teardown_scope "$scope"; return; }
+  wait_for_initial_full "$leader1" 120 || { ko t_ha_failover_watcher_handoff "no initial full on leader1"; teardown_scope "$scope"; return; }
 
   local wal_before; wal_before=$(count_archived_wal_segments)
   local fulls_before; fulls_before=$(count_backups_of_type "$leader1" full)
@@ -4567,7 +4629,7 @@ t_ha_failover_adopts_catalog_history() {
 
   psql_leader "$leader1" -c "CREATE TABLE adopt_hist(id int);" >/dev/null
   psql_leader "$leader1" -c "INSERT INTO adopt_hist VALUES (1); SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$leader1" full 120 || { ko t_ha_failover_adopts_catalog_history "no initial full on leader1"; fail_dump t_ha_failover_adopts_catalog_history "$leader1"; teardown_scope "$scope"; return; }
+  wait_for_initial_full "$leader1" 120 || { ko t_ha_failover_adopts_catalog_history "no initial full on leader1"; fail_dump t_ha_failover_adopts_catalog_history "$leader1"; teardown_scope "$scope"; return; }
 
   # Seed a diff too, so adoption of last_diff_at is exercised as well as
   # last_full_at (not just the fresh-stanza-vs-has-a-full distinction).
@@ -4691,7 +4753,7 @@ t_ha_failover_diff_chain_restore() {
   # Marker 1: inside the full's base.
   psql_leader "$leader1" -c "CREATE TABLE chain(id int, marker text);" >/dev/null
   psql_leader "$leader1" -c "INSERT INTO chain VALUES (1,'before-full'); SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$leader1" full 120 || { ko t_ha_failover_diff_chain_restore "no initial full on leader1"; fail_dump t_ha_failover_diff_chain_restore "$leader1"; teardown_scope "$scope"; return; }
+  wait_for_initial_full "$leader1" 120 || { ko t_ha_failover_diff_chain_restore "no initial full on leader1"; fail_dump t_ha_failover_diff_chain_restore "$leader1"; teardown_scope "$scope"; return; }
 
   # Marker 2: after the full, before the failover — streamed to the
   # replicas, so it's in leader2's pgdata at promotion and lands in the
