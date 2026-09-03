@@ -17,6 +17,7 @@ use postgres_patroni::patroni::{
     apply_credential_pin, credentials_from_env_requested, generate_patroni_config,
     reconcile_pgbackrest_archive_config, run_monitoring_loop, spawn_backup_watcher,
     spawn_self_heal_watcher, spawn_slot_recovery_watcher, update_pg_hba_for_replication, Config,
+    RestapiAddressSource,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
@@ -1870,8 +1871,21 @@ async fn async_main() -> Result<()> {
     info!(
         node = %config.name,
         address = %config.connect_address,
+        rest_address = %config.restapi_connect_address,
+        rest_address_source = ?config.restapi_address_source,
         "=== Patroni Runner ==="
     );
+    if config.restapi_address_source == RestapiAddressSource::PrivateDomain {
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "patroni-runner".to_string(),
+            error: format!(
+                "no usable Railway container IPv6 on the interface; restapi.connect_address is {}",
+                config.restapi_connect_address
+            ),
+            context: "other members resolve the private domain through Patroni's 600 s cache: switchover to this node can answer 412 for up to ten minutes after it redeploys"
+                .to_string(),
+        });
+    }
 
     let bootstrap_marker = format!("{}/.patroni_bootstrap_complete", volume_root);
 
@@ -2238,7 +2252,7 @@ mod tests {
         pgdata_is_dedicated_subdir, read_clone_wipe_attempts, record_clone_wipe_attempt,
         should_wipe_incomplete_clone, strip_pitr_managed_block, wipe_has_safe_clone_source,
         wipe_pgdata_contents, Config, PgbackrestConfParams, RecoverySourceConfParams,
-        MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
+        RestapiAddressSource, MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
     };
 
     fn test_config(data_dir: &str) -> Config {
@@ -2246,6 +2260,8 @@ mod tests {
             scope: "test-scope".into(),
             name: "test-node".into(),
             connect_address: "test-node".into(),
+            restapi_connect_address: "test-node:8008".into(),
+            restapi_address_source: RestapiAddressSource::PrivateDomain,
             etcd_hosts: "etcd-1:2379".into(),
             superuser: "postgres".into(),
             superuser_pass: "pw".into(),

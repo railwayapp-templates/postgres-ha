@@ -227,6 +227,7 @@ pub fn apply_credential_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patroni::RestapiAddressSource;
     use tempfile::tempdir;
 
     fn config_at(data_dir: &str) -> Config {
@@ -234,6 +235,8 @@ mod tests {
             scope: "s".into(),
             name: "n".into(),
             connect_address: "n".into(),
+            restapi_connect_address: "n:8008".into(),
+            restapi_address_source: RestapiAddressSource::PrivateDomain,
             etcd_hosts: "etcd:2379".into(),
             superuser: "postgres".into(),
             superuser_pass: "su-env".into(),

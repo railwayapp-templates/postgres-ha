@@ -141,7 +141,7 @@ name: {name}
 
 restapi:
   listen: ":::8008"
-  connect_address: {connect_address}:8008
+  connect_address: "{restapi_connect_address}"
 
 etcd3:
   hosts: {etcd_hosts}
@@ -221,6 +221,7 @@ postgresql:
         scope = config.scope,
         name = config.name,
         connect_address = config.connect_address,
+        restapi_connect_address = config.restapi_connect_address,
         etcd_hosts = config.etcd_hosts,
         ttl = config.ttl,
         loop_wait = config.loop_wait,
@@ -290,12 +291,15 @@ host replication {} ::/0 scram-sha-256
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patroni::RestapiAddressSource;
 
     fn test_config(wal_archive_bucket: Option<&str>) -> Config {
         Config {
             scope: "test-scope".into(),
             name: "test-node".into(),
             connect_address: "test-node".into(),
+            restapi_connect_address: "[fd12:8fe4:c66b:1:3000:43:ed49:ddbf]:8008".into(),
+            restapi_address_source: RestapiAddressSource::ContainerInterface,
             etcd_hosts: "etcd-1:2379".into(),
             superuser: "postgres".into(),
             superuser_pass: "pw".into(),
@@ -335,6 +339,36 @@ mod tests {
             archive_timeout_secs,
             ..test_config(wal_archive_bucket)
         }
+    }
+
+    #[test]
+    fn restapi_advertises_the_container_ipv6_while_postgresql_keeps_the_domain() {
+        let yaml = generate_patroni_config(&test_config(None), "replica");
+        // The api_url other members dial for switchover/failover checks is the
+        // address literal (nothing for Patroni's 600 s resolver cache to go
+        // stale on) ...
+        assert!(
+            yaml.contains("restapi:\n  listen: \":::8008\"\n  connect_address: \"[fd12:8fe4:c66b:1:3000:43:ed49:ddbf]:8008\"\n"),
+            "restapi block:\n{yaml}"
+        );
+        // ... while replication keeps dialing the private domain through libpq.
+        assert!(
+            yaml.contains("postgresql:\n  listen: \"*:5432\"\n  connect_address: test-node:5432\n"),
+            "postgresql block:\n{yaml}"
+        );
+        // A bracketed IPv6 literal starts with `[`, which bare YAML reads as a
+        // flow sequence: the value must stay quoted so Patroni parses the file
+        // and gets the literal back verbatim.
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&yaml).expect("rendered patroni.yml must stay parseable");
+        assert_eq!(
+            parsed["restapi"]["connect_address"].as_str(),
+            Some("[fd12:8fe4:c66b:1:3000:43:ed49:ddbf]:8008")
+        );
+        assert_eq!(
+            parsed["postgresql"]["connect_address"].as_str(),
+            Some("test-node:5432")
+        );
     }
 
     #[test]
