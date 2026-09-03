@@ -2283,6 +2283,7 @@ mod tests {
             adopt_existing_data: false,
             wait_for_leader: false,
             synchronous_mode: false,
+            failsafe_mode: true,
             wal_archive_bucket: None,
             wal_recover_from_bucket: None,
             pitr_target_time: None,

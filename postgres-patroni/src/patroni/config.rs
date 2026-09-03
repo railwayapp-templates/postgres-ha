@@ -63,6 +63,13 @@ pub struct Config {
     /// If true, enable synchronous replication mode. Ensures at least one
     /// replica has received the data before a write is acknowledged.
     pub synchronous_mode: bool,
+    /// If true, a leader that cannot renew its etcd lock keeps serving writes
+    /// for as long as it can still reach every known member over their
+    /// Patroni REST APIs. Without it, any DCS outage demotes a perfectly
+    /// healthy primary to read-only immediately. Patroni consults this only
+    /// after a leader lock update has already failed, so it changes nothing
+    /// while etcd is healthy.
+    pub failsafe_mode: bool,
     /// This cluster's own archive bucket. Tool-agnostic name read from
     /// `WAL_ARCHIVE_BUCKET`; patroni-runner translates it (and the matching
     /// `WAL_ARCHIVE_KEY` / `_SECRET` / `_REGION` / `_ENDPOINT` / `_PATH`)
@@ -621,6 +628,7 @@ impl Config {
             adopt_existing_data: bool::env_parse("PATRONI_ADOPT_EXISTING_DATA", false),
             wait_for_leader: bool::env_parse("PATRONI_WAIT_FOR_LEADER", false),
             synchronous_mode: bool::env_parse("PATRONI_SYNCHRONOUS_MODE", false),
+            failsafe_mode: bool::env_parse("PATRONI_FAILSAFE_MODE", true),
             wal_archive_bucket,
             wal_recover_from_bucket: env::var("WAL_RECOVER_FROM_BUCKET")
                 .ok()
