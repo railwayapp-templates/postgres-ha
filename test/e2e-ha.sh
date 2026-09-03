@@ -5661,6 +5661,95 @@ t_pg_stop_is_clean_and_releases_lock() {
   teardown_scope "$scope"
 }
 
+# A deleted sibling leaves its ETCD_INITIAL_CLUSTER entry behind with an
+# empty host (the platform templates each entry from the sibling's private
+# domain, which resolves to nothing once the service is gone:
+# `etcd-0=http://:2380`). The wrapper used to reject the whole variable on
+# that one entry and crash-loop on config it could never fix. It must skip the
+# entry, warn, and boot through the members that still resolve — including
+# when the dead entry sorts first, so the bootstrap-leader role falls to the
+# first surviving member instead of the ghost.
+t_etcd_tolerates_deleted_peer_in_initial_cluster() {
+  local t="t_etcd_tolerates_deleted_peer_in_initial_cluster"
+  local prefix="ghost"
+  local n1="${prefix}-etcd-1" n2="${prefix}-etcd-2" n3="${prefix}-etcd-3"
+  local hosts
+  hosts=$(setup_etcd_cluster "$prefix")
+  log "etcd cluster up ($hosts)"
+
+  local members
+  members=$(docker exec "$n1" etcdctl member list 2>/dev/null)
+  if [ "$(echo "$members" | grep -c 'started')" != "3" ]; then
+    ko "$t" "etcd cluster never reached 3 started members"
+    fail_dump "$t" "$n1" "$n2" "$n3"
+    return
+  fi
+  docker exec "$n1" etcdctl put ghost-canary survives >/dev/null 2>&1
+
+  # Restart n3 on its own volume with a ghost entry that sorts BEFORE every
+  # live member — exactly what a deleted "etcd-0" sibling renders as.
+  local poisoned="${prefix}-etcd-0=http://:2380,${n1}=http://${n1}:2380,${n2}=http://${n2}:2380,${n3}=http://${n3}:2380"
+  docker rm -f "$n3" >/dev/null 2>&1
+  docker run -d --name "$n3" --label "$HA_LABEL" --network "$NET" \
+    -e "ETCD_NAME=$n3" \
+    -e "ETCD_INITIAL_CLUSTER=$poisoned" \
+    -e "ETCD_INITIAL_ADVERTISE_PEER_URLS=http://${n3}:2380" \
+    -e "ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380" \
+    -e "ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379" \
+    -e "ETCD_ADVERTISE_CLIENT_URLS=http://${n3}:2379" \
+    -e "ETCD_INITIAL_CLUSTER_TOKEN=${prefix}-token" \
+    -e "ETCD_INITIAL_CLUSTER_STATE=new" \
+    -v "${n3}-vol:/var/lib/etcd" \
+    "$ETCD_IMAGE" >/dev/null
+
+  local deadline=$(($(date +%s) + 120)) rejoined=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    members=$(docker exec "$n1" etcdctl member list 2>/dev/null)
+    if [ "$(echo "$members" | grep -c 'started')" = "3" ] \
+      && docker exec "$n1" etcdctl endpoint health --endpoints="http://${n3}:2379" 2>/dev/null | grep -q "is healthy"; then
+      rejoined=1
+      break
+    fi
+    sleep 3
+  done
+  if [ "$rejoined" != 1 ]; then
+    ko "$t" "member with a ghost initial-cluster entry never came back healthy"
+    fail_dump "$t" "$n3" "$n1"
+    return
+  fi
+  if logs_contain "$n3" "Invalid cluster entry"; then
+    ko "$t" "wrapper still rejects the ghost entry"
+    fail_dump "$t" "$n3"
+    return
+  fi
+  if ! logs_contain "$n3" "ignoring them and joining through the remaining members"; then
+    ko "$t" "wrapper did not report the skipped ghost entry"
+    fail_dump "$t" "$n3"
+    return
+  fi
+  # The ghost sorted first; the bootstrap-leader role must have fallen to n1.
+  # (tracing wraps field names/values in ANSI codes, so `leader=<name>` is not
+  # contiguous in raw docker logs — match loosely within the bootstrap line.)
+  if ! logs_match "$n3" "Cluster bootstrap.*leader.{0,24}${n1}[^0-9]"; then
+    ko "$t" "bootstrap leader was not the first surviving member"
+    fail_dump "$t" "$n3"
+    return
+  fi
+  local canary
+  canary=$(docker exec "$n1" etcdctl get ghost-canary --print-value-only \
+    --endpoints="http://${n3}:2379" 2>/dev/null)
+  if ! assert_eq "$canary" "survives" "keyspace readable via the rejoined member"; then
+    ko "$t" "data not intact via rejoined member"
+    fail_dump "$t" "$n3"
+    return
+  fi
+
+  ok "$t"
+  note "ghost entry skipped with a warning; leader fell to $n1; $n3 rejoined healthy; canary intact"
+
+  for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1; done
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -5730,6 +5819,9 @@ ALL_TESTS=(
   # etcd wrapper: removed-member refusal wipes + re-joins within one wrapper
   # lifetime, whichever exit code the refusing run produced
   t_etcd_removed_member_wipe_rejoin
+  # etcd wrapper: an ETCD_INITIAL_CLUSTER entry whose host resolved empty (a
+  # deleted sibling) is skipped, not fatal
+  t_etcd_tolerates_deleted_peer_in_initial_cluster
   # clean-stop contract: the runtime's stop signal reaches the real process in
   # every image and the container exits 0 inside the grace period
   t_etcd_stop_is_clean
