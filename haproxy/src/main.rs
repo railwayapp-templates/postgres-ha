@@ -7,6 +7,7 @@
 mod config;
 mod monitoring;
 mod nodes;
+mod signals;
 mod template;
 
 use anyhow::{Context, Result};
@@ -70,6 +71,11 @@ fn main() -> Result<()> {
         .arg(CONFIG_FILE)
         .spawn()
         .context("Failed to spawn haproxy")?;
+
+    // We are PID 1: the runtime's stop signal lands here and nowhere else.
+    // Relay it to haproxy so a stop is a soft stop instead of a SIGKILL after
+    // the grace period (see signals.rs).
+    signals::install_forwarding(child.id());
 
     run_monitoring_loop(child, &telemetry, single_node_mode)
 }
