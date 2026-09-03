@@ -17,6 +17,14 @@
 //!   invisibly. Or if pgbackrest.conf were absent, archive-push would
 //!   fail synchronously and the wrapper's pg_wal-threshold drop would
 //!   kick in (still keeps DB up, but louder than necessary).
+//! - `failsafe_mode` is seeded `true` by `bootstrap.dcs`, so every cluster
+//!   bootstrapped after that line got it and every cluster bootstrapped
+//!   before it did not, permanently. Those clusters still demote a healthy
+//!   primary to read-only on any etcd outage, and no redeploy fixes it,
+//!   because `bootstrap.dcs` never runs again. This is the drift with the
+//!   sharpest customer impact of the set: the archive ones degrade a
+//!   guarantee, this one turns a survivable DCS blip into read-only
+//!   downtime on a cluster whose Postgres never had a problem.
 //!
 //! This runs once per node startup, after Patroni reports healthy, and uses
 //! Patroni's REST API (`PATCH /config`) so it goes through the same
@@ -162,6 +170,57 @@ fn compute_archive_reconcile_patch(
                 }
             }
         }))
+    }
+}
+
+/// The `failsafe_mode` intent: a top-level DCS scalar (a Patroni control, not
+/// a Postgres GUC), written as an explicit boolean rather than `null` so a
+/// converged cluster reads exactly like a freshly bootstrapped one. `None`
+/// when DCS already agrees, so a stable cluster issues no write on boot.
+///
+/// Enabling this on a cluster whose members do not all speak `POST /failsafe`
+/// yet cannot make anything worse. Patroni consults failsafe only after a
+/// leader lock update has already failed, and a member that does not answer
+/// counts as unreachable, which demotes — precisely what happens today with
+/// the mode off. So this is safe to converge fleet-wide during a partial
+/// image rollout; it simply buys nothing until every member is new.
+///
+/// It is also not a substitute for etcd quorum monitoring: failsafe covers
+/// etcd being unreachable, not etcd being up and leaderless. An etcd that
+/// answers `etcdserver: no leader` raises an error Patroni's failsafe path
+/// does not catch, and the primary demotes anyway (patroni#3572, open).
+fn compute_failsafe_reconcile_patch(
+    failsafe_mode: bool,
+    current_failsafe_mode: Option<bool>,
+) -> Option<bool> {
+    if current_failsafe_mode == Some(failsafe_mode) {
+        return None;
+    }
+    Some(failsafe_mode)
+}
+
+/// Combine the archive patch (nested under `postgresql.parameters`) with the
+/// top-level `failsafe_mode` intent into one `PATCH /config` body, so a node
+/// drifted on both axes writes DCS once instead of twice. The failsafe side
+/// arrives as a plain `bool` rather than pre-built JSON so there is no
+/// not-an-object case to handle here, and therefore no way for a merge to
+/// silently drop one axis and still issue a write that looks complete.
+fn merge_reconcile_patches(archive: Option<Value>, failsafe: Option<bool>) -> Option<Value> {
+    match (archive, failsafe) {
+        (None, None) => None,
+        (Some(archive), None) => Some(archive),
+        (archive, Some(failsafe_mode)) => {
+            // Deliberately no panic on the archive patch's shape: this runs in
+            // the boot path, whose caller retries on `Err` and would instead
+            // see a spawned-task panic it cannot handle. The patch is an
+            // object by construction, and if that ever stopped being true the
+            // archive axis would still be sent as-is rather than lost.
+            let mut merged = archive.unwrap_or_else(|| json!({}));
+            if let Some(object) = merged.as_object_mut() {
+                object.insert("failsafe_mode".to_string(), json!(failsafe_mode));
+            }
+            Some(merged)
+        }
     }
 }
 
@@ -868,8 +927,10 @@ where
 ///   landed can carry a stale `restore_command` with nothing left to
 ///   reconcile in DCS.
 ///
-/// The DCS decision itself lives in `compute_archive_reconcile_patch`; this
-/// function does the GET/PATCH I/O around it plus the live-GUC follow-ups.
+/// The DCS decisions themselves live in `compute_archive_reconcile_patch` and
+/// `compute_failsafe_reconcile_patch`; this function does the GET/PATCH I/O
+/// around them plus the live-GUC follow-ups, merging both intents into a
+/// single write.
 pub async fn reconcile_pgbackrest_archive_config(
     config: &Config,
     telemetry: &Telemetry,
@@ -918,24 +979,45 @@ pub async fn reconcile_pgbackrest_archive_config(
             .and_then(|v| v.as_str()),
     };
 
-    match compute_archive_reconcile_patch(enabled, expected_archive_timeout, &current_params) {
+    let archive_patch =
+        compute_archive_reconcile_patch(enabled, expected_archive_timeout, &current_params);
+
+    // failsafe_mode is top-level Patroni config, not postgresql.parameters —
+    // same GET, same PATCH path, same first-init-only bootstrap.dcs blindness
+    // as the archive params above. No live-GUC follow-up: Patroni applies the
+    // patched DCS config on its next HA-loop tick.
+    let current_failsafe_mode = current.get("failsafe_mode").and_then(Value::as_bool);
+    let failsafe_patch =
+        compute_failsafe_reconcile_patch(config.failsafe_mode, current_failsafe_mode);
+
+    if archive_patch.is_some() {
+        warn!(
+            enabled,
+            current_mode = ?current_params.archive_mode,
+            current_command = ?current_params.archive_command,
+            current_timeout = ?current_params.archive_timeout,
+            current_track_commit_timestamp = ?current_params.track_commit_timestamp,
+            current_restore_command = ?current_params.restore_command,
+            "DCS archive config drifted from env-driven intent — reconciling"
+        );
+    }
+    if failsafe_patch.is_some() {
+        warn!(
+            failsafe_mode = config.failsafe_mode,
+            current_failsafe_mode = ?current_failsafe_mode,
+            "DCS failsafe_mode drifted from env-driven intent — reconciling"
+        );
+    }
+
+    match merge_reconcile_patches(archive_patch, failsafe_patch) {
         Some(patch) => {
-            warn!(
-                enabled,
-                current_mode = ?current_params.archive_mode,
-                current_command = ?current_params.archive_command,
-                current_timeout = ?current_params.archive_timeout,
-                current_track_commit_timestamp = ?current_params.track_commit_timestamp,
-                current_restore_command = ?current_params.restore_command,
-                "DCS archive config drifted from env-driven intent — reconciling"
-            );
             send_patch(&client, &patch).await?;
-            info!(enabled, "DCS archive params reconciled");
+            info!(enabled, "DCS config reconciled with env-driven intent");
         }
         None => {
             info!(
                 enabled,
-                "DCS archive config already matches env-driven intent"
+                "DCS archive and failsafe config already match env-driven intent"
             );
         }
     }
@@ -1053,6 +1135,77 @@ mod tests {
     #[test]
     fn enabled_and_matching_is_noop() {
         assert!(compute_archive_reconcile_patch(true, 60, &MATCHING).is_none());
+    }
+
+    #[test]
+    fn failsafe_matching_is_noop() {
+        assert!(compute_failsafe_reconcile_patch(true, Some(true)).is_none());
+        assert!(compute_failsafe_reconcile_patch(false, Some(false)).is_none());
+    }
+
+    #[test]
+    fn failsafe_intent_reaches_dcs_as_a_top_level_boolean() {
+        let merged = merge_reconcile_patches(None, Some(true)).unwrap();
+        assert_eq!(merged["failsafe_mode"], true);
+        assert!(merged["failsafe_mode"].is_boolean());
+    }
+
+    #[test]
+    fn failsafe_absent_in_dcs_patches_the_key() {
+        // The whole reason this reconcile exists: a cluster bootstrapped
+        // before the bootstrap.dcs seed line has no failsafe_mode key at
+        // all, so every etcd outage demotes its healthy primary to
+        // read-only, and no redeploy ever fixes it on its own.
+        assert_eq!(
+            compute_failsafe_reconcile_patch(true, None),
+            Some(true),
+            "absent key must produce a patch"
+        );
+    }
+
+    #[test]
+    fn failsafe_opt_out_writes_explicit_false_not_null() {
+        // Explicit false, never null: null REMOVES the key from the merged
+        // DCS config, and an opted-out cluster must read the same shape
+        // bootstrap.dcs renders for it, not a half-rendered one.
+        let patch =
+            merge_reconcile_patches(None, compute_failsafe_reconcile_patch(false, Some(true)))
+                .expect("drifted DCS must produce a patch");
+        assert_eq!(patch["failsafe_mode"], false);
+        assert!(patch["failsafe_mode"].is_boolean());
+    }
+
+    #[test]
+    fn archive_and_failsafe_patches_merge_into_one_write() {
+        let archive = compute_archive_reconcile_patch(true, 60, &EMPTY).unwrap();
+        let failsafe = compute_failsafe_reconcile_patch(true, None);
+        let merged = merge_reconcile_patches(Some(archive), failsafe).unwrap();
+
+        assert_eq!(merged["failsafe_mode"], true);
+        assert_eq!(
+            merged["postgresql"]["parameters"]["archive_mode"],
+            EXPECTED_ARCHIVE_MODE
+        );
+        // failsafe_mode rides at the top level, never under postgresql.
+        assert!(!merged["postgresql"]["parameters"]
+            .as_object()
+            .unwrap()
+            .contains_key("failsafe_mode"));
+    }
+
+    #[test]
+    fn either_patch_alone_survives_the_merge_untouched() {
+        let archive = compute_archive_reconcile_patch(true, 60, &EMPTY).unwrap();
+
+        assert_eq!(
+            merge_reconcile_patches(None, Some(true)).unwrap(),
+            json!({ "failsafe_mode": true })
+        );
+        assert_eq!(
+            merge_reconcile_patches(Some(archive.clone()), None).unwrap(),
+            archive
+        );
+        assert!(merge_reconcile_patches(None, None).is_none());
     }
 
     #[test]

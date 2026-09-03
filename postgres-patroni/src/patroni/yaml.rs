@@ -152,7 +152,7 @@ bootstrap:
     loop_wait: {loop_wait}
     retry_timeout: {retry_timeout}
     maximum_lag_on_failover: 1048576
-    failsafe_mode: true
+    failsafe_mode: {failsafe_mode}
     synchronous_mode: {synchronous_mode}
     postgresql:
       use_pg_rewind: true
@@ -240,6 +240,7 @@ postgresql:
         data_dir = config.data_dir,
         certs_dir = config.certs_dir,
         synchronous_mode = config.synchronous_mode,
+        failsafe_mode = config.failsafe_mode,
         basebackup_max_rate = config.basebackup_max_rate,
         max_slot_wal_keep_size = config.max_slot_wal_keep_size,
         pgbackrest_archive_params = pgbackrest_archive_params,
@@ -317,6 +318,7 @@ mod tests {
             adopt_existing_data: false,
             wait_for_leader: false,
             synchronous_mode: false,
+            failsafe_mode: true,
             wal_archive_bucket: wal_archive_bucket.map(String::from),
             wal_recover_from_bucket: None,
             pitr_target_time: None,
