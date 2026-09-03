@@ -4,7 +4,11 @@ use crate::config::Config;
 use crate::nodes::PostgresNode;
 
 /// Generate server entries for backend configuration
-fn generate_server_entries(nodes: &[PostgresNode], single_node_mode: bool, health_port_override: Option<u16>) -> String {
+fn generate_server_entries(
+    nodes: &[PostgresNode],
+    single_node_mode: bool,
+    health_port_override: Option<u16>,
+) -> String {
     nodes
         .iter()
         .map(|node| {
@@ -31,7 +35,11 @@ fn generate_server_entries(nodes: &[PostgresNode], single_node_mode: bool, healt
 }
 
 /// Generate primary backend configuration
-fn generate_primary_backend(config: &Config, server_entries: &str, single_node_mode: bool) -> String {
+fn generate_primary_backend(
+    config: &Config,
+    server_entries: &str,
+    single_node_mode: bool,
+) -> String {
     if single_node_mode {
         format!(
             r#"backend postgresql_primary_backend
@@ -54,7 +62,11 @@ fn generate_primary_backend(config: &Config, server_entries: &str, single_node_m
 }
 
 /// Generate replica backend configuration
-fn generate_replica_backend(config: &Config, server_entries: &str, single_node_mode: bool) -> String {
+fn generate_replica_backend(
+    config: &Config,
+    server_entries: &str,
+    single_node_mode: bool,
+) -> String {
     if single_node_mode {
         format!(
             r#"backend postgresql_replicas_backend
@@ -81,7 +93,8 @@ fn generate_replica_backend(config: &Config, server_entries: &str, single_node_m
 /// Generate complete HAProxy configuration
 pub fn generate_config(config: &Config, nodes: &[PostgresNode]) -> String {
     let single_node_mode = nodes.len() == 1;
-    let server_entries = generate_server_entries(nodes, single_node_mode, config.health_port_override);
+    let server_entries =
+        generate_server_entries(nodes, single_node_mode, config.health_port_override);
     let primary_backend = generate_primary_backend(config, &server_entries, single_node_mode);
     let replica_backend = generate_replica_backend(config, &server_entries, single_node_mode);
 

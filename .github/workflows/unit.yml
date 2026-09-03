@@ -21,6 +21,9 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
 
+      - name: rustfmt
+        run: cargo fmt --all --check
+
       - name: Rust unit tests
         run: cargo test --locked
 

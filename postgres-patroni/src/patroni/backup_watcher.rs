@@ -165,12 +165,12 @@ impl WatcherConfig {
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             lag_threshold_segments: env_u64("WAL_LAG_GAP_THRESHOLD_SEGMENTS", 32),
-            catalog_verify_interval: env_u64(
-                "WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS",
-                3600,
-            ),
+            catalog_verify_interval: env_u64("WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS", 3600),
             full_retry_backoff: env_u64("WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS", 600),
-            initial_full_retry_backoff: env_u64("WAL_BACKUP_INITIAL_FULL_RETRY_BACKOFF_SECONDS", 30),
+            initial_full_retry_backoff: env_u64(
+                "WAL_BACKUP_INITIAL_FULL_RETRY_BACKOFF_SECONDS",
+                30,
+            ),
         }
     }
 }
@@ -1026,8 +1026,8 @@ async fn catalog_verify_step(data_dir: &str, config: &WatcherConfig) {
     }
 
     let now = now_epoch();
-    if let Some(last) = read_state_field(&state_path, "last_catalog_verify_at")
-        .and_then(|s| s.parse::<i64>().ok())
+    if let Some(last) =
+        read_state_field(&state_path, "last_catalog_verify_at").and_then(|s| s.parse::<i64>().ok())
     {
         if now - last < config.catalog_verify_interval as i64 {
             return;
@@ -1800,8 +1800,7 @@ async fn gap_recovery_step(
                     );
                     kick_async_daemon().await;
                     // Reset so the next kick fires after another full backoff.
-                    let _ =
-                        write_state_field(&state_path, "probe_fail_since", &now.to_string());
+                    let _ = write_state_field(&state_path, "probe_fail_since", &now.to_string());
                     let _ = write_state_field(
                         &state_path,
                         "probe_fail_wal_at_start",
@@ -2002,8 +2001,8 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     // last_full_at clear (fresh enable, rc=1 self-heal, WAL_REGRESSION
     // migrate) leaves no marker, so it fires as soon as the adoption probe
     // reads the catalog conclusively.
-    let last_full_failure_at = read_state_field(&state_path, "last_full_failure_at")
-        .and_then(|s| s.parse::<i64>().ok());
+    let last_full_failure_at =
+        read_state_field(&state_path, "last_full_failure_at").and_then(|s| s.parse::<i64>().ok());
 
     // NEEDS_INITIAL_BACKUP — no full on record, take it now. pgbackrest
     // backup brackets the base in pg_backup_start/stop and waits for the
@@ -2149,11 +2148,8 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
                     // skips the next-iteration immediate check (which fires
                     // whenever last_catalog_verify_at is unset) and defers to
                     // the normal catalog_verify_interval cadence instead.
-                    let _ = write_state_field(
-                        &state_path,
-                        "last_catalog_verify_at",
-                        &now.to_string(),
-                    );
+                    let _ =
+                        write_state_field(&state_path, "last_catalog_verify_at", &now.to_string());
                     // clear_gap_recovery_state refreshes pg_stat_archiver
                     // and writes last_full_failed_count itself — folds any
                     // failure-during-backup into the anchor so the next
@@ -2190,8 +2186,12 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
                 .await;
             match expire_res {
                 Ok(s) if s.success() => {}
-                Ok(s) => warn!(status = ?s, backup_type = %backup_type, "pgbackrest-watcher: expire failed after successful backup (retention not enforced this cycle; will retry after next backup)"),
-                Err(e) => warn!(error = %e, backup_type = %backup_type, "pgbackrest-watcher: expire invocation failed after successful backup (retention not enforced this cycle; will retry after next backup)"),
+                Ok(s) => {
+                    warn!(status = ?s, backup_type = %backup_type, "pgbackrest-watcher: expire failed after successful backup (retention not enforced this cycle; will retry after next backup)")
+                }
+                Err(e) => {
+                    warn!(error = %e, backup_type = %backup_type, "pgbackrest-watcher: expire invocation failed after successful backup (retention not enforced this cycle; will retry after next backup)")
+                }
             }
 
             emit_pitr_anchor().await;
@@ -2203,8 +2203,11 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
             // every poll. Diffs aren't gated.
             if backup_type == "full" {
                 let state_path = format!("{data_dir}/{STATE_FILENAME}");
-                let _ =
-                    write_state_field(&state_path, "last_full_failure_at", &now_epoch().to_string());
+                let _ = write_state_field(
+                    &state_path,
+                    "last_full_failure_at",
+                    &now_epoch().to_string(),
+                );
             }
             warn!(status = ?s, backup_type = %backup_type, "pgbackrest-watcher: backup failed (will retry next poll)");
             false
@@ -2212,8 +2215,11 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
         Err(e) => {
             if backup_type == "full" {
                 let state_path = format!("{data_dir}/{STATE_FILENAME}");
-                let _ =
-                    write_state_field(&state_path, "last_full_failure_at", &now_epoch().to_string());
+                let _ = write_state_field(
+                    &state_path,
+                    "last_full_failure_at",
+                    &now_epoch().to_string(),
+                );
             }
             warn!(error = %e, "pgbackrest-watcher: backup invocation failed");
             false
