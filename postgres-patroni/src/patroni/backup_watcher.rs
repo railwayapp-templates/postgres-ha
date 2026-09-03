@@ -544,6 +544,32 @@ async fn emit_wal_heartbeat() {
         .await;
 }
 
+/// Reduce a `pg_stat_archiver.last_archived_wal` value to the plain 24-char
+/// hex WAL segment it refers to, or None when it names no segment.
+///
+/// archive_command is handed more than plain segments, and pg_stat_archiver
+/// records whichever file went through last:
+///   * `000000010000000000000005`                 — a plain segment
+///   * `000000010000000000000005.00000028.backup` — a backup label, archived
+///     right after every `pg_backup_stop`
+///   * `000000010000000000000005.partial`         — a partial segment,
+///     archived when a standby is promoted
+///   * `00000002.history`                         — a timeline history file,
+///     also written at promotion
+///
+/// The first three all name a segment that has been handed off, so they
+/// reduce to it. A history file names no segment at all.
+///
+/// Feeding the raw value to `segment_to_number` rejected everything but the
+/// first form, which made `probe_catalog_max` fail for the whole window
+/// between a backup label being archived and the next plain segment — on a
+/// quiet database, an unbounded one. Observed in CI as
+/// `malformed last_archived_wal: 00000002000000000000000D.00000028.backup`.
+fn archived_wal_segment(wal: &str) -> Option<&str> {
+    let base = wal.split('.').next().unwrap_or(wal);
+    (base.len() == 24 && base.chars().all(|c| c.is_ascii_hexdigit())).then_some(base)
+}
+
 /// 24-char hex WAL filename → absolute segment count.
 /// `segments_per_log_file` = `0x100000000 / wal_segment_size`; the caller
 /// (always sourced from `ArchiverStats.segments_per_log_file`) carries
@@ -616,15 +642,32 @@ async fn probe_catalog_max(stats: &ArchiverStats) -> Result<CatalogProbe> {
     if stats.last_archived_wal.is_empty() {
         return Ok(CatalogProbe::default());
     }
-    let handed_off = segment_to_number(&stats.last_archived_wal, stats.segments_per_log_file)
-        .ok_or_else(|| {
-            anyhow::anyhow!("malformed last_archived_wal: {}", stats.last_archived_wal)
-        })?;
+    let segment = match archived_wal_segment(&stats.last_archived_wal) {
+        Some(seg) => seg,
+        None => {
+            // A timeline history file is the one legitimate last_archived_wal
+            // that names no segment; anything else here means our reading of
+            // pg_stat_archiver is wrong and is worth saying out loud. Neither
+            // is an S3 failure, so both return "nothing to measure this
+            // iteration" instead of Err: the caller reads Err as an S3
+            // blackout and can pkill a perfectly healthy async daemon.
+            if !stats.last_archived_wal.ends_with(".history") {
+                warn!(
+                    last_archived_wal = %stats.last_archived_wal,
+                    "pgbackrest-watcher: last_archived_wal names no WAL segment; skipping the lag probe this iteration"
+                );
+            }
+            return Ok(CatalogProbe::default());
+        }
+    };
+    let handed_off = segment_to_number(segment, stats.segments_per_log_file).ok_or_else(|| {
+        anyhow::anyhow!("malformed last_archived_wal: {}", stats.last_archived_wal)
+    })?;
 
     let info_json = pgbackrest_info_json().await.ok_or_else(|| {
         anyhow::anyhow!("pgbackrest info errored, timed out, or returned empty output")
     })?;
-    let tl_hex = &stats.last_archived_wal[..8];
+    let tl_hex = &segment[..8];
     let catalog_max = parse_catalog_max(&info_json, tl_hex)?;
     let lag = match catalog_max
         .as_deref()
@@ -2310,9 +2353,10 @@ fn now_epoch() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_adopt_backup_history, decide_gap_recovery, full_retry_ready, parse_catalog_max,
-        parse_has_full, parse_latest_backup_stops, probe_async_duplicate_error, segment_to_number,
-        wal_has_async_archive_duplicate_error, AdoptDecision, GapRecoveryAction, GapRecoveryInputs,
+        archived_wal_segment, decide_adopt_backup_history, decide_gap_recovery, full_retry_ready,
+        parse_catalog_max, parse_has_full, parse_latest_backup_stops, probe_async_duplicate_error,
+        segment_to_number, wal_has_async_archive_duplicate_error, AdoptDecision, GapRecoveryAction,
+        GapRecoveryInputs,
     };
     use std::fs;
 
@@ -2382,6 +2426,61 @@ mod tests {
             segment_to_number("000000010000001D000000ED", 256).unwrap()
                 - segment_to_number("000000010000001B00000024", 256).unwrap(),
             713
+        );
+    }
+
+    #[test]
+    fn archived_wal_segment_reduces_real_pg_stat_archiver_values() {
+        // Plain segment: itself.
+        assert_eq!(
+            archived_wal_segment("000000010000000000000005"),
+            Some("000000010000000000000005")
+        );
+        // Backup label, archived after every pg_backup_stop. This exact
+        // shape was rejected in CI and sent the watcher down the S3
+        // blind-spot path on a healthy cluster.
+        assert_eq!(
+            archived_wal_segment("00000002000000000000000D.00000028.backup"),
+            Some("00000002000000000000000D")
+        );
+        // Partial segment, archived on promotion.
+        assert_eq!(
+            archived_wal_segment("000000010000000000000005.partial"),
+            Some("000000010000000000000005")
+        );
+        // Timeline history file: names no segment.
+        assert_eq!(archived_wal_segment("00000002.history"), None);
+        // Genuine garbage stays None rather than being coerced.
+        assert_eq!(archived_wal_segment(""), None);
+        assert_eq!(archived_wal_segment("not-a-wal"), None);
+        assert_eq!(archived_wal_segment("00000001000000000000000.backup"), None);
+        assert_eq!(
+            archived_wal_segment("zzzzzzzzzzzzzzzzzzzzzzzz.00000028.backup"),
+            None
+        );
+    }
+
+    #[test]
+    fn archived_wal_segment_feeds_segment_to_number() {
+        // The point of the reduction: a backup label must measure the same
+        // handoff position as the plain segment it labels.
+        let plain = segment_to_number(
+            archived_wal_segment("00000002000000000000000D").unwrap(),
+            256,
+        );
+        let labelled = segment_to_number(
+            archived_wal_segment("00000002000000000000000D.00000028.backup").unwrap(),
+            256,
+        );
+        assert_eq!(plain, labelled);
+        assert_eq!(plain, Some(0x0D));
+
+        // ...and the regression itself: the raw value is what probe_catalog_max
+        // used to hand segment_to_number, which rejected it and produced the
+        // Err the caller mistook for an S3 blackout.
+        assert_eq!(
+            segment_to_number("00000002000000000000000D.00000028.backup", 256),
+            None
         );
     }
 
