@@ -606,8 +606,9 @@ fn report_marker_removal_failure(telemetry: &Telemetry, e: &std::io::Error, when
     telemetry.send(TelemetryEvent::ComponentError {
         component: "patroni-runner".to_string(),
         error: format!("failed to remove the reseed marker {when}: {e}"),
-        context: "the leftover marker keeps the self-heal watcher standing down until it is removed"
-            .to_string(),
+        context:
+            "the leftover marker keeps the self-heal watcher standing down until it is removed"
+                .to_string(),
     });
 }
 
@@ -1618,7 +1619,12 @@ fn run_as_mini_init() -> Result<()> {
     };
 
     MINI_INIT_CHILD.store(child.as_raw(), Ordering::Relaxed);
-    for sig in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGQUIT, Signal::SIGHUP] {
+    for sig in [
+        Signal::SIGTERM,
+        Signal::SIGINT,
+        Signal::SIGQUIT,
+        Signal::SIGHUP,
+    ] {
         // SAFETY: handler is async-signal-safe (atomic load + kill).
         unsafe {
             let _ = nix::sys::signal::signal(sig, SigHandler::Handler(mini_init_forward));
@@ -1814,19 +1820,17 @@ async fn async_main() -> Result<()> {
     // on exit either way. Checked before the marker/version guards below: if
     // a job holds the volume right now, that refusal is more informative than
     // whatever the marker happens to say mid-job.
-    let _upgrade_volume_lock = match major_upgrade::take_volume_upgrade_lock(
-        &volume_root,
-        &postgres_patroni::pgdata(),
-    ) {
-        Ok(lock) => lock,
-        Err(reason) => {
-            telemetry.send(TelemetryEvent::MajorUpgradeBootRefused {
-                node: env::var("PATRONI_NAME").unwrap_or_else(|_| "unknown".to_string()),
-                reason: reason.clone(),
-            });
-            anyhow::bail!("{reason}");
-        }
-    };
+    let _upgrade_volume_lock =
+        match major_upgrade::take_volume_upgrade_lock(&volume_root, &postgres_patroni::pgdata()) {
+            Ok(lock) => lock,
+            Err(reason) => {
+                telemetry.send(TelemetryEvent::MajorUpgradeBootRefused {
+                    node: env::var("PATRONI_NAME").unwrap_or_else(|_| "unknown".to_string()),
+                    reason: reason.clone(),
+                });
+                anyhow::bail!("{reason}");
+            }
+        };
 
     let image_major = major_upgrade::image_major();
     if let Some(reason) = major_upgrade::boot_refusal_reason(
@@ -1866,6 +1870,7 @@ async fn async_main() -> Result<()> {
     info!(
         node = %config.name,
         address = %config.connect_address,
+        rest_address = %config.restapi_connect_address,
         "=== Patroni Runner ==="
     );
 
@@ -2228,13 +2233,13 @@ async fn async_main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pgbackrest_conf, build_pgbackrest_recovery_source_conf, build_pitr_managed_block,
+        available_bytes, build_pgbackrest_conf, build_pgbackrest_recovery_source_conf,
+        build_pitr_managed_block, clear_clone_wipe_attempts, clone_wipe_ledger_path,
         configure_pitr_recovery, data_dir_nonempty, is_uuid_shape, parse_process_max,
-        available_bytes, clear_clone_wipe_attempts, clone_wipe_ledger_path,
         pgdata_is_dedicated_subdir, read_clone_wipe_attempts, record_clone_wipe_attempt,
         should_wipe_incomplete_clone, strip_pitr_managed_block, wipe_has_safe_clone_source,
-        wipe_pgdata_contents, Config, PgbackrestConfParams, MAX_CLONE_WIPE_ATTEMPTS,
-        RecoverySourceConfParams, PITR_MANAGED_MARKER,
+        wipe_pgdata_contents, Config, PgbackrestConfParams, RecoverySourceConfParams,
+        MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
     };
 
     fn test_config(data_dir: &str) -> Config {
@@ -2242,6 +2247,7 @@ mod tests {
             scope: "test-scope".into(),
             name: "test-node".into(),
             connect_address: "test-node".into(),
+            restapi_connect_address: "test-node".into(),
             etcd_hosts: "etcd-1:2379".into(),
             superuser: "postgres".into(),
             superuser_pass: "pw".into(),
@@ -2307,7 +2313,9 @@ mod tests {
                 retention_diff: 14,
             });
             assert!(
-                conf.contains(&format!("[global:archive-get]\nprocess-max={expected_get_max}\n")),
+                conf.contains(&format!(
+                    "[global:archive-get]\nprocess-max={expected_get_max}\n"
+                )),
                 "cpus={cpus}: expected archive-get process-max={expected_get_max} in:\n{conf}"
             );
         }
@@ -2744,7 +2752,10 @@ mod tests {
         // The wipe empties pgdata, so a ledger stored in there would reset itself
         // every pass and could never bound the loop.
         let ledger = clone_wipe_ledger_path("/var/lib/postgresql/data");
-        assert_eq!(ledger, "/var/lib/postgresql/data/.railway_clone_wipe_attempts");
+        assert_eq!(
+            ledger,
+            "/var/lib/postgresql/data/.railway_clone_wipe_attempts"
+        );
         assert!(!ledger.contains("/pgdata/"));
     }
 
@@ -2770,5 +2781,4 @@ mod tests {
         // because it is reported alongside the cap, not used to gate it.
         assert!(available_bytes("/nonexistent-path-for-test").is_none());
     }
-
 }

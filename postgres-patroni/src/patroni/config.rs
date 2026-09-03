@@ -4,13 +4,28 @@ use crate::{pgdata, ssl_dir};
 use anyhow::Result;
 use common::ConfigExt;
 use std::env;
+use std::net::Ipv6Addr;
 use tracing::{info, warn};
 
 /// Configuration for Patroni runner
 pub struct Config {
     pub scope: String,
     pub name: String,
+    /// Host part of `postgresql.connect_address`: this node's private domain.
+    /// Replication (`primary_conninfo`, pg_rewind, basebackup) dials it through
+    /// libpq, which resolves it fresh on every connect.
     pub connect_address: String,
+    /// Host part of `restapi.connect_address`, i.e. the `api_url` this member
+    /// publishes in DCS for the other members' REST calls (switchover and
+    /// failover candidate checks, failsafe pings). Patroni's etcd DCS module
+    /// installs a process-global urllib3 resolver with a 600 s cache that a
+    /// failed connect never evicts, so a hostname here keeps pointing every
+    /// other member at a redeployed node's OLD container address for up to ten
+    /// minutes, and `POST /switchover` answers `412 no good candidates` for as
+    /// long. Publishing the container's own IPv6 literal instead leaves nothing
+    /// stale to cache: a redeployed node re-registers its new address on boot.
+    /// Falls back to `connect_address` when the address cannot be read.
+    pub restapi_connect_address: String,
     pub etcd_hosts: String,
     pub superuser: String,
     pub superuser_pass: String,
@@ -193,7 +208,10 @@ fn resolve_max_slot_wal_keep_size(
 ) -> String {
     const UNLIMITED: &str = "-1";
 
-    if let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(v) = env_value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         if is_valid_slot_keep_size(&v) {
             return v;
         }
@@ -368,7 +386,10 @@ pub(crate) fn volume_total_and_free_mib(path: &str) -> (u64, u64) {
 /// by a typo.
 fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
     const DEFAULT: &str = "20M";
-    let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+    let Some(v) = env_value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
         return DEFAULT.to_string();
     };
     let kb = v
@@ -392,14 +413,88 @@ fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
     }
 }
 
+/// Kernel view of this network namespace's IPv6 addresses. One line per
+/// address: `<32 hex digits> <ifindex> <prefixlen> <scope> <flags> <ifname>`.
+const IF_INET6_PATH: &str = "/proc/net/if_inet6";
+
+/// Railway assigns every container one global-scope IPv6 under this prefix
+/// (`fd12:<network>::<host>:<workload>`); the host itself lives under `fd11`.
+const RAILWAY_CONTAINER_IPV6_PREFIX: u16 = 0xfd12;
+
+/// Scope value of a global-scope address in `/proc/net/if_inet6`.
+const IF_INET6_SCOPE_GLOBAL: &str = "00";
+
+/// Pick this container's own Railway private IPv6 out of `/proc/net/if_inet6`
+/// content: global scope, not loopback, under the container prefix. Returns
+/// the literal already bracketed for use in a `host:port` YAML field.
+pub fn container_ipv6_from_if_inet6(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let hex = fields.next()?;
+        let _ifindex = fields.next()?;
+        let _prefix_len = fields.next()?;
+        let scope = fields.next()?;
+        let _flags = fields.next()?;
+        let ifname = fields.next()?;
+        if scope != IF_INET6_SCOPE_GLOBAL || ifname == "lo" || hex.len() != 32 {
+            return None;
+        }
+        let addr = Ipv6Addr::from(u128::from_str_radix(hex, 16).ok()?);
+        (addr.segments()[0] == RAILWAY_CONTAINER_IPV6_PREFIX).then(|| format!("[{addr}]"))
+    })
+}
+
+/// Resolve the host part of `restapi.connect_address`.
+///
+/// Precedence: an explicit `PATRONI_RESTAPI_CONNECT_HOST` (operator escape
+/// hatch, used verbatim), then the container's own IPv6 literal from
+/// `/proc/net/if_inet6`, then the private domain. The address is read from the
+/// interface rather than by resolving the private domain: right after a
+/// redeploy the private DNS still answers the previous container's address
+/// for several seconds, which is exactly the staleness this field exists to
+/// avoid.
+fn resolve_restapi_connect_address(
+    override_host: Option<String>,
+    if_inet6: Option<&str>,
+    fallback: &str,
+) -> String {
+    if let Some(host) = override_host
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+    {
+        info!(host = %host, "restapi.connect_address pinned by PATRONI_RESTAPI_CONNECT_HOST");
+        return host;
+    }
+    match if_inet6.and_then(container_ipv6_from_if_inet6) {
+        Some(addr) => {
+            info!(address = %addr, "restapi.connect_address: publishing the container's own IPv6");
+            addr
+        }
+        None => {
+            warn!(
+                fallback = %fallback,
+                "no Railway container IPv6 found in /proc/net/if_inet6; restapi.connect_address falls back to the private domain (other members may dial a stale address for up to 600s after this node redeploys)"
+            );
+            fallback.to_string()
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
         let name = String::env_required("PATRONI_NAME")?;
         let connect_address = String::env_required("RAILWAY_PRIVATE_DOMAIN")?;
+        let restapi_connect_address = resolve_restapi_connect_address(
+            env::var("PATRONI_RESTAPI_CONNECT_HOST").ok(),
+            std::fs::read_to_string(IF_INET6_PATH).ok().as_deref(),
+            &connect_address,
+        );
         let etcd_hosts = String::env_required("PATRONI_ETCD3_HOSTS")?;
 
-        let wal_archive_bucket = env::var("WAL_ARCHIVE_BUCKET").ok().filter(|s| !s.is_empty());
+        let wal_archive_bucket = env::var("WAL_ARCHIVE_BUCKET")
+            .ok()
+            .filter(|s| !s.is_empty());
         let (volume_total_mib, volume_free_mib) = volume_total_and_free_mib(&crate::volume_root());
         // The runtime neutralizer also removes any stronger value left in
         // postgresql.auto.conf by an earlier ALTER SYSTEM reconcile.
@@ -415,6 +510,7 @@ impl Config {
             scope: String::env_or("PATRONI_SCOPE", "railway-pg-ha"),
             name,
             connect_address,
+            restapi_connect_address,
             etcd_hosts,
             superuser: String::env_or("PATRONI_SUPERUSER_USERNAME", "postgres"),
             superuser_pass: env::var("PATRONI_SUPERUSER_PASSWORD").unwrap_or_default(),
@@ -466,9 +562,71 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_basebackup_max_rate, resolve_max_slot_wal_keep_size,
-        resolve_startup_slot_keep_size, SLOT_KEEP_FLOOR_MIB, SLOT_KEEP_TOTAL_PCT,
+        container_ipv6_from_if_inet6, resolve_basebackup_max_rate, resolve_max_slot_wal_keep_size,
+        resolve_restapi_connect_address, resolve_startup_slot_keep_size, SLOT_KEEP_FLOOR_MIB,
+        SLOT_KEEP_TOTAL_PCT,
     };
+
+    /// Verbatim `/proc/net/if_inet6` of a live cluster member (postgres-3 of
+    /// e2e-pg-cli-combo-146981, 2026-09-02): loopback, the link-local address
+    /// and the one Railway container address, in that order.
+    const LIVE_IF_INET6: &str = "\
+00000000000000000000000000000001 01 80 10 80       lo
+fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
+fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
+";
+
+    #[test]
+    fn container_ipv6_is_the_global_fd12_address_bracketed_and_compressed() {
+        assert_eq!(
+            container_ipv6_from_if_inet6(LIVE_IF_INET6).as_deref(),
+            Some("[fd12:8fe4:c66b:1:3000:a0:5d7b:156b]")
+        );
+    }
+
+    #[test]
+    fn container_ipv6_skips_loopback_link_local_and_host_prefix_addresses() {
+        // Only loopback + link-local: nothing to publish.
+        let no_global = "\
+00000000000000000000000000000001 01 80 10 80       lo
+fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
+";
+        assert_eq!(container_ipv6_from_if_inet6(no_global), None);
+        // A global address under the host prefix (fd11) is the stacker, not us.
+        let host_only = "fd11000012340000000000000000abcd 03 40 00 80 railnet0\n";
+        assert_eq!(container_ipv6_from_if_inet6(host_only), None);
+        // Garbage lines never panic and never match.
+        assert_eq!(container_ipv6_from_if_inet6("not hex at all\n\n  \n"), None);
+        assert_eq!(container_ipv6_from_if_inet6(""), None);
+    }
+
+    #[test]
+    fn restapi_connect_address_prefers_override_then_interface_then_domain() {
+        let domain = "postgres-3.railway.internal";
+        assert_eq!(
+            resolve_restapi_connect_address(
+                Some(" pinned.example ".into()),
+                Some(LIVE_IF_INET6),
+                domain
+            ),
+            "pinned.example"
+        );
+        // An empty override is not an override.
+        assert_eq!(
+            resolve_restapi_connect_address(Some("  ".into()), Some(LIVE_IF_INET6), domain),
+            "[fd12:8fe4:c66b:1:3000:a0:5d7b:156b]"
+        );
+        assert_eq!(
+            resolve_restapi_connect_address(None, Some(LIVE_IF_INET6), domain),
+            "[fd12:8fe4:c66b:1:3000:a0:5d7b:156b]"
+        );
+        // Unreadable or address-less interface table: keep today's behaviour.
+        assert_eq!(resolve_restapi_connect_address(None, None, domain), domain);
+        assert_eq!(
+            resolve_restapi_connect_address(None, Some("garbage"), domain),
+            domain
+        );
+    }
 
     /// The rampmetrics-api geometry that PANICked on 2026-07-10: a 2 TB volume
     /// holding ~1226 GB (data + WAL) at the time of measurement.
@@ -496,7 +654,10 @@ mod tests {
             true,
         ));
         assert_eq!(cap, TWO_TB_FREE_MIB / 2);
-        assert!(cap < TWO_TB_MIB / 4, "free bound must beat the total bound here");
+        assert!(
+            cap < TWO_TB_MIB / 4,
+            "free bound must beat the total bound here"
+        );
     }
 
     #[test]
@@ -511,7 +672,10 @@ mod tests {
             true,
         ));
         let cap_gb = cap * 1024 * 1024 / 1_000_000_000;
-        assert!(cap_gb < 900, "cap {cap_gb} GB must trip before the ~900 GB that filled the disk");
+        assert!(
+            cap_gb < 900,
+            "cap {cap_gb} GB must trip before the ~900 GB that filled the disk"
+        );
         assert!(
             1226 + cap_gb < 2000,
             "used + capped WAL ({} GB) must fit the 2 TB volume",
@@ -548,7 +712,9 @@ mod tests {
         // the whole volume. The free bound alone would hand out 50% of a 2 TB
         // disk; the total bound holds it to 25% so the data can grow into the
         // rest.
-        let cap = cap_mib(&resolve_max_slot_wal_keep_size(None, TWO_TB_MIB, TWO_TB_MIB, true));
+        let cap = cap_mib(&resolve_max_slot_wal_keep_size(
+            None, TWO_TB_MIB, TWO_TB_MIB, true,
+        ));
         assert_eq!(cap, TWO_TB_MIB / 4);
     }
 
@@ -617,7 +783,12 @@ mod tests {
         );
         // kB is fine at ≥1 MB (PG's base unit for this GUC).
         assert_eq!(
-            resolve_max_slot_wal_keep_size(Some("1024kB".into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
+            resolve_max_slot_wal_keep_size(
+                Some("1024kB".into()),
+                TWO_TB_MIB,
+                TWO_TB_FREE_MIB,
+                true
+            ),
             "1024kB"
         );
     }
@@ -626,13 +797,7 @@ mod tests {
     fn slot_recovery_kill_switch_wins_over_operator_pin_and_derived_cap() {
         for env_value in [None, Some("512GB".to_string()), Some("-1".to_string())] {
             assert_eq!(
-                resolve_startup_slot_keep_size(
-                    true,
-                    env_value,
-                    TWO_TB_MIB,
-                    TWO_TB_FREE_MIB,
-                    true,
-                ),
+                resolve_startup_slot_keep_size(true, env_value, TWO_TB_MIB, TWO_TB_FREE_MIB, true,),
                 "-1"
             );
         }
@@ -643,9 +808,16 @@ mod tests {
         // "512kB" and "1000kB" would round to 0 in PG's MB base unit — the
         // "retain no WAL for slots" mode the validator exists to keep out;
         // "1024kB" (exactly 1 MB) stays acceptable.
-        for junk in ["0", "abc", "-5", "12MiB", "", "512kB", "1000kB", "0MB", "0GB"] {
+        for junk in [
+            "0", "abc", "-5", "12MiB", "", "512kB", "1000kB", "0MB", "0GB",
+        ] {
             assert_eq!(
-                resolve_max_slot_wal_keep_size(Some(junk.into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
+                resolve_max_slot_wal_keep_size(
+                    Some(junk.into()),
+                    TWO_TB_MIB,
+                    TWO_TB_FREE_MIB,
+                    true
+                ),
                 format!("{}MB", TWO_TB_FREE_MIB / 2),
                 "junk override {junk:?} must fall back to the derived cap"
             );

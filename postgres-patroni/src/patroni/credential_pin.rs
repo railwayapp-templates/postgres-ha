@@ -234,6 +234,7 @@ mod tests {
             scope: "s".into(),
             name: "n".into(),
             connect_address: "n".into(),
+            restapi_connect_address: "n".into(),
             etcd_hosts: "etcd:2379".into(),
             superuser: "postgres".into(),
             superuser_pass: "su-env".into(),
