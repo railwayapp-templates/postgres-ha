@@ -5,6 +5,8 @@ use anyhow::Result;
 use common::ConfigExt;
 use std::env;
 use std::net::Ipv6Addr;
+use std::sync::OnceLock;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Configuration for Patroni runner
@@ -15,17 +17,20 @@ pub struct Config {
     /// Replication (`primary_conninfo`, pg_rewind, basebackup) dials it through
     /// libpq, which resolves it fresh on every connect.
     pub connect_address: String,
-    /// Host part of `restapi.connect_address`, i.e. the `api_url` this member
+    /// `restapi.connect_address` as `host:port`, i.e. the `api_url` this member
     /// publishes in DCS for the other members' REST calls (switchover and
     /// failover candidate checks, failsafe pings). Patroni's etcd DCS module
     /// installs a process-global urllib3 resolver with a 600 s cache that a
     /// failed connect never evicts, so a hostname here keeps pointing every
     /// other member at a redeployed node's OLD container address for up to ten
     /// minutes, and `POST /switchover` answers `412 no good candidates` for as
-    /// long. Publishing the container's own IPv6 literal instead leaves nothing
-    /// stale to cache: a redeployed node re-registers its new address on boot.
-    /// Falls back to `connect_address` when the address cannot be read.
+    /// long. The container's own IPv6 literal leaves nothing stale to cache: a
+    /// redeployed node re-registers its new address on boot. See
+    /// [`RestapiAddressSource`] for where the value comes from.
     pub restapi_connect_address: String,
+    /// Where `restapi_connect_address` came from; the runner reports the
+    /// private-domain fallback through telemetry.
+    pub restapi_address_source: RestapiAddressSource,
     pub etcd_hosts: String,
     pub superuser: String,
     pub superuser_pass: String,
@@ -208,10 +213,7 @@ fn resolve_max_slot_wal_keep_size(
 ) -> String {
     const UNLIMITED: &str = "-1";
 
-    if let Some(v) = env_value
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         if is_valid_slot_keep_size(&v) {
             return v;
         }
@@ -386,10 +388,7 @@ pub(crate) fn volume_total_and_free_mib(path: &str) -> (u64, u64) {
 /// by a typo.
 fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
     const DEFAULT: &str = "20M";
-    let Some(v) = env_value
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    else {
+    let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
         return DEFAULT.to_string();
     };
     let kb = v
@@ -424,60 +423,142 @@ const RAILWAY_CONTAINER_IPV6_PREFIX: u16 = 0xfd12;
 /// Scope value of a global-scope address in `/proc/net/if_inet6`.
 const IF_INET6_SCOPE_GLOBAL: &str = "00";
 
+/// `ifa_flags` bits (linux/if_addr.h) of an address the peers cannot dial:
+/// duplicate-address detection failed, deprecated, or still tentative while
+/// DAD runs during the interface's first second.
+const IFA_F_DADFAILED: u8 = 0x08;
+const IFA_F_DEPRECATED: u8 = 0x20;
+const IFA_F_TENTATIVE: u8 = 0x40;
+const IF_INET6_UNUSABLE_FLAGS: u8 = IFA_F_DADFAILED | IFA_F_DEPRECATED | IFA_F_TENTATIVE;
+
+/// Port Patroni's REST API listens on in this image (`restapi.listen`).
+pub const PATRONI_RESTAPI_PORT: u16 = 8008;
+
+/// How long boot waits for the container address to appear on the interface
+/// before falling back to the private domain. The address is normally there
+/// before PID 1 starts; the retries cover DAD's tentative second.
+const IF_INET6_READ_ATTEMPTS: u32 = 10;
+const IF_INET6_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Origin of [`Config::restapi_connect_address`], in precedence order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestapiAddressSource {
+    /// `PATRONI_RESTAPI_CONNECT_ADDRESS` is set. Patroni applies its own
+    /// environment over patroni.yml, so the runner mirrors the value into the
+    /// file and the rendered config matches what Patroni publishes.
+    PatroniEnv,
+    /// The container's own IPv6 literal, read from `/proc/net/if_inet6`.
+    ContainerInterface,
+    /// No usable container address was found: the private domain.
+    PrivateDomain,
+}
+
 /// Pick this container's own Railway private IPv6 out of `/proc/net/if_inet6`
-/// content: global scope, not loopback, under the container prefix. Returns
-/// the literal already bracketed for use in a `host:port` YAML field.
-pub fn container_ipv6_from_if_inet6(content: &str) -> Option<String> {
+/// content: global scope, not loopback, under the container prefix, and
+/// neither tentative, deprecated nor DAD-failed.
+pub fn container_ipv6_from_if_inet6(content: &str) -> Option<Ipv6Addr> {
     content.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
         let hex = fields.next()?;
         let _ifindex = fields.next()?;
         let _prefix_len = fields.next()?;
         let scope = fields.next()?;
-        let _flags = fields.next()?;
+        let flags = u8::from_str_radix(fields.next()?, 16).ok()?;
         let ifname = fields.next()?;
-        if scope != IF_INET6_SCOPE_GLOBAL || ifname == "lo" || hex.len() != 32 {
+        if scope != IF_INET6_SCOPE_GLOBAL
+            || ifname == "lo"
+            || hex.len() != 32
+            || flags & IF_INET6_UNUSABLE_FLAGS != 0
+        {
             return None;
         }
         let addr = Ipv6Addr::from(u128::from_str_radix(hex, 16).ok()?);
-        (addr.segments()[0] == RAILWAY_CONTAINER_IPV6_PREFIX).then(|| format!("[{addr}]"))
+        (addr.segments()[0] == RAILWAY_CONTAINER_IPV6_PREFIX).then_some(addr)
     })
 }
 
-/// Resolve the host part of `restapi.connect_address`.
+/// Whether an operator-supplied `host:port` can be rendered verbatim inside a
+/// double-quoted YAML scalar: hostname characters, IPv6 literals with or
+/// without brackets, and a port.
+fn is_yaml_safe_host_port(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
+}
+
+/// Resolve `restapi.connect_address` (`host:port`) and where it came from.
 ///
-/// Precedence: an explicit `PATRONI_RESTAPI_CONNECT_HOST` (operator escape
-/// hatch, used verbatim), then the container's own IPv6 literal from
-/// `/proc/net/if_inet6`, then the private domain. The address is read from the
-/// interface rather than by resolving the private domain: right after a
+/// Precedence: `PATRONI_RESTAPI_CONNECT_ADDRESS` when Patroni's own
+/// environment sets it (Patroni applies it over patroni.yml, so the file
+/// mirrors it), then the container's own IPv6 literal from
+/// `/proc/net/if_inet6`, then the private domain. The address is read from
+/// the interface rather than by resolving the private domain: right after a
 /// redeploy the private DNS still answers the previous container's address
 /// for several seconds, which is exactly the staleness this field exists to
-/// avoid.
+/// avoid. The interface read is retried for a few seconds because the address
+/// is tentative while duplicate-address detection runs.
 fn resolve_restapi_connect_address(
-    override_host: Option<String>,
-    if_inet6: Option<&str>,
-    fallback: &str,
-) -> String {
-    if let Some(host) = override_host
-        .map(|h| h.trim().to_string())
-        .filter(|h| !h.is_empty())
-    {
-        info!(host = %host, "restapi.connect_address pinned by PATRONI_RESTAPI_CONNECT_HOST");
-        return host;
-    }
-    match if_inet6.and_then(container_ipv6_from_if_inet6) {
-        Some(addr) => {
-            info!(address = %addr, "restapi.connect_address: publishing the container's own IPv6");
-            addr
-        }
-        None => {
-            warn!(
-                fallback = %fallback,
-                "no Railway container IPv6 found in /proc/net/if_inet6; restapi.connect_address falls back to the private domain (other members may dial a stale address for up to 600s after this node redeploys)"
+    patroni_env: Option<&str>,
+    mut read_if_inet6: impl FnMut() -> Option<String>,
+    attempts: u32,
+    retry_delay: Duration,
+    private_domain: &str,
+) -> (String, RestapiAddressSource) {
+    if let Some(value) = patroni_env.map(str::trim).filter(|v| !v.is_empty()) {
+        if is_yaml_safe_host_port(value) {
+            info!(
+                address = %value,
+                "restapi.connect_address set by PATRONI_RESTAPI_CONNECT_ADDRESS; Patroni applies its environment over patroni.yml, the file mirrors it"
             );
-            fallback.to_string()
+            return (value.to_string(), RestapiAddressSource::PatroniEnv);
+        }
+        warn!(
+            value = %value,
+            "PATRONI_RESTAPI_CONNECT_ADDRESS holds characters patroni.yml cannot carry; not mirrored into the file, Patroni still applies it over patroni.yml"
+        );
+    }
+    let attempts = attempts.max(1);
+    for attempt in 1..=attempts {
+        if let Some(addr) = read_if_inet6()
+            .as_deref()
+            .and_then(container_ipv6_from_if_inet6)
+        {
+            let address = format!("[{addr}]:{PATRONI_RESTAPI_PORT}");
+            info!(
+                address = %address,
+                attempt,
+                "restapi.connect_address: publishing the container's own IPv6"
+            );
+            return (address, RestapiAddressSource::ContainerInterface);
+        }
+        if attempt < attempts {
+            std::thread::sleep(retry_delay);
         }
     }
+    let address = format!("{private_domain}:{PATRONI_RESTAPI_PORT}");
+    warn!(
+        address = %address,
+        attempts,
+        "no usable Railway container IPv6 in /proc/net/if_inet6; restapi.connect_address is the private domain, which other members resolve through Patroni's 600 s cache (switchover to this node can answer 412 for up to ten minutes after it redeploys)"
+    );
+    (address, RestapiAddressSource::PrivateDomain)
+}
+
+/// Resolved once per process: the interface read may wait a few seconds and
+/// `Config::from_env` runs more than once at boot.
+fn restapi_connect_address_for_process(private_domain: &str) -> (String, RestapiAddressSource) {
+    static RESOLVED: OnceLock<(String, RestapiAddressSource)> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            resolve_restapi_connect_address(
+                env::var("PATRONI_RESTAPI_CONNECT_ADDRESS").ok().as_deref(),
+                || std::fs::read_to_string(IF_INET6_PATH).ok(),
+                IF_INET6_READ_ATTEMPTS,
+                IF_INET6_RETRY_DELAY,
+                private_domain,
+            )
+        })
+        .clone()
 }
 
 impl Config {
@@ -485,16 +566,11 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let name = String::env_required("PATRONI_NAME")?;
         let connect_address = String::env_required("RAILWAY_PRIVATE_DOMAIN")?;
-        let restapi_connect_address = resolve_restapi_connect_address(
-            env::var("PATRONI_RESTAPI_CONNECT_HOST").ok(),
-            std::fs::read_to_string(IF_INET6_PATH).ok().as_deref(),
-            &connect_address,
-        );
+        let (restapi_connect_address, restapi_address_source) =
+            restapi_connect_address_for_process(&connect_address);
         let etcd_hosts = String::env_required("PATRONI_ETCD3_HOSTS")?;
 
-        let wal_archive_bucket = env::var("WAL_ARCHIVE_BUCKET")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let wal_archive_bucket = env::var("WAL_ARCHIVE_BUCKET").ok().filter(|s| !s.is_empty());
         let (volume_total_mib, volume_free_mib) = volume_total_and_free_mib(&crate::volume_root());
         // The runtime neutralizer also removes any stronger value left in
         // postgresql.auto.conf by an earlier ALTER SYSTEM reconcile.
@@ -511,6 +587,7 @@ impl Config {
             name,
             connect_address,
             restapi_connect_address,
+            restapi_address_source,
             etcd_hosts,
             superuser: String::env_or("PATRONI_SUPERUSER_USERNAME", "postgres"),
             superuser_pass: env::var("PATRONI_SUPERUSER_PASSWORD").unwrap_or_default(),
@@ -563,9 +640,11 @@ impl Config {
 mod tests {
     use super::{
         container_ipv6_from_if_inet6, resolve_basebackup_max_rate, resolve_max_slot_wal_keep_size,
-        resolve_restapi_connect_address, resolve_startup_slot_keep_size, SLOT_KEEP_FLOOR_MIB,
-        SLOT_KEEP_TOTAL_PCT,
+        resolve_restapi_connect_address, resolve_startup_slot_keep_size, RestapiAddressSource,
+        SLOT_KEEP_FLOOR_MIB, SLOT_KEEP_TOTAL_PCT,
     };
+    use std::net::Ipv6Addr;
+    use std::time::Duration;
 
     /// Verbatim `/proc/net/if_inet6` of a live cluster member (postgres-3 of
     /// e2e-pg-cli-combo-146981, 2026-09-02): loopback, the link-local address
@@ -575,12 +654,18 @@ mod tests {
 fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
 fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
 ";
+    const LIVE_ADDR: &str = "fd12:8fe4:c66b:1:3000:a0:5d7b:156b";
+    const DOMAIN: &str = "postgres-3.railway.internal";
+
+    fn live_addr() -> Ipv6Addr {
+        LIVE_ADDR.parse().unwrap()
+    }
 
     #[test]
-    fn container_ipv6_is_the_global_fd12_address_bracketed_and_compressed() {
+    fn container_ipv6_is_the_global_fd12_address() {
         assert_eq!(
-            container_ipv6_from_if_inet6(LIVE_IF_INET6).as_deref(),
-            Some("[fd12:8fe4:c66b:1:3000:a0:5d7b:156b]")
+            container_ipv6_from_if_inet6(LIVE_IF_INET6),
+            Some(live_addr())
         );
     }
 
@@ -601,31 +686,134 @@ fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
     }
 
     #[test]
-    fn restapi_connect_address_prefers_override_then_interface_then_domain() {
-        let domain = "postgres-3.railway.internal";
+    fn container_ipv6_skips_tentative_deprecated_and_dad_failed_addresses() {
+        // flags c0 = permanent + tentative (DAD still running on a fresh
+        // interface), a0 = permanent + deprecated, 88 = permanent + DAD failed.
+        for flags in ["c0", "a0", "88"] {
+            let table = format!("fd128fe4c66b0001300000a05d7b156b 03 40 00 {flags} railnet0\n");
+            assert_eq!(
+                container_ipv6_from_if_inet6(&table),
+                None,
+                "flags {flags} must not be published"
+            );
+        }
+        // An unusable address listed first does not shadow the usable one.
+        let two = "\
+fd128fe4c66b0001300000a05d7b0000 03 40 00 a0 railnet0
+fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
+";
+        assert_eq!(container_ipv6_from_if_inet6(two), Some(live_addr()));
+    }
+
+    #[test]
+    fn restapi_connect_address_prefers_patroni_env_then_interface_then_domain() {
+        let live = || Some(LIVE_IF_INET6.to_string());
+        let literal = format!("[{LIVE_ADDR}]:8008");
+        // Patroni's own variable wins and is mirrored verbatim (trimmed): the
+        // interface is not even read.
+        let mut reads = 0;
         assert_eq!(
             resolve_restapi_connect_address(
-                Some(" pinned.example ".into()),
-                Some(LIVE_IF_INET6),
-                domain
+                Some(" pinned.example:8008 "),
+                || {
+                    reads += 1;
+                    live()
+                },
+                3,
+                Duration::ZERO,
+                DOMAIN
             ),
-            "pinned.example"
+            (
+                "pinned.example:8008".to_string(),
+                RestapiAddressSource::PatroniEnv
+            )
         );
-        // An empty override is not an override.
+        assert_eq!(reads, 0);
+        // IPv6 forms Patroni accepts pass through unchanged.
         assert_eq!(
-            resolve_restapi_connect_address(Some("  ".into()), Some(LIVE_IF_INET6), domain),
-            "[fd12:8fe4:c66b:1:3000:a0:5d7b:156b]"
+            resolve_restapi_connect_address(
+                Some("[fd12::1]:8008"),
+                live,
+                3,
+                Duration::ZERO,
+                DOMAIN
+            )
+            .0,
+            "[fd12::1]:8008"
+        );
+        // An empty variable is not set; a value the YAML cannot carry is not
+        // mirrored, and the interface decides instead.
+        for env in [Some("  "), Some("bad\"value:8008"), None] {
+            assert_eq!(
+                resolve_restapi_connect_address(env, live, 3, Duration::ZERO, DOMAIN),
+                (literal.clone(), RestapiAddressSource::ContainerInterface),
+                "env {env:?}"
+            );
+        }
+        // Unreadable or address-less interface table: the private domain.
+        let domain = (
+            format!("{DOMAIN}:8008"),
+            RestapiAddressSource::PrivateDomain,
         );
         assert_eq!(
-            resolve_restapi_connect_address(None, Some(LIVE_IF_INET6), domain),
-            "[fd12:8fe4:c66b:1:3000:a0:5d7b:156b]"
-        );
-        // Unreadable or address-less interface table: keep today's behaviour.
-        assert_eq!(resolve_restapi_connect_address(None, None, domain), domain);
-        assert_eq!(
-            resolve_restapi_connect_address(None, Some("garbage"), domain),
+            resolve_restapi_connect_address(None, || None, 3, Duration::ZERO, DOMAIN),
             domain
         );
+        assert_eq!(
+            resolve_restapi_connect_address(
+                None,
+                || Some("garbage".to_string()),
+                3,
+                Duration::ZERO,
+                DOMAIN
+            ),
+            domain
+        );
+    }
+
+    #[test]
+    fn restapi_connect_address_waits_for_the_interface_address() {
+        // The address shows up on the third read: published, and the reads
+        // stop there.
+        let mut reads = 0;
+        let (address, source) = resolve_restapi_connect_address(
+            None,
+            || {
+                reads += 1;
+                (reads >= 3).then(|| LIVE_IF_INET6.to_string())
+            },
+            5,
+            Duration::ZERO,
+            DOMAIN,
+        );
+        assert_eq!(
+            (address, source),
+            (
+                format!("[{LIVE_ADDR}]:8008"),
+                RestapiAddressSource::ContainerInterface
+            )
+        );
+        assert_eq!(reads, 3);
+        // Never shows up: every attempt is spent before falling back.
+        let mut reads = 0;
+        let (address, source) = resolve_restapi_connect_address(
+            None,
+            || {
+                reads += 1;
+                None
+            },
+            4,
+            Duration::ZERO,
+            DOMAIN,
+        );
+        assert_eq!(
+            (address, source),
+            (
+                format!("{DOMAIN}:8008"),
+                RestapiAddressSource::PrivateDomain
+            )
+        );
+        assert_eq!(reads, 4);
     }
 
     /// The rampmetrics-api geometry that PANICked on 2026-07-10: a 2 TB volume
@@ -654,10 +842,7 @@ fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
             true,
         ));
         assert_eq!(cap, TWO_TB_FREE_MIB / 2);
-        assert!(
-            cap < TWO_TB_MIB / 4,
-            "free bound must beat the total bound here"
-        );
+        assert!(cap < TWO_TB_MIB / 4, "free bound must beat the total bound here");
     }
 
     #[test]
@@ -672,10 +857,7 @@ fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
             true,
         ));
         let cap_gb = cap * 1024 * 1024 / 1_000_000_000;
-        assert!(
-            cap_gb < 900,
-            "cap {cap_gb} GB must trip before the ~900 GB that filled the disk"
-        );
+        assert!(cap_gb < 900, "cap {cap_gb} GB must trip before the ~900 GB that filled the disk");
         assert!(
             1226 + cap_gb < 2000,
             "used + capped WAL ({} GB) must fit the 2 TB volume",
@@ -712,9 +894,7 @@ fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
         // the whole volume. The free bound alone would hand out 50% of a 2 TB
         // disk; the total bound holds it to 25% so the data can grow into the
         // rest.
-        let cap = cap_mib(&resolve_max_slot_wal_keep_size(
-            None, TWO_TB_MIB, TWO_TB_MIB, true,
-        ));
+        let cap = cap_mib(&resolve_max_slot_wal_keep_size(None, TWO_TB_MIB, TWO_TB_MIB, true));
         assert_eq!(cap, TWO_TB_MIB / 4);
     }
 
@@ -783,12 +963,7 @@ fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
         );
         // kB is fine at ≥1 MB (PG's base unit for this GUC).
         assert_eq!(
-            resolve_max_slot_wal_keep_size(
-                Some("1024kB".into()),
-                TWO_TB_MIB,
-                TWO_TB_FREE_MIB,
-                true
-            ),
+            resolve_max_slot_wal_keep_size(Some("1024kB".into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
             "1024kB"
         );
     }
@@ -797,7 +972,13 @@ fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
     fn slot_recovery_kill_switch_wins_over_operator_pin_and_derived_cap() {
         for env_value in [None, Some("512GB".to_string()), Some("-1".to_string())] {
             assert_eq!(
-                resolve_startup_slot_keep_size(true, env_value, TWO_TB_MIB, TWO_TB_FREE_MIB, true,),
+                resolve_startup_slot_keep_size(
+                    true,
+                    env_value,
+                    TWO_TB_MIB,
+                    TWO_TB_FREE_MIB,
+                    true,
+                ),
                 "-1"
             );
         }
@@ -808,16 +989,9 @@ fe80000000000000a0aa5dfffe7b156b 03 40 20 80 railnet0
         // "512kB" and "1000kB" would round to 0 in PG's MB base unit — the
         // "retain no WAL for slots" mode the validator exists to keep out;
         // "1024kB" (exactly 1 MB) stays acceptable.
-        for junk in [
-            "0", "abc", "-5", "12MiB", "", "512kB", "1000kB", "0MB", "0GB",
-        ] {
+        for junk in ["0", "abc", "-5", "12MiB", "", "512kB", "1000kB", "0MB", "0GB"] {
             assert_eq!(
-                resolve_max_slot_wal_keep_size(
-                    Some(junk.into()),
-                    TWO_TB_MIB,
-                    TWO_TB_FREE_MIB,
-                    true
-                ),
+                resolve_max_slot_wal_keep_size(Some(junk.into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
                 format!("{}MB", TWO_TB_FREE_MIB / 2),
                 "junk override {junk:?} must fall back to the derived cap"
             );

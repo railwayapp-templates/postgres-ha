@@ -6,14 +6,14 @@
 
 use anyhow::{anyhow, Context, Result};
 use common::{init_logging, ConfigExt, RailwayEnv, Telemetry, TelemetryEvent};
-use nix::sys::signal::{SigHandler, Signal};
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::Pid;
 use postgres_patroni::{
     cert_expires_within, ensure_pg_stat_statements, is_patroni_enabled, is_valid_x509v3_cert,
     major_upgrade, pgdata, ssl_dir, sudo_command, volume_lock, volume_root,
     EXPECTED_VOLUME_MOUNT_PATH,
 };
+use nix::sys::signal::{SigHandler, Signal};
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::Pid;
 use std::env;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -149,16 +149,16 @@ async fn main() -> Result<()> {
     // holding the volume right now refuses BOTH modes with the same message.
     let _upgrade_volume_lock =
         match major_upgrade::take_volume_upgrade_lock(&volume_root(), &pgdata) {
-            Ok(lock) => lock,
-            Err(reason) => {
-                error!("{reason}");
-                telemetry.send(TelemetryEvent::MajorUpgradeBootRefused {
-                    node: String::env_or("PATRONI_NAME", "unknown"),
-                    reason,
-                });
-                std::process::exit(1);
-            }
-        };
+        Ok(lock) => lock,
+        Err(reason) => {
+            error!("{reason}");
+            telemetry.send(TelemetryEvent::MajorUpgradeBootRefused {
+                node: String::env_or("PATRONI_NAME", "unknown"),
+                reason,
+            });
+            std::process::exit(1);
+        }
+    };
 
     // Major-upgrade boot guard, before the mode fork so BOTH modes are
     // covered. Patroni mode re-checks in patroni-runner, but the standalone
@@ -424,7 +424,9 @@ async fn main() -> Result<()> {
         let child_pid = Pid::from_raw(child.id() as i32);
         loop {
             match waitpid(Pid::from_raw(-1), None) {
-                Ok(WaitStatus::Exited(pid, code)) if pid == child_pid => std::process::exit(code),
+                Ok(WaitStatus::Exited(pid, code)) if pid == child_pid => {
+                    std::process::exit(code)
+                }
                 Ok(WaitStatus::Signaled(pid, sig, _)) if pid == child_pid => {
                     std::process::exit(128 + sig as i32)
                 }

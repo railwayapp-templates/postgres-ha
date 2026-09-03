@@ -32,10 +32,7 @@ async fn primary_handler(State(config): State<HealthServerConfig>) -> impl IntoR
     match tokio::time::timeout(budget, primary_check(&config)).await {
         Ok(result) => result,
         Err(_) => {
-            debug!(
-                timeout_ms = config.check_timeout_ms,
-                "Primary check: TIMEOUT (exceeded check budget)"
-            );
+            debug!(timeout_ms = config.check_timeout_ms, "Primary check: TIMEOUT (exceeded check budget)");
             (StatusCode::SERVICE_UNAVAILABLE, "timeout")
         }
     }
@@ -83,10 +80,7 @@ async fn replica_handler(State(config): State<HealthServerConfig>) -> impl IntoR
     match tokio::time::timeout(budget, replica_check(&config)).await {
         Ok(result) => result,
         Err(_) => {
-            debug!(
-                timeout_ms = config.check_timeout_ms,
-                "Replica check: TIMEOUT (exceeded check budget)"
-            );
+            debug!(timeout_ms = config.check_timeout_ms, "Replica check: TIMEOUT (exceeded check budget)");
             (StatusCode::SERVICE_UNAVAILABLE, "timeout")
         }
     }
@@ -131,10 +125,7 @@ async fn health_handler(State(config): State<HealthServerConfig>) -> impl IntoRe
     match tokio::time::timeout(budget, health_check(&config)).await {
         Ok(result) => result,
         Err(_) => {
-            debug!(
-                timeout_ms = config.check_timeout_ms,
-                "Health check: TIMEOUT (exceeded check budget)"
-            );
+            debug!(timeout_ms = config.check_timeout_ms, "Health check: TIMEOUT (exceeded check budget)");
             (StatusCode::SERVICE_UNAVAILABLE, "timeout")
         }
     }

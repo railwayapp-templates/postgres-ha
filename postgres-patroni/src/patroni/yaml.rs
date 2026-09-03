@@ -141,7 +141,7 @@ name: {name}
 
 restapi:
   listen: ":::8008"
-  connect_address: "{restapi_connect_address}:8008"
+  connect_address: "{restapi_connect_address}"
 
 etcd3:
   hosts: {etcd_hosts}
@@ -291,13 +291,15 @@ host replication {} ::/0 scram-sha-256
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patroni::RestapiAddressSource;
 
     fn test_config(wal_archive_bucket: Option<&str>) -> Config {
         Config {
             scope: "test-scope".into(),
             name: "test-node".into(),
             connect_address: "test-node".into(),
-            restapi_connect_address: "[fd12:8fe4:c66b:1:3000:43:ed49:ddbf]".into(),
+            restapi_connect_address: "[fd12:8fe4:c66b:1:3000:43:ed49:ddbf]:8008".into(),
+            restapi_address_source: RestapiAddressSource::ContainerInterface,
             etcd_hosts: "etcd-1:2379".into(),
             superuser: "postgres".into(),
             superuser_pass: "pw".into(),
@@ -329,10 +331,7 @@ mod tests {
         }
     }
 
-    fn test_config_with_timeout(
-        wal_archive_bucket: Option<&str>,
-        archive_timeout_secs: i64,
-    ) -> Config {
+    fn test_config_with_timeout(wal_archive_bucket: Option<&str>, archive_timeout_secs: i64) -> Config {
         Config {
             archive_timeout_secs,
             ..test_config(wal_archive_bucket)
@@ -342,8 +341,8 @@ mod tests {
     #[test]
     fn restapi_advertises_the_container_ipv6_while_postgresql_keeps_the_domain() {
         let yaml = generate_patroni_config(&test_config(None), "replica");
-        // The api_url other members dial for switchover/failover checks must be
-        // the address literal (nothing for Patroni's 600 s resolver cache to go
+        // The api_url other members dial for switchover/failover checks is the
+        // address literal (nothing for Patroni's 600 s resolver cache to go
         // stale on) ...
         assert!(
             yaml.contains("restapi:\n  listen: \":::8008\"\n  connect_address: \"[fd12:8fe4:c66b:1:3000:43:ed49:ddbf]:8008\"\n"),
@@ -377,12 +376,8 @@ mod tests {
         // both occurrences (bootstrap DCS + local params) must stay
         // byte-identical to each other regardless of the timeout value.
         for timeout in [60, 120, 5] {
-            let yaml = generate_patroni_config(
-                &test_config_with_timeout(Some("bucket"), timeout),
-                "replica",
-            );
-            let expected =
-                "restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n";
+            let yaml = generate_patroni_config(&test_config_with_timeout(Some("bucket"), timeout), "replica");
+            let expected = "restore_command: \"/usr/local/bin/pgbackrest-archive-get-wrapper.sh %f %p\"\n";
             let occurrences = yaml.matches(expected).count();
             assert_eq!(
                 occurrences, 2,
@@ -410,9 +405,7 @@ mod tests {
         // It must sit under the local `postgresql:` section, after the ssl
         // params — not inside bootstrap.dcs.
         let yaml = generate_patroni_config(&test_config(None), "replica");
-        let bootstrap_end = yaml
-            .find("postgresql:\n  listen:")
-            .expect("local postgresql section");
+        let bootstrap_end = yaml.find("postgresql:\n  listen:").expect("local postgresql section");
         let cap_at = yaml.find("max_slot_wal_keep_size:").expect("cap rendered");
         assert!(
             cap_at > bootstrap_end,
@@ -457,9 +450,9 @@ mod tests {
     #[test]
     fn replica_method_block_renders_between_data_dir_and_basebackup_options() {
         let yaml = generate_patroni_config(&test_config(Some("bucket")), "replica");
-        assert!(
-            yaml.contains("  data_dir: /var/lib/postgresql/data/pgdata\n  create_replica_methods:")
-        );
+        assert!(yaml.contains(
+            "  data_dir: /var/lib/postgresql/data/pgdata\n  create_replica_methods:"
+        ));
         assert!(yaml.contains("    no_params: true\n  basebackup:"));
     }
 

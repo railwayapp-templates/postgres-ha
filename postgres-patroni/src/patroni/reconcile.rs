@@ -377,9 +377,7 @@ async fn alter_system_clear_restore_command() {
             stderr = %String::from_utf8_lossy(&o.stderr),
             "reconcile: pg_reload_conf after clearing restore_command failed"
         ),
-        Err(e) => {
-            warn!(error = %e, "reconcile: failed to spawn psql reloading config after clearing restore_command")
-        }
+        Err(e) => warn!(error = %e, "reconcile: failed to spawn psql reloading config after clearing restore_command"),
     }
 }
 
@@ -745,7 +743,9 @@ async fn verify_and_heal_live_archive_config(
         );
         mark_archive_gucs_forced(&config.data_dir).await?;
         force_live_archive_gucs(&config.superuser, expected_archive_timeout).await?;
-        info!("live archive_command/archive_timeout corrected via ALTER SYSTEM + pg_reload_conf()");
+        info!(
+            "live archive_command/archive_timeout corrected via ALTER SYSTEM + pg_reload_conf()"
+        );
         telemetry.send(TelemetryEvent::ArchiveConfigForced {
             node: config.name.clone(),
             live_archive_command: live.archive_command,
@@ -995,7 +995,8 @@ pub async fn reconcile_pgbackrest_archive_config(
         // `.pitr_configured` is stamped by the restore gate on the boot
         // after a staged replay completes (patroni_runner.rs owns the
         // marker lifecycle).
-        let replay_done = Path::new(&format!("{}/.pitr_configured", config.data_dir)).exists();
+        let replay_done =
+            Path::new(&format!("{}/.pitr_configured", config.data_dir)).exists();
         if pitr_replay_pending(config.wal_recover_from_bucket.is_some(), replay_done) {
             info!(
                 "reconcile: staged PITR replay still pending — skipping the restore_command clear; the staged value is the replay's WAL source and Patroni sanitizes it at promote"
@@ -1078,10 +1079,7 @@ mod tests {
         };
         let patch = compute_archive_reconcile_patch(true, 60, &current)
             .expect("partial drift must still produce a patch");
-        assert_eq!(
-            patch["postgresql"]["parameters"]["track_commit_timestamp"],
-            "on"
-        );
+        assert_eq!(patch["postgresql"]["parameters"]["track_commit_timestamp"], "on");
     }
 
     #[test]
@@ -1166,14 +1164,8 @@ mod tests {
         // Patroni never reconciles recovery params on a primary, so a stale
         // value there is ours to clear; the same value on a standby is
         // Patroni's to rewrite from the now-clean DCS — we only wait.
-        assert_eq!(
-            next_clear_step(Some(STALE_GUC), true),
-            ClearStep::ClearOnPrimary
-        );
-        assert_eq!(
-            next_clear_step(Some(STALE_GUC), false),
-            ClearStep::AwaitPatroni
-        );
+        assert_eq!(next_clear_step(Some(STALE_GUC), true), ClearStep::ClearOnPrimary);
+        assert_eq!(next_clear_step(Some(STALE_GUC), false), ClearStep::AwaitPatroni);
     }
 
     #[test]
@@ -1372,7 +1364,8 @@ mod tests {
     async fn poll_match_mid_window_wins_over_earlier_mismatches() {
         // Patroni applies the config partway through the observation
         // window (the ordinary just-patched-DCS case): Applied, no force.
-        let mut outcomes: Vec<Result<LiveArchiveGucs>> = (0..3).map(|_| Ok(gucs("", 60))).collect();
+        let mut outcomes: Vec<Result<LiveArchiveGucs>> =
+            (0..3).map(|_| Ok(gucs("", 60))).collect();
         outcomes.push(Ok(gucs(EXPECTED_ARCHIVE_COMMAND, 60)));
         let verdict = poll_live_archive_gucs(scripted(outcomes), 60, Duration::ZERO)
             .await
