@@ -122,10 +122,8 @@ mod tests {
 
     #[test]
     fn skips_every_malformed_entry_but_keeps_going_if_any_are_valid() {
-        let nodes = parse_nodes(
-            "bad::8008,also-bad:x:8008,postgres-3.railway.internal:5432:8008",
-        )
-        .unwrap();
+        let nodes =
+            parse_nodes("bad::8008,also-bad:x:8008,postgres-3.railway.internal:5432:8008").unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].name, "postgres-3");
     }

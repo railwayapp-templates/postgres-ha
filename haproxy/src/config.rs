@@ -44,9 +44,10 @@ impl Config {
                 // issues" — a typo'd value silently dropping it would point
                 // every health check at the Patroni port the override was
                 // created to avoid. Fail loud on a malformed value instead.
-                Ok(raw) => Some(raw.parse::<u16>().context(format!(
-                    "HAPROXY_HEALTH_PORT={raw} is not a valid port"
-                ))?),
+                Ok(raw) => Some(
+                    raw.parse::<u16>()
+                        .context(format!("HAPROXY_HEALTH_PORT={raw} is not a valid port"))?,
+                ),
                 Err(_) => None,
             },
         })

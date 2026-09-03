@@ -74,7 +74,13 @@ pub async fn get_voting_member_endpoint(initial_cluster: &str) -> Result<Option<
 
     for (_name, peer_url) in cluster.iter() {
         let client_endpoint = peer_to_client_url(peer_url);
-        if etcdctl_probe(&["member", "list", &format!("--endpoints={}", client_endpoint)]).await? {
+        if etcdctl_probe(&[
+            "member",
+            "list",
+            &format!("--endpoints={}", client_endpoint),
+        ])
+        .await?
+        {
             return Ok(Some(client_endpoint));
         }
     }
@@ -197,7 +203,8 @@ pub async fn add_self_to_cluster(
 
             if !has_data {
                 warn!("Registered as member but no local data - removing stale entry");
-                remove_stale_self(leader_endpoint, &config.etcd_name, &my_peer_url, telemetry).await?;
+                remove_stale_self(leader_endpoint, &config.etcd_name, &my_peer_url, telemetry)
+                    .await?;
 
                 // Clean partial data
                 match clear_directory(Path::new(&config.data_dir)).await {
@@ -338,7 +345,10 @@ pub async fn has_local_data(data_dir: &str) -> Result<bool> {
     match entries.next_entry().await {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("Failed to read WAL directory entries: {}", e)),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to read WAL directory entries: {}",
+            e
+        )),
     }
 }
 
@@ -378,7 +388,12 @@ pub async fn start_etcd(
     // shadowed by corresponding command-line flag") and refuses to start. A user
     // tuning a documented setting like ETCD_AUTO_COMPACTION_RETENTION would
     // otherwise crash the node, so let the env var win and skip our default.
-    apply_default_flag(&mut cmd, "--auto-compaction-retention", "ETCD_AUTO_COMPACTION_RETENTION", "1");
+    apply_default_flag(
+        &mut cmd,
+        "--auto-compaction-retention",
+        "ETCD_AUTO_COMPACTION_RETENTION",
+        "1",
+    );
     apply_default_flag(&mut cmd, "--snapshot-count", "ETCD_SNAPSHOT_COUNT", "1000");
     apply_default_flag(&mut cmd, "--max-learners", "ETCD_MAX_LEARNERS", "2");
 

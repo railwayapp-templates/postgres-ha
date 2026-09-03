@@ -293,9 +293,11 @@ pub const LEGACY_LOCK_FILENAME: &str = ".railway-major-upgrade.lock";
 
 /// One-time note written into an otherwise-empty lock file: bare lock files
 /// keep getting read as event markers during forensics on a dead volume.
-const LOCK_FILE_NOTE: &str = "Advisory flock rendezvous between the Postgres container and Railway maintenance \
+const LOCK_FILE_NOTE: &str =
+    "Advisory flock rendezvous between the Postgres container and Railway maintenance \
 jobs.\nCreated on every boot; its presence is not a record of any upgrade or other event.\n";
-const LEGACY_LOCK_FILE_NOTE: &str = "Legacy name of .railway-volume.lock (see that file). Older image builds create \
+const LEGACY_LOCK_FILE_NOTE: &str =
+    "Legacy name of .railway-volume.lock (see that file). Older image builds create \
 this\nfile on EVERY boot; its presence is not evidence that a major version upgrade ran.\n";
 
 pub fn lock_path(volume_root: &str) -> String {
@@ -303,7 +305,11 @@ pub fn lock_path(volume_root: &str) -> String {
 }
 
 pub fn legacy_lock_path(volume_root: &str) -> String {
-    format!("{}/{}", volume_root.trim_end_matches('/'), LEGACY_LOCK_FILENAME)
+    format!(
+        "{}/{}",
+        volume_root.trim_end_matches('/'),
+        LEGACY_LOCK_FILENAME
+    )
 }
 
 /// Write `note` into the file at `path` if it is currently empty. Best-effort
@@ -366,8 +372,7 @@ pub fn take_volume_upgrade_lock(
     volume_root: &str,
     pgdata: &str,
 ) -> Result<Vec<Flock<File>>, String> {
-    let pgdata_is_volume_root =
-        pgdata.trim_end_matches('/') == volume_root.trim_end_matches('/');
+    let pgdata_is_volume_root = pgdata.trim_end_matches('/') == volume_root.trim_end_matches('/');
     if pgdata_is_volume_root {
         let pg_version = format!("{}/PG_VERSION", pgdata.trim_end_matches('/'));
         if !std::path::Path::new(&pg_version).exists() {
@@ -685,7 +690,10 @@ mod tests {
         let _job_lock = Flock::lock(job_file, FlockArg::LockExclusiveNonblock).unwrap();
 
         let result = take_volume_upgrade_lock(root, &format!("{root}/pgdata"));
-        assert!(result.is_err(), "expected the shared lock attempt to refuse");
+        assert!(
+            result.is_err(),
+            "expected the shared lock attempt to refuse"
+        );
         assert!(result.unwrap_err().contains("held by another process"));
     }
 
@@ -703,7 +711,10 @@ mod tests {
         let _job_lock = Flock::lock(job_file, FlockArg::LockExclusiveNonblock).unwrap();
 
         let result = take_volume_upgrade_lock(root, &format!("{root}/pgdata"));
-        assert!(result.is_err(), "expected the legacy lock attempt to refuse");
+        assert!(
+            result.is_err(),
+            "expected the legacy lock attempt to refuse"
+        );
         assert!(result.unwrap_err().contains("held by another process"));
     }
 
@@ -797,7 +808,9 @@ mod tests {
         fs::write(format!("{root}/PG_VERSION"), "16\n").unwrap();
 
         let locks = take_volume_upgrade_lock(root, root).unwrap();
-        assert!(!locks.is_empty(), "initialized root layout must take the lock");
+        assert!(
+            !locks.is_empty(),
+            "initialized root layout must take the lock"
+        );
     }
 }
-
