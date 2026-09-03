@@ -23,7 +23,11 @@ pub enum TelemetryEvent {
     },
 
     /// Node rejoined cluster as replica
-    PostgresRejoined { node: String, role: String, scope: String },
+    PostgresRejoined {
+        node: String,
+        role: String,
+        scope: String,
+    },
 
     /// Bootstrap process started
     BootstrapStarted { node: String, is_fresh: bool },
@@ -64,7 +68,11 @@ pub enum TelemetryEvent {
     DcsUnavailable { node: String, scope: String },
 
     /// Replica backend unavailable - no healthy replicas for read traffic
-    ReplicaUnavailable { node: String, scope: String, servers: Vec<String> },
+    ReplicaUnavailable {
+        node: String,
+        scope: String,
+        servers: Vec<String>,
+    },
 
     /// Self-heal supervisor issued POST /reinitialize against the local
     /// Patroni REST API and Patroni accepted the call. Replica only; never
@@ -153,7 +161,11 @@ pub enum TelemetryEvent {
     /// the real cause, which is almost always capacity: a replica volume too
     /// small for the primary, or one that has filled up. Carries the volume's
     /// free space so the reader can tell those apart without a shell.
-    IncompleteCloneWipeCapped { node: String, attempts: u32, available_bytes: Option<u64> },
+    IncompleteCloneWipeCapped {
+        node: String,
+        attempts: u32,
+        available_bytes: Option<u64>,
+    },
 
     /// Live `archive_command`/`archive_timeout` on this node diverged from
     /// what DCS says they should be, and the divergence doesn't look like
@@ -241,7 +253,10 @@ pub enum TelemetryEvent {
 
     // === HAProxy Events ===
     /// HAProxy started successfully
-    HaproxyStarted { node_count: usize, single_node_mode: bool },
+    HaproxyStarted {
+        node_count: usize,
+        single_node_mode: bool,
+    },
 
     /// HAProxy config generation starting
     HaproxyConfigGenerating { nodes: Vec<String> },
@@ -273,7 +288,9 @@ impl TelemetryEvent {
             Self::DcsUnavailable { .. } => "POSTGRES_HA_DCS_UNAVAILABLE",
             Self::ReplicaUnavailable { .. } => "POSTGRES_HA_REPLICA_UNAVAILABLE",
             Self::SelfHealReinitTriggered { .. } => "POSTGRES_HA_SELF_HEAL_REINIT_TRIGGERED",
-            Self::SelfHealReinitRequestFailed { .. } => "POSTGRES_HA_SELF_HEAL_REINIT_REQUEST_FAILED",
+            Self::SelfHealReinitRequestFailed { .. } => {
+                "POSTGRES_HA_SELF_HEAL_REINIT_REQUEST_FAILED"
+            }
             Self::SelfHealRecovered { .. } => "POSTGRES_HA_SELF_HEAL_RECOVERED",
             Self::SelfHealGaveUp { .. } => "POSTGRES_HA_SELF_HEAL_GAVE_UP",
             Self::MajorUpgradeBootRefused { .. } => "POSTGRES_HA_MAJOR_UPGRADE_BOOT_REFUSED",
@@ -313,7 +330,9 @@ impl TelemetryEvent {
             Self::BootstrapStarted { node, is_fresh } => {
                 format!("Bootstrap started on {} (fresh={})", node, is_fresh)
             }
-            Self::BootstrapCompleted { node, duration_ms, .. } => {
+            Self::BootstrapCompleted {
+                node, duration_ms, ..
+            } => {
                 format!("Bootstrap completed on {} in {}ms", node, duration_ms)
             }
             Self::BootstrapFailed { node, error, phase } => {
@@ -337,10 +356,7 @@ impl TelemetryEvent {
                 process,
                 exit_code,
             } => {
-                format!(
-                    "{} died on {} (exit {:?})",
-                    process, node, exit_code
-                )
+                format!("{} died on {} (exit {:?})", process, node, exit_code)
             }
             Self::DcsUnavailable { node, scope } => {
                 format!(
@@ -348,7 +364,11 @@ impl TelemetryEvent {
                     node, scope
                 )
             }
-            Self::ReplicaUnavailable { node, scope, servers } => {
+            Self::ReplicaUnavailable {
+                node,
+                scope,
+                servers,
+            } => {
                 if servers.is_empty() {
                     format!(
                         "Replica unavailable - {} reports no healthy replicas in {} (read-only traffic affected)",
@@ -361,32 +381,52 @@ impl TelemetryEvent {
                     )
                 }
             }
-            Self::SelfHealReinitTriggered { node, reason, attempt } => {
+            Self::SelfHealReinitTriggered {
+                node,
+                reason,
+                attempt,
+            } => {
                 format!(
                     "Self-heal: reinitializing {} (reason: {}, attempt {})",
                     node, reason, attempt
                 )
             }
-            Self::SelfHealReinitRequestFailed { node, reason, attempt, error } => {
+            Self::SelfHealReinitRequestFailed {
+                node,
+                reason,
+                attempt,
+                error,
+            } => {
                 format!(
                     "Self-heal: reinitialize request for {} failed (reason: {}, attempt {}, error: {})",
                     node, reason, attempt, error
                 )
             }
-            Self::SelfHealRecovered { node, recovered_in_secs, attempts } => {
+            Self::SelfHealRecovered {
+                node,
+                recovered_in_secs,
+                attempts,
+            } => {
                 format!(
                     "Self-heal: {} recovered after {} attempt(s) in {}s",
                     node, attempts, recovered_in_secs
                 )
             }
-            Self::SelfHealGaveUp { node, attempts, last_reason } => {
+            Self::SelfHealGaveUp {
+                node,
+                attempts,
+                last_reason,
+            } => {
                 format!(
                     "Self-heal: giving up on {} after {} attempts (last: {}); manual intervention required",
                     node, attempts, last_reason
                 )
             }
             Self::MajorUpgradeBootRefused { node, reason } => {
-                format!("Boot refused on {} by the major-upgrade guard: {}", node, reason)
+                format!(
+                    "Boot refused on {} by the major-upgrade guard: {}",
+                    node, reason
+                )
             }
             Self::MajorUpgradeReseedWiped {
                 node,
@@ -419,7 +459,11 @@ impl TelemetryEvent {
                     node, leader
                 )
             }
-            Self::IncompleteCloneWipeCapped { node, attempts, available_bytes } => {
+            Self::IncompleteCloneWipeCapped {
+                node,
+                attempts,
+                available_bytes,
+            } => {
                 let free = match available_bytes {
                     Some(b) => format!("{:.2} GB free", *b as f64 / 1024.0 / 1024.0 / 1024.0),
                     None => "free space unknown".to_string(),
@@ -739,14 +783,20 @@ mod tests {
             classify(200, r#"{"data":{"telemetrySend":true}}"#),
             SendOutcome::Sent
         );
-        assert_eq!(classify(400, "bad request"), SendOutcome::Rejected("http status"));
+        assert_eq!(
+            classify(400, "bad request"),
+            SendOutcome::Rejected("http status")
+        );
     }
 
     /// A body that merely mentions the word must not be read as a rejection.
     #[test]
     fn success_bodies_are_not_misread_as_rejections() {
         assert_eq!(
-            classify(200, r#"{"data":{"telemetrySend":true},"note":"no errors here"}"#),
+            classify(
+                200,
+                r#"{"data":{"telemetrySend":true},"note":"no errors here"}"#
+            ),
             SendOutcome::Sent
         );
     }

@@ -213,7 +213,10 @@ fn resolve_max_slot_wal_keep_size(
 ) -> String {
     const UNLIMITED: &str = "-1";
 
-    if let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(v) = env_value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         if is_valid_slot_keep_size(&v) {
             return v;
         }
@@ -388,7 +391,10 @@ pub(crate) fn volume_total_and_free_mib(path: &str) -> (u64, u64) {
 /// by a typo.
 fn resolve_basebackup_max_rate(env_value: Option<String>) -> String {
     const DEFAULT: &str = "20M";
-    let Some(v) = env_value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+    let Some(v) = env_value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
         return DEFAULT.to_string();
     };
     let kb = v
@@ -570,7 +576,9 @@ impl Config {
             restapi_connect_address_for_process(&connect_address);
         let etcd_hosts = String::env_required("PATRONI_ETCD3_HOSTS")?;
 
-        let wal_archive_bucket = env::var("WAL_ARCHIVE_BUCKET").ok().filter(|s| !s.is_empty());
+        let wal_archive_bucket = env::var("WAL_ARCHIVE_BUCKET")
+            .ok()
+            .filter(|s| !s.is_empty());
         let (volume_total_mib, volume_free_mib) = volume_total_and_free_mib(&crate::volume_root());
         // The runtime neutralizer also removes any stronger value left in
         // postgresql.auto.conf by an earlier ALTER SYSTEM reconcile.
@@ -842,7 +850,10 @@ fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
             true,
         ));
         assert_eq!(cap, TWO_TB_FREE_MIB / 2);
-        assert!(cap < TWO_TB_MIB / 4, "free bound must beat the total bound here");
+        assert!(
+            cap < TWO_TB_MIB / 4,
+            "free bound must beat the total bound here"
+        );
     }
 
     #[test]
@@ -857,7 +868,10 @@ fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
             true,
         ));
         let cap_gb = cap * 1024 * 1024 / 1_000_000_000;
-        assert!(cap_gb < 900, "cap {cap_gb} GB must trip before the ~900 GB that filled the disk");
+        assert!(
+            cap_gb < 900,
+            "cap {cap_gb} GB must trip before the ~900 GB that filled the disk"
+        );
         assert!(
             1226 + cap_gb < 2000,
             "used + capped WAL ({} GB) must fit the 2 TB volume",
@@ -894,7 +908,9 @@ fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
         // the whole volume. The free bound alone would hand out 50% of a 2 TB
         // disk; the total bound holds it to 25% so the data can grow into the
         // rest.
-        let cap = cap_mib(&resolve_max_slot_wal_keep_size(None, TWO_TB_MIB, TWO_TB_MIB, true));
+        let cap = cap_mib(&resolve_max_slot_wal_keep_size(
+            None, TWO_TB_MIB, TWO_TB_MIB, true,
+        ));
         assert_eq!(cap, TWO_TB_MIB / 4);
     }
 
@@ -963,7 +979,12 @@ fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
         );
         // kB is fine at ≥1 MB (PG's base unit for this GUC).
         assert_eq!(
-            resolve_max_slot_wal_keep_size(Some("1024kB".into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
+            resolve_max_slot_wal_keep_size(
+                Some("1024kB".into()),
+                TWO_TB_MIB,
+                TWO_TB_FREE_MIB,
+                true
+            ),
             "1024kB"
         );
     }
@@ -972,13 +993,7 @@ fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
     fn slot_recovery_kill_switch_wins_over_operator_pin_and_derived_cap() {
         for env_value in [None, Some("512GB".to_string()), Some("-1".to_string())] {
             assert_eq!(
-                resolve_startup_slot_keep_size(
-                    true,
-                    env_value,
-                    TWO_TB_MIB,
-                    TWO_TB_FREE_MIB,
-                    true,
-                ),
+                resolve_startup_slot_keep_size(true, env_value, TWO_TB_MIB, TWO_TB_FREE_MIB, true,),
                 "-1"
             );
         }
@@ -989,9 +1004,16 @@ fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
         // "512kB" and "1000kB" would round to 0 in PG's MB base unit — the
         // "retain no WAL for slots" mode the validator exists to keep out;
         // "1024kB" (exactly 1 MB) stays acceptable.
-        for junk in ["0", "abc", "-5", "12MiB", "", "512kB", "1000kB", "0MB", "0GB"] {
+        for junk in [
+            "0", "abc", "-5", "12MiB", "", "512kB", "1000kB", "0MB", "0GB",
+        ] {
             assert_eq!(
-                resolve_max_slot_wal_keep_size(Some(junk.into()), TWO_TB_MIB, TWO_TB_FREE_MIB, true),
+                resolve_max_slot_wal_keep_size(
+                    Some(junk.into()),
+                    TWO_TB_MIB,
+                    TWO_TB_FREE_MIB,
+                    true
+                ),
                 format!("{}MB", TWO_TB_FREE_MIB / 2),
                 "junk override {junk:?} must fall back to the derived cap"
             );
