@@ -187,14 +187,29 @@ new_volume() {
 }
 
 # Build the etcd image once per harness invocation — same workspace as
-# postgres-patroni so we reuse cargo cache.
+# postgres-patroni so we reuse cargo cache. Same always-rebuild policy (and
+# E2E_SKIP_BUILD escape hatch) as ensure_image: a stale local image would
+# silently test yesterday's etcd supervisor.
 ETCD_IMAGE="postgres-ha-etcd-test:latest"
 ensure_etcd_image() {
-  if docker image inspect "$ETCD_IMAGE" >/dev/null 2>&1; then
+  if [ "${E2E_SKIP_BUILD:-0}" = "1" ] && docker image inspect "$ETCD_IMAGE" >/dev/null 2>&1; then
+    log "image $ETCD_IMAGE reused (E2E_SKIP_BUILD=1)"
     return
   fi
   log "building $ETCD_IMAGE from $REPO_ROOT/etcd/Dockerfile"
   docker build -q -f "$REPO_ROOT/etcd/Dockerfile" -t "$ETCD_IMAGE" "$REPO_ROOT" >/dev/null
+}
+
+# Build the haproxy image on demand (only the clean-stop test needs it, so it
+# is not part of the harness preamble). Same policy as ensure_etcd_image.
+HAPROXY_IMAGE="postgres-ha-haproxy-test:latest"
+ensure_haproxy_image() {
+  if [ "${E2E_SKIP_BUILD:-0}" = "1" ] && docker image inspect "$HAPROXY_IMAGE" >/dev/null 2>&1; then
+    log "image $HAPROXY_IMAGE reused (E2E_SKIP_BUILD=1)"
+    return
+  fi
+  log "building $HAPROXY_IMAGE from $REPO_ROOT/haproxy/Dockerfile"
+  docker build -q -f "$REPO_ROOT/haproxy/Dockerfile" -t "$HAPROXY_IMAGE" "$REPO_ROOT" >/dev/null
 }
 
 # Build this repo's HA image for an arbitrary major. The choreography test
@@ -5390,6 +5405,200 @@ t_etcd_removed_member_wipe_rejoin() {
   for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1; done
 }
 
+# ----- clean-stop contract ---------------------------------------------------
+# A container runtime stops a container by sending the image's STOPSIGNAL to
+# PID 1 and SIGKILLing everything once the grace period expires (10s on the
+# platform's plain stop, 15s on its restart). Every image in this repo puts a
+# Rust supervisor at PID 1; these tests pin that the signal reaches the real
+# process and the container exits on its own — cleanly, well inside that
+# grace. The failure shape they exist to catch: a PID 1 that drops the signal
+# reads as a full-grace stall ending in exit 137, on every redeploy.
+
+# stop_container_timed <name> — `docker stop -t 15` the container; echoes
+# "<elapsed_seconds> <exit_code>".
+stop_container_timed() {
+  local c="$1" start
+  start=$(date +%s)
+  docker stop -t 15 "$c" >/dev/null
+  echo "$(( $(date +%s) - start )) $(docker inspect -f '{{.State.ExitCode}}' "$c")"
+}
+
+# Stopping one etcd member: the supervisor forwards SIGTERM, etcd runs its own
+# graceful stop, the container exits 0 quickly, and the survivors keep quorum.
+t_etcd_stop_is_clean() {
+  local t="t_etcd_stop_is_clean"
+  local prefix="stp"
+  local n1="${prefix}-etcd-1" n2="${prefix}-etcd-2" n3="${prefix}-etcd-3"
+  local hosts
+  hosts=$(setup_etcd_cluster "$prefix")
+  log "etcd cluster up ($hosts)"
+
+  local members
+  members=$(docker exec "$n1" etcdctl member list 2>/dev/null)
+  if [ "$(echo "$members" | grep -c 'started')" != "3" ]; then
+    ko "$t" "etcd cluster never reached 3 started members"
+    fail_dump "$t" "$n1" "$n2" "$n3"
+    return
+  fi
+  docker exec "$n1" etcdctl put stp-canary survives >/dev/null 2>&1
+
+  local elapsed code
+  read -r elapsed code < <(stop_container_timed "$n3")
+  if [ "$elapsed" -ge 10 ] || [ "$code" != "0" ]; then
+    ko "$t" "stop took ${elapsed}s and exited ${code} (want <10s and exit 0; a dropped signal shows as the full grace + SIGKILL/137)"
+    fail_dump "$t" "$n3"
+    return
+  fi
+  if ! logs_contain "$n3" "forwarding SIGTERM to etcd" \
+    || ! logs_contain "$n3" "etcd stopped on request"; then
+    ko "$t" "supervisor did not log the forwarded stop"
+    fail_dump "$t" "$n3"
+    return
+  fi
+  # etcd's own shutdown, not just the supervisor's account of it (logs_match:
+  # the alternation needs -E, and logs_contain is a fixed-string grep).
+  if ! logs_match "$n3" "received signal; shutting down|closed etcd server"; then
+    ko "$t" "etcd did not log its graceful shutdown"
+    fail_dump "$t" "$n3"
+    return
+  fi
+  # The two survivors still hold quorum and serve the keyspace.
+  local canary
+  canary=$(docker exec "$n1" etcdctl get stp-canary --print-value-only \
+    --endpoints="http://${n2}:2379" 2>/dev/null)
+  if ! assert_eq "$canary" "survives" "keyspace served by the survivors"; then
+    ko "$t" "survivors lost quorum or the key"
+    fail_dump "$t" "$n1" "$n2"
+    return
+  fi
+
+  ok "$t"
+  note "stopped $n3 in ${elapsed}s, exit $code; etcd logged its own shutdown; survivors serve"
+
+  for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1; done
+}
+
+# Stopping the edge: the supervisor relays the STOPSIGNAL (SIGUSR1 = haproxy's
+# soft stop, bounded by `hard-stop-after`), haproxy exits, the container exits
+# 0 quickly. A backend that does not exist is fine — only the stop path is
+# under test.
+t_haproxy_stop_is_clean() {
+  local t="t_haproxy_stop_is_clean"
+  local c="stp-haproxy"
+  ensure_haproxy_image
+  docker rm -f "$c" >/dev/null 2>&1 || true
+  docker run -d --name "$c" --label "$HA_LABEL" --network "$NET" \
+    -e "POSTGRES_NODES=stp-nowhere:5432:8008" \
+    "$HAPROXY_IMAGE" >/dev/null
+
+  local deadline=$(($(date +%s) + 60)) up=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec "$c" wget -qO- http://127.0.0.1:8404/stats >/dev/null 2>&1; then
+      up=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$up" != "1" ]; then
+    ko "$t" "haproxy never served its stats page"
+    fail_dump "$t" "$c"
+    return
+  fi
+  # The shape the forwarder relies on: supervisor at PID 1, haproxy its child.
+  local pid1
+  pid1=$(docker exec "$c" cat /proc/1/comm 2>/dev/null)
+  if ! assert_eq "$pid1" "entrypoint" "PID 1 is the supervisor"; then
+    ko "$t" "unexpected PID 1"
+    fail_dump "$t" "$c"
+    return
+  fi
+
+  local elapsed code
+  read -r elapsed code < <(stop_container_timed "$c")
+  if [ "$elapsed" -ge 10 ] || [ "$code" != "0" ]; then
+    ko "$t" "stop took ${elapsed}s and exited ${code} (want <10s and exit 0; a dropped signal shows as the full grace + SIGKILL/137)"
+    fail_dump "$t" "$c"
+    return
+  fi
+  if ! logs_contain "$c" "HAProxy exited after the requested stop"; then
+    ko "$t" "supervisor did not report the requested stop"
+    fail_dump "$t" "$c"
+    return
+  fi
+
+  ok "$t"
+  note "stopped $c in ${elapsed}s, exit $code"
+  docker rm -f "$c" >/dev/null 2>&1 || true
+}
+
+# Stopping the Patroni leader: the runner's mini-init forwards the signal,
+# Patroni stops Postgres with a checkpoint (fast mode), releases the leader
+# key on its way out, and the container exits 0 — so a replica can take the
+# lock at once instead of waiting for the TTL. Pins the already-correct path
+# so a regression in any of the three layers shows up here.
+t_pg_stop_is_clean_and_releases_lock() {
+  local t="t_pg_stop_is_clean_and_releases_lock"
+  local scope="t-cleanstop-${PG_VERSION}"
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  local n1 n2 n3
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || { ko "$t" "no leader"; fail_dump "$t" "$n1" "$n2" "$n3"; teardown_scope "$scope"; return; }
+  # A streaming replica must exist for the post-stop election to have a
+  # candidate; without one the lock-release assertion would be vacuous.
+  wait_for_replication "$scope" 1 240 >/dev/null 2>&1 || { ko "$t" "no replica streaming"; fail_dump "$t" "$n1" "$n2" "$n3"; teardown_scope "$scope"; return; }
+
+  local pid1
+  pid1=$(docker exec "$leader" cat /proc/1/comm 2>/dev/null)
+  if ! assert_eq "$pid1" "patroni-runner" "PID 1 is the runner's mini-init"; then
+    ko "$t" "unexpected PID 1 on the leader"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+
+  local elapsed code
+  read -r elapsed code < <(stop_container_timed "$leader")
+  # Read the lock right after the stop returns. Patroni deletes it in
+  # on_shutdown, before the container exits — so by now it is either gone or
+  # already taken by a replica (the whole point of releasing it). What must
+  # NOT be there is the stopped node's own name: that is the TTL-expiry
+  # failure mode a dropped signal produces.
+  local key
+  key=$(docker exec "${scope}-etcd-1" etcdctl get "/service/${scope}/leader" --print-value-only 2>/dev/null)
+  if [ "$elapsed" -ge 10 ] || [ "$code" != "0" ]; then
+    ko "$t" "stop took ${elapsed}s and exited ${code} (want <10s and exit 0)"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! logs_contain "$leader" "database system is shut down"; then
+    ko "$t" "postgres did not log a clean shutdown"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  if [ "$key" = "$leader" ]; then
+    ko "$t" "leader key still held by the stopped node '$key' right after a clean stop (lock not released)"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"
+    return
+  fi
+  local leader2
+  leader2=$(wait_for_new_leader "$leader" 120 "$n1" "$n2" "$n3")
+  if [ -z "$leader2" ]; then
+    ko "$t" "no new leader elected after the clean stop"
+    fail_dump "$t" "$n1" "$n2" "$n3"
+    teardown_scope "$scope"
+    return
+  fi
+
+  ok "$t"
+  note "stopped $leader in ${elapsed}s, exit $code; leader key right after stop='${key:-<empty>}'; new leader $leader2"
+  teardown_scope "$scope"
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -5459,6 +5668,11 @@ ALL_TESTS=(
   # etcd wrapper: removed-member refusal wipes + re-joins within one wrapper
   # lifetime, whichever exit code the refusing run produced
   t_etcd_removed_member_wipe_rejoin
+  # clean-stop contract: the runtime's stop signal reaches the real process in
+  # every image and the container exits 0 inside the grace period
+  t_etcd_stop_is_clean
+  t_haproxy_stop_is_clean
+  t_pg_stop_is_clean_and_releases_lock
 )
 
 usage() {

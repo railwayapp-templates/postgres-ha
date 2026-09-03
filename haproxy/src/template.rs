@@ -102,6 +102,12 @@ pub fn generate_config(config: &Config, nodes: &[PostgresNode]) -> String {
         r#"global
     maxconn {}
     log stdout format raw local0
+    # The container's STOPSIGNAL (SIGUSR1, inherited from the upstream image)
+    # starts a soft stop that waits for open sessions to end. With client and
+    # server timeouts of 30m that drain would outlive the container runtime's
+    # stop grace period (10s) and end in SIGKILL anyway; 8s keeps the graceful
+    # exit inside the grace with room for the entrypoint to report it.
+    hard-stop-after 8s
 
 defaults
     log global
@@ -158,4 +164,42 @@ frontend postgresql_replicas
         primary_backend,
         replica_backend
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_config;
+    use crate::config::Config;
+    use crate::nodes::parse_nodes;
+
+    fn test_config(postgres_nodes: &str) -> Config {
+        Config {
+            postgres_nodes: postgres_nodes.to_string(),
+            max_conn: "1000".to_string(),
+            timeout_connect: "10s".to_string(),
+            timeout_client: "30m".to_string(),
+            timeout_server: "30m".to_string(),
+            timeout_check: "3s".to_string(),
+            check_interval: "3s".to_string(),
+            check_fastinter: "500ms".to_string(),
+            check_downinter: "500ms".to_string(),
+            health_port_override: None,
+        }
+    }
+
+    #[test]
+    fn soft_stop_is_bounded_inside_the_stop_grace() {
+        let config = test_config("pg-1:5432:8008,pg-2:5432:8008");
+        let nodes = parse_nodes(&config.postgres_nodes).unwrap();
+        let rendered = generate_config(&config, &nodes);
+
+        let global = rendered
+            .split("\ndefaults")
+            .next()
+            .expect("config starts with the global section");
+        assert!(
+            global.contains("hard-stop-after 8s"),
+            "hard-stop-after must live in the global section:\n{global}"
+        );
+    }
 }
