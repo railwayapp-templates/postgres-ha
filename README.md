@@ -450,6 +450,15 @@ HAProxy automatically routes connections:
 | `HAPROXY_MAX_CONN` | `1000` | Maximum concurrent connections |
 | `HAPROXY_CHECK_INTERVAL` | `3s` | Backend health check interval |
 
+Control-plane credentials (see [Control-plane authentication](#control-plane-authentication)):
+
+| Variable | Where | Effect |
+|---|---|---|
+| `PATRONI_RESTAPI_PASSWORD` | Postgres nodes | Patroni's REST API requires HTTP Basic auth on every mutating endpoint. The template sets it to the cluster's superuser password. |
+| `PATRONI_RESTAPI_USERNAME` | Postgres nodes | Username for the above (default: the superuser name). |
+| `ETCD_ROOT_PASSWORD` | etcd nodes | etcd enables authentication with a `root` user holding this password. The template sets it to the cluster's superuser password. |
+| `PATRONI_ETCD3_USERNAME` / `PATRONI_ETCD3_PASSWORD` | Postgres nodes | Credential Patroni presents to etcd (default: `root` / the superuser password). |
+
 ### Scaling HAProxy
 
 HAProxy is stateless and can be scaled horizontally via Railway replicas:
@@ -474,7 +483,7 @@ curl http://postgres-1.railway.internal:8008/primary  # 200 if primary
 curl http://postgres-1.railway.internal:8008/replica  # 200 if replica
 
 # etcd
-curl http://etcd-1.railway.internal:2379/health
+curl http://etcd-1.railway.internal:2379/health   # /health is open; the key-value API needs a token once ETCD_ROOT_PASSWORD is set
 
 # HAProxy stats dashboard (remote clients authenticate with the database account)
 curl -u "$PGUSER:$PGPASSWORD" http://haproxy.railway.internal:8404/stats
@@ -699,6 +708,22 @@ This template supports PostgreSQL 14, 15, 16, 17, and 18. To upgrade:
 - Private networking isolates cluster from public internet
 - SSL enabled by default for PostgreSQL connections
 - Recommend enabling Railway's 2FA for project access
+
+### Control-plane authentication
+
+Two APIs on the private network can change or destroy the cluster: Patroni's REST API (`PATCH /config`, `POST /switchover`, `/restart`, `/reinitialize`) and etcd's key-value API. Both are authenticated:
+
+- **Patroni REST.** With `PATRONI_RESTAPI_PASSWORD` set, mutating endpoints answer `401` without HTTP Basic auth; reads (`/health`, `/patroni`, `/cluster`, `/primary`, `/replica`) stay open for health checks. Every member always *presents* the credential to its peers (`PATRONI_RESTAPI_PASSWORD`, or the superuser password when unset), so enforcement can be turned on one member at a time without a window in which members reject each other.
+- **etcd.** With `ETCD_ROOT_PASSWORD` set, the etcd entrypoint creates the `root` user and enables authentication once the cluster is healthy. `/health` and `/metrics` stay open. Patroni presents `PATRONI_ETCD3_USERNAME` / `PATRONI_ETCD3_PASSWORD` (default `root` / the superuser password); the credential is accepted by an etcd cluster with authentication enabled and ignored by one without, so Postgres nodes can carry it before etcd enforces.
+
+Example, from a service on the same private network:
+
+```bash
+curl -X PATCH http://postgres-1.railway.internal:8008/config -d '{"loop_wait": 10}'             # 401
+curl -u "postgres:$PGPASSWORD" -X PATCH http://postgres-1.railway.internal:8008/config -d '{"loop_wait": 10}'   # 200
+```
+
+Rollout order for an existing cluster: Postgres nodes first (they start presenting the credential), then `ETCD_ROOT_PASSWORD` on the etcd nodes, then `PATRONI_RESTAPI_PASSWORD` on the Postgres nodes.
 
 ## Performance Tuning
 

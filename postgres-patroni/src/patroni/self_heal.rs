@@ -751,10 +751,7 @@ pub fn disabled() -> bool {
 
 /// Build the same short-timeout HTTP client the watcher uses. Best-effort.
 pub fn http_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .ok()
+    super::rest::client(Duration::from_secs(5)).ok()
 }
 
 /// This node's Patroni role, or None if the local REST API didn't answer.
@@ -1230,9 +1227,7 @@ fn env_i64(k: &str, default: i64) -> i64 {
 // ====================================================================
 
 async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+    let client = super::rest::client(Duration::from_secs(5))?;
 
     let state_path = format!("{volume_root}/{STATE_FILENAME}");
     // Sliding window of recent postmaster_start_time observations.

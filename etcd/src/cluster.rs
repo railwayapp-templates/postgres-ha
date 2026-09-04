@@ -4,7 +4,7 @@
 
 use crate::config::{parse_initial_cluster, peer_to_client_url, Config};
 use anyhow::{anyhow, Context, Result};
-use common::{etcdctl, etcdctl_probe, Telemetry, TelemetryEvent};
+use common::{etcd_http_health, etcdctl, etcdctl_probe, Telemetry, TelemetryEvent};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::fs;
@@ -57,12 +57,12 @@ pub async fn get_member_list(endpoint: &str) -> Result<Vec<MemberInfo>> {
 
 /// Check cluster health via localhost or voting member
 pub async fn check_cluster_health(initial_cluster: &str) -> Result<bool> {
-    if etcdctl_probe(&["endpoint", "health", "--endpoints=127.0.0.1:2379"]).await? {
+    if etcd_http_health("127.0.0.1:2379").await? {
         return Ok(true);
     }
 
     if let Some(endpoint) = get_voting_member_endpoint(initial_cluster).await? {
-        return etcdctl_probe(&["endpoint", "health", &format!("--endpoints={}", endpoint)]).await;
+        return etcd_http_health(&endpoint).await;
     }
 
     Ok(false)

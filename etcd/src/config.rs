@@ -18,6 +18,10 @@ pub struct Config {
     pub etcd_name: String,
     pub initial_cluster: String,
     pub initial_advertise_peer_urls: String,
+    /// `ETCD_ROOT_PASSWORD`: when set, this member turns on etcd authentication
+    /// (root user, root role) once the cluster is healthy, and every local
+    /// `etcdctl` call authenticates as root. Unset keeps the cluster open.
+    pub root_password: Option<String>,
 }
 
 impl Config {
@@ -32,6 +36,9 @@ impl Config {
             etcd_name: String::env_required("ETCD_NAME")?,
             initial_cluster: String::env_required("ETCD_INITIAL_CLUSTER")?,
             initial_advertise_peer_urls: String::env_required("ETCD_INITIAL_ADVERTISE_PEER_URLS")?,
+            root_password: std::env::var(common::ETCD_ROOT_PASSWORD_ENV)
+                .ok()
+                .filter(|p| !p.trim().is_empty()),
         })
     }
 

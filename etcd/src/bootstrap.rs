@@ -8,7 +8,7 @@ use crate::cluster::{
 };
 use crate::config::{get_leader_endpoint, parse_initial_cluster, peer_to_client_url, Config};
 use anyhow::{anyhow, Result};
-use common::{etcdctl, etcdctl_probe, Telemetry, TelemetryEvent};
+use common::{etcd_http_health, etcdctl, Telemetry, TelemetryEvent};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -50,13 +50,7 @@ pub async fn check_existing_cluster(
         let client_endpoint = peer_to_client_url(peer_url);
         info!(peer = %name, endpoint = %client_endpoint, "Checking peer");
 
-        if etcdctl_probe(&[
-            "endpoint",
-            "health",
-            &format!("--endpoints={}", client_endpoint),
-        ])
-        .await?
-        {
+        if etcd_http_health(&client_endpoint).await? {
             info!(peer = %name, "Found healthy cluster");
             return Ok(Some(client_endpoint));
         }
@@ -78,7 +72,7 @@ pub async fn wait_for_any_healthy_peer(
     while start.elapsed() < config.peer_wait_timeout {
         // Try preferred leader first
         if let Some(endpoint) = get_leader_endpoint(&config.initial_cluster, preferred_leader)? {
-            if etcdctl_probe(&["endpoint", "health", &format!("--endpoints={}", endpoint)]).await? {
+            if etcd_http_health(&endpoint).await? {
                 info!(leader = %preferred_leader, "Leader is healthy");
                 return Ok((preferred_leader.to_string(), endpoint));
             }
@@ -92,13 +86,7 @@ pub async fn wait_for_any_healthy_peer(
             }
 
             let client_endpoint = peer_to_client_url(peer_url);
-            if etcdctl_probe(&[
-                "endpoint",
-                "health",
-                &format!("--endpoints={}", client_endpoint),
-            ])
-            .await?
-            {
+            if etcd_http_health(&client_endpoint).await? {
                 info!(peer = %name, "Found healthy peer");
                 return Ok((name.clone(), client_endpoint));
             }
@@ -168,6 +156,7 @@ pub async fn monitor_and_mark_bootstrap(
 ) {
     let mut promoted = false;
     let mut promotion_attempts = 0u32;
+    let mut auth_enabled = config.root_password.is_none();
 
     loop {
         sleep(std::time::Duration::from_secs(5)).await;
@@ -188,6 +177,17 @@ pub async fn monitor_and_mark_bootstrap(
         };
 
         if is_healthy {
+            // Turn on authentication once this member is a voting participant
+            // of a healthy cluster. Idempotent on the etcd side, so every
+            // member may attempt it; the first to succeed settles it.
+            if !auth_enabled && (!joined_as_learner || promoted) {
+                match ensure_auth_enabled(config.root_password.as_deref().unwrap_or_default()).await
+                {
+                    Ok(()) => auth_enabled = true,
+                    Err(e) => warn!(error = %e, "etcd auth enable failed; retrying next cycle"),
+                }
+            }
+
             if joined_as_learner && !promoted {
                 info!("Healthy, attempting promotion");
                 match promote_self(&config.initial_cluster, &config.etcd_name, &telemetry).await {
@@ -238,6 +238,38 @@ pub async fn monitor_and_mark_bootstrap(
             }
         }
     }
+}
+
+/// True when an etcdctl failure means the step already happened.
+fn is_already_done(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("already exists") || e.contains("already enabled") || e.contains("already granted")
+}
+
+/// Run one auth-setup step, treating "already done" as success.
+async fn auth_step(args: &[&str]) -> Result<()> {
+    match etcdctl(args).await {
+        Ok(_) => Ok(()),
+        Err(e) if is_already_done(&e.to_string()) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Enable etcd authentication with `root` (root role) as the only account.
+/// Each step is idempotent, and `--user` is already attached to every call
+/// (accepted by etcd before enabling, required after).
+async fn ensure_auth_enabled(root_password: &str) -> Result<()> {
+    let ep = "--endpoints=127.0.0.1:2379";
+    auth_step(&["user", "add", &format!("root:{root_password}"), ep]).await?;
+    auth_step(&["role", "add", "root", ep]).await?;
+    auth_step(&["user", "grant-role", "root", "root", ep]).await?;
+    let status = etcdctl(&["auth", "status", ep]).await?;
+    if status.contains("Authentication Status: true") {
+        return Ok(());
+    }
+    etcdctl(&["auth", "enable", ep]).await?;
+    info!("etcd authentication enabled (root)");
+    Ok(())
 }
 
 /// Result of bootstrap determination
@@ -497,7 +529,7 @@ pub async fn defrag_loop(config: Config, telemetry: Telemetry) {
     sleep(jitter).await;
 
     loop {
-        match etcdctl_probe(&["endpoint", "health", "--endpoints=127.0.0.1:2379"]).await {
+        match etcd_http_health("127.0.0.1:2379").await {
             Ok(true) => {
                 if is_this_node_leader().await {
                     info!("This node is leader; transferring leadership and skipping defrag until next cycle");
@@ -560,9 +592,7 @@ pub async fn local_liveness_watchdog(config: Config, telemetry: Telemetry) {
     loop {
         sleep(LIVENESS_CHECK_INTERVAL).await;
 
-        let local_ok = etcdctl_probe(&["endpoint", "health", "--endpoints=127.0.0.1:2379"])
-            .await
-            .unwrap_or(false);
+        let local_ok = etcd_http_health("127.0.0.1:2379").await.unwrap_or(false);
 
         if local_ok {
             healthy_once = true;
@@ -642,5 +672,18 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(present);
+    }
+
+    #[test]
+    fn already_done_errors_are_recognized() {
+        assert!(is_already_done("etcdctl failed (exit 1): {\"level\":\"warn\"} Error: etcdserver: user name already exists"));
+        assert!(is_already_done(
+            "Error: etcdserver: role name already exists"
+        ));
+        assert!(is_already_done(
+            "Error: etcdserver: authentication is already enabled"
+        ));
+        assert!(!is_already_done("Error: etcdserver: permission denied"));
+        assert!(!is_already_done("connection refused"));
     }
 }
