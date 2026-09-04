@@ -18,6 +18,35 @@ pub struct Config {
     /// If set, uses this port instead of the patroni port from POSTGRES_NODES.
     /// Set to 8009 to use the direct health server instead of Patroni API.
     pub health_port_override: Option<u16>,
+    /// Basic-auth account for the stats page when reached over the network.
+    /// Loopback (the local monitor and the container healthcheck) never
+    /// authenticates. `None` means no credential is available, and remote
+    /// access to the stats page is denied outright.
+    pub stats_auth: Option<StatsAuth>,
+}
+
+/// Credential guarding the stats page for non-loopback clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsAuth {
+    pub user: String,
+    pub password: String,
+}
+
+/// Resolve the stats credential: `HAPROXY_STATS_USER` / `HAPROXY_STATS_PASSWORD`
+/// when set, else the database account the proxy already carries
+/// (`PGUSER` / `PGPASSWORD`). An empty password yields `None`.
+pub(crate) fn resolve_stats_auth(
+    stats_user: Option<String>,
+    stats_password: Option<String>,
+    pg_user: Option<String>,
+    pg_password: Option<String>,
+) -> Option<StatsAuth> {
+    let non_empty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    let password = non_empty(stats_password).or_else(|| non_empty(pg_password))?;
+    let user = non_empty(stats_user)
+        .or_else(|| non_empty(pg_user))
+        .unwrap_or_else(|| "postgres".to_string());
+    Some(StatsAuth { user, password })
 }
 
 impl Config {
@@ -50,6 +79,57 @@ impl Config {
                 ),
                 Err(_) => None,
             },
+            stats_auth: resolve_stats_auth(
+                std::env::var("HAPROXY_STATS_USER").ok(),
+                std::env::var("HAPROXY_STATS_PASSWORD").ok(),
+                std::env::var("PGUSER").ok(),
+                std::env::var("PGPASSWORD").ok(),
+            ),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn stats_auth_prefers_explicit_over_database_account() {
+        let auth = resolve_stats_auth(s("ops"), s("secret"), s("railway"), s("dbpass")).unwrap();
+        assert_eq!(
+            auth,
+            StatsAuth {
+                user: "ops".into(),
+                password: "secret".into()
+            }
+        );
+    }
+
+    #[test]
+    fn stats_auth_falls_back_to_database_account() {
+        let auth = resolve_stats_auth(None, None, s("railway"), s("dbpass")).unwrap();
+        assert_eq!(
+            auth,
+            StatsAuth {
+                user: "railway".into(),
+                password: "dbpass".into()
+            }
+        );
+    }
+
+    #[test]
+    fn stats_auth_defaults_user_when_only_password_is_known() {
+        let auth = resolve_stats_auth(None, s("secret"), None, None).unwrap();
+        assert_eq!(auth.user, "postgres");
+    }
+
+    #[test]
+    fn stats_auth_is_none_without_a_password() {
+        assert!(resolve_stats_auth(s("ops"), None, s("railway"), None).is_none());
+        assert!(resolve_stats_auth(None, s("  "), None, s("")).is_none());
     }
 }
