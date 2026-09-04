@@ -332,6 +332,61 @@ struct EtcdRangeResponse {
     kvs: Option<Vec<serde_json::Value>>,
 }
 
+#[derive(Serialize)]
+struct EtcdAuthRequest<'a> {
+    name: &'a str,
+    password: &'a str,
+}
+
+#[derive(Deserialize)]
+struct EtcdAuthResponse {
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// Token for etcd's HTTP gateway, or `None` when the cluster has not enabled
+/// authentication (the request is then accepted without one). Any other
+/// failure also yields `None`; the following request surfaces the real error.
+async fn etcd_gateway_token(
+    client: &reqwest::Client,
+    host: &str,
+    cred: Option<&postgres_patroni::patroni::Credential>,
+) -> Option<String> {
+    let cred = cred?;
+    let url = format!("http://{}/v3/auth/authenticate", host.trim());
+    let resp = client
+        .post(&url)
+        .json(&EtcdAuthRequest {
+            name: &cred.username,
+            password: &cred.password,
+        })
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<EtcdAuthResponse>().await.ok()?.token
+}
+
+/// `POST /v3/kv/range` for one key on one etcd host, authenticating first when
+/// a credential is configured.
+async fn etcd_range(
+    client: &reqwest::Client,
+    host: &str,
+    key_base64: &str,
+    cred: Option<&postgres_patroni::patroni::Credential>,
+) -> reqwest::Result<reqwest::Response> {
+    let url = format!("http://{}/v3/kv/range", host.trim());
+    let mut req = client.post(&url).json(&EtcdRangeRequest {
+        key: key_base64.to_string(),
+    });
+    if let Some(token) = etcd_gateway_token(client, host, cred).await {
+        req = req.header(reqwest::header::AUTHORIZATION, token);
+    }
+    req.send().await
+}
+
 /// Wait for the Patroni cluster to exist in etcd before starting.
 /// This prevents replicas from racing with the primary during initial setup.
 /// Only the primary (with existing data) should be allowed to initialize the cluster.
@@ -368,12 +423,7 @@ async fn wait_for_cluster_in_etcd(config: &Config) -> Result<()> {
 
         // Try each etcd host until one succeeds
         for host in &etcd_hosts {
-            let url = format!("http://{}/v3/kv/range", host.trim());
-            let request = EtcdRangeRequest {
-                key: key_base64.clone(),
-            };
-
-            match client.post(&url).json(&request).send().await {
+            match etcd_range(&client, host, &key_base64, config.etcd_auth.as_ref()).await {
                 Ok(response) if response.status().is_success() => {
                     if let Ok(range_response) = response.json::<EtcdRangeResponse>().await {
                         // Check if we got any keys back (cluster exists and has a leader)
@@ -531,11 +581,8 @@ async fn probe_cluster_leader(config: &Config) -> Option<String> {
     let leader_key = format!("/service/{}/leader", config.scope);
     let key_base64 = BASE64.encode(leader_key.as_bytes());
     for host in config.etcd_hosts.split(',') {
-        let url = format!("http://{}/v3/kv/range", host.trim());
-        let request = EtcdRangeRequest {
-            key: key_base64.clone(),
-        };
-        let Ok(resp) = client.post(&url).json(&request).send().await else {
+        let Ok(resp) = etcd_range(&client, host, &key_base64, config.etcd_auth.as_ref()).await
+        else {
             continue;
         };
         if !resp.status().is_success() {
@@ -2263,6 +2310,9 @@ mod tests {
             restapi_connect_address: "test-node:8008".into(),
             restapi_address_source: RestapiAddressSource::PrivateDomain,
             etcd_hosts: "etcd-1:2379".into(),
+            etcd_auth: None,
+            restapi_auth: None,
+            restapi_auth_enforced: false,
             superuser: "postgres".into(),
             superuser_pass: "pw".into(),
             repl_user: "repl".into(),

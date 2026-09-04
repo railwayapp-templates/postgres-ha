@@ -13,12 +13,13 @@ mod exit_history;
 mod health;
 mod monitoring;
 mod reconcile;
+pub mod rest;
 mod self_heal;
 mod slot_recovery;
 mod yaml;
 
 pub use backup_watcher::spawn as spawn_backup_watcher;
-pub use config::{Config, RestapiAddressSource};
+pub use config::{Config, Credential, RestapiAddressSource};
 pub use credential_pin::{
     apply_credential_pin, credentials_from_env_requested, read_credential_pin,
     write_credential_pin, PinOutcome, PinnedCredentials, CREDENTIAL_PIN_FILE,

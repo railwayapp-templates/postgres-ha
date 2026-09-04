@@ -938,10 +938,7 @@ pub async fn reconcile_pgbackrest_archive_config(
     let enabled = config.wal_archive_bucket.is_some();
     let expected_archive_timeout = config.archive_timeout_secs;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .context("build reqwest client")?;
+    let client = super::rest::client(Duration::from_secs(10))?;
 
     wait_for_patroni_rest(&client).await?;
 

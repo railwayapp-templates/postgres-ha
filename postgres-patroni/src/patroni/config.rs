@@ -9,6 +9,72 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// A username/password pair for one of the cluster's control-plane APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credential {
+    pub username: String,
+    pub password: String,
+}
+
+fn non_empty(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.trim().is_empty())
+}
+
+/// REST API credential and whether the local server enforces it.
+///
+/// The password is `PATRONI_RESTAPI_PASSWORD` when set (enforced), else the
+/// superuser password (sent, not enforced). The username defaults to the
+/// superuser name. Returns `(None, false)` when neither password exists.
+pub(crate) fn resolve_restapi_auth(
+    restapi_user: Option<String>,
+    restapi_password: Option<String>,
+    superuser: &str,
+    superuser_password: &str,
+) -> (Option<Credential>, bool) {
+    let username = non_empty(restapi_user).unwrap_or_else(|| superuser.to_string());
+    match non_empty(restapi_password) {
+        Some(password) => (Some(Credential { username, password }), true),
+        None if !superuser_password.trim().is_empty() => (
+            Some(Credential {
+                username,
+                password: superuser_password.to_string(),
+            }),
+            false,
+        ),
+        None => (None, false),
+    }
+}
+
+/// The REST API credential as the running process would resolve it — for
+/// callers that talk to the local REST API without a `Config` in hand.
+pub(crate) fn restapi_auth_from_env() -> Option<Credential> {
+    let superuser = String::env_or("PATRONI_SUPERUSER_USERNAME", "postgres");
+    let superuser_pass = env::var("PATRONI_SUPERUSER_PASSWORD").unwrap_or_default();
+    resolve_restapi_auth(
+        env::var("PATRONI_RESTAPI_USERNAME").ok(),
+        env::var("PATRONI_RESTAPI_PASSWORD").ok(),
+        &superuser,
+        &superuser_pass,
+    )
+    .0
+}
+
+/// etcd credential: `PATRONI_ETCD3_USERNAME` / `PATRONI_ETCD3_PASSWORD` when
+/// set, else `root` with the superuser password (the etcd image enables
+/// authentication with that same root password). `None` without a password.
+pub(crate) fn resolve_etcd_auth(
+    etcd_user: Option<String>,
+    etcd_password: Option<String>,
+    superuser_password: &str,
+) -> Option<Credential> {
+    let password =
+        non_empty(etcd_password).or_else(|| non_empty(Some(superuser_password.to_string())))?;
+    Some(Credential {
+        username: non_empty(etcd_user).unwrap_or_else(|| "root".to_string()),
+        password,
+    })
+}
+
 /// Configuration for Patroni runner
 pub struct Config {
     pub scope: String,
@@ -32,6 +98,20 @@ pub struct Config {
     /// private-domain fallback through telemetry.
     pub restapi_address_source: RestapiAddressSource,
     pub etcd_hosts: String,
+    /// Credential for etcd (`etcd3.username` / `etcd3.password`). Sent on
+    /// every etcd request; ignored by an etcd cluster that has not enabled
+    /// authentication, required once it has. `None` only when no password
+    /// of any kind is configured.
+    pub etcd_auth: Option<Credential>,
+    /// Credential Patroni presents to other members' REST APIs and that the
+    /// local tooling presents to this member's. Always sent when known.
+    pub restapi_auth: Option<Credential>,
+    /// Whether this member's own REST API REQUIRES that credential on the
+    /// mutating endpoints. Set when `PATRONI_RESTAPI_PASSWORD` is provided;
+    /// a member without it still SENDS the credential (from
+    /// `PATRONI_SUPERUSER_PASSWORD`) so a cluster can turn enforcement on
+    /// member by member without a window where peers reject each other.
+    pub restapi_auth_enforced: bool,
     pub superuser: String,
     pub superuser_pass: String,
     pub repl_user: String,
@@ -582,6 +662,22 @@ impl Config {
         let (restapi_connect_address, restapi_address_source) =
             restapi_connect_address_for_process(&connect_address);
         let etcd_hosts = String::env_required("PATRONI_ETCD3_HOSTS")?;
+        let superuser = String::env_or("PATRONI_SUPERUSER_USERNAME", "postgres");
+        let superuser_pass = env::var("PATRONI_SUPERUSER_PASSWORD").unwrap_or_default();
+        let (restapi_auth, restapi_auth_enforced) = resolve_restapi_auth(
+            env::var("PATRONI_RESTAPI_USERNAME").ok(),
+            env::var("PATRONI_RESTAPI_PASSWORD").ok(),
+            &superuser,
+            &superuser_pass,
+        );
+        let etcd_auth = resolve_etcd_auth(
+            env::var("PATRONI_ETCD3_USERNAME").ok(),
+            env::var("PATRONI_ETCD3_PASSWORD").ok(),
+            &superuser_pass,
+        );
+        if restapi_auth.is_none() {
+            warn!("no PATRONI_RESTAPI_PASSWORD or PATRONI_SUPERUSER_PASSWORD: the REST API's mutating endpoints stay unauthenticated");
+        }
 
         let wal_archive_bucket = env::var("WAL_ARCHIVE_BUCKET")
             .ok()
@@ -604,8 +700,11 @@ impl Config {
             restapi_connect_address,
             restapi_address_source,
             etcd_hosts,
-            superuser: String::env_or("PATRONI_SUPERUSER_USERNAME", "postgres"),
-            superuser_pass: env::var("PATRONI_SUPERUSER_PASSWORD").unwrap_or_default(),
+            etcd_auth,
+            restapi_auth,
+            restapi_auth_enforced,
+            superuser,
+            superuser_pass,
             repl_user: String::env_or("PATRONI_REPLICATION_USERNAME", "replicator"),
             repl_pass: env::var("PATRONI_REPLICATION_PASSWORD").unwrap_or_default(),
             app_user: String::env_or("POSTGRES_USER", "postgres"),
@@ -659,6 +758,7 @@ mod tests {
         resolve_restapi_connect_address, resolve_startup_slot_keep_size, RestapiAddressSource,
         SLOT_KEEP_FLOOR_MIB, SLOT_KEEP_TOTAL_PCT,
     };
+    use super::{resolve_etcd_auth, resolve_restapi_auth, Credential};
     use std::net::Ipv6Addr;
     use std::time::Duration;
 
@@ -1066,5 +1166,62 @@ fd128fe4c66b0001300000a05d7b156b 03 40 00 80 railnet0
             resolve_basebackup_max_rate(Some("99999999999999999999M".into())),
             "20M"
         );
+    }
+
+    fn some(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn restapi_password_enforces_and_is_sent() {
+        let (cred, enforced) = resolve_restapi_auth(None, some("rest-pw"), "postgres", "su-pw");
+        assert_eq!(
+            cred,
+            Some(Credential {
+                username: "postgres".into(),
+                password: "rest-pw".into()
+            })
+        );
+        assert!(enforced);
+    }
+
+    #[test]
+    fn superuser_password_is_sent_but_not_enforced() {
+        let (cred, enforced) = resolve_restapi_auth(None, None, "postgres", "su-pw");
+        assert_eq!(cred.unwrap().password, "su-pw");
+        assert!(!enforced);
+        // Blank counts as absent: an empty enforced password would lock everyone out.
+        let (cred, enforced) = resolve_restapi_auth(None, some("  "), "postgres", "su-pw");
+        assert_eq!(cred.unwrap().password, "su-pw");
+        assert!(!enforced);
+    }
+
+    #[test]
+    fn restapi_username_override_and_no_password_at_all() {
+        let (cred, _) = resolve_restapi_auth(some("ops"), some("pw"), "postgres", "");
+        assert_eq!(cred.unwrap().username, "ops");
+        assert_eq!(
+            resolve_restapi_auth(None, None, "postgres", ""),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn etcd_auth_defaults_to_root_with_superuser_password() {
+        assert_eq!(
+            resolve_etcd_auth(None, None, "su-pw"),
+            Some(Credential {
+                username: "root".into(),
+                password: "su-pw".into()
+            })
+        );
+        assert_eq!(
+            resolve_etcd_auth(some("patroni"), some("etcd-pw"), "su-pw"),
+            Some(Credential {
+                username: "patroni".into(),
+                password: "etcd-pw".into()
+            })
+        );
+        assert_eq!(resolve_etcd_auth(None, None, ""), None);
     }
 }

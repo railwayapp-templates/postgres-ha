@@ -51,7 +51,7 @@ COPY --from=rust-builder-local-output / /
 # ============================================================
 FROM postgres:${POSTGRES_IMAGE_TAG} AS ha
 
-ARG PATRONI_VERSION=4.1.0
+ARG PATRONI_VERSION=4.1.3
 
 # Extension packages are pinned AT THE MINOR (mirrors postgres-ssl): the
 # volume keeps each extension's SQL catalog at install-time version while

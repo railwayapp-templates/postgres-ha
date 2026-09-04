@@ -277,9 +277,7 @@ async fn run(data_dir: String) -> Result<()> {
     // timeout because the API is local and any latency above that
     // probably means Patroni is wedged — we skip backups in that case
     // anyway via the "not leader" path.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+    let client = super::rest::client(Duration::from_secs(5))?;
 
     loop {
         watcher_iteration(&data_dir, &config, &client).await;

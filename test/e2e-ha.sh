@@ -271,8 +271,23 @@ HA_LABEL="postgres-ha-e2e=1"
 # ${prefix}-etcd-1, -2, -3. Returns the comma-separated client endpoint
 # list on stdout (used as PATRONI_ETCD3_HOSTS).
 setup_etcd_cluster() {
-  local prefix="$1"
+  local prefix="$1"; shift
   local n1="${prefix}-etcd-1" n2="${prefix}-etcd-2" n3="${prefix}-etcd-3"
+  # $2..$N: extra `-e KEY=VALUE` flags for every etcd node. When one of them
+  # is ETCD_ROOT_PASSWORD the wait below authenticates its etcdctl probes —
+  # the entrypoint enables authentication as soon as the cluster is healthy,
+  # after which an unauthenticated `endpoint health` reads as unhealthy.
+  # (An empty array expansion is unbound under `set -u` on bash <4.4, so the
+  # no-extras case carries a harmless repeated label instead.)
+  local extra_args=("$@")
+  [ "${#extra_args[@]}" -eq 0 ] && extra_args=(--label "$HA_LABEL")
+  local etcdctl_user=(--write-out=simple)
+  local a
+  for a in "${extra_args[@]}"; do
+    case "$a" in
+      ETCD_ROOT_PASSWORD=*) etcdctl_user=("--user=root:${a#ETCD_ROOT_PASSWORD=}") ;;
+    esac
+  done
 
   for n in "$n1" "$n2" "$n3"; do
     docker rm -f "$n" >/dev/null 2>&1 || true
@@ -292,6 +307,7 @@ setup_etcd_cluster() {
       -e "ETCD_ADVERTISE_CLIENT_URLS=http://${n}:2379" \
       -e "ETCD_INITIAL_CLUSTER_TOKEN=${prefix}-token" \
       -e "ETCD_INITIAL_CLUSTER_STATE=new" \
+      "${extra_args[@]}" \
       -v "${n}-vol:/var/lib/etcd" \
       "$ETCD_IMAGE" >/dev/null
   done
@@ -304,13 +320,13 @@ setup_etcd_cluster() {
   local deadline=$(($(date +%s) + 180))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local healthy
-    healthy=$(docker exec "$n1" etcdctl endpoint health \
+    healthy=$(docker exec "$n1" etcdctl "${etcdctl_user[@]}" endpoint health \
       --endpoints="http://${n1}:2379,http://${n2}:2379,http://${n3}:2379" 2>/dev/null \
       | grep -c "is healthy" || true)
     if [ "$healthy" = "3" ]; then
       # member list lines end with `, false` (voting) or `, true` (learner).
       local learners
-      learners=$(docker exec "$n1" etcdctl member list 2>/dev/null \
+      learners=$(docker exec "$n1" etcdctl "${etcdctl_user[@]}" member list 2>/dev/null \
         | grep -cE ', true$' || true)
       if [ "${learners:-0}" = "0" ]; then
         break
@@ -5752,6 +5768,147 @@ t_etcd_tolerates_deleted_peer_in_initial_cluster() {
 
 # ----- runner ----------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Control-plane authentication
+#
+# Two APIs on the private network can change or destroy the cluster: Patroni's
+# REST API (PATCH /config, POST /reinitialize, /switchover, /restart) and the
+# etcd key-value API. With PATRONI_RESTAPI_PASSWORD / ETCD_ROOT_PASSWORD set,
+# both reject unauthenticated writes; health probes stay open.
+# ---------------------------------------------------------------------------
+t_ha_control_plane_auth_enforced() {
+  local t=t_ha_control_plane_auth_enforced
+  local scope=t-cpauth-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope" -e "ETCD_ROOT_PASSWORD=test")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" -e "PATRONI_RESTAPI_PASSWORD=test")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no leader elected with authentication enabled"
+    fail_dump "$t" "$n1" "$n2" "$n3" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "replicas did not stream with authentication enabled"
+    fail_dump "$t" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  # etcd: authentication is on, and it was the entrypoint that turned it on.
+  local auth_status
+  auth_status=$(docker exec "${scope}-etcd-1" etcdctl --user=root:test auth status 2>/dev/null)
+  if ! echo "$auth_status" | grep -q "Authentication Status: true"; then
+    ko "$t" "etcd authentication not enabled: $auth_status"
+    fail_dump "$t" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  # etcd key-value API: refused without a token, served with one.
+  local code
+  code=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' -X POST \
+    "http://${scope}-etcd-1:2379/v3/kv/range" -d '{"key":"Lw=="}')
+  if [ "$code" = "200" ]; then
+    ko "$t" "etcd kv/range answered 200 without a token"
+    teardown_scope "$scope"; return
+  fi
+  local token
+  token=$(docker exec "$leader" curl -s -X POST "http://${scope}-etcd-1:2379/v3/auth/authenticate" \
+    -d '{"name":"root","password":"test"}' | grep -oE '"token":"[^"]+"' | cut -d'"' -f4)
+  code=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: $token" "http://${scope}-etcd-1:2379/v3/kv/range" -d '{"key":"Lw=="}')
+  if [ "$code" != "200" ]; then
+    ko "$t" "etcd kv/range with a root token answered $code"
+    teardown_scope "$scope"; return
+  fi
+
+  # Patroni REST: mutating endpoints need the credential; reads do not.
+  for n in "$n1" "$n2" "$n3"; do
+    code=$(docker exec "$n" curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+      http://localhost:8008/config -d '{"loop_wait":10}')
+    if [ "$code" != "401" ]; then
+      ko "$t" "$n: unauthenticated PATCH /config answered $code (want 401)"
+      fail_dump "$t" "$n"
+      teardown_scope "$scope"; return
+    fi
+    code=$(docker exec "$n" curl -s -o /dev/null -w '%{http_code}' -X POST \
+      http://localhost:8008/restart -d '{"schedule":"2999-01-01T00:00:00+00:00"}')
+    if [ "$code" != "401" ]; then
+      ko "$t" "$n: unauthenticated POST /restart answered $code (want 401)"
+      teardown_scope "$scope"; return
+    fi
+    code=$(docker exec "$n" curl -s -o /dev/null -w '%{http_code}' http://localhost:8008/patroni)
+    if [ "$code" != "200" ]; then
+      ko "$t" "$n: GET /patroni answered $code (reads must stay open)"
+      teardown_scope "$scope"; return
+    fi
+  done
+  code=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' -u postgres:test -X PATCH \
+    http://localhost:8008/config -d '{"loop_wait":10}')
+  if [ "$code" != "200" ]; then
+    ko "$t" "authenticated PATCH /config answered $code (want 200)"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  # A wrong password is not a credential.
+  code=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' -u postgres:wrong -X PATCH \
+    http://localhost:8008/config -d '{"loop_wait":10}')
+  if [ "$code" != "401" ]; then
+    ko "$t" "PATCH /config with a wrong password answered $code (want 401)"
+    teardown_scope "$scope"; return
+  fi
+
+  # The member's own tooling still reaches its API: the boot-time reconcile
+  # reads and (when needed) patches /config and must not have been refused.
+  if docker logs "$leader" 2>&1 | grep -qE "PATCH /config failed: 401|/config GET returned 401"; then
+    ko "$t" "in-image caller was refused by its own REST API"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "leader=$leader; etcd auth on; REST writes 401 without the credential, 200 with it"
+  teardown_scope "$scope"
+}
+
+# Without PATRONI_RESTAPI_PASSWORD the member keeps accepting unauthenticated
+# writes (so a cluster can adopt enforcement one member at a time) but already
+# presents the superuser credential to its peers.
+t_ha_restapi_auth_unenforced_still_sends_credential() {
+  local t=t_ha_restapi_auth_unenforced_still_sends_credential
+  local scope=t-cpcompat-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || {
+    ko "$t" "no leader elected"
+    fail_dump "$t" "$n1" "$n2" "$n3"
+    teardown_scope "$scope"; return
+  }
+
+  local code
+  code=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+    http://localhost:8008/config -d '{"loop_wait":10}')
+  if [ "$code" != "200" ]; then
+    ko "$t" "unenforced member refused PATCH /config with $code (want 200)"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  if ! docker exec "$leader" grep -A3 '^ctl:' /etc/patroni/patroni.yml | grep -q 'password: "test"'; then
+    ko "$t" "ctl.authentication (the credential sent to peers) missing from the rendered config"
+    docker exec "$leader" sed -n '1,20p' /etc/patroni/patroni.yml >&2 || true
+    teardown_scope "$scope"; return
+  fi
+  if docker exec "$leader" grep -A4 '^restapi:' /etc/patroni/patroni.yml | grep -q 'authentication'; then
+    ko "$t" "restapi.authentication rendered without PATRONI_RESTAPI_PASSWORD"
+    teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "leader=$leader; writes still open, superuser credential rendered under ctl"
+  teardown_scope "$scope"
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
@@ -5827,6 +5984,9 @@ ALL_TESTS=(
   t_etcd_stop_is_clean
   t_haproxy_stop_is_clean
   t_pg_stop_is_clean_and_releases_lock
+  # control-plane authentication: etcd RBAC + Patroni REST basic auth
+  t_ha_control_plane_auth_enforced
+  t_ha_restapi_auth_unenforced_still_sends_credential
 )
 
 usage() {

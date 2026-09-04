@@ -135,6 +135,37 @@ pub fn generate_patroni_config(config: &Config, wal_level: &str) -> String {
     // checkpoint_timeout of apparent hang before the first byte lands).
     // config.basebackup_max_rate is the validated POSTGRES_BASEBACKUP_MAX_RATE
     // override for oversized emergencies, resolved in Config::from_env.
+    // REST API credential. `restapi.authentication` both enforces on this
+    // member's mutating endpoints and is what Patroni sends to other members;
+    // `ctl.authentication` is only sent. A member not yet enforcing therefore
+    // still authenticates against peers that already are.
+    let restapi_auth_block = match (&config.restapi_auth, config.restapi_auth_enforced) {
+        (Some(cred), true) => format!(
+            "  authentication:\n    username: \"{}\"\n    password: \"{}\"\n",
+            yaml_quote(&cred.username),
+            yaml_quote(&cred.password)
+        ),
+        _ => String::new(),
+    };
+    let ctl_block = match (&config.restapi_auth, config.restapi_auth_enforced) {
+        (Some(cred), false) => format!(
+            "ctl:\n  authentication:\n    username: \"{}\"\n    password: \"{}\"\n\n",
+            yaml_quote(&cred.username),
+            yaml_quote(&cred.password)
+        ),
+        _ => String::new(),
+    };
+    // etcd credential: ignored by an etcd cluster without authentication,
+    // required by one with it, so it is always emitted when known.
+    let etcd_auth_block = match &config.etcd_auth {
+        Some(cred) => format!(
+            "  username: \"{}\"\n  password: \"{}\"\n",
+            yaml_quote(&cred.username),
+            yaml_quote(&cred.password)
+        ),
+        None => String::new(),
+    };
+
     format!(
         r#"scope: {scope}
 name: {name}
@@ -142,10 +173,10 @@ name: {name}
 restapi:
   listen: ":::8008"
   connect_address: "{restapi_connect_address}"
-
-etcd3:
+{restapi_auth_block}
+{ctl_block}etcd3:
   hosts: {etcd_hosts}
-
+{etcd_auth_block}
 bootstrap:
   dcs:
     ttl: {ttl}
@@ -246,7 +277,15 @@ postgresql:
         max_slot_wal_keep_size = config.max_slot_wal_keep_size,
         pgbackrest_archive_params = pgbackrest_archive_params,
         pgbackrest_local_params = pgbackrest_local_params,
+        restapi_auth_block = restapi_auth_block,
+        ctl_block = ctl_block,
+        etcd_auth_block = etcd_auth_block,
     )
+}
+
+/// Escape a value for a double-quoted YAML scalar.
+fn yaml_quote(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Update pg_hba.conf to add replication entries for adopted data
@@ -302,6 +341,9 @@ mod tests {
             restapi_connect_address: "[fd12:8fe4:c66b:1:3000:43:ed49:ddbf]:8008".into(),
             restapi_address_source: RestapiAddressSource::ContainerInterface,
             etcd_hosts: "etcd-1:2379".into(),
+            etcd_auth: None,
+            restapi_auth: None,
+            restapi_auth_enforced: false,
             superuser: "postgres".into(),
             superuser_pass: "pw".into(),
             repl_user: "repl".into(),
@@ -540,5 +582,65 @@ mod tests {
         assert_eq!(get(&["postgresql", "app_user", "username"]), cfg.app_user);
         assert_eq!(get(&["postgresql", "app_user", "password"]), cfg.app_pass);
         assert_eq!(get(&["postgresql", "app_user", "database"]), cfg.app_db);
+    }
+
+    fn cred(u: &str, p: &str) -> crate::patroni::Credential {
+        crate::patroni::Credential {
+            username: u.into(),
+            password: p.into(),
+        }
+    }
+
+    #[test]
+    fn restapi_auth_enforced_emits_restapi_authentication_only() {
+        let mut cfg = test_config(None);
+        cfg.restapi_auth = Some(cred("postgres", "rest-pw"));
+        cfg.restapi_auth_enforced = true;
+        let yaml = generate_patroni_config(&cfg, "replica");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed["restapi"]["authentication"]["username"], "postgres");
+        assert_eq!(parsed["restapi"]["authentication"]["password"], "rest-pw");
+        assert!(parsed.get("ctl").is_none());
+    }
+
+    #[test]
+    fn restapi_auth_not_enforced_emits_ctl_authentication_only() {
+        let mut cfg = test_config(None);
+        cfg.restapi_auth = Some(cred("postgres", "su-pw"));
+        cfg.restapi_auth_enforced = false;
+        let yaml = generate_patroni_config(&cfg, "replica");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed["restapi"].get("authentication").is_none());
+        assert_eq!(parsed["ctl"]["authentication"]["password"], "su-pw");
+    }
+
+    #[test]
+    fn no_credential_leaves_restapi_ctl_and_etcd3_untouched() {
+        let yaml = generate_patroni_config(&test_config(None), "replica");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed["restapi"].get("authentication").is_none());
+        assert!(parsed.get("ctl").is_none());
+        assert!(parsed["etcd3"].get("username").is_none());
+        assert_eq!(parsed["etcd3"]["hosts"], "etcd-1:2379");
+    }
+
+    #[test]
+    fn etcd_credential_is_emitted_under_etcd3() {
+        let mut cfg = test_config(None);
+        cfg.etcd_auth = Some(cred("root", "su-pw"));
+        let yaml = generate_patroni_config(&cfg, "replica");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed["etcd3"]["hosts"], "etcd-1:2379");
+        assert_eq!(parsed["etcd3"]["username"], "root");
+        assert_eq!(parsed["etcd3"]["password"], "su-pw");
+    }
+
+    #[test]
+    fn credentials_with_quotes_and_backslashes_survive_yaml() {
+        let mut cfg = test_config(None);
+        cfg.etcd_auth = Some(cred("root", r#"a"b\c"#));
+        let yaml = generate_patroni_config(&cfg, "replica");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed["etcd3"]["password"], r#"a"b\c"#);
     }
 }
