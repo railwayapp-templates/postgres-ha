@@ -66,11 +66,19 @@ fn main() -> Result<()> {
 
     info!("Starting HAProxy...");
 
-    let child = Command::new("haproxy")
-        .arg("-f")
-        .arg(CONFIG_FILE)
-        .spawn()
-        .context("Failed to spawn haproxy")?;
+    let mut haproxy = Command::new("haproxy");
+    haproxy.arg("-f").arg(CONFIG_FILE);
+    // The stats credential reaches haproxy through its environment, expanded
+    // at config parse time — never through the rendered (and logged) file.
+    if let Some(auth) = &config.stats_auth {
+        haproxy
+            .env("HAPROXY_STATS_USER", &auth.user)
+            .env("HAPROXY_STATS_PASSWORD", &auth.password);
+        info!(user = %auth.user, "Stats page: loopback open, remote clients authenticate");
+    } else {
+        info!("Stats page: loopback only (no HAPROXY_STATS_PASSWORD / PGPASSWORD)");
+    }
+    let child = haproxy.spawn().context("Failed to spawn haproxy")?;
 
     // We are PID 1: the runtime's stop signal lands here and nowhere else.
     // Relay it to haproxy so a stop is a soft stop instead of a SIGKILL after

@@ -134,14 +134,7 @@ resolvers railway
     hold valid      10s
     hold obsolete   10s
 
-# Stats page for monitoring
-listen stats
-    bind :::8404 v4v6
-    mode http
-    stats enable
-    stats uri /stats
-    stats refresh 10s
-
+{}
 # Primary PostgreSQL (read-write)
 frontend postgresql_primary
     bind :::5432 v4v6
@@ -161,8 +154,40 @@ frontend postgresql_replicas
         config.timeout_client,
         config.timeout_server,
         config.timeout_check,
+        generate_stats_listener(config),
         primary_backend,
         replica_backend
+    )
+}
+
+/// The stats listener. Loopback clients (the in-container monitor and the
+/// healthcheck) are always allowed. Anyone else must present the stats
+/// credential; without a credential configured, remote access is denied.
+///
+/// The credential is read by haproxy from the environment at parse time
+/// (`"${HAPROXY_STATS_USER}"` / `"${HAPROXY_STATS_PASSWORD}"`) so the
+/// rendered config — which is logged at startup — never contains it.
+fn generate_stats_listener(config: &Config) -> String {
+    let (userlist, remote_rule) = if config.stats_auth.is_some() {
+        (
+            "userlist stats_users\n    user \"${HAPROXY_STATS_USER}\" insecure-password \"${HAPROXY_STATS_PASSWORD}\"\n\n",
+            "http-request auth unless { http_auth(stats_users) }",
+        )
+    } else {
+        ("", "http-request deny")
+    };
+    format!(
+        r#"{userlist}# Stats page for monitoring
+listen stats
+    bind :::8404 v4v6
+    mode http
+    acl LOCALHOST src 127.0.0.1 ::1 ::ffff:127.0.0.1
+    http-request allow if LOCALHOST
+    {remote_rule}
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+"#
     )
 }
 
@@ -184,6 +209,7 @@ mod tests {
             check_fastinter: "500ms".to_string(),
             check_downinter: "500ms".to_string(),
             health_port_override: None,
+            stats_auth: None,
         }
     }
 
@@ -201,5 +227,64 @@ mod tests {
             global.contains("hard-stop-after 8s"),
             "hard-stop-after must live in the global section:\n{global}"
         );
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+    use crate::config::StatsAuth;
+
+    fn test_config(stats_auth: Option<StatsAuth>) -> Config {
+        Config {
+            postgres_nodes: "pg-1:5432:8009,pg-2:5432:8009".into(),
+            max_conn: "1000".into(),
+            timeout_connect: "10s".into(),
+            timeout_client: "30m".into(),
+            timeout_server: "30m".into(),
+            timeout_check: "3s".into(),
+            check_interval: "3s".into(),
+            check_fastinter: "500ms".into(),
+            check_downinter: "500ms".into(),
+            health_port_override: Some(8009),
+            stats_auth,
+        }
+    }
+
+    fn nodes() -> Vec<PostgresNode> {
+        crate::nodes::parse_nodes("pg-1:5432:8009,pg-2:5432:8009").unwrap()
+    }
+
+    #[test]
+    fn stats_page_requires_auth_for_remote_clients_when_credential_is_set() {
+        let auth = StatsAuth {
+            user: "railway".into(),
+            password: "s3cret".into(),
+        };
+        let cfg = generate_config(&test_config(Some(auth)), &nodes());
+
+        assert!(cfg.contains("userlist stats_users\n    user \"${HAPROXY_STATS_USER}\" insecure-password \"${HAPROXY_STATS_PASSWORD}\""));
+        assert!(cfg.contains("acl LOCALHOST src 127.0.0.1 ::1 ::ffff:127.0.0.1"));
+        assert!(cfg.contains("http-request allow if LOCALHOST\n    http-request auth unless { http_auth(stats_users) }\n    stats enable"));
+        assert!(!cfg.contains("http-request deny"));
+        // The secret itself never lands in the rendered file (it is logged at boot).
+        assert!(!cfg.contains("s3cret"));
+        assert!(!cfg.contains("ops-user"));
+    }
+
+    #[test]
+    fn stats_page_denies_remote_clients_without_a_credential() {
+        let cfg = generate_config(&test_config(None), &nodes());
+
+        assert!(!cfg.contains("userlist"));
+        assert!(cfg
+            .contains("http-request allow if LOCALHOST\n    http-request deny\n    stats enable"));
+    }
+
+    #[test]
+    fn stats_listener_keeps_its_bind_and_uri() {
+        let cfg = generate_config(&test_config(None), &nodes());
+        assert!(cfg.contains("listen stats\n    bind :::8404 v4v6\n    mode http\n"));
+        assert!(cfg.contains("stats uri /stats\n    stats refresh 10s\n"));
     }
 }

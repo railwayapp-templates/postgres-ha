@@ -476,8 +476,8 @@ curl http://postgres-1.railway.internal:8008/replica  # 200 if replica
 # etcd
 curl http://etcd-1.railway.internal:2379/health
 
-# HAProxy stats dashboard
-curl http://haproxy.railway.internal:8404/stats
+# HAProxy stats dashboard (remote clients authenticate with the database account)
+curl -u "$PGUSER:$PGPASSWORD" http://haproxy.railway.internal:8404/stats
 ```
 
 ### Cluster Status
@@ -519,7 +519,7 @@ Response:
 
 ### HAProxy Stats
 
-Access the HAProxy stats dashboard at `http://haproxy.railway.internal:8404/stats` for real-time backend health and connection metrics.
+Access the HAProxy stats dashboard at `http://haproxy.railway.internal:8404/stats` for real-time backend health and connection metrics. From inside the HAProxy container the page is open on loopback; any other client authenticates with HTTP Basic auth using `HAPROXY_STATS_USER` / `HAPROXY_STATS_PASSWORD` (default: the `PGUSER` / `PGPASSWORD` the proxy already carries). With no password available, remote access is denied.
 
 ## Failover Behavior
 
@@ -630,7 +630,7 @@ If lag is high (>1GB):
 
 1. Check HAProxy stats:
    ```bash
-   curl http://haproxy.railway.internal:8404/stats
+   curl -u "$PGUSER:$PGPASSWORD" http://haproxy.railway.internal:8404/stats
    ```
 
 2. Verify backends are healthy:
