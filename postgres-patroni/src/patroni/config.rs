@@ -75,6 +75,29 @@ pub(crate) fn resolve_etcd_auth(
     })
 }
 
+/// The control-plane passwords as the running process resolves them, for
+/// callers that pin credentials without a `Config` in hand (post-bootstrap).
+/// Returns `(etcd, restapi)`.
+pub fn control_plane_passwords_from_env() -> (Option<String>, Option<String>) {
+    let superuser = String::env_or("PATRONI_SUPERUSER_USERNAME", "postgres");
+    let superuser_pass = env::var("PATRONI_SUPERUSER_PASSWORD").unwrap_or_default();
+    let etcd = resolve_etcd_auth(
+        env::var("PATRONI_ETCD3_USERNAME").ok(),
+        env::var("PATRONI_ETCD3_PASSWORD").ok(),
+        &superuser_pass,
+    )
+    .map(|c| c.password);
+    let restapi = resolve_restapi_auth(
+        env::var("PATRONI_RESTAPI_USERNAME").ok(),
+        env::var("PATRONI_RESTAPI_PASSWORD").ok(),
+        &superuser,
+        &superuser_pass,
+    )
+    .0
+    .map(|c| c.password);
+    (etcd, restapi)
+}
+
 /// Configuration for Patroni runner
 pub struct Config {
     pub scope: String,
