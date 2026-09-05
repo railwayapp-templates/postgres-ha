@@ -5870,6 +5870,110 @@ t_ha_control_plane_auth_enforced() {
   teardown_scope "$scope"
 }
 
+# ---------------------------------------------------------------------------
+# The credential pin has to cover the CONTROL-PLANE passwords too, not just the
+# role passwords. etcd's `root` user is created once, when the entrypoint first
+# enables authentication, and nothing ever runs `user passwd`; the peers enforce
+# the REST password they booted with. Both are therefore frozen at
+# cluster-creation time while the variables they came from are not — and the
+# production template defines both as references to POSTGRES_PASSWORD.
+#
+# Reproduced on a live Railway cluster 2026-09-05: editing POSTGRES_PASSWORD
+# (which the platform documents as NOT rotating the database password) pinned
+# the role passwords correctly but sent the NEW password to etcd, and the member
+# crash-looped on
+#   CRITICAL: Etcd3 authentication failed: invalid user ID or password
+# It lost its leadership and never rejoined; the two members that had not
+# restarted yet stayed healthy, so the cluster dies one restart at a time.
+#
+# t_ha_password_variable_edit_does_not_rotate covers the same edit WITHOUT
+# control-plane auth, which is why it never caught this.
+# ---------------------------------------------------------------------------
+t_ha_password_edit_keeps_control_plane_credentials() {
+  local t=t_ha_password_edit_keeps_control_plane_credentials
+  local scope=t-cpauth-rotate-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope" -e "ETCD_ROOT_PASSWORD=test")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" -e "PATRONI_RESTAPI_PASSWORD=test")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no leader elected before the edit"
+    fail_dump "$t" "$n1" "$n2" "$n3" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "replicas did not stream before the edit — test setup invalid"
+    fail_dump "$t" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  # "Edit POSTGRES_PASSWORD and redeploy": on Railway every PATRONI_*_PASSWORD
+  # and PATRONI_RESTAPI_PASSWORD is a reference to it, so they all follow.
+  # ETCD_ROOT_PASSWORD does NOT change on the etcd side: `user add` is a no-op
+  # once the user exists, which is exactly the asymmetry under test.
+  log "recreating all 3 nodes with rotated password variables, control-plane auth on"
+  for n in "$n1" "$n2" "$n3"; do
+    run_patroni_node "$scope" "$etcd_hosts" "$n" \
+      -e "PATRONI_RESTAPI_PASSWORD=rotated-su" \
+      -e "POSTGRES_PASSWORD=rotated-app" \
+      -e "PATRONI_SUPERUSER_PASSWORD=rotated-su" \
+      -e "PATRONI_REPLICATION_PASSWORD=rotated-repl"
+  done
+
+  for n in "$n1" "$n2" "$n3"; do
+    if ! wait_for_pg_accepting "$n" 240; then
+      ko "$t" "$n never accepted connections after the edit"
+      fail_dump "$t" "$n" "${scope}-etcd-1"
+      teardown_scope "$scope"; return
+    fi
+  done
+
+  # The failure this test exists for: Patroni cannot authenticate to the DCS.
+  local n
+  for n in "$n1" "$n2" "$n3"; do
+    if docker logs "$n" 2>&1 | grep -q "Etcd3 authentication failed"; then
+      ko "$t" "$n could not authenticate to etcd after a POSTGRES_PASSWORD edit — the pin did not cover the etcd credential"
+      fail_dump "$t" "$n" "${scope}-etcd-1"
+      teardown_scope "$scope"; return
+    fi
+  done
+
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no leader after the edit — the cluster lost its DCS"
+    fail_dump "$t" "$n1" "$n2" "$n3" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "replication did not recover after the edit"
+    fail_dump "$t" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  # And the REST API still speaks the ORIGINAL password, not the edited one:
+  # that is what the peers enforce.
+  local code
+  code=$(docker exec "$leader" curl -s -o /dev/null -w "%{http_code}" \
+    -u "postgres:test" -X PATCH "http://localhost:8008/config" \
+    -H 'Content-Type: application/json' -d '{"loop_wait":10}' 2>/dev/null)
+  if [ "$code" != "200" ]; then
+    ko "$t" "REST API no longer accepts the pinned credential (HTTP $code)"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  code=$(docker exec "$leader" curl -s -o /dev/null -w "%{http_code}" \
+    -u "postgres:rotated-su" -X PATCH "http://localhost:8008/config" \
+    -H 'Content-Type: application/json' -d '{"loop_wait":10}' 2>/dev/null)
+  if [ "$code" = "200" ]; then
+    ko "$t" "REST API accepted the EDITED password — the variable rotated the credential after all"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "leader=$leader; cluster survived a POSTGRES_PASSWORD edit with etcd+REST auth on; REST still enforces the pinned credential"
+  teardown_scope "$scope"
+}
+
 # Without PATRONI_RESTAPI_PASSWORD the member keeps accepting unauthenticated
 # writes (so a cluster can adopt enforcement one member at a time) but already
 # presents the superuser credential to its peers.
@@ -5986,6 +6090,7 @@ ALL_TESTS=(
   t_pg_stop_is_clean_and_releases_lock
   # control-plane authentication: etcd RBAC + Patroni REST basic auth
   t_ha_control_plane_auth_enforced
+  t_ha_password_edit_keeps_control_plane_credentials
   t_ha_restapi_auth_unenforced_still_sends_credential
 )
 

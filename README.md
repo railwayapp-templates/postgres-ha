@@ -725,6 +725,8 @@ curl -u "postgres:$PGPASSWORD" -X PATCH http://postgres-1.railway.internal:8008/
 
 Rollout order for an existing cluster: Postgres nodes first (they start presenting the credential), then `ETCD_ROOT_PASSWORD` on the etcd nodes, then `PATRONI_RESTAPI_PASSWORD` on the Postgres nodes.
 
+Both control-plane passwords are covered by the credential pin (`$PGDATA/.railway_credentials`, `postgres-patroni/src/patroni/credential_pin.rs`): etcd's `root` user is created once, when the entrypoint first enables authentication, and the peers enforce the REST password they booted with — so both are frozen at cluster-creation time while the variables they came from are not. Editing `POSTGRES_PASSWORD` therefore does not change what this node presents to etcd or to its peers, exactly as it does not change the role passwords. Use `PATRONI_CREDENTIALS_FROM_ENV=true` only after rotating the credentials on the other side (`etcdctl user passwd root`, and the peers' `PATRONI_RESTAPI_PASSWORD`).
+
 ## Performance Tuning
 
 ### PostgreSQL

@@ -10,7 +10,9 @@ use postgres_patroni::bootstrap::{
     dollar_quote_tag, quote_ident, quote_literal, read_credentials, run_psql, run_psql_in_db,
     run_psql_script, PATRONI_CONFIG,
 };
-use postgres_patroni::patroni::{write_credential_pin, PinnedCredentials};
+use postgres_patroni::patroni::{
+    control_plane_passwords_from_env, write_credential_pin, PinnedCredentials,
+};
 use postgres_patroni::{pgdata, volume_root};
 use std::env;
 use std::path::Path;
@@ -157,6 +159,7 @@ END
     // re-syncs role passwords), and clones inherit the pin with the data. A
     // failed write is not fatal — the runner adopts the variables as the pin on
     // the next boot, which at that point still equal these values.
+    let (etcd_pass, restapi_pass) = control_plane_passwords_from_env();
     let pin_dir = if creds.data_dir.is_empty() {
         pgdata()
     } else {
@@ -168,6 +171,12 @@ END
             superuser_pass: creds.superuser_pass.clone(),
             repl_pass: creds.repl_pass.clone(),
             app_pass: creds.app_pass.clone(),
+            // Read from the environment rather than patroni.yml: at bootstrap
+            // the variables ARE what the cluster is being created with (etcd's
+            // root user is created from the same secret), so this is the one
+            // moment they can be trusted.
+            etcd_pass,
+            restapi_pass,
         },
     ) {
         Ok(()) => info!(data_dir = %pin_dir, "Pinned the bootstrap credentials"),
