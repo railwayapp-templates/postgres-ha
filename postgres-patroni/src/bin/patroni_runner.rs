@@ -13,6 +13,7 @@ use nix::unistd::{ForkResult, Pid};
 use postgres_patroni::bootstrap::{reconcile_pg_stat_statements, refresh_collation_versions};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::major_upgrade;
+use postgres_patroni::patroni::rest::set_pinned_restapi_auth;
 use postgres_patroni::patroni::{
     apply_credential_pin, credentials_from_env_requested, generate_patroni_config,
     reconcile_pgbackrest_archive_config, run_monitoring_loop, spawn_backup_watcher,
@@ -762,23 +763,49 @@ async fn handle_reseed_marker(
 }
 
 /// Patroni's own configuration loader gives `PATRONI_*` environment variables
-/// priority over the config file, so it is not enough to render the pinned
-/// credentials into patroni.yml: Patroni would read the drifted
-/// `PATRONI_REPLICATION_PASSWORD` / `PATRONI_SUPERUSER_PASSWORD` straight out
-/// of the environment, override the file, and write the drifted replication
+/// priority over the config file: `Config._get_auth` reads
+/// `PATRONI_REPLICATION_PASSWORD` / `PATRONI_SUPERUSER_PASSWORD` /
+/// `PATRONI_RESTAPI_PASSWORD` / `PATRONI_ETCD3_PASSWORD` (and the matching
+/// `_USERNAME` vars) straight out of the environment and patches them over
+/// whatever patroni.yml says, so it is not enough to render the pinned
+/// credentials into the file. Left alone, Patroni would read the drifted
+/// variable, override the file, and either write the drifted replication
 /// password into its pgpass — which is what `primary_conninfo` authenticates
-/// with. The replicas then fail to authenticate against a leader whose roles
-/// still carry the pinned password, which is exactly the outage the pin
-/// exists to prevent.
+/// with, so replicas fail against a leader whose roles still carry the
+/// pinned password — or enforce/present the drifted etcd or REST API
+/// credential instead of the one the DCS and the peers actually run with.
+/// Either is the same outage the pin exists to prevent.
 ///
 /// Hand Patroni the same values the config file already carries, so the two
 /// sources agree whatever the variables say. `config` here is post-pin, so on
 /// a fresh volume these are the variables themselves and this is a no-op.
+///
+/// `PATRONI_RESTAPI_PASSWORD` is gated on `restapi_auth_enforced`: unlike
+/// etcd (always sent when known, harmless against a cluster that hasn't
+/// enabled auth) and unlike ctl (this repo never sets `PATRONI_CTL_*`), an
+/// unenforced member's `restapi_auth` is the superuser password sent but not
+/// required. Setting `PATRONI_RESTAPI_PASSWORD` unconditionally would hand
+/// Patroni's `_get_auth('restapi')` a value it wouldn't otherwise see and
+/// make it materialize `restapi.authentication`, turning enforcement on by
+/// accident.
 async fn start_patroni(config: &Config) -> Result<tokio::process::Child> {
-    let child = Command::new("patroni")
-        .arg("/etc/patroni/patroni.yml")
+    let mut cmd = Command::new("patroni");
+    cmd.arg("/etc/patroni/patroni.yml")
         .env("PATRONI_REPLICATION_PASSWORD", &config.repl_pass)
-        .env("PATRONI_SUPERUSER_PASSWORD", &config.superuser_pass)
+        .env("PATRONI_SUPERUSER_PASSWORD", &config.superuser_pass);
+
+    if let Some(etcd_auth) = &config.etcd_auth {
+        cmd.env("PATRONI_ETCD3_USERNAME", &etcd_auth.username)
+            .env("PATRONI_ETCD3_PASSWORD", &etcd_auth.password);
+    }
+    if config.restapi_auth_enforced {
+        if let Some(restapi_auth) = &config.restapi_auth {
+            cmd.env("PATRONI_RESTAPI_USERNAME", &restapi_auth.username)
+                .env("PATRONI_RESTAPI_PASSWORD", &restapi_auth.password);
+        }
+    }
+
+    let child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1976,6 +2003,12 @@ async fn async_main() -> Result<()> {
         &telemetry,
     );
     info!(outcome = ?pin_outcome, "credential pin reconciled");
+
+    // Every in-image REST caller (self-heal, slot-recovery, the backup
+    // watcher, the archive-config reconcile task) must authenticate with
+    // THIS value from here on, not a fresh re-read of the (possibly drifted)
+    // environment — see `patroni::rest::set_pinned_restapi_auth`.
+    set_pinned_restapi_auth(config.restapi_auth.clone());
 
     // Recover the debris of an interrupted clone. A non-empty data directory
     // with NO pg_control is what a pg_basebackup killed mid-stream leaves
