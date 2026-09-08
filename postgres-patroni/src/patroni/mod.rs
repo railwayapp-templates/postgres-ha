@@ -9,6 +9,7 @@
 mod backup_watcher;
 mod config;
 mod credential_pin;
+pub mod etcd_preflight;
 mod exit_history;
 mod health;
 mod monitoring;

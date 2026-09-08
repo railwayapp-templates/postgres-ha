@@ -13,11 +13,15 @@ use nix::unistd::{ForkResult, Pid};
 use postgres_patroni::bootstrap::{reconcile_pg_stat_statements, refresh_collation_versions};
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::major_upgrade;
+use postgres_patroni::patroni::etcd_preflight::{
+    etcd_password_source_variable, probe_etcd_credential, rejection_message, EtcdAuthProbe,
+    REJECTION_PREFIX,
+};
 use postgres_patroni::patroni::{
     apply_credential_pin, credentials_from_env_requested, generate_patroni_config,
     reconcile_pgbackrest_archive_config, run_monitoring_loop, spawn_backup_watcher,
     spawn_self_heal_watcher, spawn_slot_recovery_watcher, update_pg_hba_for_replication, Config,
-    RestapiAddressSource,
+    PinOutcome, RestapiAddressSource,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
@@ -1976,6 +1980,43 @@ async fn async_main() -> Result<()> {
         &telemetry,
     );
     info!(outcome = ?pin_outcome, "credential pin reconciled");
+
+    // etcd's root password is fixed when the etcd entrypoint first enables
+    // authentication; the credential this member presents is re-derived from
+    // its variables on every boot. Ask etcd before Patroni does, so a member
+    // whose password variable was edited after the cluster was created stops
+    // with a message that names the variable and the fix, instead of Patroni's
+    // bare "Etcd3 authentication failed". Only an explicit rejection stops the
+    // boot: an etcd without authentication, or one that is unreachable right
+    // now, is left to Patroni's own retry loop (see patroni::etcd_preflight).
+    if let Some(cred) = config.etcd_auth.as_ref() {
+        let probe = probe_etcd_credential(&config.etcd_hosts, cred, Duration::from_secs(3)).await;
+        if probe == EtcdAuthProbe::Rejected {
+            let drifted: &[&str] = match &pin_outcome {
+                PinOutcome::KeptPinned(fields) => fields.as_slice(),
+                _ => &[],
+            };
+            let message = rejection_message(
+                &cred.username,
+                etcd_password_source_variable(env::var("PATRONI_ETCD3_PASSWORD").ok().as_deref()),
+                drifted,
+            );
+            error!("{message}");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "patroni-runner".to_string(),
+                error: format!(
+                    "{REJECTION_PREFIX}; drifted variables: {}",
+                    if drifted.is_empty() {
+                        "none recorded".to_string()
+                    } else {
+                        drifted.join(", ")
+                    }
+                ),
+                context: "etcd credential pre-flight".to_string(),
+            });
+            anyhow::bail!("{REJECTION_PREFIX}; see the message above for the variable to restore");
+        }
+    }
 
     // Recover the debris of an interrupted clone. A non-empty data directory
     // with NO pg_control is what a pg_basebackup killed mid-stream leaves

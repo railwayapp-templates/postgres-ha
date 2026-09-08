@@ -5909,6 +5909,123 @@ t_ha_restapi_auth_unenforced_still_sends_credential() {
   teardown_scope "$scope"
 }
 
+# Editing the password variable after the cluster was created does not rotate
+# etcd's root password: the edited member would present the new value, etcd
+# would refuse it, and Patroni would exit on a bare "Etcd3 authentication
+# failed". The runner asks etcd first and stops the member with a message
+# that names the variable and the fix; the rest of the cluster keeps serving,
+# and restoring the value brings the member back.
+t_ha_password_edit_stops_member_with_guidance() {
+  local t=t_ha_password_edit_stops_member_with_guidance
+  local scope=t-pwedit-cpauth-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope" -e "ETCD_ROOT_PASSWORD=test")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" -e "PATRONI_RESTAPI_PASSWORD=test")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no leader elected with authentication enabled"
+    fail_dump "$t" "$n1" "$n2" "$n3" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "replicas did not stream with authentication enabled"
+    fail_dump "$t" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  # The member whose variables get edited: a replica, so the leader's view
+  # of the cluster is what the survival assertions below read.
+  local victim="" n
+  for n in "$n1" "$n2" "$n3"; do
+    [ "$n" = "$leader" ] && continue
+    victim="$n"; break
+  done
+
+  # "Edit POSTGRES_PASSWORD and redeploy": on the template the superuser and
+  # REST passwords reference it, so all three move together on that member.
+  log "recreating $victim with an edited password variable"
+  run_patroni_node "$scope" "$etcd_hosts" "$victim" \
+    -e "POSTGRES_PASSWORD=edited" \
+    -e "PATRONI_SUPERUSER_PASSWORD=edited" \
+    -e "PATRONI_RESTAPI_PASSWORD=edited"
+
+  # The member must stop on its own, with the guidance in its log.
+  local deadline=$(($(date +%s) + 180)) running="true"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    running=$(docker inspect -f '{{.State.Running}}' "$victim" 2>/dev/null || echo "gone")
+    [ "$running" != "true" ] && break
+    sleep 2
+  done
+  if [ "$running" = "true" ]; then
+    ko "$t" "$victim kept running with a credential etcd refuses"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  local exit_code
+  exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$victim" 2>/dev/null || echo "?")
+  if [ "$exit_code" = "0" ]; then
+    ko "$t" "$victim exited 0 after etcd refused its credential (want a failure)"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_contain "$victim" "etcd rejected this member's credential"; then
+    ko "$t" "$victim stopped without the guidance message"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_contain "$victim" "the password in PATRONI_SUPERUSER_PASSWORD is not the one etcd was created with"; then
+    ko "$t" "the guidance does not name the variable the etcd password came from"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_match "$victim" "Variables that differ from the credentials this cluster runs with: .*PATRONI_SUPERUSER_PASSWORD.*POSTGRES_PASSWORD"; then
+    ko "$t" "the guidance does not list the edited variables the credential pin saw"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_contain "$victim" "restore the previous value of the edited variable and redeploy this member"; then
+    ko "$t" "the guidance does not say how to recover"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+
+  # The rest of the cluster is untouched: same leader, the other replica streams.
+  local leader_after
+  leader_after=$(wait_for_leader "$scope" 60) || {
+    ko "$t" "no leader after one member was stopped by the pre-flight"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  }
+  if [ "$leader_after" != "$leader" ]; then
+    ko "$t" "leadership moved from $leader to $leader_after while a replica was stopped"
+    fail_dump "$t" "$leader" "$leader_after"
+    teardown_scope "$scope"; return
+  fi
+  if ! wait_for_replication "$scope" 1 120; then
+    ko "$t" "the remaining replica stopped streaming"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  # The fix the message gives: restore the previous value and redeploy.
+  log "recreating $victim with the original password variables"
+  run_patroni_node "$scope" "$etcd_hosts" "$victim" -e "PATRONI_RESTAPI_PASSWORD=test"
+  if ! wait_for_pg_accepting "$victim" 240; then
+    ko "$t" "$victim did not come back after the variable was restored"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! wait_for_replication "$scope" 2 240; then
+    ko "$t" "$victim did not rejoin replication after the variable was restored"
+    fail_dump "$t" "$leader" "$victim"
+    teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "victim=$victim exit=$exit_code; leader $leader kept the lock; the member rejoined once the variable was restored"
+  teardown_scope "$scope"
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
@@ -5987,6 +6104,7 @@ ALL_TESTS=(
   # control-plane authentication: etcd RBAC + Patroni REST basic auth
   t_ha_control_plane_auth_enforced
   t_ha_restapi_auth_unenforced_still_sends_credential
+  t_ha_password_edit_stops_member_with_guidance
 )
 
 usage() {

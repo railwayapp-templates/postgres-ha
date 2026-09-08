@@ -725,6 +725,8 @@ curl -u "postgres:$PGPASSWORD" -X PATCH http://postgres-1.railway.internal:8008/
 
 Rollout order for an existing cluster: Postgres nodes first (they start presenting the credential), then `ETCD_ROOT_PASSWORD` on the etcd nodes, then `PATRONI_RESTAPI_PASSWORD` on the Postgres nodes.
 
+Both passwords are fixed when the cluster is created: etcd's `root` password the moment the entrypoint enables authentication, and the credential a Postgres member presents is re-read from its variables on every boot. Editing the password variable afterwards does not rotate either side. On the template that variable is `POSTGRES_PASSWORD`, which `PATRONI_SUPERUSER_PASSWORD` and the etcd credential are derived from, so a member that restarts after such an edit would present a password etcd does not hold. The runner asks etcd first and stops that member before Patroni starts, logging `etcd rejected this member's credential` with the variables that differ from the cluster's pinned credentials and the fix: restore the previous value of the edited variable and redeploy the member. Members that have not restarted keep serving with the original credentials. An etcd cluster that has not enabled authentication, or one that is unreachable at boot, is left to Patroni's own retry loop.
+
 ## Performance Tuning
 
 ### PostgreSQL
