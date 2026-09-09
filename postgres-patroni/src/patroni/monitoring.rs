@@ -649,10 +649,7 @@ async fn ensure_reinitialize_unparked(config: &Config) {
         // immediate. A no-op (logged) if postgres already died on its own.
         stop_postgres_directly(&config.data_dir).await;
 
-        let reissue_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(REINIT_REISSUE_TIMEOUT_SECS))
-            .build();
-        match reissue_client {
+        match reissue_client() {
             Ok(c) => match self_heal::force_reinitialize(&c).await {
                 Ok(()) => info!(attempt, "startup self-heal: re-issued reinitialize after preempting the wedged postgres"),
                 Err(e) => warn!(attempt, error = %e, "startup self-heal: reinitialize re-issue failed even with the longer timeout"),
@@ -669,6 +666,16 @@ async fn ensure_reinitialize_unparked(config: &Config) {
         attempts = REINIT_UNPARK_MAX_ATTEMPTS,
         "startup self-heal: reinitialize still parked after all unpark attempts — leaving it to the recovery exit"
     );
+}
+
+/// The client the unpark re-issue posts `/reinitialize` with: the shared REST
+/// client, so the re-issue carries this member's credential like every other
+/// in-image call, with the longer timeout this path needs. On a member that
+/// enforces `PATRONI_RESTAPI_PASSWORD` a bare client is answered 401 three
+/// times and the unpark path falls through to the recovery exit instead of
+/// the reclone it exists to land.
+fn reissue_client() -> anyhow::Result<reqwest::Client> {
+    super::rest::client(Duration::from_secs(REINIT_REISSUE_TIMEOUT_SECS))
 }
 
 /// Poll for `pg_control`'s disappearance (the wipe's first observable step)
@@ -899,6 +906,35 @@ async fn fetch_patroni_xlog_position(client: &reqwest::Client) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patroni::rest::test_support::{capture_one_request, header_value, ENV_LOCK};
+
+    #[tokio::test]
+    async fn reissue_client_presents_the_members_rest_credential() {
+        let _env = ENV_LOCK.lock().unwrap();
+        std::env::set_var("PATRONI_RESTAPI_PASSWORD", "reissue-pw");
+        std::env::set_var("PATRONI_SUPERUSER_USERNAME", "postgres");
+        let client = reissue_client();
+        std::env::remove_var("PATRONI_RESTAPI_PASSWORD");
+        std::env::remove_var("PATRONI_SUPERUSER_USERNAME");
+        drop(_env);
+
+        let (url, rx) = capture_one_request("/reinitialize");
+        client
+            .unwrap()
+            .post(&url)
+            .json(&serde_json::json!({ "force": true }))
+            .send()
+            .await
+            .unwrap();
+        let request = rx.recv().unwrap();
+        assert!(request.starts_with("POST /reinitialize "), "{request}");
+        // base64("postgres:reissue-pw")
+        assert_eq!(
+            header_value(&request, "authorization").as_deref(),
+            Some("Basic cG9zdGdyZXM6cmVpc3N1ZS1wdw=="),
+            "{request}"
+        );
+    }
 
     #[test]
     fn wal_reinit_fires_immediately_without_archive() {
