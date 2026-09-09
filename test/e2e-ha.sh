@@ -6035,6 +6035,14 @@ t_ha_restapi_auth_unenforced_still_sends_credential() {
     [ "$n" = "$leader" ] && continue
     blank_member="$n"; break
   done
+  # The vanilla setup returns as soon as a leader exists; let the replica
+  # finish its clone before it is recreated, so the boot under test starts
+  # from a complete data directory rather than incomplete-clone debris.
+  if ! wait_for_replication "$scope" 2 240; then
+    ko "$t" "replicas never streamed before the blank-variable recreate"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
   log "recreating $blank_member with blank control-plane credential variables"
   run_patroni_node "$scope" "$etcd_hosts" "$blank_member" \
     -e "PATRONI_RESTAPI_PASSWORD=  " \
