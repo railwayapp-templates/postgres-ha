@@ -90,15 +90,22 @@ Operator-facing env contract:
 | `WAL_BACKUP_RETENTION_DIFF` | differentials kept by `pgbackrest expire` (default `14`) |
 | `WAL_HEARTBEAT_DISABLED` | set to `1` to disable the idle-DB WAL heartbeat (advanced; reduces archive cost on quiet DBs at the price of stale PITR ceiling) |
 
-Image-level tuning knobs (pgBackRest-native, internal):
+Image-level tuning knobs:
 
 | Env var | Purpose |
 |---|---|
 | `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `5120`, matching `archive-push-queue-max`). Outside the `PGBACKREST_*` namespace because pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
 | `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
-| `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default `1` (WAL replay is serial). |
-| `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 16)`. |
+| `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
+| `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 2)`. Set `1` to reduce backup concurrency independently of archiving and restores. |
 | `PGBACKREST_RESTORE_PROCESS_MAX` | parallel workers for `restore`. Default auto-sized as `clamp(cpus, 1, 32)`. |
+
+The four worker overrides are template settings, not native pgBackRest
+environment options. `patroni-runner` renders them into command-specific
+config sections. The image's `pgbackrest` launcher removes these variables
+(and the legacy `PGBACKREST_DROP_THRESHOLD_MB` alias) only from pgBackRest's
+environment so unknown-option warnings cannot corrupt `info --output=json`.
+Native options such as `PGBACKREST_REPO1_PATH` remain available.
 
 When `WAL_ARCHIVE_BUCKET` is set, `patroni-runner` writes
 `archive_mode=on`, `archive_command='/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'`,
