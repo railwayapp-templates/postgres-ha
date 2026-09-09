@@ -51,7 +51,11 @@ ENV ETCD_ELECTION_TIMEOUT=5000
 
 EXPOSE 2379 2380
 
+# Exec form: the base image is distroless (no /bin/sh, no curl), so the check
+# is the entrypoint itself probing GET /health on the local client port. etcd
+# serves /health outside its RBAC layer, so the probe keeps answering once
+# ETCD_ROOT_PASSWORD has enabled authentication and carries no credential.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
-  CMD etcdctl endpoint health --endpoints=127.0.0.1:2379 || exit 1
+  CMD ["/entrypoint", "healthcheck"]
 
 ENTRYPOINT ["/entrypoint"]

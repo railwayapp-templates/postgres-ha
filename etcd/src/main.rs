@@ -12,7 +12,7 @@ mod cluster;
 mod config;
 
 use anyhow::{Context, Result};
-use common::{init_logging, Telemetry, TelemetryEvent};
+use common::{etcd_http_health, init_logging, Telemetry, TelemetryEvent};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::os::unix::process::ExitStatusExt;
@@ -153,8 +153,30 @@ fn exit_code_for(code: Option<i32>, signal: Option<i32>, forwarded: i32) -> i32 
     }
 }
 
+/// Argument that turns the entrypoint into the image's `HEALTHCHECK` probe.
+const HEALTHCHECK_ARG: &str = "healthcheck";
+
+/// The local client endpoint the health probe asks.
+const LOCAL_CLIENT_ENDPOINT: &str = "127.0.0.1:2379";
+
+/// `/entrypoint healthcheck`: the Dockerfile's `HEALTHCHECK` command. The base
+/// image is distroless, so there is no shell to run `etcdctl` from, and
+/// `etcdctl endpoint health` reads a key, which an etcd with authentication
+/// enabled refuses without a credential. `GET /health` is served outside the
+/// RBAC layer and answers without one.
+fn is_healthcheck_invocation(mut args: impl Iterator<Item = String>) -> bool {
+    args.nth(1).as_deref() == Some(HEALTHCHECK_ARG)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if is_healthcheck_invocation(std::env::args()) {
+        let healthy = etcd_http_health(LOCAL_CLIENT_ENDPOINT)
+            .await
+            .unwrap_or(false);
+        std::process::exit(if healthy { 0 } else { 1 });
+    }
+
     let _guard = init_logging("etcd");
 
     let telemetry = Telemetry::from_env("etcd");
@@ -433,7 +455,27 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_code_for, exit_is_clean, is_raft_corruption_line, is_removed_member_line};
+    use super::{
+        exit_code_for, exit_is_clean, is_healthcheck_invocation, is_raft_corruption_line,
+        is_removed_member_line,
+    };
+
+    #[test]
+    fn healthcheck_mode_is_the_first_argument_only() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_healthcheck_invocation(
+            args(&["/entrypoint", "healthcheck"]).into_iter()
+        ));
+        assert!(!is_healthcheck_invocation(
+            args(&["/entrypoint"]).into_iter()
+        ));
+        assert!(!is_healthcheck_invocation(
+            args(&["/entrypoint", "--healthcheck"]).into_iter()
+        ));
+        assert!(!is_healthcheck_invocation(
+            args(&["/entrypoint", "serve", "healthcheck"]).into_iter()
+        ));
+    }
 
     #[test]
     fn clean_exit_without_flags_ends_supervision() {
