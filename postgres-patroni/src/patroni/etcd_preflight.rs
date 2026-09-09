@@ -86,6 +86,14 @@ pub fn etcd_password_source_variable(etcd3_password: Option<&str>) -> &'static s
     }
 }
 
+/// Why the edit did not take: shared by every credential pre-flight message.
+pub const FIXED_AT_CREATION: &str = "This cluster's passwords were fixed when it was created; editing a password variable afterwards does not change them. \
+     On the postgres-ha template the edited variable is normally POSTGRES_PASSWORD, which PATRONI_SUPERUSER_PASSWORD, PATRONI_RESTAPI_PASSWORD and the etcd credential are derived from.";
+
+/// The fix: shared by every credential pre-flight message.
+pub const RECOVERY: &str = "To recover: restore the previous value of the edited variable and redeploy this member. \
+     Members that have not restarted keep serving with the original credentials until they do, so restore the value before they restart.";
+
 /// The message a member logs when etcd refuses its credential. Names the
 /// variable the password came from, the variables that differ from the
 /// cluster's pinned credentials (when the credential pin saw the edit), and
@@ -98,22 +106,14 @@ pub fn rejection_message(
     let mut lines = vec![format!(
         "{REJECTION_PREFIX} (user \"{username}\"): the password in {source_variable} is not the one etcd was created with."
     )];
-    lines.push(
-        "This cluster's passwords were fixed when it was created; editing a password variable afterwards does not change them. \
-         On the postgres-ha template the edited variable is normally POSTGRES_PASSWORD, which PATRONI_SUPERUSER_PASSWORD and the etcd credential are derived from."
-            .to_string(),
-    );
+    lines.push(FIXED_AT_CREATION.to_string());
     if !drifted_variables.is_empty() {
         lines.push(format!(
             "Variables that differ from the credentials this cluster runs with: {}.",
             drifted_variables.join(", ")
         ));
     }
-    lines.push(
-        "To recover: restore the previous value of the edited variable and redeploy this member. \
-         Members that have not restarted keep serving with the original credentials until they do, so restore the value before they restart."
-            .to_string(),
-    );
+    lines.push(RECOVERY.to_string());
     lines.join("\n")
 }
 

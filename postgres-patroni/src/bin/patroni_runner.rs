@@ -17,11 +17,14 @@ use postgres_patroni::patroni::etcd_preflight::{
     etcd_password_source_variable, probe_etcd_credential, rejection_message, EtcdAuthProbe,
     REJECTION_PREFIX,
 };
+use postgres_patroni::patroni::rest_preflight::{
+    divergence_message, rest_credential_diverges, DIVERGENCE_PREFIX,
+};
 use postgres_patroni::patroni::{
-    apply_credential_pin, credentials_from_env_requested, generate_patroni_config,
-    reconcile_pgbackrest_archive_config, run_monitoring_loop, spawn_backup_watcher,
-    spawn_self_heal_watcher, spawn_slot_recovery_watcher, update_pg_hba_for_replication, Config,
-    PinOutcome, RestapiAddressSource,
+    apply_credential_pin, credential_drift, credentials_from_env_requested,
+    generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
+    spawn_backup_watcher, spawn_self_heal_watcher, spawn_slot_recovery_watcher,
+    update_pg_hba_for_replication, Config, RestapiAddressSource,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
@@ -763,6 +766,15 @@ async fn handle_reseed_marker(
         to_major: image_major.unwrap_or("?").to_string(),
     });
     Ok(())
+}
+
+/// The drifted-variable list as a telemetry field.
+fn drifted_summary(drifted: &[&str]) -> String {
+    if drifted.is_empty() {
+        "none recorded".to_string()
+    } else {
+        drifted.join(", ")
+    }
 }
 
 /// Patroni's own configuration loader gives `PATRONI_*` environment variables
@@ -1940,6 +1952,72 @@ async fn async_main() -> Result<()> {
 
     let bootstrap_marker = format!("{}/.patroni_bootstrap_complete", volume_root);
 
+    // Credential pre-flights, ahead of the reseed handling below and of
+    // anything else that touches the volume: a reseed boot probes etcd for the
+    // leader before it wipes, and with a refused credential it would stop on
+    // "not safe to wipe" instead of on the message that names the edited
+    // variable. The drift list is a read of the credential pin (which the
+    // reseed wipe removes along with the rest of pgdata); the pin itself is
+    // applied further down, once the post-reseed state of the data directory
+    // is known, and reports the same list.
+    let credential_drift = credential_drift(&config, credentials_from_env_requested());
+
+    // etcd's root password is fixed when the etcd entrypoint first enables
+    // authentication; the credential this member presents is re-derived from
+    // its variables on every boot. Ask etcd before Patroni does, so a member
+    // whose password variable was edited after the cluster was created stops
+    // with a message that names the variable and the fix, instead of Patroni's
+    // bare "Etcd3 authentication failed". Only an explicit rejection stops the
+    // boot: an etcd without authentication, or one that is unreachable right
+    // now, is left to Patroni's own retry loop (see patroni::etcd_preflight).
+    if let Some(cred) = config.etcd_auth.as_ref() {
+        let probe = probe_etcd_credential(&config.etcd_hosts, cred, Duration::from_secs(3)).await;
+        if probe == EtcdAuthProbe::Rejected {
+            let message = rejection_message(
+                &cred.username,
+                etcd_password_source_variable(env::var("PATRONI_ETCD3_PASSWORD").ok().as_deref()),
+                &credential_drift,
+            );
+            error!("{message}");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "patroni-runner".to_string(),
+                error: format!(
+                    "{REJECTION_PREFIX}; drifted variables: {}",
+                    drifted_summary(&credential_drift)
+                ),
+                context: "etcd credential pre-flight".to_string(),
+            });
+            anyhow::bail!("{REJECTION_PREFIX}; see the message above for the variable to restore");
+        }
+    }
+
+    // The same edit seen from the REST API, for the cluster where etcd does
+    // not check the password (authentication not enabled, or a dedicated
+    // PATRONI_ETCD3_PASSWORD): the member would enforce and present the edited
+    // REST password while its peers hold the original, and every call between
+    // them — the failsafe pings included — would be refused both ways. Decided
+    // from the pin's drift list and the variables alone (see
+    // patroni::rest_preflight). `config` is pre-pin here, so its superuser
+    // password is the variable's value.
+    let restapi_password = config
+        .restapi_auth
+        .as_ref()
+        .filter(|_| config.restapi_auth_enforced)
+        .map(|cred| cred.password.as_str());
+    if rest_credential_diverges(&credential_drift, restapi_password, &config.superuser_pass) {
+        let message = divergence_message(&credential_drift);
+        error!("{message}");
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "patroni-runner".to_string(),
+            error: format!(
+                "{DIVERGENCE_PREFIX}; drifted variables: {}",
+                drifted_summary(&credential_drift)
+            ),
+            context: "REST credential pre-flight".to_string(),
+        });
+        anyhow::bail!("{DIVERGENCE_PREFIX}; see the message above for the variable to restore");
+    }
+
     // Consume a reseed marker before anything else reads or patches the data
     // directory: a cross-major pgdata is wiped here (so the adoption patch and
     // the pg_control checks below see the post-wipe state), and a matching one
@@ -1980,43 +2058,6 @@ async fn async_main() -> Result<()> {
         &telemetry,
     );
     info!(outcome = ?pin_outcome, "credential pin reconciled");
-
-    // etcd's root password is fixed when the etcd entrypoint first enables
-    // authentication; the credential this member presents is re-derived from
-    // its variables on every boot. Ask etcd before Patroni does, so a member
-    // whose password variable was edited after the cluster was created stops
-    // with a message that names the variable and the fix, instead of Patroni's
-    // bare "Etcd3 authentication failed". Only an explicit rejection stops the
-    // boot: an etcd without authentication, or one that is unreachable right
-    // now, is left to Patroni's own retry loop (see patroni::etcd_preflight).
-    if let Some(cred) = config.etcd_auth.as_ref() {
-        let probe = probe_etcd_credential(&config.etcd_hosts, cred, Duration::from_secs(3)).await;
-        if probe == EtcdAuthProbe::Rejected {
-            let drifted: &[&str] = match &pin_outcome {
-                PinOutcome::KeptPinned(fields) => fields.as_slice(),
-                _ => &[],
-            };
-            let message = rejection_message(
-                &cred.username,
-                etcd_password_source_variable(env::var("PATRONI_ETCD3_PASSWORD").ok().as_deref()),
-                drifted,
-            );
-            error!("{message}");
-            telemetry.send(TelemetryEvent::ComponentError {
-                component: "patroni-runner".to_string(),
-                error: format!(
-                    "{REJECTION_PREFIX}; drifted variables: {}",
-                    if drifted.is_empty() {
-                        "none recorded".to_string()
-                    } else {
-                        drifted.join(", ")
-                    }
-                ),
-                context: "etcd credential pre-flight".to_string(),
-            });
-            anyhow::bail!("{REJECTION_PREFIX}; see the message above for the variable to restore");
-        }
-    }
 
     // Recover the debris of an interrupted clone. A non-empty data directory
     // with NO pg_control is what a pg_basebackup killed mid-stream leaves
