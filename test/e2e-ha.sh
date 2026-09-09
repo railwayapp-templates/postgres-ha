@@ -6026,6 +6026,133 @@ t_ha_password_edit_stops_member_with_guidance() {
   teardown_scope "$scope"
 }
 
+# The same edit on a cluster whose etcd does not check the password (no
+# ETCD_ROOT_PASSWORD, so authentication is off): etcd accepts the member, but
+# it would enforce and present the edited REST password while its peers hold
+# the original — every call between them refused both ways, the leader's
+# failsafe pings included. The runner sees the superuser variable moved (the
+# credential pin) and PATRONI_RESTAPI_PASSWORD following it, and stops the
+# member with the same guidance; the rest of the cluster keeps serving and
+# accepting the cluster credential, and restoring the value brings it back.
+t_ha_password_edit_stops_member_rest_only() {
+  local t=t_ha_password_edit_stops_member_rest_only
+  local scope=t-pwedit-rest-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" -e "PATRONI_RESTAPI_PASSWORD=test")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no leader elected with REST authentication enabled"
+    fail_dump "$t" "$n1" "$n2" "$n3" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "replicas did not stream with REST authentication enabled"
+    fail_dump "$t" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  local victim="" n
+  for n in "$n1" "$n2" "$n3"; do
+    [ "$n" = "$leader" ] && continue
+    victim="$n"; break
+  done
+
+  log "recreating $victim with an edited password variable (etcd authentication off)"
+  run_patroni_node "$scope" "$etcd_hosts" "$victim" \
+    -e "POSTGRES_PASSWORD=edited" \
+    -e "PATRONI_SUPERUSER_PASSWORD=edited" \
+    -e "PATRONI_RESTAPI_PASSWORD=edited"
+
+  local deadline=$(($(date +%s) + 180)) running="true"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    running=$(docker inspect -f '{{.State.Running}}' "$victim" 2>/dev/null || echo "gone")
+    [ "$running" != "true" ] && break
+    sleep 2
+  done
+  if [ "$running" = "true" ]; then
+    ko "$t" "$victim kept running with a REST password its peers do not hold"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  local exit_code
+  exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$victim" 2>/dev/null || echo "?")
+  if [ "$exit_code" = "0" ]; then
+    ko "$t" "$victim exited 0 with a diverged REST credential (want a failure)"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_contain "$victim" "REST API credential differs from the one this cluster's members hold"; then
+    ko "$t" "$victim stopped without the REST guidance message"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if logs_contain "$victim" "etcd rejected this member's credential"; then
+    ko "$t" "$victim was stopped by the etcd pre-flight, but etcd authentication is off in this scenario"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_contain "$victim" "PATRONI_RESTAPI_PASSWORD follows the edited PATRONI_SUPERUSER_PASSWORD"; then
+    ko "$t" "the guidance does not name the variables involved"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_match "$victim" "Variables that differ from the credentials this cluster runs with: .*PATRONI_SUPERUSER_PASSWORD.*POSTGRES_PASSWORD"; then
+    ko "$t" "the guidance does not list the edited variables the credential pin saw"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_contain "$victim" "restore the previous value of the edited variable and redeploy this member"; then
+    ko "$t" "the guidance does not say how to recover"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+
+  # The rest of the cluster is untouched: same leader, the other replica
+  # streams, and the cluster credential is still the one the leader accepts.
+  local leader_after
+  leader_after=$(wait_for_leader "$scope" 60) || {
+    ko "$t" "no leader after one member was stopped by the pre-flight"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  }
+  if [ "$leader_after" != "$leader" ]; then
+    ko "$t" "leadership moved from $leader to $leader_after while a replica was stopped"
+    fail_dump "$t" "$leader" "$leader_after"
+    teardown_scope "$scope"; return
+  fi
+  if ! wait_for_replication "$scope" 1 120; then
+    ko "$t" "the remaining replica stopped streaming"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  local code
+  code=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' -u postgres:test -X PATCH \
+    http://localhost:8008/config -d '{"loop_wait":10}')
+  if [ "$code" != "200" ]; then
+    ko "$t" "the leader answered $code to the cluster credential after the edit (want 200)"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  log "recreating $victim with the original password variables"
+  run_patroni_node "$scope" "$etcd_hosts" "$victim" -e "PATRONI_RESTAPI_PASSWORD=test"
+  if ! wait_for_pg_accepting "$victim" 240; then
+    ko "$t" "$victim did not come back after the variable was restored"
+    fail_dump "$t" "$victim"
+    teardown_scope "$scope"; return
+  fi
+  if ! wait_for_replication "$scope" 2 240; then
+    ko "$t" "$victim did not rejoin replication after the variable was restored"
+    fail_dump "$t" "$leader" "$victim"
+    teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "victim=$victim exit=$exit_code; stopped by the REST pre-flight with etcd auth off; leader $leader kept the lock; the member rejoined once the variable was restored"
+  teardown_scope "$scope"
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
@@ -6105,6 +6232,7 @@ ALL_TESTS=(
   t_ha_control_plane_auth_enforced
   t_ha_restapi_auth_unenforced_still_sends_credential
   t_ha_password_edit_stops_member_with_guidance
+  t_ha_password_edit_stops_member_rest_only
 )
 
 usage() {
