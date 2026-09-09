@@ -6320,6 +6320,102 @@ t_ha_password_edit_stops_member_rest_only() {
   teardown_scope "$scope"
 }
 
+# A member added to a running cluster with control-plane authentication on
+# (etcd RBAC + Patroni REST auth) must authenticate to etcd with the same
+# credential its peers use, clone from the leader, stream, and enforce the
+# REST credential itself. No scenario covered a fourth member joining an
+# authenticated cluster; the three-member ones boot everything at once.
+t_ha_scale_up_joins_authenticated_cluster() {
+  local t=t_ha_scale_up_joins_authenticated_cluster
+  local scope=t-scaleup-cpauth-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope" -e "ETCD_ROOT_PASSWORD=test")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" -e "PATRONI_RESTAPI_PASSWORD=test")
+  local n4="${scope}-pg-4"
+  cleanup_n4() { docker rm -f "$n4" >/dev/null 2>&1 || true; docker volume rm "${n4}-vol" >/dev/null 2>&1 || true; }
+
+  local leader
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no leader elected with authentication enabled"
+    fail_dump "$t" "$n1" "$n2" "$n3" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "the founding replicas did not stream"
+    fail_dump "$t" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+  psql_leader "$leader" -v ON_ERROR_STOP=1 -c \
+    "CREATE TABLE scale_up_probe (id int PRIMARY KEY); INSERT INTO scale_up_probe VALUES (1)" >/dev/null || {
+      ko "$t" "could not write the probe row before the scale-up"
+      teardown_scope "$scope"; return
+    }
+
+  # The scale-up: a fresh volume, the same variables a template scale-up
+  # renders (references to the root's credentials), on a cluster that already
+  # enforces both control-plane credentials.
+  log "adding $n4 to the authenticated cluster"
+  new_volume "${n4}-vol"
+  run_patroni_node "$scope" "$etcd_hosts" "$n4" -e "PATRONI_RESTAPI_PASSWORD=test"
+
+  if ! wait_for_pg_accepting "$n4" 300; then
+    ko "$t" "$n4 never accepted connections after joining"
+    fail_dump "$t" "$n4" "$leader" "${scope}-etcd-1"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  if ! wait_for_replication "$scope" 3 300; then
+    ko "$t" "$n4 never streamed from the leader"
+    fail_dump "$t" "$n4" "$leader"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  if ! docker exec "$leader" curl -sf http://localhost:8008/cluster 2>/dev/null | grep -q "\"name\":[[:space:]]*\"$n4\""; then
+    ko "$t" "$n4 is not listed as a member on the leader's /cluster"
+    fail_dump "$t" "$n4" "$leader"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  local row
+  row=$(docker exec -u postgres "$n4" psql -tAc "SELECT id FROM scale_up_probe" 2>/dev/null | tr -d '[:space:]')
+  if [ "$row" != "1" ]; then
+    ko "$t" "$n4 did not replicate the probe row (got '$row')"
+    fail_dump "$t" "$n4" "$leader"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+
+  # The new member enforces the REST credential like its peers: reads open,
+  # an unauthenticated write refused, the cluster credential accepted.
+  local code
+  code=$(docker exec "$n4" curl -s -o /dev/null -w '%{http_code}' http://localhost:8008/patroni)
+  if [ "$code" != "200" ]; then
+    ko "$t" "$n4: GET /patroni answered $code (reads must stay open)"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  code=$(docker exec "$n4" curl -s -o /dev/null -w '%{http_code}' -X POST \
+    http://localhost:8008/restart -d '{"schedule":"2999-01-01T00:00:00+00:00"}')
+  if [ "$code" != "401" ]; then
+    ko "$t" "$n4: unauthenticated POST /restart answered $code (want 401)"
+    fail_dump "$t" "$n4"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  code=$(docker exec "$n4" curl -s -o /dev/null -w '%{http_code}' -u postgres:test -X DELETE \
+    http://localhost:8008/restart)
+  if [ "$code" != "200" ]; then
+    ko "$t" "$n4: authenticated DELETE /restart answered $code (want 200)"
+    fail_dump "$t" "$n4"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+
+  # And its etcd session is the authenticated one: no auth failure anywhere in its boot.
+  if logs_match "$n4" "Etcd3 authentication failed|etcd rejected this member's credential"; then
+    ko "$t" "$n4 logged an etcd authentication failure while joining"
+    fail_dump "$t" "$n4"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "leader=$leader; $n4 joined with etcd RBAC + REST auth on, streams, and enforces the credential"
+  cleanup_n4
+  teardown_scope "$scope"
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
@@ -6403,6 +6499,7 @@ ALL_TESTS=(
   t_ha_restapi_auth_unenforced_still_sends_credential
   t_ha_password_edit_stops_member_with_guidance
   t_ha_password_edit_stops_member_rest_only
+  t_ha_scale_up_joins_authenticated_cluster
 )
 
 usage() {
