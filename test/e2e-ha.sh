@@ -6430,10 +6430,21 @@ t_ha_scale_up_joins_authenticated_cluster() {
     fail_dump "$t" "$n4"
     cleanup_n4; teardown_scope "$scope"; return
   fi
+  # Patroni answers 200 when it removed a scheduled restart and 404 when none
+  # was pending (api.py do_DELETE_restart) — and the bare POST above was
+  # refused, so nothing is pending. Either code means the credential passed
+  # the check_access gate; a refused credential is 401.
   code=$(docker exec "$n4" curl -s -o /dev/null -w '%{http_code}' -u postgres:test -X DELETE \
     http://localhost:8008/restart)
-  if [ "$code" != "200" ]; then
-    ko "$t" "$n4: authenticated DELETE /restart answered $code (want 200)"
+  if [ "$code" != "200" ] && [ "$code" != "404" ]; then
+    ko "$t" "$n4: authenticated DELETE /restart answered $code (want 200 or 404: past the credential check)"
+    fail_dump "$t" "$n4"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  code=$(docker exec "$n4" curl -s -o /dev/null -w '%{http_code}' -u postgres:wrong -X DELETE \
+    http://localhost:8008/restart)
+  if [ "$code" != "401" ]; then
+    ko "$t" "$n4: DELETE /restart with a wrong password answered $code (want 401)"
     fail_dump "$t" "$n4"
     cleanup_n4; teardown_scope "$scope"; return
   fi
