@@ -774,11 +774,31 @@ async fn handle_reseed_marker(
 /// Hand Patroni the same values the config file already carries, so the two
 /// sources agree whatever the variables say. `config` here is post-pin, so on
 /// a fresh volume these are the variables themselves and this is a no-op.
+///
+/// The control-plane credential variables get the same treatment for the
+/// opposite reason: the runner reads a blank (whitespace-only) value as unset
+/// and renders patroni.yml accordingly, while Patroni's loader keeps any
+/// non-empty string (`_get_auth`: `if value:`) and applies it over the file.
+/// A blank `PATRONI_RESTAPI_PASSWORD` then reaches Patroni as
+/// `restapi.authentication = {password: "  "}` with no username, and
+/// `'{username}:{password}'.format(...)` raises KeyError before the API
+/// starts; a blank `PATRONI_ETCD3_PASSWORD` replaces the etcd password the
+/// file carries with spaces. Blank variables are removed from the child's
+/// environment so both sides agree they are unset.
 async fn start_patroni(config: &Config) -> Result<tokio::process::Child> {
-    let child = Command::new("patroni")
+    let mut command = Command::new("patroni");
+    command
         .arg("/etc/patroni/patroni.yml")
         .env("PATRONI_REPLICATION_PASSWORD", &config.repl_pass)
-        .env("PATRONI_SUPERUSER_PASSWORD", &config.superuser_pass)
+        .env("PATRONI_SUPERUSER_PASSWORD", &config.superuser_pass);
+    for var in blank_credential_vars(|name| env::var(name).ok()) {
+        warn!(
+            variable = var,
+            "credential variable is blank; treated as unset and not passed to Patroni"
+        );
+        command.env_remove(var);
+    }
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -786,6 +806,26 @@ async fn start_patroni(config: &Config) -> Result<tokio::process::Child> {
         .context("Failed to start patroni")?;
 
     Ok(child)
+}
+
+/// Control-plane credential variables the runner treats as unset when blank
+/// (see `patroni::config::resolve_restapi_auth` / `resolve_etcd_auth`) and
+/// Patroni would treat as set.
+const BLANK_IS_UNSET_CREDENTIAL_VARS: [&str; 4] = [
+    "PATRONI_RESTAPI_USERNAME",
+    "PATRONI_RESTAPI_PASSWORD",
+    "PATRONI_ETCD3_USERNAME",
+    "PATRONI_ETCD3_PASSWORD",
+];
+
+/// The credential variables whose value under `lookup` is blank, i.e. the ones
+/// to withhold from Patroni's environment. Unset variables are not listed.
+fn blank_credential_vars(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    BLANK_IS_UNSET_CREDENTIAL_VARS
+        .iter()
+        .copied()
+        .filter(|name| lookup(name).is_some_and(|value| value.trim().is_empty()))
+        .collect()
 }
 
 /// Render `/etc/pgbackrest/pgbackrest.conf` with operator-policy defaults +
@@ -2293,14 +2333,37 @@ async fn async_main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        available_bytes, build_pgbackrest_conf, build_pgbackrest_recovery_source_conf,
-        build_pitr_managed_block, clear_clone_wipe_attempts, clone_wipe_ledger_path,
-        configure_pitr_recovery, data_dir_nonempty, is_uuid_shape, parse_process_max,
-        pgdata_is_dedicated_subdir, read_clone_wipe_attempts, record_clone_wipe_attempt,
-        should_wipe_incomplete_clone, strip_pitr_managed_block, wipe_has_safe_clone_source,
-        wipe_pgdata_contents, Config, PgbackrestConfParams, RecoverySourceConfParams,
-        RestapiAddressSource, MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
+        available_bytes, blank_credential_vars, build_pgbackrest_conf,
+        build_pgbackrest_recovery_source_conf, build_pitr_managed_block, clear_clone_wipe_attempts,
+        clone_wipe_ledger_path, configure_pitr_recovery, data_dir_nonempty, is_uuid_shape,
+        parse_process_max, pgdata_is_dedicated_subdir, read_clone_wipe_attempts,
+        record_clone_wipe_attempt, should_wipe_incomplete_clone, strip_pitr_managed_block,
+        wipe_has_safe_clone_source, wipe_pgdata_contents, Config, PgbackrestConfParams,
+        RecoverySourceConfParams, RestapiAddressSource, MAX_CLONE_WIPE_ATTEMPTS,
+        PITR_MANAGED_MARKER,
     };
+
+    #[test]
+    fn blank_credential_variables_are_withheld_from_patroni_set_ones_are_not() {
+        let env = |name: &str| match name {
+            "PATRONI_RESTAPI_PASSWORD" => Some("  ".to_string()),
+            "PATRONI_ETCD3_PASSWORD" => Some(String::new()),
+            "PATRONI_RESTAPI_USERNAME" => Some("ops".to_string()),
+            // PATRONI_ETCD3_USERNAME unset
+            _ => None,
+        };
+        assert_eq!(
+            blank_credential_vars(env),
+            vec!["PATRONI_RESTAPI_PASSWORD", "PATRONI_ETCD3_PASSWORD"]
+        );
+    }
+
+    #[test]
+    fn a_real_password_with_inner_whitespace_is_not_blank() {
+        let env = |name: &str| (name == "PATRONI_RESTAPI_PASSWORD").then(|| " a b ".to_string());
+        assert!(blank_credential_vars(env).is_empty());
+        assert!(blank_credential_vars(|_| None).is_empty());
+    }
 
     fn test_config(data_dir: &str) -> Config {
         Config {
