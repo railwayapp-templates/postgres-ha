@@ -644,6 +644,25 @@ wait_for_pg_accepting() {
   return 1
 }
 
+# wait_for_docker_healthy <container> <timeout_secs> — true once the image's
+# HEALTHCHECK has Docker reporting the container healthy. `none` means the
+# image declares no HEALTHCHECK at all.
+wait_for_docker_healthy() {
+  local c="$1" timeout_secs="${2:-120}"
+  local deadline=$(($(date +%s) + timeout_secs))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$(docker_health_status "$c")" = "healthy" ]; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+docker_health_status() {
+  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$1" 2>/dev/null || echo "gone"
+}
+
 # Run psql as superuser via the Patroni-managed unix socket. Avoids
 # password setup, which Patroni hands to the app user. SSL-only TCP
 # would otherwise need cert plumbing in the harness.
@@ -5803,6 +5822,20 @@ t_ha_control_plane_auth_enforced() {
     teardown_scope "$scope"; return
   fi
 
+  # The image's HEALTHCHECK is the entrypoint probing GET /health, an endpoint
+  # etcd serves outside its RBAC layer: every member reads healthy with
+  # authentication on. (A shell-form `etcdctl endpoint health` cannot even
+  # start on the distroless base image, and would read a key RBAC refuses.)
+  local en
+  for en in "${scope}-etcd-1" "${scope}-etcd-2" "${scope}-etcd-3"; do
+    if ! wait_for_docker_healthy "$en" 120; then
+      ko "$t" "$en HEALTHCHECK reads '$(docker_health_status "$en")' with etcd authentication on (want healthy)"
+      docker inspect -f '{{json .State.Health}}' "$en" >&2 2>/dev/null || true
+      fail_dump "$t" "$en"
+      teardown_scope "$scope"; return
+    fi
+  done
+
   # etcd key-value API: refused without a token, served with one.
   local code
   code=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' -X POST \
@@ -5836,6 +5869,15 @@ t_ha_control_plane_auth_enforced() {
       ko "$t" "$n: unauthenticated POST /restart answered $code (want 401)"
       teardown_scope "$scope"; return
     fi
+    # The route the self-heal paths post to. Refused before Patroni reads the
+    # body, so a bare request never wipes anything; an in-image caller without
+    # the credential would get this same answer (see the log sweep below).
+    code=$(docker exec "$n" curl -s -o /dev/null -w '%{http_code}' -X POST \
+      http://localhost:8008/reinitialize -d '{"force":true}')
+    if [ "$code" != "401" ]; then
+      ko "$t" "$n: unauthenticated POST /reinitialize answered $code (want 401)"
+      teardown_scope "$scope"; return
+    fi
     code=$(docker exec "$n" curl -s -o /dev/null -w '%{http_code}' http://localhost:8008/patroni)
     if [ "$code" != "200" ]; then
       ko "$t" "$n: GET /patroni answered $code (reads must stay open)"
@@ -5857,17 +5899,95 @@ t_ha_control_plane_auth_enforced() {
     teardown_scope "$scope"; return
   fi
 
-  # The member's own tooling still reaches its API: the boot-time reconcile
-  # reads and (when needed) patches /config and must not have been refused.
-  if docker logs "$leader" 2>&1 | grep -qE "PATCH /config failed: 401|/config GET returned 401"; then
-    ko "$t" "in-image caller was refused by its own REST API"
-    fail_dump "$t" "$leader"
-    teardown_scope "$scope"; return
-  fi
+  # The members' own tooling still reaches their APIs: the boot-time reconcile
+  # reads and (when needed) patches /config, and both self-heal paths post
+  # /reinitialize — the startup gate's first issue and the unpark re-issue
+  # alike. A 401 from any of them means an in-image client was built without
+  # the credential (the bare re-issue client, until it went through the shared
+  # REST client).
+  for n in "$n1" "$n2" "$n3"; do
+    if logs_match "$n" "PATCH /config failed: 401|/config GET returned 401|POST /reinitialize returned 401|reinitialize re-issue failed"; then
+      ko "$t" "$n: an in-image caller was refused by its own REST API"
+      fail_dump "$t" "$n"
+      teardown_scope "$scope"; return
+    fi
+  done
 
   ok "$t"
-  note "leader=$leader; etcd auth on; REST writes 401 without the credential, 200 with it"
+  note "leader=$leader; etcd auth on and HEALTHCHECK healthy; REST writes 401 without the credential, 200 with it"
   teardown_scope "$scope"
+}
+
+# The etcd root password reaches etcd byte for byte and never on a command
+# line: the entrypoint creates the user through the gRPC gateway (a JSON body)
+# and hands the credential to etcdctl through its environment. A password with
+# a space is the shape `etcdctl user add root:<password>` would have shown in
+# /proc/<pid>/cmdline and `etcdctl user add root --interactive=false` (stdin,
+# read with Scanf) would have truncated at the space. With authentication on,
+# the members' HEALTHCHECK still reads healthy: the probe is the entrypoint's
+# own GET /health, not an etcdctl key read.
+t_etcd_auth_root_password_with_whitespace() {
+  local t="t_etcd_auth_root_password_with_whitespace"
+  local prefix="wspw"
+  local n1="${prefix}-etcd-1" n2="${prefix}-etcd-2" n3="${prefix}-etcd-3"
+  local pw="sp ace-9f3c"
+  local hosts
+  hosts=$(setup_etcd_cluster "$prefix" -e "ETCD_ROOT_PASSWORD=${pw}")
+  log "etcd cluster up ($hosts)"
+
+  local deadline=$(($(date +%s) + 120)) status=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status=$(docker exec "$n1" etcdctl "--user=root:${pw}" auth status 2>/dev/null || true)
+    echo "$status" | grep -q "Authentication Status: true" && break
+    sleep 3
+  done
+  if ! echo "$status" | grep -q "Authentication Status: true"; then
+    ko "$t" "etcd authentication never enabled with a root password containing a space: '$status'"
+    fail_dump "$t" "$n1" "$n2" "$n3"
+    for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1; done
+    return
+  fi
+
+  # The gateway accepts the whole password and refuses the part before the
+  # space — the value a whitespace-delimited stdin read would have stored.
+  gateway_auth() {
+    docker run --rm --network "$NET" --entrypoint curl "$IMAGE" -s -o /dev/null -w '%{http_code}' \
+      -X POST "http://${n1}:2379/v3/auth/authenticate" -d "{\"name\":\"root\",\"password\":\"$1\"}"
+  }
+  local code
+  code=$(gateway_auth "$pw")
+  if [ "$code" != "200" ]; then
+    ko "$t" "the full root password was refused by /v3/auth/authenticate ($code; want 200)"
+    fail_dump "$t" "$n1"
+    for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1; done
+    return
+  fi
+  code=$(gateway_auth "sp")
+  if [ "$code" != "400" ]; then
+    ko "$t" "the password truncated at the space authenticated ($code; want 400)"
+    fail_dump "$t" "$n1"
+    for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1; done
+    return
+  fi
+
+  for n in "$n1" "$n2" "$n3"; do
+    if logs_contain "$n" "$pw"; then
+      ko "$t" "$n: the root password appears in the entrypoint's log"
+      for c in "$n1" "$n2" "$n3"; do docker rm -f "$c" >/dev/null 2>&1; done
+      return
+    fi
+    if ! wait_for_docker_healthy "$n" 120; then
+      ko "$t" "$n HEALTHCHECK reads '$(docker_health_status "$n")' with etcd authentication on (want healthy)"
+      docker inspect -f '{{json .State.Health}}' "$n" >&2 2>/dev/null || true
+      fail_dump "$t" "$n"
+      for c in "$n1" "$n2" "$n3"; do docker rm -f "$c" >/dev/null 2>&1; done
+      return
+    fi
+  done
+
+  ok "$t"
+  note "root password with a space enabled authentication, authenticates whole, refuses truncated; HEALTHCHECK healthy on all 3"
+  for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1; done
 }
 
 # Without PATRONI_RESTAPI_PASSWORD the member keeps accepting unauthenticated
@@ -5904,8 +6024,46 @@ t_ha_restapi_auth_unenforced_still_sends_credential() {
     teardown_scope "$scope"; return
   fi
 
+  # A blank (whitespace-only) PATRONI_RESTAPI_PASSWORD is "unset" to the runner
+  # and must be unset to Patroni too. Handed through, Patroni's loader keeps
+  # any non-empty string: restapi.authentication becomes a password with no
+  # username and Patroni dies at config load (KeyError), or a REST password of
+  # spaces the runner never sends is enforced. The member boots open, like its
+  # peers, and says why.
+  local blank_member="" n
+  for n in "$n1" "$n2" "$n3"; do
+    [ "$n" = "$leader" ] && continue
+    blank_member="$n"; break
+  done
+  log "recreating $blank_member with blank control-plane credential variables"
+  run_patroni_node "$scope" "$etcd_hosts" "$blank_member" \
+    -e "PATRONI_RESTAPI_PASSWORD=  " \
+    -e "PATRONI_ETCD3_PASSWORD=  "
+  if ! wait_for_pg_accepting "$blank_member" 240; then
+    ko "$t" "$blank_member never came back with blank credential variables (Patroni read them as set?)"
+    fail_dump "$t" "$blank_member"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_contain "$blank_member" "credential variable is blank"; then
+    ko "$t" "$blank_member did not report the blank variables it withheld from Patroni"
+    fail_dump "$t" "$blank_member"
+    teardown_scope "$scope"; return
+  fi
+  code=$(docker exec "$blank_member" curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+    http://localhost:8008/config -d '{"loop_wait":10}')
+  if [ "$code" != "200" ]; then
+    ko "$t" "$blank_member answered PATCH /config with $code under a blank PATRONI_RESTAPI_PASSWORD (want 200: blank is unset)"
+    fail_dump "$t" "$blank_member"
+    teardown_scope "$scope"; return
+  fi
+  if logs_match "$blank_member" "KeyError|Etcd3 authentication failed"; then
+    ko "$t" "$blank_member: Patroni read the blank variables as credentials"
+    fail_dump "$t" "$blank_member"
+    teardown_scope "$scope"; return
+  fi
+
   ok "$t"
-  note "leader=$leader; writes still open, superuser credential rendered under ctl"
+  note "leader=$leader; writes still open, superuser credential rendered under ctl; $blank_member booted open with blank credential variables"
   teardown_scope "$scope"
 }
 
@@ -5979,6 +6137,9 @@ ALL_TESTS=(
   # etcd wrapper: an ETCD_INITIAL_CLUSTER entry whose host resolved empty (a
   # deleted sibling) is skipped, not fatal
   t_etcd_tolerates_deleted_peer_in_initial_cluster
+  # etcd wrapper: the root password is carried verbatim (gateway body + etcdctl
+  # environment, never argv) and the HEALTHCHECK stays healthy under RBAC
+  t_etcd_auth_root_password_with_whitespace
   # clean-stop contract: the runtime's stop signal reaches the real process in
   # every image and the container exits 0 inside the grace period
   t_etcd_stop_is_clean
