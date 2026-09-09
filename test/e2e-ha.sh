@@ -6325,6 +6325,14 @@ t_ha_password_edit_stops_member_rest_only() {
 # credential its peers use, clone from the leader, stream, and enforce the
 # REST credential itself. No scenario covered a fourth member joining an
 # authenticated cluster; the three-member ones boot everything at once.
+#
+# The template's replica slots render PATRONI_WAIT_FOR_LEADER=true (mono
+# seed-postgres-templates.ts, the Postgres-2/-3 slots), which makes the runner
+# itself read the leader key from etcd before Patroni starts — the one path in
+# the runner that authenticates to etcd with a gateway token. The new member
+# carries it here, and the scenario asserts both that etcd is enforcing (so a
+# cluster that silently never enabled authentication cannot pass) and that the
+# runner's authenticated read found the leader.
 t_ha_scale_up_joins_authenticated_cluster() {
   local t=t_ha_scale_up_joins_authenticated_cluster
   local scope=t-scaleup-cpauth-${PG_VERSION}
@@ -6350,16 +6358,43 @@ t_ha_scale_up_joins_authenticated_cluster() {
       teardown_scope "$scope"; return
     }
 
-  # The scale-up: a fresh volume, the same variables a template scale-up
-  # renders (references to the root's credentials), on a cluster that already
-  # enforces both control-plane credentials.
+  # etcd must be enforcing before the new member arrives: the entrypoint turns
+  # authentication on once the trio is healthy, and without this check the
+  # scenario would pass against an etcd that never did.
+  local auth_status
+  auth_status=$(docker exec "${scope}-etcd-1" etcdctl --user=root:test auth status 2>/dev/null)
+  if ! echo "$auth_status" | grep -q "Authentication Status: true"; then
+    ko "$t" "etcd authentication is not enabled before the scale-up: '$auth_status'"
+    fail_dump "$t" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  # The scale-up: a fresh volume, the variables the template renders on a
+  # replica slot (the credential references and PATRONI_WAIT_FOR_LEADER=true),
+  # on a cluster that already enforces both control-plane credentials.
   log "adding $n4 to the authenticated cluster"
   new_volume "${n4}-vol"
-  run_patroni_node "$scope" "$etcd_hosts" "$n4" -e "PATRONI_RESTAPI_PASSWORD=test"
+  run_patroni_node "$scope" "$etcd_hosts" "$n4" \
+    -e "PATRONI_RESTAPI_PASSWORD=test" \
+    -e "PATRONI_WAIT_FOR_LEADER=true"
 
   if ! wait_for_pg_accepting "$n4" 300; then
     ko "$t" "$n4 never accepted connections after joining"
     fail_dump "$t" "$n4" "$leader" "${scope}-etcd-1"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  # The runner's own authenticated etcd read: with PATRONI_WAIT_FOR_LEADER it
+  # fetches a gateway token and ranges the leader key before Patroni starts.
+  # A token etcd refused shows as the non-success warning and a five-minute
+  # wait instead of this line.
+  if ! logs_contain "$n4" "Cluster leader found, proceeding to start Patroni"; then
+    ko "$t" "$n4 did not find the leader in etcd through the runner's authenticated read"
+    fail_dump "$t" "$n4" "${scope}-etcd-1"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  if logs_contain "$n4" "etcd returned non-success status"; then
+    ko "$t" "$n4: etcd refused the runner's leader read (token not accepted)"
+    fail_dump "$t" "$n4" "${scope}-etcd-1"
     cleanup_n4; teardown_scope "$scope"; return
   fi
   if ! wait_for_replication "$scope" 3 300; then
@@ -6411,7 +6446,7 @@ t_ha_scale_up_joins_authenticated_cluster() {
   fi
 
   ok "$t"
-  note "leader=$leader; $n4 joined with etcd RBAC + REST auth on, streams, and enforces the credential"
+  note "leader=$leader; etcd enforcing; $n4 found the leader through an authenticated etcd read, joined, streams, and enforces the REST credential"
   cleanup_n4
   teardown_scope "$scope"
 }
