@@ -192,19 +192,10 @@ pub fn apply_credential_pin(
         return PinOutcome::Matches;
     }
 
-    let mut overridden: Vec<&'static str> = Vec::new();
-    if pinned.superuser_pass != config.superuser_pass {
-        config.superuser_pass = pinned.superuser_pass.clone();
-        overridden.push("PATRONI_SUPERUSER_PASSWORD");
-    }
-    if pinned.repl_pass != config.repl_pass {
-        config.repl_pass = pinned.repl_pass.clone();
-        overridden.push("PATRONI_REPLICATION_PASSWORD");
-    }
-    if pinned.app_pass != config.app_pass {
-        config.app_pass = pinned.app_pass.clone();
-        overridden.push("POSTGRES_PASSWORD");
-    }
+    let overridden = drifted_variables(&pinned, &from_env);
+    config.superuser_pass = pinned.superuser_pass;
+    config.repl_pass = pinned.repl_pass;
+    config.app_pass = pinned.app_pass;
 
     warn!(
         drifted = ?overridden,
@@ -224,11 +215,95 @@ pub fn apply_credential_pin(
     PinOutcome::KeptPinned(overridden)
 }
 
+/// The variables whose value differs from the pinned password of the same
+/// role — the list [`PinOutcome::KeptPinned`] carries.
+pub fn drifted_variables(
+    pinned: &PinnedCredentials,
+    from_env: &PinnedCredentials,
+) -> Vec<&'static str> {
+    let mut drifted = Vec::new();
+    if pinned.superuser_pass != from_env.superuser_pass {
+        drifted.push("PATRONI_SUPERUSER_PASSWORD");
+    }
+    if pinned.repl_pass != from_env.repl_pass {
+        drifted.push("PATRONI_REPLICATION_PASSWORD");
+    }
+    if pinned.app_pass != from_env.app_pass {
+        drifted.push("POSTGRES_PASSWORD");
+    }
+    drifted
+}
+
+/// The variables that differ from the pin on this volume, without applying
+/// the pin — for boot-time checks that run before [`apply_credential_pin`]
+/// (the credential pre-flights run ahead of the reseed handling, which may
+/// wipe the data directory the pin lives in). Empty on a fresh volume, when
+/// the pin cannot be read, and under `PATRONI_CREDENTIALS_FROM_ENV=true`,
+/// where the variables are declared right by the operator. `config` must be
+/// pre-pin: its passwords are the variables' values.
+pub fn credential_drift(config: &Config, credentials_from_env: bool) -> Vec<&'static str> {
+    if credentials_from_env {
+        return Vec::new();
+    }
+    match read_credential_pin(&config.data_dir) {
+        Some(pinned) => drifted_variables(&pinned, &PinnedCredentials::from_config(config)),
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::patroni::RestapiAddressSource;
     use tempfile::tempdir;
+
+    #[test]
+    fn drifted_variables_names_each_role_whose_variable_moved() {
+        let pinned = PinnedCredentials {
+            superuser_pass: "su".into(),
+            repl_pass: "repl".into(),
+            app_pass: "app".into(),
+        };
+        let mut from_env = pinned.clone();
+        assert!(drifted_variables(&pinned, &from_env).is_empty());
+        from_env.superuser_pass = "edited".into();
+        from_env.app_pass = "edited".into();
+        assert_eq!(
+            drifted_variables(&pinned, &from_env),
+            vec!["PATRONI_SUPERUSER_PASSWORD", "POSTGRES_PASSWORD"]
+        );
+        from_env.repl_pass = "edited".into();
+        assert_eq!(drifted_variables(&pinned, &from_env).len(), 3);
+    }
+
+    #[test]
+    fn credential_drift_reads_the_pin_without_applying_it() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let config = config_at(&data_dir);
+
+        // Fresh volume: nothing to compare against.
+        assert!(credential_drift(&config, false).is_empty());
+
+        write_credential_pin(
+            &data_dir,
+            &PinnedCredentials {
+                superuser_pass: "su-pinned".into(),
+                repl_pass: "repl-env".into(),
+                app_pass: "app-env".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            credential_drift(&config, false),
+            vec!["PATRONI_SUPERUSER_PASSWORD"]
+        );
+        // The config's passwords are untouched: applying the pin is
+        // apply_credential_pin's job.
+        assert_eq!(config.superuser_pass, "su-env");
+        // Break-glass: the operator declared the variables right.
+        assert!(credential_drift(&config, true).is_empty());
+    }
 
     fn config_at(data_dir: &str) -> Config {
         Config {
