@@ -42,6 +42,14 @@ jobs:
           cache-from: type=gha,scope=patroni-pg${{ matrix.pg_version }}
           cache-to: type=gha,scope=patroni-pg${{ matrix.pg_version }},mode=max
 
+      - name: pgBackRest environment regression (no database or network)
+        run: |
+          docker run --rm --user postgres --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,size=16m,mode=1777 \
+            --mount "type=bind,source=${{ github.workspace }}/test/pgbackrest-env.py,target=/test/pgbackrest-env.py,readonly" \
+            --entrypoint python3 postgres-ha-pitr:${{ matrix.pg_version }} /test/pgbackrest-env.py
+
       - name: Build etcd image
         uses: docker/build-push-action@v5
         with:
