@@ -288,26 +288,68 @@ fn yaml_quote(v: &str) -> String {
     v.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Update pg_hba.conf to add replication entries for adopted data
+/// Ensure pg_hba.conf allows `config.repl_user` to make a physical
+/// replication connection from ANY node address, regardless of how this
+/// data directory came to exist.
+///
+/// Runs on EVERY boot of every node — not just a node adopting a pre-existing
+/// vanilla Postgres data directory. pg_hba.conf lives on the volume, not the
+/// image, so a rule written once (at `initdb`, or by an earlier version of
+/// this function gated to the adoption path) is never revisited again on its
+/// own: a replica clones it byte-for-byte via `pg_basebackup`, and nothing
+/// else in the wrapper ever edits it after that. On a cluster whose members
+/// get replaced over its lifetime — a redeploy, a self-heal reclone, a
+/// failover promoting a node that was never the one adoption/bootstrap ran
+/// on — the CURRENT leader is whichever member happens to be enforcing
+/// connections right now, and that member's on-disk file may predate this
+/// rule, or may carry an even OLDER, narrower one (e.g. a fixed peer IP or
+/// CIDR that Railway's private network — dynamic per-container-boot address
+/// — has long since moved past). Self-heal that only fires "if adopting"
+/// leaves every such cluster to rot the moment the fix-carrying node stops
+/// being the one that matters.
+///
+/// Observed 2026-09-11 on a customer cluster whose replicas had been unable
+/// to (re)join the leader for 2+ days: both non-leader members retried
+/// `pg_basebackup` every ~5s, wiping their empty data directory each time,
+/// while the LEADER's own postgres log recorded, continuously,
+/// `FATAL: no pg_hba.conf entry for replication connection from host
+/// "<railway-private-ipv6>", user "postgres"` (both SSL and plaintext) — for
+/// a `repl_user` confirmed identical to what the leader itself was
+/// configured with. The leader was never the node the adoption/bootstrap
+/// path had patched.
+///
+/// Idempotency is keyed on the WIDE-OPEN form specifically
+/// (`replication {repl_user} 0.0.0.0/0` / `::/0`), not merely on any
+/// occurrence of `replication {repl_user}` — a substring match on the
+/// user name alone is satisfied by a narrower, stale rule (a specific old
+/// peer address) just as easily as by the wide one, and would then skip
+/// ever widening it. New entries are prepended (see below), so even when an
+/// old narrower rule for the same user is already present further down the
+/// file, the fresh wildcard lines are matched FIRST by pg_hba's own
+/// first-match-wins semantics and the connection succeeds regardless of
+/// what stale rule follows.
 pub fn update_pg_hba_for_replication(config: &Config) -> Result<()> {
     let pg_hba_path = format!("{}/pg_hba.conf", config.data_dir);
 
+    // Nothing to patch before the first initdb has run.
     if !Path::new(&pg_hba_path).exists() {
         return Ok(());
     }
 
-    info!(user = %config.repl_user, "Checking pg_hba.conf for replication");
+    info!(user = %config.repl_user, "Checking pg_hba.conf for wide-open replication access");
 
     let content = fs::read_to_string(&pg_hba_path)?;
 
-    if content.contains(&format!("replication {}", config.repl_user))
-        || content.contains(&format!("replication\t{}", config.repl_user))
-    {
-        info!("Replication entries already exist");
+    let has_wildcard = |cidr: &str| {
+        content.contains(&format!("replication {} {cidr}", config.repl_user))
+            || content.contains(&format!("replication\t{}\t{cidr}", config.repl_user))
+    };
+    if has_wildcard("0.0.0.0/0") && has_wildcard("::/0") {
+        info!("Wide-open replication entries already exist");
         return Ok(());
     }
 
-    info!("Adding replication entries to pg_hba.conf");
+    info!("Adding wide-open replication entries to pg_hba.conf");
 
     let new_entries = format!(
         r#"# Replication entries for {}
@@ -642,5 +684,140 @@ mod tests {
         let yaml = generate_patroni_config(&cfg, "replica");
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed["etcd3"]["password"], r#"a"b\c"#);
+    }
+
+    mod update_pg_hba_for_replication {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn config_with_data_dir(data_dir: &std::path::Path, repl_user: &str) -> Config {
+            Config {
+                repl_user: repl_user.into(),
+                data_dir: data_dir.to_string_lossy().into_owned(),
+                ..test_config(None)
+            }
+        }
+
+        fn write_hba(dir: &std::path::Path, contents: &str) -> std::path::PathBuf {
+            let path = dir.join("pg_hba.conf");
+            fs::write(&path, contents).unwrap();
+            path
+        }
+
+        #[test]
+        fn no_ops_before_the_first_initdb() {
+            // Fresh volume: pg_hba.conf does not exist yet. Must not create it —
+            // that is Patroni's own bootstrap job, and doing it here would race
+            // whatever initdb is about to write.
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_with_data_dir(dir.path(), "postgres");
+            update_pg_hba_for_replication(&cfg).unwrap();
+            assert!(!dir.path().join("pg_hba.conf").exists());
+        }
+
+        #[test]
+        fn adds_wide_open_entries_when_none_exist() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_hba(dir.path(), "local all all trust\n");
+            let cfg = config_with_data_dir(dir.path(), "postgres");
+
+            update_pg_hba_for_replication(&cfg).unwrap();
+
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(content.contains("hostssl replication postgres 0.0.0.0/0 scram-sha-256"));
+            assert!(content.contains("hostssl replication postgres ::/0 scram-sha-256"));
+            assert!(content.contains("host replication postgres 0.0.0.0/0 scram-sha-256"));
+            assert!(content.contains("host replication postgres ::/0 scram-sha-256"));
+            // The original line survives.
+            assert!(content.contains("local all all trust"));
+        }
+
+        /// Regression test for the 2026-09-11 production incident: a stale,
+        /// narrower replication rule for the SAME user (the shape a rule
+        /// written against an old, now-rotated peer address leaves behind)
+        /// must not be mistaken for "already wide open". The prior
+        /// implementation's check (`content.contains("replication {user}")`)
+        /// matched this narrower line's text too and skipped adding the
+        /// wildcard — leaving a replica that no longer has that exact address
+        /// permanently unable to reconnect.
+        #[test]
+        fn widens_a_stale_narrow_rule_for_the_same_user_instead_of_treating_it_as_sufficient() {
+            let dir = tempfile::tempdir().unwrap();
+            let stale = "local all all trust\n\
+                hostssl replication postgres 10.0.0.5/32 scram-sha-256\n";
+            let path = write_hba(dir.path(), stale);
+            let cfg = config_with_data_dir(dir.path(), "postgres");
+
+            update_pg_hba_for_replication(&cfg).unwrap();
+
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(
+                content.contains("hostssl replication postgres 0.0.0.0/0 scram-sha-256"),
+                "must widen even though a narrower same-user rule already exists:\n{content}"
+            );
+            assert!(content.contains("hostssl replication postgres ::/0 scram-sha-256"));
+            // The wide-open lines are prepended, so pg_hba's first-match-wins
+            // semantics pick them before the stale narrow rule is ever reached.
+            let wide_pos = content.find("0.0.0.0/0").unwrap();
+            let stale_pos = content.find("10.0.0.5/32").unwrap();
+            assert!(
+                wide_pos < stale_pos,
+                "wide-open entries must precede the stale rule"
+            );
+            // The stale rule itself is left in place, not rewritten in place —
+            // harmless once shadowed, and simplest to reason about.
+            assert!(content.contains("10.0.0.5/32"));
+        }
+
+        #[test]
+        fn is_idempotent_once_wide_open_entries_exist() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_hba(dir.path(), "local all all trust\n");
+            let cfg = config_with_data_dir(dir.path(), "postgres");
+
+            update_pg_hba_for_replication(&cfg).unwrap();
+            let once = fs::read_to_string(&path).unwrap();
+            update_pg_hba_for_replication(&cfg).unwrap();
+            let twice = fs::read_to_string(&path).unwrap();
+
+            assert_eq!(once, twice, "a second boot must not duplicate the entries");
+            assert_eq!(
+                twice
+                    .matches("hostssl replication postgres 0.0.0.0/0")
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn scopes_to_the_configured_repl_user_only() {
+            // A wide-open rule for a DIFFERENT user (e.g. a cluster whose
+            // PATRONI_REPLICATION_USERNAME was rotated away from "replicator")
+            // must not be read as covering "postgres".
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_hba(
+                dir.path(),
+                "hostssl replication replicator 0.0.0.0/0 scram-sha-256\n\
+                 hostssl replication replicator ::/0 scram-sha-256\n",
+            );
+            let cfg = config_with_data_dir(dir.path(), "postgres");
+
+            update_pg_hba_for_replication(&cfg).unwrap();
+
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(content.contains("hostssl replication postgres 0.0.0.0/0 scram-sha-256"));
+        }
+
+        #[test]
+        fn writes_restrictive_permissions() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_hba(dir.path(), "local all all trust\n");
+            let cfg = config_with_data_dir(dir.path(), "postgres");
+
+            update_pg_hba_for_replication(&cfg).unwrap();
+
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }
