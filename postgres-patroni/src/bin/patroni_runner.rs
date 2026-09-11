@@ -2064,10 +2064,18 @@ async fn async_main() -> Result<()> {
     // just sheds the marker.
     handle_reseed_marker(&config, &volume_root, image_major.as_deref(), &telemetry).await?;
 
-    // Handle data adoption from vanilla PostgreSQL
-    if config.adopt_existing_data {
-        update_pg_hba_for_replication(&config)?;
-    }
+    // Unconditional, every boot, every node — not gated behind
+    // `adopt_existing_data`. pg_hba.conf lives on the volume and nothing else
+    // ever revisits it after it is first written; whichever member is
+    // enforcing connections right now (the current leader) may be a node
+    // that was never the one an earlier adoption/bootstrap patched. Self-heal
+    // scoped to "the node that was adopted" rather than "whoever is leader
+    // today" leaves every later leadership change unprotected — see
+    // update_pg_hba_for_replication's doc comment for the 2026-09-11
+    // production incident this closes. No-ops before the first initdb
+    // (pg_hba.conf does not exist yet) and once the wide-open entries are
+    // already present.
+    update_pg_hba_for_replication(&config)?;
 
     let pg_control_path = format!("{}/global/pg_control", config.data_dir);
     let has_pg_control = Path::new(&pg_control_path).exists();
