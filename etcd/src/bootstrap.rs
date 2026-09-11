@@ -8,7 +8,7 @@ use crate::cluster::{
 };
 use crate::config::{get_leader_endpoint, parse_initial_cluster, peer_to_client_url, Config};
 use anyhow::{anyhow, Result};
-use common::{etcd_http_health, etcdctl, Telemetry, TelemetryEvent};
+use common::{etcd_http_health, etcd_http_user_add, etcdctl, Telemetry, TelemetryEvent};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -256,17 +256,24 @@ async fn auth_step(args: &[&str]) -> Result<()> {
 }
 
 /// Enable etcd authentication with `root` (root role) as the only account.
-/// Each step is idempotent, and `--user` is already attached to every call
-/// (accepted by etcd before enabling, required after).
+/// Each step is idempotent, and the root credential rides along on every
+/// `etcdctl` call in its environment (accepted by etcd before enabling,
+/// required after). The user itself is created through the gRPC gateway, so
+/// the password is never on a command line (see `common::etcd_http_user_add`).
+/// A cluster that already enforces has the user by construction, so the
+/// status check comes first and the remaining steps run only while the
+/// cluster is still open. If a peer enables authentication between the two,
+/// the tokenless user add fails and the next cycle finds the status flipped.
 async fn ensure_auth_enabled(root_password: &str) -> Result<()> {
+    const LOCAL: &str = "127.0.0.1:2379";
     let ep = "--endpoints=127.0.0.1:2379";
-    auth_step(&["user", "add", &format!("root:{root_password}"), ep]).await?;
-    auth_step(&["role", "add", "root", ep]).await?;
-    auth_step(&["user", "grant-role", "root", "root", ep]).await?;
     let status = etcdctl(&["auth", "status", ep]).await?;
     if status.contains("Authentication Status: true") {
         return Ok(());
     }
+    etcd_http_user_add(LOCAL, "root", root_password).await?;
+    auth_step(&["role", "add", "root", ep]).await?;
+    auth_step(&["user", "grant-role", "root", "root", ep]).await?;
     etcdctl(&["auth", "enable", ep]).await?;
     info!("etcd authentication enabled (root)");
     Ok(())
