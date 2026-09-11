@@ -5973,6 +5973,7 @@ t_etcd_auth_root_password_with_whitespace() {
   for n in "$n1" "$n2" "$n3"; do
     if logs_contain "$n" "$pw"; then
       ko "$t" "$n: the root password appears in the entrypoint's log"
+      fail_dump "$t" "$n1" "$n2" "$n3"
       for c in "$n1" "$n2" "$n3"; do docker rm -f "$c" >/dev/null 2>&1; done
       return
     fi

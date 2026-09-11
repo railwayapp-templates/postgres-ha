@@ -397,6 +397,8 @@ pub async fn start_etcd(
     apply_default_flag(&mut cmd, "--snapshot-count", "ETCD_SNAPSHOT_COUNT", "1000");
     apply_default_flag(&mut cmd, "--max-learners", "ETCD_MAX_LEARNERS", "2");
 
+    withhold_entrypoint_secrets(&mut cmd);
+
     // stderr is piped (not inherited) so the supervisor can watch etcd's log
     // stream for the unrecoverable raft-log corruption panic; the caller tees it
     // back to its own stderr so container logs are unaffected.
@@ -410,6 +412,18 @@ pub async fn start_etcd(
         .context("Failed to start etcd")?;
 
     Ok(child)
+}
+
+/// Keep the entrypoint's own secrets out of the etcd child's environment.
+///
+/// etcd reads every `ETCD_*` variable as a flag and, for one it does not know,
+/// logs `unrecognized environment variable` with the whole `NAME=value` pair
+/// verbatim at warn level (etcd 3.6.6 `pkg/flags/flag.go`, `verifyEnv`). The
+/// root password is such a variable: it is the entrypoint's credential for
+/// `etcdctl` and the gateway, never an etcd setting, so an inherited copy only
+/// ends up printed in the member's log at every boot.
+fn withhold_entrypoint_secrets(cmd: &mut Command) {
+    cmd.env_remove(common::ETCD_ROOT_PASSWORD_ENV);
 }
 
 /// Apply a wrapper default as a CLI flag, but only when the operator has not set
@@ -428,5 +442,28 @@ fn apply_default_flag(cmd: &mut Command, flag: &str, env_key: &str, default: &st
         _ => {
             cmd.arg(format!("{}={}", flag, default));
         }
+    }
+}
+
+#[cfg(test)]
+mod entrypoint_secret_tests {
+    use super::withhold_entrypoint_secrets;
+    use std::ffi::OsStr;
+    use tokio::process::Command;
+
+    #[test]
+    fn the_root_password_is_withheld_from_the_etcd_child() {
+        let mut cmd = Command::new("/usr/local/bin/etcd");
+        cmd.env("ETCD_INITIAL_CLUSTER", "etcd-1=http://etcd-1:2380");
+        withhold_entrypoint_secrets(&mut cmd);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            envs.contains(&(OsStr::new(common::ETCD_ROOT_PASSWORD_ENV), None)),
+            "ETCD_ROOT_PASSWORD must be removed from the child's environment: {envs:?}"
+        );
+        assert!(envs.contains(&(
+            OsStr::new("ETCD_INITIAL_CLUSTER"),
+            Some(OsStr::new("etcd-1=http://etcd-1:2380"))
+        )));
     }
 }
