@@ -877,6 +877,16 @@ t_vanilla_boot() {
     return
   fi
 
+  # Patroni caches its dynamic configuration in PGDATA. The standalone boot's
+  # orphan-slot reaper (orphan_slots.rs) gates on this file as the proof that
+  # the data directory was Patroni-managed — if Patroni ever stops writing it,
+  # that reaper goes silent on every reverted cluster. Pin the assumption.
+  if ! docker exec "$leader" test -f /var/lib/postgresql/data/pgdata/patroni.dynamic.json; then
+    ko t_vanilla_boot "patroni.dynamic.json missing from the leader's PGDATA (the standalone orphan-slot reaper gates on it)"
+    teardown_scope "$scope"
+    return
+  fi
+
   ok t_vanilla_boot
   note "leader=$leader; replicas streaming; archiving disabled (vanilla HA)"
   teardown_scope "$scope"
@@ -6462,6 +6472,173 @@ t_ha_scale_up_joins_authenticated_cluster() {
   teardown_scope "$scope"
 }
 
+# Seed $vol with a vanilla PostgreSQL data dir carrying the replication-slot
+# population a reverted HA root inherits: two Patroni member slots (physical,
+# reserved — what the leader holds for `postgres-2`/`postgres-3`), one physical
+# slot an external consumer will hold open during the test, and a Fivetran-style
+# logical slot. wal_level=logical so the logical slot can exist. Some WAL is
+# written past the slots' restart_lsn so the reaper has a real retained size to
+# report. Clean shutdown, like the redeploy a revert triggers.
+_seed_pgdata_with_member_slots() {
+  local vol="$1" name="$2"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label "$HA_LABEL" --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -v "${vol}:/var/lib/postgresql/data" \
+    "postgres:${PG_VERSION}" \
+    -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10 >/dev/null
+  # TCP probe, never the socket — see _seed_standalone_pgdata.
+  local up=0 _i
+  for _i in $(seq 1 120); do
+    if docker exec "$name" pg_isready -U postgres -h localhost -q >/dev/null 2>&1; then up=1; break; fi
+    sleep 1
+  done
+  if [ "$up" != 1 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; return 1; fi
+  docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 -q \
+    -c "SELECT pg_create_physical_replication_slot('postgres_2', true);" \
+    -c "SELECT pg_create_physical_replication_slot('postgres_3', true);" \
+    -c "SELECT pg_create_physical_replication_slot('external_standby', true);" \
+    -c "SELECT pg_create_logical_replication_slot('fivetran_pgoutput_slot','pgoutput');" \
+    -c "CREATE TABLE churn AS SELECT g, repeat('x',500) AS v FROM generate_series(1,50000) g;" \
+    -c "CHECKPOINT;" \
+    >/dev/null || { docker rm -f "$name" >/dev/null 2>&1 || true; return 1; }
+  docker stop -t 30 "$name" >/dev/null
+  docker rm "$name" >/dev/null
+}
+
+# Boot $IMAGE standalone (PATRONI_ENABLED unset) on an already-seeded volume,
+# with a short orphan-slot grace so the verdict lands inside the test window.
+# Returns 0 once the server accepts TCP connections.
+_boot_standalone_on_volume() {
+  local name="$1" vol="$2"
+  docker run -d --name "$name" --label "$HA_LABEL" --network "$NET" \
+    -v "${vol}:/var/lib/postgresql/data" \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -e POSTGRES_PASSWORD=test \
+    -e POSTGRES_ORPHAN_SLOT_GRACE_SECONDS=20 \
+    "$IMAGE" >/dev/null
+  local _i
+  for _i in $(seq 1 120); do
+    if docker exec "$name" pg_isready -U postgres -h localhost -q >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# `name:active` for every replication slot, comma-joined and sorted.
+_slot_census() {
+  docker exec "$1" psql -U postgres -h /var/run/postgresql -Atc \
+    "SELECT slot_name || ':' || active::text FROM pg_replication_slots ORDER BY slot_name" 2>/dev/null \
+    | paste -sd, -
+}
+
+# A reverted HA cluster leaves the members' physical replication slots on the
+# former leader, and nothing drops them once Patroni is gone — each pins WAL
+# without bound (69 GB observed live on a near-empty volume, 2026-09-13). The
+# standalone boot must reap them, and ONLY them:
+#   - gated on Patroni's footprint (patroni.dynamic.json in PGDATA): the very
+#     same slots on a never-HA standalone are left alone (phase A);
+#   - a physical slot a consumer holds open (pg_receivewal here, a standby in
+#     life) survives — every slot is inactive at the instant of boot, so the
+#     verdict waits for the grace window (phase B);
+#   - a logical slot (customer CDC) is never touched.
+# Asserts on the reaper's own log lines, not just the end state, so the drop
+# is causally ours.
+t_standalone_reaps_orphaned_member_slots() {
+  local t=t_standalone_reaps_orphaned_member_slots
+  local vol="orphslots-vol-${PG_VERSION}" n="orphslots-pg-${PG_VERSION}"
+  local seed="orphslots-seed-${PG_VERSION}"
+  local all_idle="external_standby:f,fivetran_pgoutput_slot:f,postgres_2:f,postgres_3:f"
+  docker rm -f "$n" "$seed" >/dev/null 2>&1 || true
+  new_volume "$vol"
+  if ! _seed_pgdata_with_member_slots "$vol" "$seed"; then
+    ko "$t" "failed to seed pgdata with replication slots"
+    return
+  fi
+
+  # Phase A — never-HA data directory: no marker, nothing may be dropped.
+  if ! _boot_standalone_on_volume "$n" "$vol"; then
+    ko "$t" "phase A: standalone postgres never became ready"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  # Past the 20s grace with margin: if the gate were missing, the drops
+  # would have landed by now.
+  sleep 35
+  local census
+  census=$(_slot_census "$n")
+  if [ "$census" != "$all_idle" ]; then
+    ko "$t" "phase A: slots changed on a never-HA data directory (got '$census', want '$all_idle')"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  if logs_contain "$n" "orphan-slots:"; then
+    ko "$t" "phase A: the reaper ran without Patroni provenance"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  docker stop -t 30 "$n" >/dev/null
+  docker rm -f "$n" >/dev/null 2>&1
+
+  # Phase B — the same volume, now carrying Patroni's footprint, exactly as
+  # a reverted leader does. uid 999 = postgres in the official image.
+  if ! docker run --rm -v "$vol:/v" alpine sh -c \
+      'printf "%s" "{\"ttl\":30,\"loop_wait\":10,\"postgresql\":{\"use_slots\":true}}" > /v/pgdata/patroni.dynamic.json && chown 999:999 /v/pgdata/patroni.dynamic.json'; then
+    ko "$t" "could not write patroni.dynamic.json onto the volume"
+    return
+  fi
+  if ! _boot_standalone_on_volume "$n" "$vol"; then
+    ko "$t" "phase B: standalone postgres never became ready"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  # A legitimate consumer reconnecting after the restart: hold
+  # external_standby open before the grace window closes.
+  docker exec -d "$n" bash -c \
+    'mkdir -p /tmp/wal && exec pg_receivewal -D /tmp/wal -S external_standby -h /var/run/postgresql -U postgres --no-sync'
+  local attached=0 _i
+  for _i in $(seq 1 15); do
+    if [ "$(docker exec "$n" psql -U postgres -h /var/run/postgresql -Atc \
+          "SELECT active FROM pg_replication_slots WHERE slot_name='external_standby'" 2>/dev/null)" = "t" ]; then
+      attached=1; break
+    fi
+    sleep 1
+  done
+  if [ "$attached" != 1 ]; then
+    ko "$t" "phase B: pg_receivewal never attached to external_standby (test rig, not product)"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  # Causal assertion: the reaper's own drop lines for both member slots.
+  local reaped=0 deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$n" 2>&1 | grep "dropped orphaned replication slot" | grep -q "postgres_2" \
+       && docker logs "$n" 2>&1 | grep "dropped orphaned replication slot" | grep -q "postgres_3"; then
+      reaped=1; break
+    fi
+    sleep 3
+  done
+  if [ "$reaped" != 1 ]; then
+    ko "$t" "phase B: the reaper never logged dropping postgres_2 and postgres_3"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  census=$(_slot_census "$n")
+  local want="external_standby:t,fivetran_pgoutput_slot:f"
+  if [ "$census" != "$want" ]; then
+    ko "$t" "phase B: wrong slot population after the reap (got '$census', want '$want')"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  # The database is unharmed and writable after the drops.
+  if ! docker exec "$n" psql -U postgres -h /var/run/postgresql -v ON_ERROR_STOP=1 -q \
+      -c "INSERT INTO churn VALUES (-1, 'after-reap')" >/dev/null 2>&1; then
+    ko "$t" "phase B: database not writable after the reap"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  ok "$t"
+  note "never-HA boot left all 4 slots; Patroni-managed boot dropped postgres_2+postgres_3, kept the held-open physical slot and the logical slot"
+  docker rm -f "$n" >/dev/null 2>&1
+  docker volume rm -f "$vol" >/dev/null 2>&1 || true
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
@@ -6526,6 +6703,10 @@ ALL_TESTS=(
   t_ha_adopt_preserves_logical
   t_ha_adopt_default_replica
   t_upgrade_lock_standalone_lifetime
+  # HA→standalone revert: the former leader's member slots are dropped after
+  # the consumer grace window; a never-HA data dir, a held-open physical slot
+  # and a logical slot are untouched
+  t_standalone_reaps_orphaned_member_slots
   # etcd wrapper: removed-member refusal wipes + re-joins within one wrapper
   # lifetime, whichever exit code the refusing run produced
   t_etcd_removed_member_wipe_rejoin
