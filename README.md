@@ -575,6 +575,28 @@ patronictl -c /etc/patroni/patroni.yml switchover
 # Follow prompts to select new leader
 ```
 
+## Reverting to standalone
+
+Unsetting `PATRONI_ENABLED` (what a Railway revert does) boots the same data
+directory as plain PostgreSQL. Two things Patroni owned need attention, and
+the wrapper handles both:
+
+- **`standby.signal`** — a reverted replica would otherwise start read-only,
+  waiting for a primary that no longer exists. The wrapper removes it and the
+  node promotes.
+- **Member replication slots** — Patroni runs with `use_slots: true`, so the
+  leader carries one physical replication slot per member. Slots live in
+  PGDATA and survive the revert; PostgreSQL never drops one on its own, and
+  an unclaimed slot pins WAL without bound (69 GB observed on a near-empty
+  volume). On a data directory Patroni has managed (`patroni.dynamic.json`
+  present in PGDATA), the wrapper waits `POSTGRES_ORPHAN_SLOT_GRACE_SECONDS`
+  (default 60) after the server accepts connections, then drops every
+  physical slot that still has no consumer attached. Logical slots (CDC
+  pipelines) are never touched. A physical slot a standby or `pg_receivewal`
+  reconnected to within the window is kept. Each drop is logged with the WAL
+  it released and emitted as `StandaloneOrphanSlotsDropped` telemetry; the
+  WAL itself is reclaimed at the next checkpoint.
+
 ## Local Development
 
 Test the cluster locally with Docker Compose:

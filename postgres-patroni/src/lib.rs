@@ -9,6 +9,7 @@
 pub mod bootstrap;
 pub mod health_server;
 pub mod major_upgrade;
+pub mod orphan_slots;
 mod paths;
 pub mod patroni;
 pub mod pgbackrest;

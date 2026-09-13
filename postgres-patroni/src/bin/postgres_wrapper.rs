@@ -11,7 +11,7 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 use postgres_patroni::{
     cert_expires_within, ensure_pg_stat_statements, is_patroni_enabled, is_valid_x509v3_cert,
-    major_upgrade, pgdata, ssl_dir, sudo_command, volume_lock, volume_root,
+    major_upgrade, orphan_slots, pgdata, ssl_dir, sudo_command, volume_lock, volume_root,
     EXPECTED_VOLUME_MOUNT_PATH,
 };
 use std::env;
@@ -419,6 +419,22 @@ async fn main() -> Result<()> {
             unsafe {
                 let _ = nix::sys::signal::signal(sig, SigHandler::Handler(standalone_forward));
             }
+        }
+
+        // A reverted HA cluster leaves the members' physical replication
+        // slots behind on this (former leader's) data directory, and nothing
+        // drops them once Patroni is gone: each pins WAL without bound until
+        // the volume fills. Gated on Patroni's own footprint in PGDATA so a
+        // standalone that was never HA is not touched; runs beside the server
+        // and judges only after a grace window for legitimate consumers to
+        // reconnect. In-process over the local socket — no child process, so
+        // the waitpid(-1) loop below keeps its "exactly one direct child"
+        // invariant. See orphan_slots.rs.
+        if orphan_slots::pgdata_was_patroni_managed(&pgdata) {
+            tokio::spawn(orphan_slots::reap_after_boot(
+                pgdata.clone(),
+                telemetry.clone(),
+            ));
         }
 
         let child_pid = Pid::from_raw(child.id() as i32);
