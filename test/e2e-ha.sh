@@ -6639,6 +6639,105 @@ t_standalone_reaps_orphaned_member_slots() {
   docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
+# The reaper's pass must complete once per boot, however long PostgreSQL
+# takes to admit it: a reverted root still in crash recovery, or a login the
+# reaper cannot yet use, must not mean "orphans until the next redeploy"
+# (months, with WAL growing the whole time). Here POSTGRES_USER names a role
+# that does not exist — docker-entrypoint only reads it at initdb, so nothing
+# creates it — and every login is refused; the test creates the role once the
+# reaper has logged a retry, and the pass then completes. And exactly ONE
+# pass: the reaper is not periodic.
+t_standalone_orphan_slot_reaper_retries_until_it_completes() {
+  local t=t_standalone_orphan_slot_reaper_retries_until_it_completes
+  local vol="orphretry-vol-${PG_VERSION}" n="orphretry-pg-${PG_VERSION}"
+  local seed="orphretry-seed-${PG_VERSION}"
+  local all_idle="external_standby:f,fivetran_pgoutput_slot:f,postgres_2:f,postgres_3:f"
+  docker rm -f "$n" "$seed" >/dev/null 2>&1 || true
+  new_volume "$vol"
+  if ! _seed_pgdata_with_member_slots "$vol" "$seed"; then
+    ko "$t" "failed to seed pgdata with replication slots"
+    return
+  fi
+  if ! docker run --rm -v "$vol:/v" alpine sh -c \
+      'printf "%s" "{\"ttl\":30,\"loop_wait\":10,\"postgresql\":{\"use_slots\":true}}" > /v/pgdata/patroni.dynamic.json && chown 999:999 /v/pgdata/patroni.dynamic.json'; then
+    ko "$t" "could not write patroni.dynamic.json onto the volume"
+    return
+  fi
+  docker run -d --name "$n" --label "$HA_LABEL" --network "$NET" \
+    -v "${vol}:/var/lib/postgresql/data" \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -e POSTGRES_PASSWORD=test \
+    -e POSTGRES_USER=late_admin \
+    -e POSTGRES_ORPHAN_SLOT_GRACE_SECONDS=5 \
+    "$IMAGE" >/dev/null
+  local _i ready=0
+  for _i in $(seq 1 120); do
+    if docker exec "$n" pg_isready -U postgres -h localhost -q >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" != 1 ]; then
+    ko "$t" "standalone postgres never became ready"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  # Refused login → the reaper must be retrying, loudly, and touching nothing.
+  local retrying=0 deadline=$(($(date +%s) + 90))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if logs_contain "$n" "orphan-slots: pass did not complete; retrying"; then retrying=1; break; fi
+    sleep 2
+  done
+  if [ "$retrying" != 1 ]; then
+    ko "$t" "reaper never logged a retry while its login was refused"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  local census
+  census=$(_slot_census "$n")
+  if [ "$census" != "$all_idle" ]; then
+    ko "$t" "slots changed while the reaper could not log in (got '$census', want '$all_idle')"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  # Let it in. The next attempt (backoff ≤ 60s) connects, waits the 5s
+  # grace, and completes the pass — all three idle physical slots go, the
+  # logical slot stays.
+  if ! docker exec "$n" psql -U postgres -h /var/run/postgresql -v ON_ERROR_STOP=1 -q \
+      -c "CREATE ROLE late_admin SUPERUSER LOGIN" >/dev/null 2>&1; then
+    ko "$t" "could not create the late role (test rig, not product)"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  local completed=0; deadline=$(($(date +%s) + 180))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if logs_contain "$n" "orphan-slots: pass completed after retries"; then completed=1; break; fi
+    sleep 3
+  done
+  if [ "$completed" != 1 ]; then
+    ko "$t" "pass never completed after the role was created"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  census=$(_slot_census "$n")
+  local want="fivetran_pgoutput_slot:f"
+  if [ "$census" != "$want" ]; then
+    ko "$t" "wrong slot population after the pass (got '$census', want '$want')"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  # One pass per boot, not periodic: past another backoff cap + grace, still
+  # exactly three drop lines and no second census line.
+  sleep 70
+  local drops idle_passes
+  drops=$(docker logs "$n" 2>&1 | grep -c "dropped orphaned replication slot")
+  idle_passes=$(docker logs "$n" 2>&1 | grep -c "no unclaimed physical replication slots")
+  if [ "$drops" != "3" ] || [ "$idle_passes" != "0" ]; then
+    ko "$t" "expected exactly one pass (3 drop lines, 0 idle passes); got drops=$drops idle_passes=$idle_passes"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  ok "$t"
+  note "login refused → retry lines, slots untouched; role created → one pass, 3 idle physical slots dropped, logical kept; no second pass in 70s"
+  docker rm -f "$n" >/dev/null 2>&1
+  docker volume rm -f "$vol" >/dev/null 2>&1 || true
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
@@ -6707,6 +6806,9 @@ ALL_TESTS=(
   # the consumer grace window; a never-HA data dir, a held-open physical slot
   # and a logical slot are untouched
   t_standalone_reaps_orphaned_member_slots
+  # the reaper's pass retries until it completes once (refused login here),
+  # and runs exactly once per boot
+  t_standalone_orphan_slot_reaper_retries_until_it_completes
   # etcd wrapper: removed-member refusal wipes + re-joins within one wrapper
   # lifetime, whichever exit code the refusing run produced
   t_etcd_removed_member_wipe_rejoin

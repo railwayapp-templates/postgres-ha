@@ -44,13 +44,24 @@
 //!
 //! Every drop is logged with the slot name and the WAL it was retaining, and
 //! reported as a telemetry event, so the reclaim is visible rather than
-//! silent. Connection failures give up at a deadline and warn; the next boot
-//! tries again.
+//! silent.
+//!
+//! **One pass per boot, however long it takes.** The pass retries with
+//! backoff until it completes once: a server still in crash recovery, a
+//! socket that is not there yet, a login the reaper cannot yet use — none of
+//! these may turn into "orphans until the next redeploy", which can be months
+//! away with WAL growing the whole time. The pass is NOT periodic, on
+//! purpose: orphans only appear at the revert, which is a boot, and a
+//! periodic dropper would cost a customer's own external standby its slot on
+//! any outage longer than the grace window, not only at a redeploy. A pass
+//! that PostgreSQL answered counts as complete even when it refused some
+//! drops — a refused slot has a consumer.
 
 use anyhow::{Context, Result};
 use common::{Telemetry, TelemetryEvent};
+use std::future::Future;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio_postgres::NoTls;
 use tracing::{info, warn};
 
@@ -64,11 +75,11 @@ pub const GRACE_ENV: &str = "POSTGRES_ORPHAN_SLOT_GRACE_SECONDS";
 
 const DEFAULT_GRACE_SECS: u64 = 60;
 
-/// How long to keep trying to reach PostgreSQL before giving up on this
-/// boot. Crash recovery on a large volume can take a while; the next boot
-/// retries anyway.
-const READINESS_DEADLINE: Duration = Duration::from_secs(15 * 60);
-const READINESS_POLL: Duration = Duration::from_secs(3);
+/// Retry backoff between attempts of the pass: starts at 3 s, doubles, and
+/// caps at 60 s, so a long crash recovery is re-checked every minute rather
+/// than hammered — and never waited out past the cap.
+const BACKOFF_INITIAL: Duration = Duration::from_secs(3);
+const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// The unix socket directory and port the standalone server listens on:
 /// Patroni's rendered `unix_socket_directories` and the official image's
@@ -149,11 +160,21 @@ pub struct ReapOutcome {
     pub reclaimed_wal_bytes: i64,
 }
 
-/// Runs beside the standalone server for one boot: wait until PostgreSQL
-/// accepts connections, hold the grace window, then drop the orphaned member
-/// slots. Never returns an error to the caller — every failure is logged and
-/// the boot continues, because a database that comes up with stale slots is
-/// strictly better than one that does not come up.
+/// Backoff before retry number `attempt` (1-based): 3 s, 6 s, 12 s, ...,
+/// capped at 60 s. Pure so the schedule is unit-tested.
+pub fn backoff_for_attempt(attempt: u32) -> Duration {
+    let doublings = attempt.saturating_sub(1).min(16);
+    BACKOFF_INITIAL
+        .saturating_mul(1u32 << doublings)
+        .min(BACKOFF_CAP)
+}
+
+/// Runs beside the standalone server for one boot: connect, hold the grace
+/// window, reap — and retry the whole attempt with backoff until it completes
+/// once. Never returns an error to the caller — every failure is logged and
+/// retried, because a database that comes up with stale slots is strictly
+/// better than one that does not come up, and one that keeps the orphans
+/// until the next redeploy is not acceptable either.
 pub async fn reap_after_boot(pgdata: String, telemetry: Telemetry) {
     let grace = grace_from_env();
     info!(
@@ -163,56 +184,73 @@ pub async fn reap_after_boot(pgdata: String, telemetry: Telemetry) {
         "orphan-slots: data directory was Patroni-managed; will drop physical replication slots still unclaimed after the grace window"
     );
 
-    let client = match wait_for_server(SOCKET_DIR, PORT, READINESS_DEADLINE).await {
-        Ok(client) => client,
-        Err(e) => {
-            warn!(
-                error = %e,
-                "orphan-slots: PostgreSQL never became reachable within the readiness deadline; leaving replication slots as they are (retried on next boot)"
-            );
-            return;
-        }
-    };
+    let outcome = run_until_complete(
+        || async {
+            let client = connect(SOCKET_DIR, PORT).await?;
+            // The grace runs after EVERY successful connection, not once per
+            // boot: a retry here means the previous session was lost, and
+            // whatever cost us the session may have cost a consumer its
+            // connection too.
+            tokio::time::sleep(grace).await;
+            reap(&client).await
+        },
+        backoff_for_attempt,
+    )
+    .await;
 
-    tokio::time::sleep(grace).await;
-
-    match reap(&client).await {
-        Ok(outcome) if outcome.dropped.is_empty() => info!(
+    if outcome.dropped.is_empty() {
+        info!(
             slots_seen = outcome.seen,
+            refused = outcome.refused.len(),
             "orphan-slots: no unclaimed physical replication slots; nothing to drop"
-        ),
-        Ok(outcome) => {
-            info!(
-                dropped = outcome.dropped.len(),
-                reclaimed_wal = %human_bytes(outcome.reclaimed_wal_bytes),
-                "orphan-slots: the retained WAL is released at the next checkpoint"
-            );
-            telemetry.send(TelemetryEvent::StandaloneOrphanSlotsDropped {
-                slots: outcome.dropped,
-                retained_wal_bytes: outcome.reclaimed_wal_bytes.max(0) as u64,
-                grace_secs: grace.as_secs(),
-            });
-        }
-        Err(e) => warn!(
-            error = %e,
-            "orphan-slots: could not reconcile replication slots this boot; leaving them as they are (retried on next boot)"
-        ),
+        );
+        return;
     }
+    info!(
+        dropped = outcome.dropped.len(),
+        reclaimed_wal = %human_bytes(outcome.reclaimed_wal_bytes),
+        "orphan-slots: the retained WAL is released at the next checkpoint"
+    );
+    telemetry.send(TelemetryEvent::StandaloneOrphanSlotsDropped {
+        slots: outcome.dropped,
+        retained_wal_bytes: outcome.reclaimed_wal_bytes.max(0) as u64,
+        grace_secs: grace.as_secs(),
+    });
 }
 
-/// Connect over the local socket, retrying until `deadline` has elapsed.
-/// Returns the last connection error when it has.
-pub async fn wait_for_server(
-    socket_dir: &str,
-    port: u16,
-    deadline: Duration,
-) -> Result<tokio_postgres::Client> {
-    let give_up_at = Instant::now() + deadline;
+/// Drive `attempt` until it returns `Ok`, sleeping `backoff(n)` after the
+/// n-th failure. Every failure is a warning naming the attempt and the wait,
+/// so a pass that cannot complete is loud for as long as it lasts. Generic
+/// over the attempt and the backoff so the loop itself is unit-tested
+/// without a database.
+pub async fn run_until_complete<F, Fut>(
+    mut attempt: F,
+    backoff: impl Fn(u32) -> Duration,
+) -> ReapOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<ReapOutcome>>,
+{
+    let mut attempts: u32 = 0;
     loop {
-        match connect(socket_dir, port).await {
-            Ok(client) => return Ok(client),
-            Err(e) if Instant::now() >= give_up_at => return Err(e),
-            Err(_) => tokio::time::sleep(READINESS_POLL).await,
+        attempts = attempts.saturating_add(1);
+        match attempt().await {
+            Ok(outcome) => {
+                if attempts > 1 {
+                    info!(attempts, "orphan-slots: pass completed after retries");
+                }
+                return outcome;
+            }
+            Err(e) => {
+                let wait = backoff(attempts);
+                warn!(
+                    attempt = attempts,
+                    retry_in_secs = wait.as_secs(),
+                    error = %e,
+                    "orphan-slots: pass did not complete; retrying until one pass completes"
+                );
+                tokio::time::sleep(wait).await;
+            }
         }
     }
 }
@@ -392,6 +430,75 @@ mod tests {
             grace_from_value(Some("not-a-number")),
             Duration::from_secs(DEFAULT_GRACE_SECS)
         );
+    }
+
+    #[test]
+    fn backoff_doubles_from_three_seconds_and_caps_at_a_minute() {
+        let secs: Vec<u64> = (1..=8).map(|n| backoff_for_attempt(n).as_secs()).collect();
+        assert_eq!(secs, vec![3, 6, 12, 24, 48, 60, 60, 60]);
+        assert_eq!(backoff_for_attempt(0).as_secs(), 3);
+        assert_eq!(backoff_for_attempt(u32::MAX).as_secs(), 60);
+    }
+
+    #[tokio::test]
+    async fn loop_retries_until_one_pass_completes_then_stops() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicU32::new(0));
+        let seen = calls.clone();
+        let outcome = run_until_complete(
+            move || {
+                let seen = seen.clone();
+                async move {
+                    let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n < 3 {
+                        anyhow::bail!("connection refused (attempt {n})")
+                    }
+                    Ok(ReapOutcome {
+                        seen: 2,
+                        dropped: vec!["postgres_2".into()],
+                        ..ReapOutcome::default()
+                    })
+                }
+            },
+            |_| Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "two failures, then success"
+        );
+        assert_eq!(outcome.dropped, vec!["postgres_2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_pass_with_refused_drops_still_counts_as_complete() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicU32::new(0));
+        let seen = calls.clone();
+        let outcome = run_until_complete(
+            move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok(ReapOutcome {
+                        seen: 1,
+                        refused: vec!["external_standby".into()],
+                        ..ReapOutcome::default()
+                    })
+                }
+            },
+            |_| Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a refused drop has a consumer; no retry"
+        );
+        assert_eq!(outcome.refused, vec!["external_standby".to_string()]);
     }
 
     #[test]

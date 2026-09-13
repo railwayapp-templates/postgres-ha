@@ -595,7 +595,12 @@ the wrapper handles both:
   pipelines) are never touched. A physical slot a standby or `pg_receivewal`
   reconnected to within the window is kept. Each drop is logged with the WAL
   it released and emitted as `StandaloneOrphanSlotsDropped` telemetry; the
-  WAL itself is reclaimed at the next checkpoint.
+  WAL itself is reclaimed at the next checkpoint. The pass retries with
+  backoff (3 s doubling to 60 s) until it completes once — a server still in
+  crash recovery or a refused login must not mean "orphans until the next
+  redeploy" — and it is deliberately not periodic: orphans only appear at the
+  revert, which is a boot, and a periodic dropper would cost a customer's own
+  standby its slot on any outage longer than the window.
 
 ## Local Development
 
