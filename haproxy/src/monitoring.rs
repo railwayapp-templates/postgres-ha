@@ -13,6 +13,8 @@ use tracing::{error, info, warn};
 
 const STATS_URL: &str = "http://localhost:8404/stats;csv";
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Structured SLI heartbeat cadence for the Postgres HA uptime passive layer.
+const SLI_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the loop looks for haproxy's exit between health checks. Short
 /// on purpose: after a forwarded stop signal, haproxy's exit is what ends the
 /// container, and the runtime's grace period is 10s — noticing it up to a
@@ -60,6 +62,10 @@ pub fn run_monitoring_loop(
 
     let mut no_primary_alerted = false;
     let mut no_replica_alerted = false;
+    let mut last_sli_at = Instant::now()
+        .checked_sub(SLI_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut last_sli: Option<(usize, usize, usize)> = None;
 
     loop {
         // Wait out the check interval in short slices, watching for haproxy's
@@ -92,6 +98,8 @@ pub fn run_monitoring_loop(
                 replica,
                 down_replicas,
             }) => {
+                let total_replicas = replica + down_replicas.len();
+
                 // Handle primary backend
                 if primary == 0 {
                     if !no_primary_alerted {
@@ -125,6 +133,21 @@ pub fn run_monitoring_loop(
                         info!(healthy_count = replica, "Replica backend recovered");
                     }
                     no_replica_alerted = false;
+                }
+
+                let counts = (primary, replica, total_replicas);
+                let due = last_sli_at.elapsed() >= SLI_INTERVAL;
+                let changed = last_sli.map(|prev| prev != counts).unwrap_or(true);
+                if due || changed {
+                    // Matched by the Postgres HA uptime tick as a heartbeat.
+                    info!(
+                        "sli haproxy primary_up={} replicas_up={} replicas_total={}",
+                        if primary > 0 { 1 } else { 0 },
+                        replica,
+                        total_replicas
+                    );
+                    last_sli_at = Instant::now();
+                    last_sli = Some(counts);
                 }
             }
             Err(e) => {
