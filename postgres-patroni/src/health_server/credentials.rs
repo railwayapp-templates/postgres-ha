@@ -359,29 +359,6 @@ async fn apply(
     Ok(json!({"version": 1, "leader": leader}))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn quotes_sql_and_pgpass_without_interpolation() {
-        assert_eq!(quote_identifier("odd\"role"), "\"odd\"\"role\"");
-        assert_eq!(quote_literal("a'b"), "'a''b'");
-        assert_eq!(pgpass("a:b\\c"), "a\\:b\\\\c");
-    }
-    #[test]
-    fn atomic_files_are_private_and_complete() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("pgpass");
-        atomic_write(path.to_str().unwrap(), b"secret").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"secret");
-        assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-}
-
 /// The pending credential is private on-disk intent, never progress or logs.
 pub(super) fn pending_password(data_dir: &str) -> Option<String> {
     let request: Rotation =
@@ -440,5 +417,28 @@ pub(super) async fn reconcile(config: HealthServerConfig) {
         // Expected while waiting for the coordinator; do not log credentials
         // or churn health status because a prepare has not committed yet.
         let _ = tokio::time::timeout(Duration::from_secs(20), attempt).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn quotes_sql_and_pgpass_without_interpolation() {
+        assert_eq!(quote_identifier("odd\"role"), "\"odd\"\"role\"");
+        assert_eq!(quote_literal("a'b"), "'a''b'");
+        assert_eq!(pgpass("a:b\\c"), "a\\:b\\\\c");
+    }
+    #[test]
+    fn atomic_files_are_private_and_complete() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pgpass");
+        atomic_write(path.to_str().unwrap(), b"secret").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }
