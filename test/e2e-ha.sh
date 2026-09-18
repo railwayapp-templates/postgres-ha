@@ -6769,7 +6769,7 @@ t_ha_credentials_rotate_route() {
     teardown_scope "$scope"; return
   fi
   # The member that sits out the rotation and the one rotated live.
-  local stopped replica
+  local stopped="" replica=""
   for n in "$n3" "$n2" "$n1"; do
     if [ "$n" != "$leader" ] && [ -z "$stopped" ]; then stopped="$n"; continue; fi
     if [ "$n" != "$leader" ] && [ -z "$replica" ]; then replica="$n"; fi
