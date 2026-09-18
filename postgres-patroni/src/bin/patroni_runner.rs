@@ -577,6 +577,142 @@ fn should_wipe_incomplete_clone(
         && wipe_has_safe_clone_source(pgdata_is_dedicated_subdir, leader, my_name)
 }
 
+/// A staged rotation survives a restart before the variable commit. Prove
+/// the candidate against the elected primary AND authenticated DCS before
+/// re-pinning; an edited variable alone cannot alter a dataset credential.
+async fn reconcile_rotation_at_boot(config: &mut Config) -> Result<()> {
+    let Some(pin) = postgres_patroni::patroni::read_credential_pin(&config.data_dir) else {
+        return Ok(());
+    };
+    let journal = format!("{}/.railway_rotation", config.data_dir);
+    let pending = std::fs::read(&journal)
+        .ok()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
+    let mut candidates = Vec::new();
+    if let Some(request) = &pending {
+        for key in ["newPassword", "currentPassword"] {
+            if let Some(password) = request[key].as_str() {
+                candidates.push(password.to_string());
+            }
+        }
+    }
+    candidates.push(config.superuser_pass.clone());
+    candidates.push(pin.superuser_pass.clone());
+    if pending.is_none() && config.superuser_pass == pin.superuser_pass {
+        return Ok(());
+    }
+    let mut accepted = None;
+    for password in &candidates {
+        let credential = postgres_patroni::patroni::Credential {
+            username: "root".into(),
+            password: password.clone(),
+        };
+        if probe_etcd_credential(&config.etcd_hosts, &credential, Duration::from_secs(2)).await
+            == EtcdAuthProbe::Accepted
+        {
+            accepted = Some(credential);
+            break;
+        }
+    }
+    let Some(credential) = accepted else {
+        return Ok(());
+    };
+    // A staged restart may fall between the SQL and DCS commits. Each plane
+    // uses a proven credential until the coordinator completes that boundary.
+    if pending.is_some() {
+        config.superuser_pass = pin.superuser_pass.clone();
+        config.repl_pass = pin.repl_pass.clone();
+        config.app_pass = pin.app_pass.clone();
+        if let Some(auth) = config.etcd_auth.as_mut() {
+            auth.password = credential.password.clone();
+        }
+        if let Some(auth) = config.restapi_auth.as_mut() {
+            auth.password = pin.superuser_pass.clone();
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    let proof = async {
+        for host in config.etcd_hosts.split(',') {
+            let attempt = async {
+                let leader_key = BASE64.encode(format!("/service/{}/leader", config.scope));
+                let response = etcd_range(&client, host, &leader_key, Some(&credential)).await?;
+                let value: serde_json::Value = response.error_for_status()?.json().await?;
+                let leader = String::from_utf8(
+                    BASE64.decode(value["kvs"][0]["value"].as_str().context("leader absent")?)?,
+                )?;
+                let member_key =
+                    BASE64.encode(format!("/service/{}/members/{}", config.scope, leader));
+                let response = etcd_range(&client, host, &member_key, Some(&credential)).await?;
+                let value: serde_json::Value = response.error_for_status()?.json().await?;
+                let member: serde_json::Value = serde_json::from_slice(
+                    &BASE64.decode(value["kvs"][0]["value"].as_str().context("member absent")?)?,
+                )?;
+                let url = reqwest::Url::parse(
+                    member["conn_url"]
+                        .as_str()
+                        .context("primary endpoint absent")?,
+                )?;
+                for candidate in &candidates {
+                    if pending.is_none() && *candidate != credential.password {
+                        continue;
+                    }
+                    let roles = async {
+                        for user in [&config.superuser, &config.repl_user, &config.app_user] {
+                            let (sql, connection) = tokio_postgres::Config::new()
+                                .host(url.host_str().context("missing host")?)
+                                .port(url.port().unwrap_or(5432))
+                                .user(user)
+                                .password(&candidate)
+                                .dbname("postgres")
+                                .connect_timeout(Duration::from_secs(3))
+                                .connect(tokio_postgres::NoTls)
+                                .await?;
+                            tokio::spawn(async move {
+                                let _ = connection.await;
+                            });
+                            anyhow::ensure!(
+                                !sql.query_one("SELECT pg_is_in_recovery()", &[])
+                                    .await?
+                                    .get::<_, bool>(0),
+                                "leader changed"
+                            );
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    };
+                    if roles.await.is_ok() {
+                        return Ok::<String, anyhow::Error>(candidate.clone());
+                    }
+                }
+                anyhow::bail!("no database credential proved")
+            };
+            if let Ok(candidate) = attempt.await {
+                return Ok::<String, anyhow::Error>(candidate);
+            }
+        }
+        anyhow::bail!("primary unavailable")
+    };
+    // Never log database connection errors: some drivers include credentials.
+    let Ok(Ok(candidate)) = tokio::time::timeout(Duration::from_secs(20), proof).await else {
+        return Ok(());
+    };
+    config.superuser_pass = candidate.clone();
+    config.repl_pass = candidate.clone();
+    config.app_pass = candidate.clone();
+    if let Some(auth) = config.etcd_auth.as_mut() {
+        auth.password = credential.password;
+    }
+    if let Some(auth) = config.restapi_auth.as_mut() {
+        auth.password = candidate;
+    }
+    postgres_patroni::patroni::write_credential_pin(
+        &config.data_dir,
+        &postgres_patroni::patroni::PinnedCredentials::from_config(config),
+    )?;
+    Ok(())
+}
+
 /// Read the current leader's member name from etcd (`/service/{scope}/leader`).
 /// Returns None when no leader holds the lock or etcd is unreachable — both
 /// block the destructive wipe. Best-effort across all etcd hosts.
@@ -1970,6 +2106,7 @@ async fn async_main() -> Result<()> {
     let health_config = HealthServerConfig::from_env();
 
     let mut config = Config::from_env()?;
+    reconcile_rotation_at_boot(&mut config).await?;
 
     info!(
         node = %config.name,

@@ -1093,8 +1093,7 @@ pub async fn reconcile_pgbackrest_archive_config(
 }
 
 pub(crate) async fn send_patch(client: &reqwest::Client, patch: &Value) -> Result<()> {
-    let resp = client
-        .patch(format!("{PATRONI_REST}/config"))
+    let resp = super::rest::authenticate(client.patch(format!("{PATRONI_REST}/config")))
         .json(patch)
         .send()
         .await

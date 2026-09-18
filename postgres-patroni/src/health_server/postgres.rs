@@ -26,15 +26,30 @@ pub async fn is_in_recovery(config: &HealthServerConfig) -> Result<bool> {
     // unreliable under 2s, too coarse for a sub-second budget.
     let stage_budget = Duration::from_millis(config.check_timeout_ms / 2);
 
-    let connection_string = format!(
-        "host=localhost port={} user={} password={} dbname={}",
-        config.pg_port, config.pg_user, config.pg_password, config.pg_database
-    );
-
-    let (client, connection) = tokio::time::timeout(
-        stage_budget,
-        tokio_postgres::connect(&connection_string, NoTls),
-    )
+    let password = crate::patroni::read_credential_pin(&crate::paths::pgdata())
+        .map(|p| p.app_pass)
+        .unwrap_or_else(|| config.pg_password.clone());
+    let mut options = tokio_postgres::Config::new();
+    options
+        .host("localhost")
+        .port(config.pg_port)
+        .user(&config.pg_user)
+        .password(&password)
+        .dbname(&config.pg_database);
+    let (client, connection) = tokio::time::timeout(stage_budget, async {
+        match options.connect(NoTls).await {
+            Ok(connection) => Ok(connection),
+            Err(original) => {
+                if let Some(pending) = super::credentials::pending_password(&crate::paths::pgdata())
+                {
+                    options.password(pending);
+                    options.connect(NoTls).await
+                } else {
+                    Err(original)
+                }
+            }
+        }
+    })
     .await
     .context("Timed out connecting to PostgreSQL")?
     .context("Failed to connect to PostgreSQL")?;
