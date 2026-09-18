@@ -76,6 +76,34 @@ pub fn combine(probes: impl IntoIterator<Item = EtcdAuthProbe>) -> EtcdAuthProbe
     verdict
 }
 
+/// What a booting member does with its variables after asking etcd about
+/// both credentials it could present: the one the variables derive and the one
+/// the credential pin holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationAdoption {
+    /// etcd accepts the variables' password and refuses the pinned one: the
+    /// cluster rotated while this member was down, and the variables carry
+    /// the password its roles now have. Re-pin from the variables.
+    Adopt,
+    /// Any other pair of answers: today's rules apply (the pin wins, or the
+    /// etcd pre-flight stops the member on a refused variable).
+    KeepPin,
+}
+
+/// Decide [`RotationAdoption`] from the two probes. Only the exact pair
+/// "variables accepted, pin refused" adopts; a refused variable is still the
+/// edited-variable case the pre-flight stops on, and an etcd that does not
+/// check passwords (not enabled, unreachable) proves nothing.
+pub fn rotation_adoption(
+    variables_probe: EtcdAuthProbe,
+    pinned_probe: EtcdAuthProbe,
+) -> RotationAdoption {
+    match (variables_probe, pinned_probe) {
+        (EtcdAuthProbe::Accepted, EtcdAuthProbe::Rejected) => RotationAdoption::Adopt,
+        _ => RotationAdoption::KeepPin,
+    }
+}
+
 /// The variable the etcd password was read from: the dedicated one when it is
 /// set, else the superuser password (the etcd image enables authentication
 /// with that same value).
@@ -186,6 +214,31 @@ async fn probe_host(client: &reqwest::Client, host: &str, cred: &Credential) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_variables_accepted_and_pin_refused_adopts() {
+        let all = [
+            EtcdAuthProbe::Accepted,
+            EtcdAuthProbe::NotEnabled,
+            EtcdAuthProbe::Rejected,
+            EtcdAuthProbe::Inconclusive,
+        ];
+        for variables in all {
+            for pinned in all {
+                let expected =
+                    if variables == EtcdAuthProbe::Accepted && pinned == EtcdAuthProbe::Rejected {
+                        RotationAdoption::Adopt
+                    } else {
+                        RotationAdoption::KeepPin
+                    };
+                assert_eq!(
+                    rotation_adoption(variables, pinned),
+                    expected,
+                    "variables={variables:?} pinned={pinned:?}"
+                );
+            }
+        }
+    }
 
     const ETCD_35_REJECTED: &str = r#"{"error":"etcdserver: authentication failed, invalid user ID or password","code":3,"message":"etcdserver: authentication failed, invalid user ID or password"}"#;
     const ETCD_36_REJECTED: &str =
