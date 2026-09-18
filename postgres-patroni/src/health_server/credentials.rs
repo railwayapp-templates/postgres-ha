@@ -329,7 +329,10 @@ async fn apply(
                 anyhow::ensure!(
                     connect(config, &user, &request.current_password)
                         .await
-                        .is_err(),
+                        .err()
+                        .and_then(|error| error.downcast::<tokio_postgres::Error>().ok())
+                        .is_some_and(|error| error.code()
+                            == Some(&tokio_postgres::error::SqlState::INVALID_PASSWORD)),
                     "previous password still accepted"
                 );
             }
