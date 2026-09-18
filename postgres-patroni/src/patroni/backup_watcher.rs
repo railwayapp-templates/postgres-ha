@@ -1174,7 +1174,10 @@ async fn patch_patroni_dcs_repo_path(client: &reqwest::Client, path: &str) -> Re
         PATRONI_REPO_PATH_CONFIG_KEY.to_string(),
         serde_json::Value::String(path.to_string()),
     );
-    let resp = client.patch(PATRONI_CONFIG_URL).json(&body).send().await?;
+    let resp = super::rest::authenticate(client.patch(PATRONI_CONFIG_URL))
+        .json(&body)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         anyhow::bail!("Patroni /config PATCH returned {}", resp.status());
     }
