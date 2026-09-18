@@ -2,7 +2,13 @@
 
 use super::config::HealthServerConfig;
 use super::postgres::{check_patroni_role, is_in_recovery};
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
 use std::time::Duration;
 use tracing::debug;
 
@@ -12,6 +18,7 @@ pub fn create_router(config: HealthServerConfig) -> Router {
         .route("/primary", get(primary_handler))
         .route("/replica", get(replica_handler))
         .route("/health", get(health_handler))
+        .route("/credentials/rotate", post(super::credentials::rotate))
         .with_state(config)
 }
 

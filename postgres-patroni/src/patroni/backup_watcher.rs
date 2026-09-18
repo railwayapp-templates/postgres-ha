@@ -1552,9 +1552,7 @@ async fn patch_patroni_dcs_repo_path(client: &Coordinator, path: &str) -> Result
         PATRONI_REPO_PATH_CONFIG_KEY.to_string(),
         serde_json::Value::String(path.to_string()),
     );
-    let resp = client
-        .http
-        .patch(PATRONI_CONFIG_URL)
+    let resp = super::rest::authenticate(client.http.patch(PATRONI_CONFIG_URL))
         .json(&body)
         .send()
         .await?;
