@@ -14,17 +14,19 @@ use postgres_patroni::bootstrap::{reconcile_pg_stat_statements, refresh_collatio
 use postgres_patroni::health_server::{self, HealthServerConfig};
 use postgres_patroni::major_upgrade;
 use postgres_patroni::patroni::etcd_preflight::{
-    etcd_password_source_variable, probe_etcd_credential, rejection_message, EtcdAuthProbe,
-    REJECTION_PREFIX,
+    etcd_password_source_variable, probe_etcd_credential, rejection_message, rotation_adoption,
+    EtcdAuthProbe, RotationAdoption, REJECTION_PREFIX,
 };
+use postgres_patroni::patroni::live_credentials;
 use postgres_patroni::patroni::rest_preflight::{
     divergence_message, rest_credential_diverges, DIVERGENCE_PREFIX,
 };
 use postgres_patroni::patroni::{
-    apply_credential_pin, credential_drift, credentials_from_env_requested,
-    generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
-    spawn_backup_watcher, spawn_self_heal_watcher, spawn_slot_recovery_watcher,
-    update_pg_hba_for_replication, Config, RestapiAddressSource,
+    apply_credential_pin_with_proof, credential_drift, credentials_from_env_requested,
+    generate_patroni_config, read_credential_pin, reconcile_pgbackrest_archive_config,
+    run_monitoring_loop, spawn_backup_watcher, spawn_self_heal_watcher,
+    spawn_slot_recovery_watcher, update_pg_hba_for_replication, Config, Credential,
+    RestapiAddressSource,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
@@ -801,12 +803,23 @@ fn drifted_summary(drifted: &[&str]) -> String {
 /// starts; a blank `PATRONI_ETCD3_PASSWORD` replaces the etcd password the
 /// file carries with spaces. Blank variables are removed from the child's
 /// environment so both sides agree they are unset.
+///
+/// Since the live rotation route (`patroni::rotation`), the password variables
+/// are WITHHELD from Patroni's environment altogether rather than mirrored
+/// into it: patroni.yml already carries the post-pin values, and with no
+/// environment copy to apply over the file, a rewrite of the file plus
+/// `POST /reload` moves Patroni to a new password without a restart. The
+/// usernames, hosts and every other `PATRONI_*` variable still pass through.
 async fn start_patroni(config: &Config) -> Result<tokio::process::Child> {
+    info!(
+        node = %config.name,
+        "starting Patroni with patroni.yml as the only source of its passwords"
+    );
     let mut command = Command::new("patroni");
-    command
-        .arg("/etc/patroni/patroni.yml")
-        .env("PATRONI_REPLICATION_PASSWORD", &config.repl_pass)
-        .env("PATRONI_SUPERUSER_PASSWORD", &config.superuser_pass);
+    command.arg("/etc/patroni/patroni.yml");
+    for var in PASSWORD_VARS_FILE_ONLY {
+        command.env_remove(var);
+    }
     for var in blank_credential_vars(|name| env::var(name).ok()) {
         warn!(
             variable = var,
@@ -823,6 +836,17 @@ async fn start_patroni(config: &Config) -> Result<tokio::process::Child> {
 
     Ok(child)
 }
+
+/// Password variables Patroni reads from patroni.yml only. Patroni's loader
+/// applies its environment over the file, so any of these in the child's
+/// environment would survive a rewrite of the file and defeat a live
+/// rotation; the runner renders their post-pin values into the file instead.
+const PASSWORD_VARS_FILE_ONLY: [&str; 4] = [
+    "PATRONI_SUPERUSER_PASSWORD",
+    "PATRONI_REPLICATION_PASSWORD",
+    "PATRONI_RESTAPI_PASSWORD",
+    "PATRONI_ETCD3_PASSWORD",
+];
 
 /// Control-plane credential variables the runner treats as unset when blank
 /// (see `patroni::config::resolve_restapi_auth` / `resolve_etcd_auth`) and
@@ -2000,7 +2024,11 @@ async fn async_main() -> Result<()> {
     // reseed wipe removes along with the rest of pgdata); the pin itself is
     // applied further down, once the post-reseed state of the data directory
     // is known, and reports the same list.
-    let credential_drift = credential_drift(&config, credentials_from_env_requested());
+    let mut credential_drift = credential_drift(&config, credentials_from_env_requested());
+    // Set when etcd proves the variables carry the cluster's rotated
+    // password (see rotation_adoption); apply_credential_pin re-pins from
+    // the variables instead of keeping the stale pin.
+    let mut credentials_proven_by_etcd = false;
 
     // etcd's root password is fixed when the etcd entrypoint first enables
     // authentication; the credential this member presents is re-derived from
@@ -2028,6 +2056,41 @@ async fn async_main() -> Result<()> {
                 context: "etcd credential pre-flight".to_string(),
             });
             anyhow::bail!("{REJECTION_PREFIX}; see the message above for the variable to restore");
+        }
+
+        // A member that was down while the cluster rotated its password boots
+        // with the variables already moved and a pin that still holds the old
+        // password. etcd is the oracle: the rotation changed root's password
+        // to the new value, so etcd accepting the variables' password and
+        // refusing the pinned one proves the variables are the cluster's
+        // credentials now. Only that exact pair adopts; a dedicated
+        // PATRONI_ETCD3_PASSWORD says nothing about the superuser password.
+        if probe == EtcdAuthProbe::Accepted
+            && !credential_drift.is_empty()
+            && etcd_password_source_variable(env::var("PATRONI_ETCD3_PASSWORD").ok().as_deref())
+                == "PATRONI_SUPERUSER_PASSWORD"
+        {
+            if let Some(pinned) = read_credential_pin(&config.data_dir) {
+                let pinned_cred = Credential {
+                    username: cred.username.clone(),
+                    password: pinned.superuser_pass.clone(),
+                };
+                let pinned_probe =
+                    probe_etcd_credential(&config.etcd_hosts, &pinned_cred, Duration::from_secs(3))
+                        .await;
+                if rotation_adoption(probe, pinned_probe) == RotationAdoption::Adopt {
+                    info!(
+                        drifted = ?credential_drift,
+                        "etcd accepts the variables' password and refuses the pinned one: the cluster rotated its password while this member was down; adopting the variables"
+                    );
+                    telemetry.send(TelemetryEvent::CredentialsAdopted {
+                        node: config.name.clone(),
+                        variables: credential_drift.iter().map(|v| v.to_string()).collect(),
+                    });
+                    credentials_proven_by_etcd = true;
+                    credential_drift = Vec::new();
+                }
+            }
         }
     }
 
@@ -2091,13 +2154,18 @@ async fn async_main() -> Result<()> {
     // patroni::credential_pin). Must run before generate_patroni_config and
     // before anything else reads config.*_pass.
     let has_cluster_data = has_pg_control && has_marker;
-    let pin_outcome = apply_credential_pin(
+    let pin_outcome = apply_credential_pin_with_proof(
         &mut config,
         has_cluster_data,
         credentials_from_env_requested(),
+        credentials_proven_by_etcd,
         &telemetry,
     );
     info!(outcome = ?pin_outcome, "credential pin reconciled");
+    // The passwords in force for the rest of this process: the rotation
+    // route compares against them and moves them; the REST client and the
+    // wrapper's psql calls read them at call time.
+    live_credentials::seed(&config);
 
     // Recover the debris of an interrupted clone. A non-empty data directory
     // with NO pg_control is what a pg_basebackup killed mid-stream leaves

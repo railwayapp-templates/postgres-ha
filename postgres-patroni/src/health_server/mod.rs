@@ -29,7 +29,7 @@ async fn run(config: HealthServerConfig) -> Result<()> {
     info!(
         port,
         patroni_fallback_port = patroni_port,
-        "Health server listening (endpoints: /primary, /replica, /health)"
+        "Health server listening (endpoints: /primary, /replica, /health, POST /credentials/rotate)"
     );
 
     axum::serve(listener, app)
