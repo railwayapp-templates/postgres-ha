@@ -50,13 +50,34 @@ pub(crate) fn resolve_restapi_auth(
 pub(crate) fn restapi_auth_from_env() -> Option<Credential> {
     let superuser = String::env_or("PATRONI_SUPERUSER_USERNAME", "postgres");
     let superuser_pass = env::var("PATRONI_SUPERUSER_PASSWORD").unwrap_or_default();
-    resolve_restapi_auth(
+    let mut cred = resolve_restapi_auth(
         env::var("PATRONI_RESTAPI_USERNAME").ok(),
         env::var("PATRONI_RESTAPI_PASSWORD").ok(),
         &superuser,
         &superuser_pass,
     )
-    .0
+    .0?;
+    // A live rotation moved the password after this process read its
+    // variables; the rotation records the value in force.
+    if let Some(password) = super::live_credentials::rest_password_override() {
+        cred.password = password;
+    }
+    Some(cred)
+}
+
+/// Set every password `config` carries to `password`: the three roles, and
+/// the etcd and REST credentials when the member has them. The cluster keeps
+/// one password; usernames never change.
+pub fn apply_one_password(config: &mut Config, password: &str) {
+    config.superuser_pass = password.to_string();
+    config.repl_pass = password.to_string();
+    config.app_pass = password.to_string();
+    if let Some(cred) = config.etcd_auth.as_mut() {
+        cred.password = password.to_string();
+    }
+    if let Some(cred) = config.restapi_auth.as_mut() {
+        cred.password = password.to_string();
+    }
 }
 
 /// etcd credential: `PATRONI_ETCD3_USERNAME` / `PATRONI_ETCD3_PASSWORD` when

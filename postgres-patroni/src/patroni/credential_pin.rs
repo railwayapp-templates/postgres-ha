@@ -83,6 +83,10 @@ pub enum PinOutcome {
     KeptPinned(Vec<&'static str>),
     /// `PATRONI_CREDENTIALS_FROM_ENV=true`: the variables won and were re-pinned.
     RepinnedFromEnv,
+    /// The cluster rotated its password while this member was down: etcd
+    /// accepted the variables' password and refused the pinned one, so the
+    /// variables were re-pinned. Carries the variables that had drifted.
+    AdoptedAfterRotation(Vec<&'static str>),
 }
 
 pub fn pin_path(data_dir: &str) -> String {
@@ -142,6 +146,28 @@ pub fn apply_credential_pin(
     credentials_from_env: bool,
     telemetry: &Telemetry,
 ) -> PinOutcome {
+    apply_credential_pin_with_proof(
+        config,
+        has_cluster_data,
+        credentials_from_env,
+        false,
+        telemetry,
+    )
+}
+
+/// [`apply_credential_pin`] with one more input: `proven_by_etcd` says the
+/// etcd pre-flight found the variables' password accepted by etcd and the
+/// pinned one refused (see `etcd_preflight::rotation_adoption`), which is
+/// how a member that was down during a rotation learns the cluster moved.
+/// The variables are then re-pinned exactly as the break-glass path does,
+/// but with an informational outcome instead of a warning.
+pub fn apply_credential_pin_with_proof(
+    config: &mut Config,
+    has_cluster_data: bool,
+    credentials_from_env: bool,
+    proven_by_etcd: bool,
+    telemetry: &Telemetry,
+) -> PinOutcome {
     // The pin lives inside PGDATA so that clones inherit it, but
     // `has_cluster_data` is keyed on the volume-root bootstrap marker, which
     // `post_bootstrap` writes only on the node that bootstrapped the cluster.
@@ -157,6 +183,20 @@ pub fn apply_credential_pin(
     }
 
     let from_env = PinnedCredentials::from_config(config);
+
+    if proven_by_etcd {
+        if let Some(pinned) = existing_pin.as_ref().filter(|pinned| **pinned != from_env) {
+            let drifted = drifted_variables(pinned, &from_env);
+            match write_credential_pin(&config.data_dir, &from_env) {
+                Ok(()) => info!(
+                    drifted = ?drifted,
+                    "credential variables adopted after a rotation: etcd accepts the variables' password and refuses the pinned one, so the roles were rotated while this member was down"
+                ),
+                Err(e) => warn!(error = %e, "failed to re-pin the rotated credentials"),
+            }
+            return PinOutcome::AdoptedAfterRotation(drifted);
+        }
+    }
 
     if credentials_from_env {
         match write_credential_pin(&config.data_dir, &from_env) {
