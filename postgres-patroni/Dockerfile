@@ -18,6 +18,41 @@ ARG POSTGRES_VERSION=18
 # apt package names (postgresql-<major>-pgvector) are per-major only.
 ARG POSTGRES_IMAGE_TAG=${POSTGRES_VERSION}
 
+# Debian release the upstream image is built on — FROZEN, never floated.
+#
+# `postgres:<major>` and `postgres:<major>.<minor>` upstream are moving
+# targets across Debian releases: on 2026-08-29 the sibling postgres-ssl:16
+# image's daily rebuild silently went Debian 12 (glibc 2.36) -> Debian 13
+# (glibc 2.41) because its Dockerfile floated `FROM postgres:16`. glibc's
+# collation order changed between the two, every btree index on a text
+# column was suddenly in the wrong order for the running libc, and a
+# customer's rows became unfindable (~170k "lost" records; the heap was
+# intact). Railway's CVE lane redeploys these images in place on every
+# confirmed CVE, so a floating distro is a live data-corruption hazard, not
+# a cosmetic one. The runtime now REINDEXes before refreshing collation
+# versions (postgres-patroni/src/bootstrap/collation.rs), but that is the
+# safety net — the primary control is that the libc under a volume only
+# changes when a human moves this ARG.
+#
+# Value: the release the CURRENTLY PUBLISHED tags are built on. Verified
+# 2026-09-20 against ghcr.io/railwayapp-templates/postgres-ha/postgres-patroni
+# :14 :15 :16 :17 :18 (all Debian 13.7 / glibc 2.41 / pgdg13) and against
+# every published per-minor tag's upstream base (all `postgres:X.Y` resolve
+# to `X.Y-trixie`). Pinning bookworm here would have flipped the whole
+# fleet 2.41 -> 2.36 and reproduced the incident in the other direction.
+#
+# Moving to a new Debian release is a deliberate, per-major act:
+#   1. change POSTGRES_BASE_DISTRO here (and the workflow's per-major map);
+#   2. every cluster's next redeploy boots on the new libc, detects the
+#      collation version delta on the leader and REINDEXes all affected
+#      indexes BEFORE refreshing — budget for that I/O and time on large
+#      databases, and roll the leader promptly after the replicas (a
+#      replica on the new libc streaming from a leader on the old one
+#      reads mis-ordered indexes until the leader's reindex lands);
+#   3. never do it inside a same-tag digest bump that the CVE lane will
+#      fire unattended.
+ARG POSTGRES_BASE_DISTRO=trixie
+
 # ============================================================
 # Rust builder stage: Compile all Rust binaries (local builds)
 # ============================================================
@@ -49,7 +84,7 @@ COPY --from=rust-builder-local-output / /
 # ============================================================
 # Final stage: PostgreSQL with Patroni HA
 # ============================================================
-FROM postgres:${POSTGRES_IMAGE_TAG} AS ha
+FROM postgres:${POSTGRES_IMAGE_TAG}-${POSTGRES_BASE_DISTRO} AS ha
 
 ARG PATRONI_VERSION=4.1.3
 
