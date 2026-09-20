@@ -394,7 +394,9 @@ async fn main() -> Result<()> {
                 || a.starts_with("--wal_level=")
         });
         if !caller_pinned_wal_level && read_wal_level(&pgdata).as_deref() == Some("logical") {
-            info!("Data directory carries wal_level=logical; preserving it for standalone PostgreSQL");
+            info!(
+                "Data directory carries wal_level=logical; preserving it for standalone PostgreSQL"
+            );
             args.push("-c".to_string());
             args.push("wal_level=logical".to_string());
         }
