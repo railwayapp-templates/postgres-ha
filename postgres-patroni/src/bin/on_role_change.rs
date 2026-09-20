@@ -63,6 +63,17 @@ fn main() {
                 info!(repo_path = %repo_path, "pgbackrest: repo-path marker refreshed on master promotion");
             }
 
+            // Leader-only by construction (we are inside the promotion
+            // branch, and the function re-checks pg_is_in_recovery() and
+            // Patroni's /leader itself). When the promoted node's libc
+            // differs from the one the indexes were built under, this
+            // REINDEXes them before refreshing the recorded version — a
+            // promotion is exactly where a rolling image update lands the
+            // new glibc on the writable node for the first time (see
+            // bootstrap::collation for the rolling-update reasoning). Patroni
+            // kills a still-running callback only when it fires the next
+            // one, i.e. on another role change, which is precisely when this
+            // node must stop anyway.
             refresh_collation_versions();
 
             // A promoted node may carry a pg_stat_statements that lags what

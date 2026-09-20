@@ -6738,9 +6738,232 @@ t_standalone_orphan_slot_reaper_retries_until_it_completes() {
   docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
+# The image's Debian release is pinned in the Dockerfile
+# (POSTGRES_BASE_DISTRO) and must be what the built image actually runs: a
+# libc change under a volume invalidates every text index (the 2026-08-29
+# postgres-ssl:16 bookworm->trixie digest bump). No cluster needed.
+t_image_base_distro_pinned() {
+  local pinned codename glibc
+  pinned=$(sed -nE 's/^ARG POSTGRES_BASE_DISTRO=(.*)$/\1/p' "$DOCKERFILE")
+  if [ -z "$pinned" ]; then
+    ko t_image_base_distro_pinned "Dockerfile has no ARG POSTGRES_BASE_DISTRO=<release> — the base distro is floating again"
+    return
+  fi
+  codename=$(docker run --rm --entrypoint sh "$IMAGE" -c '. /etc/os-release && printf %s "$VERSION_CODENAME"' 2>/dev/null)
+  glibc=$(docker run --rm --entrypoint sh "$IMAGE" -c 'ldd --version 2>/dev/null | head -1' 2>/dev/null)
+  if [ "$codename" != "$pinned" ]; then
+    ko t_image_base_distro_pinned "image runs debian '$codename', Dockerfile pins '$pinned'"
+    return
+  fi
+  ok t_image_base_distro_pinned
+  note "debian=$codename ($glibc)"
+}
+
+# A collation version mismatch (the volume's catalogs stamped with an older
+# libc than the image runs) is repaired on the LEADER by REINDEXing every
+# index that depends on the changed collation FIRST and refreshing the
+# recorded version only afterwards; replicas never reindex (they receive the
+# rebuilt indexes through WAL). Simulates the 2026-08-29 incident: the
+# same-tag digest bump moved postgres-ssl:16 from glibc 2.36 to 2.41 and the
+# wrapper refreshed the stamp without reindexing, leaving every text index
+# mis-ordered for the running libc. Here the stamp is forged in the catalog
+# (allow_system_table_mods) and the leader container is restarted, which is
+# what an image redeploy does.
+t_ha_collation_mismatch_reindex_then_refresh() {
+  local scope=t-collation-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || {
+    ko t_ha_collation_mismatch_reindex_then_refresh "no leader elected"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$n1" "$n2" "$n3"
+    teardown_scope "$scope"; return
+  }
+  wait_for_replication "$scope" 2 240 || {
+    ko t_ha_collation_mismatch_reindex_then_refresh "replicas did not stream"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$leader"
+    teardown_scope "$scope"; return
+  }
+
+  # The boot-time pass on a healthy cluster is a no-op; let it finish so the
+  # assertions below cannot race it.
+  local deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    logs_match "$leader" 'collation-refresh: completed for all databases' && break
+    sleep 2
+  done
+  if ! logs_match "$leader" 'collation-refresh: completed for all databases'; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "boot-time collation pass never completed on the leader"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$leader"
+    teardown_scope "$scope"; return
+  fi
+  if logs_match "$leader" 'collation-refresh: reindexed'; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "a healthy cluster reindexed at boot (nothing was mismatched)"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  # Fixture: a uuid PK (not collatable — must be left alone), a text unique
+  # index on the database default collation (must be rebuilt
+  # CONCURRENTLY), a COLLATE "C" index (unversioned — left alone) and, when
+  # the OS ships the locale, a named libc collation column (rebuilt, then
+  # ALTER COLLATION ... REFRESH VERSION).
+  local has_en_us
+  has_en_us=$(psql_leader "$leader" -At -c "SELECT count(*) FROM pg_collation WHERE collname = 'en_US' AND collprovider = 'c'" 2>/dev/null)
+  local country_col="" country_idx=""
+  if [ "${has_en_us:-0}" -ge 1 ]; then
+    country_col=', country text COLLATE "en_US"'
+    country_idx='CREATE INDEX users_country_idx ON users(country);'
+  fi
+  if ! psql_leader "$leader" -v ON_ERROR_STOP=1 -q -c "
+      CREATE TABLE users(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), email text NOT NULL UNIQUE, tag text COLLATE \"C\" ${country_col});
+      CREATE INDEX users_tag_idx ON users(tag);
+      ${country_idx}
+      INSERT INTO users(email, tag ${country_col:+, country}) SELECT 'u'||g||'@example.com', 't'||g ${country_col:+, 'c'||g} FROM generate_series(1, 2000) g;" >/dev/null 2>&1; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "fixture creation failed"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  # Forge the previous libc's stamp — exactly what a volume carries after
+  # its image moved to a newer glibc. Replicated to the standbys by WAL, so
+  # every node sees the same "mismatch" against its (identical) libc.
+  if ! psql_leader "$leader" -v ON_ERROR_STOP=1 -q -c "
+      SET allow_system_table_mods = on;
+      UPDATE pg_database SET datcollversion = '2.36' WHERE datname = current_database();
+      UPDATE pg_collation SET collversion = '2.36' WHERE collname = 'en_US' AND collprovider = 'c';" >/dev/null 2>&1; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "could not forge the collation stamps"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$leader"
+    teardown_scope "$scope"; return
+  fi
+  local stamped
+  stamped=$(psql_leader "$leader" -At -c "SELECT (datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)) FROM pg_database WHERE datname = current_database()" 2>/dev/null)
+  if [ "$stamped" != "t" ]; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "forged stamp did not register as a mismatch (got '$stamped')"
+    teardown_scope "$scope"; return
+  fi
+
+  # An image redeploy is a container restart. Patroni releases the lock on a
+  # clean stop, so this usually promotes a standby (on_role_change path);
+  # when the same node comes back as leader it is the boot path instead.
+  # Either way exactly one leader must do the repair.
+  local old_leader="$leader"
+  docker restart "$old_leader" >/dev/null 2>&1
+
+  local repairer=""
+  deadline=$(($(date +%s) + 300))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    for n in "$n1" "$n2" "$n3"; do
+      if logs_match "$n" 'collation-refresh: refreshed database collation version'; then
+        repairer="$n"; break 2
+      fi
+    done
+    sleep 3
+  done
+  if [ -z "$repairer" ]; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "no node refreshed the database collation version after the restart"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$n1" "$n2" "$n3"
+    teardown_scope "$scope"; return
+  fi
+
+  leader=$(wait_for_leader "$scope" 120) || {
+    ko t_ha_collation_mismatch_reindex_then_refresh "no leader after restart"
+    teardown_scope "$scope"; return
+  }
+  if [ "$repairer" != "$leader" ]; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "the node that repaired ($repairer) is not the leader ($leader)"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$repairer" "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  # Leader-only: the other two must never have reindexed anything.
+  for n in "$n1" "$n2" "$n3"; do
+    [ "$n" = "$leader" ] && continue
+    if logs_match "$n" 'collation-refresh: reindexed'; then
+      ko t_ha_collation_mismatch_reindex_then_refresh "non-leader $n ran REINDEX"
+      fail_dump t_ha_collation_mismatch_reindex_then_refresh "$n"
+      teardown_scope "$scope"; return
+    fi
+  done
+
+  local logs; logs="$(docker logs "$leader" 2>&1)"
+  # Selection: the default-collation text index was rebuilt concurrently;
+  # the uuid PK and the COLLATE "C" index were not touched.
+  if ! grep -E 'collation-refresh: reindexed.*users_email_key' <<<"$logs" | grep -q 'concurrent=true'; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "users_email_key was not rebuilt CONCURRENTLY"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$leader"
+    teardown_scope "$scope"; return
+  fi
+  if grep -E 'collation-refresh: reindexed.*(users_pkey|users_tag_idx)' -q <<<"$logs"; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "a non-collatable or COLLATE \"C\" index was reindexed"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$leader"
+    teardown_scope "$scope"; return
+  fi
+  if [ -n "$country_idx" ] && ! grep -qE 'collation-refresh: reindexed.*users_country_idx' <<<"$logs"; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "the en_US-collated index was not reindexed"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$leader"
+    teardown_scope "$scope"; return
+  fi
+  # Order: every REINDEX line precedes the refresh line.
+  local last_reindex first_refresh
+  last_reindex=$(grep -nE 'collation-refresh: reindexed' <<<"$logs" | tail -1 | cut -d: -f1)
+  first_refresh=$(grep -nE 'collation-refresh: refreshed database collation version' <<<"$logs" | head -1 | cut -d: -f1)
+  if [ -z "$last_reindex" ] || [ -z "$first_refresh" ] || [ "$last_reindex" -ge "$first_refresh" ]; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "refresh (line $first_refresh) did not come after the last REINDEX (line $last_reindex)"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  # Catalog converged on the leader, and — via WAL — on a replica; rows are
+  # still findable through the rebuilt unique index everywhere.
+  wait_for_replication "$scope" 2 240 >/dev/null 2>&1 || true
+  local n_mismatch found replica
+  n_mismatch=$(psql_leader "$leader" -At -c "SELECT count(*) FROM pg_database WHERE datallowconn AND datname <> 'template0' AND datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)" 2>/dev/null)
+  if [ "$n_mismatch" != "0" ]; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "leader still reports $n_mismatch mismatched database(s)"
+    teardown_scope "$scope"; return
+  fi
+  n_mismatch=$(psql_leader "$leader" -At -c "SELECT count(*) FROM pg_collation WHERE collprovider = 'c' AND collversion IS DISTINCT FROM pg_collation_actual_version(oid)" 2>/dev/null)
+  if [ "$n_mismatch" != "0" ]; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "leader still reports $n_mismatch mismatched libc collation(s)"
+    teardown_scope "$scope"; return
+  fi
+  for n in "$n1" "$n2" "$n3"; do
+    [ "$n" = "$leader" ] && continue
+    replica="$n"; break
+  done
+  wait_for_pg_accepting "$replica" 120 || true
+  local rep_ok
+  rep_ok=$(docker exec "$replica" psql -U postgres -h /var/run/postgresql -At -c "SELECT (datcollversion IS NOT DISTINCT FROM pg_database_collation_actual_version(oid)) FROM pg_database WHERE datname = current_database()" 2>/dev/null)
+  if [ "$rep_ok" != "t" ]; then
+    ko t_ha_collation_mismatch_reindex_then_refresh "replica $replica did not receive the refreshed stamp (got '$rep_ok')"
+    fail_dump t_ha_collation_mismatch_reindex_then_refresh "$replica"
+    teardown_scope "$scope"; return
+  fi
+  for n in "$leader" "$replica"; do
+    found=$(docker exec "$n" psql -U postgres -h /var/run/postgresql -At -c "SET enable_seqscan = off; SELECT count(*) FROM users WHERE email = 'u1500@example.com'" 2>/dev/null | tail -1)
+    if [ "$found" != "1" ]; then
+      ko t_ha_collation_mismatch_reindex_then_refresh "index lookup on $n found '$found' rows for a present key (expected 1)"
+      fail_dump t_ha_collation_mismatch_reindex_then_refresh "$n"
+      teardown_scope "$scope"; return
+    fi
+  done
+
+  ok t_ha_collation_mismatch_reindex_then_refresh
+  note "repaired on $leader ($([ "$repairer" = "$old_leader" ] && echo 'same node, boot path' || echo 'promoted standby, on_role_change path')); en_US present=${has_en_us:-0}"
+  teardown_scope "$scope"
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
+  # the image runs the Debian release the Dockerfile pins (libc under a
+  # volume must never move by accident)
+  t_image_base_distro_pinned
+  # a collation version mismatch is repaired leader-only, REINDEX before
+  # REFRESH, and replicas receive the result through WAL
+  t_ha_collation_mismatch_reindex_then_refresh
   t_archiving_boot
   t_pitr_happy_path
   t_watcher_initial_full

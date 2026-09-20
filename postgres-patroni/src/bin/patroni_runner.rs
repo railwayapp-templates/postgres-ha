@@ -1781,12 +1781,21 @@ fn main() -> Result<()> {
 /// WAL_ARCHIVE_BUCKET gate to piggyback on.
 ///
 /// Safe to double-run with an on_role_change-triggered refresh (e.g. right
-/// after an actual promotion): refresh_collation_versions's SQL already
-/// no-ops per-database once nothing is mismatched.
+/// after an actual promotion): refresh_collation_versions detects the
+/// mismatch from the catalogs and no-ops per-database once nothing is
+/// mismatched.
+///
+/// The refresh is not a quick stamp any more: when the image's libc moved
+/// under the volume it REINDEXes every affected index before refreshing
+/// (see bootstrap::collation), which can run for a long time on a big
+/// database. It is synchronous psql work, so it goes on a blocking thread
+/// rather than parking one of the runtime's async workers for the duration.
 fn spawn_collation_refresh() {
     tokio::spawn(async move {
         if wait_until_local_primary(Duration::from_secs(600)).await {
-            refresh_collation_versions();
+            if let Err(e) = tokio::task::spawn_blocking(refresh_collation_versions).await {
+                warn!(error = %e, "collation-refresh: task panicked");
+            }
         }
     });
 }
