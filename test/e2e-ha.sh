@@ -6495,7 +6495,10 @@ _seed_pgdata_with_member_slots() {
     sleep 1
   done
   if [ "$up" != 1 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; return 1; fi
+  # The seed's command-line setting does not survive container replacement.
+  # Preserve logical decoding for the standalone boot that retains this slot.
   docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 -q \
+    -c "ALTER SYSTEM SET wal_level = 'logical';" \
     -c "SELECT pg_create_physical_replication_slot('postgres_2', true);" \
     -c "SELECT pg_create_physical_replication_slot('postgres_3', true);" \
     -c "SELECT pg_create_physical_replication_slot('external_standby', true);" \
