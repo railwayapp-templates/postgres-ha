@@ -6552,7 +6552,7 @@ t_standalone_reaps_orphaned_member_slots() {
   local t=t_standalone_reaps_orphaned_member_slots
   local vol="orphslots-vol-${PG_VERSION}" n="orphslots-pg-${PG_VERSION}"
   local seed="orphslots-seed-${PG_VERSION}"
-  local all_idle="external_standby:f,fivetran_pgoutput_slot:f,postgres_2:f,postgres_3:f"
+  local all_idle="external_standby:false,fivetran_pgoutput_slot:false,postgres_2:false,postgres_3:false"
   docker rm -f "$n" "$seed" >/dev/null 2>&1 || true
   new_volume "$vol"
   if ! _seed_pgdata_with_member_slots "$vol" "$seed"; then
@@ -6624,7 +6624,7 @@ t_standalone_reaps_orphaned_member_slots() {
   fi
 
   census=$(_slot_census "$n")
-  local want="external_standby:t,fivetran_pgoutput_slot:f"
+  local want="external_standby:true,fivetran_pgoutput_slot:false"
   if [ "$census" != "$want" ]; then
     ko "$t" "phase B: wrong slot population after the reap (got '$census', want '$want')"
     fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
@@ -6654,7 +6654,7 @@ t_standalone_orphan_slot_reaper_retries_until_it_completes() {
   local t=t_standalone_orphan_slot_reaper_retries_until_it_completes
   local vol="orphretry-vol-${PG_VERSION}" n="orphretry-pg-${PG_VERSION}"
   local seed="orphretry-seed-${PG_VERSION}"
-  local all_idle="external_standby:f,fivetran_pgoutput_slot:f,postgres_2:f,postgres_3:f"
+  local all_idle="external_standby:false,fivetran_pgoutput_slot:false,postgres_2:false,postgres_3:false"
   docker rm -f "$n" "$seed" >/dev/null 2>&1 || true
   new_volume "$vol"
   if ! _seed_pgdata_with_member_slots "$vol" "$seed"; then
@@ -6718,7 +6718,7 @@ t_standalone_orphan_slot_reaper_retries_until_it_completes() {
     fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
   fi
   census=$(_slot_census "$n")
-  local want="fivetran_pgoutput_slot:f"
+  local want="fivetran_pgoutput_slot:false"
   if [ "$census" != "$want" ]; then
     ko "$t" "wrong slot population after the pass (got '$census', want '$want')"
     fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
