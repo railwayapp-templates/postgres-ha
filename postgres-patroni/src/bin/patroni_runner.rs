@@ -659,24 +659,39 @@ async fn reconcile_rotation_at_boot(config: &mut Config) -> Result<()> {
                         continue;
                     }
                     let roles = async {
+                        let (sql, connection) = tokio_postgres::Config::new()
+                            .host(url.host_str().context("missing host")?)
+                            .port(url.port().unwrap_or(5432))
+                            .user(&config.superuser)
+                            .password(candidate)
+                            .dbname("postgres")
+                            .connect_timeout(Duration::from_secs(3))
+                            .connect(tokio_postgres::NoTls)
+                            .await?;
+                        tokio::spawn(async move {
+                            let _ = connection.await;
+                        });
+                        anyhow::ensure!(
+                            !sql.query_one("SELECT pg_is_in_recovery()", &[])
+                                .await?
+                                .get::<_, bool>(0),
+                            "leader changed"
+                        );
                         for user in [&config.superuser, &config.repl_user, &config.app_user] {
-                            let (sql, connection) = tokio_postgres::Config::new()
-                                .host(url.host_str().context("missing host")?)
-                                .port(url.port().unwrap_or(5432))
-                                .user(user)
-                                .password(&candidate)
-                                .dbname("postgres")
-                                .connect_timeout(Duration::from_secs(3))
-                                .connect(tokio_postgres::NoTls)
+                            let row = sql
+                                .query_one(
+                                    "SELECT rolpassword FROM pg_authid WHERE rolname = $1",
+                                    &[user],
+                                )
                                 .await?;
-                            tokio::spawn(async move {
-                                let _ = connection.await;
-                            });
+                            let verifier: Option<String> = row.get(0);
                             anyhow::ensure!(
-                                !sql.query_one("SELECT pg_is_in_recovery()", &[])
-                                    .await?
-                                    .get::<_, bool>(0),
-                                "leader changed"
+                                verifier.is_some_and(|value| {
+                                    postgres_patroni::patroni::scram::verify(
+                                        &value, user, candidate,
+                                    ) == postgres_patroni::patroni::scram::VerifierCheck::Matches
+                                }),
+                                "role password differs"
                             );
                         }
                         Ok::<(), anyhow::Error>(())
@@ -913,36 +928,25 @@ fn drifted_summary(drifted: &[&str]) -> String {
     }
 }
 
-/// Patroni's own configuration loader gives `PATRONI_*` environment variables
-/// priority over the config file, so it is not enough to render the pinned
-/// credentials into patroni.yml: Patroni would read the drifted
-/// `PATRONI_REPLICATION_PASSWORD` / `PATRONI_SUPERUSER_PASSWORD` straight out
-/// of the environment, override the file, and write the drifted replication
-/// password into its pgpass — which is what `primary_conninfo` authenticates
-/// with. The replicas then fail to authenticate against a leader whose roles
-/// still carry the pinned password, which is exactly the outage the pin
-/// exists to prevent.
-///
-/// Hand Patroni the same values the config file already carries, so the two
-/// sources agree whatever the variables say. `config` here is post-pin, so on
-/// a fresh volume these are the variables themselves and this is a no-op.
-///
-/// The control-plane credential variables get the same treatment for the
-/// opposite reason: the runner reads a blank (whitespace-only) value as unset
-/// and renders patroni.yml accordingly, while Patroni's loader keeps any
-/// non-empty string (`_get_auth`: `if value:`) and applies it over the file.
-/// A blank `PATRONI_RESTAPI_PASSWORD` then reaches Patroni as
-/// `restapi.authentication = {password: "  "}` with no username, and
-/// `'{username}:{password}'.format(...)` raises KeyError before the API
-/// starts; a blank `PATRONI_ETCD3_PASSWORD` replaces the etcd password the
-/// file carries with spaces. Blank variables are removed from the child's
-/// environment so both sides agree they are unset.
-async fn start_patroni(config: &Config) -> Result<tokio::process::Child> {
+/// Patroni caches its environment at process start and reapplies it on reload.
+/// Withhold password overrides so live rotation can update the authoritative
+/// YAML without restarting Patroni. Blank usernames are also treated as unset,
+/// matching the runner's configuration parser.
+async fn start_patroni(_config: &Config) -> Result<tokio::process::Child> {
     let mut command = Command::new("patroni");
-    command
-        .arg("/etc/patroni/patroni.yml")
-        .env("PATRONI_REPLICATION_PASSWORD", &config.repl_pass)
-        .env("PATRONI_SUPERUSER_PASSWORD", &config.superuser_pass);
+    command.arg("/etc/patroni/patroni.yml");
+    // Patroni caches environment overrides at startup. Passwords must come
+    // exclusively from the reloadable YAML, including on adopted volumes.
+    for name in [
+        "PATRONI_SUPERUSER_PASSWORD",
+        "PATRONI_REPLICATION_PASSWORD",
+        "PATRONI_REWIND_PASSWORD",
+        "PATRONI_RESTAPI_PASSWORD",
+        "PATRONI_CTL_PASSWORD",
+        "PATRONI_ETCD3_PASSWORD",
+    ] {
+        command.env_remove(name);
+    }
     for var in blank_credential_vars(|name| env::var(name).ok()) {
         warn!(
             variable = var,
