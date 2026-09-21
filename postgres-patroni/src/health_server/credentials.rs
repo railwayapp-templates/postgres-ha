@@ -91,6 +91,36 @@ async fn connect(
     Ok(client)
 }
 
+// A successful loopback login is not evidence of a password match: adopted
+// datasets may retain a trust rule. Check the stored verifier with a superuser
+// connection, without changing the customer's HBA policy.
+async fn roles_match(
+    client: &tokio_postgres::Client,
+    roles: &[&str],
+    password: &str,
+) -> Result<bool> {
+    use crate::patroni::scram::{verify, VerifierCheck};
+    for role in roles {
+        let row = client
+            .query_opt(
+                "SELECT rolpassword FROM pg_authid WHERE rolname = $1",
+                &[role],
+            )
+            .await?
+            .context("rotation role missing")?;
+        let verifier: Option<String> = row.get(0);
+        match verifier
+            .as_deref()
+            .map(|value| verify(value, role, password))
+        {
+            Some(VerifierCheck::Matches) => {}
+            Some(VerifierCheck::Differs) | None => return Ok(false),
+            Some(VerifierCheck::Unsupported(_)) => anyhow::bail!("unsupported password verifier"),
+        }
+    }
+    Ok(true)
+}
+
 pub async fn rotate(
     State(config): State<HealthServerConfig>,
     headers: HeaderMap,
@@ -160,9 +190,16 @@ async fn apply(
     let patroni = format!("http://127.0.0.1:{}", config.patroni_port);
     match request.operation {
         Operation::Preflight => {
-            for role in [&user, &replication_user, &app_user] {
-                connect(config, role, &request.new_password).await?;
-            }
+            let client = connect(config, &user, &request.new_password).await?;
+            anyhow::ensure!(
+                roles_match(
+                    &client,
+                    &[&user, &replication_user, &app_user],
+                    &request.new_password
+                )
+                .await?,
+                "role password differs"
+            );
             let dynamic: Value = http
                 .get(format!("{patroni}/config"))
                 .send()
@@ -200,8 +237,17 @@ async fn apply(
             )?;
         }
         Operation::Database => {
-            if connect(config, &user, &request.new_password).await.is_err() {
-                let mut client = connect(config, &user, &request.current_password).await?;
+            let mut client = match connect(config, &user, &request.new_password).await {
+                Ok(client) => client,
+                Err(_) => connect(config, &user, &request.current_password).await?,
+            };
+            if !roles_match(
+                &client,
+                &[&user, &replication_user, &app_user],
+                &request.new_password,
+            )
+            .await?
+            {
                 let transaction = client.transaction().await?;
                 anyhow::ensure!(
                     !transaction
@@ -227,7 +273,16 @@ async fn apply(
         }
         Operation::Member => {
             // Wait for the role transaction to replay before changing a replica.
-            connect(config, &user, &request.new_password).await?;
+            let client = connect(config, &user, &request.new_password).await?;
+            anyhow::ensure!(
+                roles_match(
+                    &client,
+                    &[&user, &replication_user, &app_user],
+                    &request.new_password
+                )
+                .await?,
+                "role password not replicated"
+            );
             let rest_user = text(&yaml["restapi"]["authentication"]["username"])?.to_string();
             let old_rest_password =
                 text(&yaml["restapi"]["authentication"]["password"])?.to_string();
@@ -315,9 +370,16 @@ async fn apply(
             )?;
         }
         Operation::Verify => {
-            for role in [&user, &replication_user, &app_user] {
-                connect(config, role, &request.new_password).await?;
-            }
+            let client = connect(config, &user, &request.new_password).await?;
+            anyhow::ensure!(
+                roles_match(
+                    &client,
+                    &[&user, &replication_user, &app_user],
+                    &request.new_password
+                )
+                .await?,
+                "role password differs"
+            );
             let pin = read_credential_pin(&data_dir).context("pin missing")?;
             anyhow::ensure!(
                 pin.superuser_pass == request.new_password
@@ -327,12 +389,7 @@ async fn apply(
             );
             if request.current_password != request.new_password {
                 anyhow::ensure!(
-                    connect(config, &user, &request.current_password)
-                        .await
-                        .err()
-                        .and_then(|error| error.downcast::<tokio_postgres::Error>().ok())
-                        .is_some_and(|error| error.code()
-                            == Some(&tokio_postgres::error::SqlState::INVALID_PASSWORD)),
+                    !roles_match(&client, &[&user], &request.current_password).await?,
                     "previous password still accepted"
                 );
             }
@@ -356,7 +413,7 @@ async fn apply(
         .query_one("SELECT pg_is_in_recovery()", &[])
         .await?
         .get::<_, bool>(0);
-    Ok(json!({"version": 1, "leader": leader}))
+    Ok(json!({"version": 1, "leader": leader, "capabilities": ["catalog_verifier"]}))
 }
 
 /// The pending credential is private on-disk intent, never progress or logs.
@@ -423,6 +480,51 @@ pub(super) async fn reconcile(config: HealthServerConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires an isolated local PostgreSQL server with loopback trust"]
+    async fn live_rotation_with_loopback_trust() {
+        let mut config = HealthServerConfig::from_env();
+        config.pg_port = std::env::var("ROTATION_TEST_PG_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let client = connect(&config, "postgres", "never-set").await.unwrap();
+        client.batch_execute("CREATE ROLE rotation_replica LOGIN; CREATE ROLE rotation_app LOGIN; ALTER ROLE postgres PASSWORD 'rotation-old-local'; ALTER ROLE rotation_replica PASSWORD 'rotation-old-local'; ALTER ROLE rotation_app PASSWORD 'rotation-old-local';").await.unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str("postgresql:\n  data_dir: /unused\n  authentication:\n    superuser:\n      username: postgres\n    replication:\n      username: rotation_replica\n  app_user:\n    username: rotation_app\n").unwrap();
+        for (previous, target) in [
+            ("rotation-old-local", "rotation-new-local"),
+            ("rotation-new-local", "rotation-old-local"),
+        ] {
+            assert!(!roles_match(
+                &client,
+                &["postgres", "rotation_replica", "rotation_app"],
+                target
+            )
+            .await
+            .unwrap());
+            for _ in 0..2 {
+                apply(
+                    &config,
+                    yaml.clone(),
+                    Rotation {
+                        operation: Operation::Database,
+                        new_password: target.into(),
+                        current_password: previous.into(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(roles_match(
+                &client,
+                &["postgres", "rotation_replica", "rotation_app"],
+                target
+            )
+            .await
+            .unwrap());
+            assert!(!roles_match(&client, &["postgres"], previous).await.unwrap());
+        }
+    }
     #[test]
     fn quotes_sql_and_pgpass_without_interpolation() {
         assert_eq!(quote_identifier("odd\"role"), "\"odd\"\"role\"");
