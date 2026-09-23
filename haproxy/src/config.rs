@@ -23,6 +23,19 @@ pub struct Config {
     /// authenticates. `None` means no credential is available, and remote
     /// access to the stats page is denied outright.
     pub stats_auth: Option<StatsAuth>,
+    /// User name the sli probe presents in its StartupMessage. Only the name:
+    /// the probe never sends a password, it stops at the server's
+    /// authentication request.
+    pub probe_user: String,
+    /// What spreads this replica's probes inside the 10-second slot.
+    pub replica_identity: String,
+}
+
+/// The name the sli probe presents: `PGUSER` when set, else `postgres`.
+pub(crate) fn resolve_probe_user(pg_user: Option<String>) -> String {
+    pg_user
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "postgres".to_string())
 }
 
 /// Credential guarding the stats page for non-loopback clients.
@@ -85,6 +98,10 @@ impl Config {
                 std::env::var("PGUSER").ok(),
                 std::env::var("PGPASSWORD").ok(),
             ),
+            probe_user: resolve_probe_user(std::env::var("PGUSER").ok()),
+            replica_identity: std::env::var("RAILWAY_REPLICA_ID")
+                .or_else(|_| std::env::var("HOSTNAME"))
+                .unwrap_or_default(),
         })
     }
 }
@@ -125,6 +142,13 @@ mod tests {
     fn stats_auth_defaults_user_when_only_password_is_known() {
         let auth = resolve_stats_auth(None, s("secret"), None, None).unwrap();
         assert_eq!(auth.user, "postgres");
+    }
+
+    #[test]
+    fn probe_user_is_pguser_or_postgres() {
+        assert_eq!(resolve_probe_user(s("railway")), "railway");
+        assert_eq!(resolve_probe_user(s(" ")), "postgres");
+        assert_eq!(resolve_probe_user(None), "postgres");
     }
 
     #[test]

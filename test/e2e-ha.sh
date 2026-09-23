@@ -200,8 +200,8 @@ ensure_etcd_image() {
   docker build -q -f "$REPO_ROOT/etcd/Dockerfile" -t "$ETCD_IMAGE" "$REPO_ROOT" >/dev/null
 }
 
-# Build the haproxy image on demand (only the clean-stop test needs it, so it
-# is not part of the harness preamble). Same policy as ensure_etcd_image.
+# Build the haproxy image on demand (only the edge tests need it, so it is
+# not part of the harness preamble). Same policy as ensure_etcd_image.
 HAPROXY_IMAGE="postgres-ha-haproxy-test:latest"
 ensure_haproxy_image() {
   if [ "${E2E_SKIP_BUILD:-0}" = "1" ] && docker image inspect "$HAPROXY_IMAGE" >/dev/null 2>&1; then
@@ -5638,6 +5638,112 @@ t_haproxy_stop_is_clean() {
   docker rm -f "$c" >/dev/null 2>&1 || true
 }
 
+# The uptime SLI's host probe. In front of a real 3-node cluster the edge logs
+# `sli haproxy ... probe=ok` from a login-free handshake on its own 5432 (the
+# customer's path); with every Postgres node stopped it logs `probe=fail`,
+# probes back to back, and on the first success after the nodes return logs the
+# measured recovery as `rto_ms=`. The probe never sends a message Postgres
+# would log as a protocol violation, and the stats listener's access log (the
+# monitor polls it every 5s) is gone. Each etcd member logs its own `sli etcd`
+# redundancy line.
+wait_for_log_line() {
+  local c="$1" pattern="$2" secs="$3"
+  local deadline=$(($(date +%s) + secs))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    logs_contain "$c" "$pattern" && return 0
+    sleep 2
+  done
+  return 1
+}
+
+t_haproxy_sli_probe_reports_the_path() {
+  local t="t_haproxy_sli_probe_reports_the_path"
+  local scope="t-sliprobe-${PG_VERSION}"
+  local h="${scope}-haproxy"
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  local n1 n2 n3
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
+  wait_for_leader "$scope" 240 >/dev/null || { ko "$t" "no leader"; fail_dump "$t" "$n1" "$n2" "$n3"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 >/dev/null 2>&1 || true
+
+  ensure_haproxy_image
+  docker rm -f "$h" >/dev/null 2>&1 || true
+  docker run -d --name "$h" --label "$HA_LABEL" --network "$NET" \
+    -e "POSTGRES_NODES=${n1}:5432:8008,${n2}:5432:8008,${n3}:5432:8008" \
+    -e "PGUSER=postgres" \
+    "$HAPROXY_IMAGE" >/dev/null
+
+  if ! wait_for_log_line "$h" "sli haproxy primary_up=1 replicas_up=2 replicas_total=3 probe=ok latency_ms=" 90; then
+    ko "$t" "no ok sli line in front of a healthy cluster"
+    fail_dump "$t" "$h"
+    docker rm -f "$h" >/dev/null 2>&1 || true
+    teardown_scope "$scope"
+    return
+  fi
+  # At least 25s of monitor polls (every 5s) have run by now: none is logged.
+  sleep 25
+  if logs_contain "$h" "8404 (stats/HTTP)"; then
+    ko "$t" "the stats listener still access-logs the monitor's polls"
+    fail_dump "$t" "$h"
+    docker rm -f "$h" >/dev/null 2>&1 || true
+    teardown_scope "$scope"
+    return
+  fi
+  local ok_lines
+  ok_lines=$(docker logs "$h" 2>&1 | grep -c "probe=ok" || true)
+  if [ "${ok_lines:-0}" -lt 3 ]; then
+    ko "$t" "expected a line every 10s, saw ${ok_lines} ok lines in ~30s"
+    fail_dump "$t" "$h"
+    docker rm -f "$h" >/dev/null 2>&1 || true
+    teardown_scope "$scope"
+    return
+  fi
+  local n
+  for n in "$n1" "$n2" "$n3"; do
+    if logs_contain "$n" "expected SASL response" || logs_contain "$n" "invalid length of startup packet" \
+       || logs_contain "$n" "incomplete startup packet"; then
+      ko "$t" "$n logged the probe as a protocol violation"
+      fail_dump "$t" "$n"
+      docker rm -f "$h" >/dev/null 2>&1 || true
+      teardown_scope "$scope"
+      return
+    fi
+  done
+  if ! wait_for_log_line "${scope}-etcd-1" "sli etcd healthy=1 members=3 members_healthy=3 quorum=1" 60; then
+    ko "$t" "etcd member logged no full sli etcd line"
+    fail_dump "$t" "${scope}-etcd-1"
+    docker rm -f "$h" >/dev/null 2>&1 || true
+    teardown_scope "$scope"
+    return
+  fi
+
+  # The whole database tier goes away: the edge has nothing to route to.
+  docker stop -t 10 "$n1" "$n2" "$n3" >/dev/null
+  if ! wait_for_log_line "$h" "probe=fail reason=" 90; then
+    ko "$t" "no fail sli line with every Postgres node stopped"
+    fail_dump "$t" "$h"
+    docker rm -f "$h" >/dev/null 2>&1 || true
+    teardown_scope "$scope"
+    return
+  fi
+  docker start "$n1" "$n2" "$n3" >/dev/null
+  if ! wait_for_log_line "$h" "probe=ok latency_ms=[0-9]* rto_ms=" 300; then
+    ko "$t" "no recovery line with rto_ms after the nodes came back"
+    fail_dump "$t" "$h" "$n1" "$n2" "$n3"
+    docker rm -f "$h" >/dev/null 2>&1 || true
+    teardown_scope "$scope"
+    return
+  fi
+
+  local reasons rto
+  reasons=$(docker logs "$h" 2>&1 | grep -o "probe=fail reason=[a-z]*" | sort | uniq -c | tr '\n' ';')
+  rto=$(docker logs "$h" 2>&1 | grep -o "rto_ms=[0-9]*" | tail -1)
+  ok "$t"
+  note "fail reasons: ${reasons}; recovery ${rto}"
+  docker rm -f "$h" >/dev/null 2>&1 || true
+  teardown_scope "$scope"
+}
+
 # Stopping the Patroni leader: the runner's mini-init forwards the signal,
 # Patroni stops Postgres with a checkpoint (fast mode), releases the leader
 # key on its way out, and the container exits 0 — so a replica can take the
@@ -6823,6 +6929,9 @@ ALL_TESTS=(
   t_etcd_stop_is_clean
   t_haproxy_stop_is_clean
   t_pg_stop_is_clean_and_releases_lock
+  # uptime SLI host probe: login-free handshake on the edge's own 5432, ok /
+  # fail / back-to-back retry with rto_ms; stats access log silenced; etcd line
+  t_haproxy_sli_probe_reports_the_path
   # control-plane authentication: etcd RBAC + Patroni REST basic auth
   t_ha_control_plane_auth_enforced
   t_ha_restapi_auth_unenforced_still_sends_credential
