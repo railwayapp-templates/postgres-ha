@@ -141,14 +141,20 @@ struct WatcherConfig {
     /// against only matters once a full already exists; until then, retrying
     /// promptly (once the hiccup clears) is the safer trade.
     initial_full_retry_backoff: u64,
+    /// Minimum age of a half-created-stanza sighting before the watcher acts
+    /// on it (see `half_created_stanza_step`). Defaults to `poll_interval`,
+    /// so the two sightings are always at least one normal poll apart, even
+    /// while the watcher runs its tighter pre-first-full cadence.
+    half_stanza_confirm: u64,
 }
 
 impl WatcherConfig {
     fn from_env() -> Self {
         let full_hours = env_u64("WAL_BACKUP_FULL_INTERVAL_HOURS", 168);
         let diff_hours = env_u64("WAL_BACKUP_DIFF_INTERVAL_HOURS", 24);
+        let poll_interval = env_u64("WAL_BACKUP_POLL_INTERVAL_SECONDS", 60);
         Self {
-            poll_interval: env_u64("WAL_BACKUP_POLL_INTERVAL_SECONDS", 60),
+            poll_interval,
             initial_poll_interval: env_u64("WAL_BACKUP_INITIAL_POLL_SECONDS", 5),
             gap_recovery_backoff: env_u64("WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS", 600),
             // WAL_BACKUP_FULL_INTERVAL_SECONDS overrides hours for the e2e
@@ -171,6 +177,7 @@ impl WatcherConfig {
                 "WAL_BACKUP_INITIAL_FULL_RETRY_BACKOFF_SECONDS",
                 30,
             ),
+            half_stanza_confirm: env_u64("WAL_BACKUP_HALF_STANZA_CONFIRM_SECONDS", poll_interval),
         }
     }
 }
@@ -359,7 +366,7 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
     // the stanza is healthy; repairs a missing or corrupt backup.info on the
     // spot. Running every iteration means a broken stanza is fixed on the next
     // poll rather than waiting up to catalog_verify_interval (default 3600 s).
-    stanza_create_step().await;
+    stanza_create_step(data_dir, config, client, &stats).await;
 
     adopt_backup_history_from_catalog(data_dir).await;
 
@@ -996,7 +1003,17 @@ async fn log_catalog_probe_error() {
 /// decouples stanza repair from the catalog-verify interval so a broken stanza
 /// is fixed on the next poll (~60 s) rather than waiting up to
 /// `catalog_verify_interval` (default 3600 s). Logs only on failure.
-async fn stanza_create_step() {
+///
+/// A failure is also checked for a half-created stanza
+/// (`half_created_stanza_kind`), the one stanza-create failure that retrying
+/// never fixes; see `half_created_stanza_step`.
+async fn stanza_create_step(
+    data_dir: &str,
+    config: &WatcherConfig,
+    client: &reqwest::Client,
+    stats: &ArchiverStats,
+) {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         Command::new("pgbackrest")
@@ -1007,18 +1024,233 @@ async fn stanza_create_step() {
     )
     .await;
     match result {
-        Ok(Ok(o)) if o.status.success() => {}
+        Ok(Ok(o)) if o.status.success() => {
+            // A whole stanza ends any half-created sighting in progress: the
+            // earlier sighting was a stanza-create caught between its writes.
+            if clear_half_stanza_sighting(&state_path) {
+                info!("pgbackrest-watcher: half-created stanza: stanza-create now succeeds; the earlier sighting was transient");
+            }
+        }
         Ok(Ok(o)) => {
-            let stderr: String = String::from_utf8_lossy(&o.stderr)
-                .replace('\n', " ")
-                .chars()
-                .take(300)
-                .collect();
-            warn!(status = ?o.status, stderr = %stderr, "pgbackrest-watcher: stanza-create failed");
+            // pgBackRest writes ERROR/WARN lines to stderr and the rest of
+            // its console log (log-level-console=info) to stdout; classify
+            // and excerpt over both so neither the stream split nor the long
+            // "command begin" preamble can hide the error.
+            let output = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            warn!(
+                status = ?o.status,
+                error = %stanza_create_error_excerpt(&output),
+                "pgbackrest-watcher: stanza-create failed"
+            );
+            if let Some(kind) = half_created_stanza_kind(&output) {
+                half_created_stanza_step(data_dir, config, client, stats, kind).await;
+            }
         }
         Ok(Err(e)) => warn!(error = %e, "pgbackrest-watcher: stanza-create invocation failed"),
         Err(_) => warn!("pgbackrest-watcher: stanza-create timed out"),
     }
+}
+
+/// State field holding the epoch of the first half-created-stanza sighting in
+/// the current run of sightings. Empty/absent = none.
+const HALF_STANZA_FIRST_SEEN_FIELD: &str = "half_stanza_first_seen_at";
+
+/// Which of the two stanza info files is missing on repo1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HalfStanzaKind {
+    /// `archive.info` present, `backup.info` (and its `.copy`) missing — what
+    /// an interrupted stanza-create leaves behind.
+    BackupInfoMissing,
+    /// `backup.info` present, `archive.info` (and its `.copy`) missing.
+    ArchiveInfoMissing,
+}
+
+impl HalfStanzaKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            HalfStanzaKind::BackupInfoMissing => "backup.info-missing",
+            HalfStanzaKind::ArchiveInfoMissing => "archive.info-missing",
+        }
+    }
+}
+
+/// Classifies stanza-create output as a half-created stanza on repo1.
+///
+/// pgBackRest's stanza-create (src/command/stanza/create.c) writes
+/// `archive.info` (+ `.copy`) FIRST and `backup.info` (+ `.copy`) SECOND. A
+/// stanza-create interrupted between the two — e.g. a container restarted
+/// seconds into its first boot — leaves `archive.info` with no `backup.info`,
+/// and from then on every stanza-create refuses to touch the repo:
+///
+/// ```text
+/// ERROR: [055]: archive.info exists but backup.info is missing on repo1
+///        HINT: this may be a symptom of repository corruption!
+/// ```
+///
+/// archive-push keeps working (it only needs `archive.info`), but every backup
+/// fails loading `backup.info`, so the cluster archives WAL with no base
+/// backup to replay it onto — zero restorable points, indefinitely.
+/// run_backup's exit-55 → stanza-create → retry cannot help: that
+/// stanza-create is the one refusing.
+///
+/// The symmetric "backup.info exists but archive.info is missing" is the same
+/// dead end from the other side: archive-push needs `archive.info`, so WAL
+/// stops reaching the repo and every backup's archive check fails with it. It
+/// cannot come out of an interrupted stanza-create (`archive.info` is written
+/// first), so something removed `archive.info`; whatever backups remain at
+/// that path stay there untouched, and a fresh path is the only place new
+/// ones can be taken.
+///
+/// Only repo1 counts: it is the cluster's own bucket and the only repo this
+/// watcher writes. On a fork the same message "on repo2" names the source's
+/// bucket, which moving repo1 would not fix.
+fn half_created_stanza_kind(output: &str) -> Option<HalfStanzaKind> {
+    if output.contains("archive.info exists but backup.info is missing on repo1") {
+        Some(HalfStanzaKind::BackupInfoMissing)
+    } else if output.contains("backup.info exists but archive.info is missing on repo1") {
+        Some(HalfStanzaKind::ArchiveInfoMissing)
+    } else {
+        None
+    }
+}
+
+/// The part of a failed pgBackRest command's output worth logging: the
+/// ERROR/WARN lines and their HINT continuation lines, joined on one line.
+/// Falls back to the flattened tail when the output carries none (a kill, a
+/// crash before logging). With log-level-console=info the output opens with a
+/// long "command begin" line listing every option, so a plain prefix of the
+/// output never reaches the error.
+fn stanza_create_error_excerpt(output: &str) -> String {
+    const MAX_CHARS: usize = 600;
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("ERROR:") || l.contains("WARN:") || l.contains("HINT:"))
+        .collect();
+    let excerpt = if lines.is_empty() {
+        let flat = output.split_whitespace().collect::<Vec<_>>().join(" ");
+        let skip = flat.chars().count().saturating_sub(300);
+        flat.chars().skip(skip).collect::<String>()
+    } else {
+        lines.join(" ")
+    };
+    excerpt.chars().take(MAX_CHARS).collect()
+}
+
+/// What to do about a half-created-stanza sighting, given when the first
+/// sighting of the current run was recorded.
+#[derive(Debug, PartialEq, Eq)]
+enum HalfStanzaDecision {
+    /// No (valid) earlier sighting — record `now` and wait for a later poll.
+    RecordFirstSighting,
+    /// Seen before, but less than the confirm window ago.
+    Wait { age: i64 },
+    /// Seen continuously for at least the confirm window — migrate.
+    Migrate { age: i64 },
+}
+
+/// Persistence gate for the half-created-stanza heal. A stanza-create
+/// running elsewhere (another node mid-bootstrap, a boot-time loop) writes
+/// the two info files a few milliseconds apart, so a single sighting can be a
+/// stanza caught mid-creation. Only a sighting that persists across a second
+/// iteration at least `confirm_seconds` after the first one is acted on.
+fn decide_half_stanza(
+    first_seen: Option<i64>,
+    now: i64,
+    confirm_seconds: u64,
+) -> HalfStanzaDecision {
+    let Some(first_seen) = first_seen.filter(|t| *t > 0 && *t <= now) else {
+        return HalfStanzaDecision::RecordFirstSighting;
+    };
+    let age = now - first_seen;
+    if age >= confirm_seconds as i64 {
+        HalfStanzaDecision::Migrate { age }
+    } else {
+        HalfStanzaDecision::Wait { age }
+    }
+}
+
+/// Heals a half-created stanza on repo1 by moving archiving to a fresh path —
+/// the same non-destructive migration the WAL_REGRESSION self-heal uses
+/// (`cluster-<sysid>` → `cluster-<sysid>-<epoch>`), including its Patroni DCS
+/// broadcast, so replicas adopt the new path exactly as they do after a
+/// WAL_REGRESSION migration. Nothing at the old path is written or deleted: it
+/// keeps whatever it holds (WAL with no base backup, in the
+/// interrupted-stanza-create case), and mono's restore picker keeps listing it
+/// with every other cluster-* prefix. After the migration the next
+/// stanza-create builds a whole stanza at the new path and NEEDS_INITIAL_BACKUP
+/// takes the first full there.
+///
+/// The first-sighting epoch lives in the state file, so a watcher respawn or
+/// a restart does not reset the clock; a failover resets it naturally (the
+/// new leader has its own state file) and the new leader re-confirms.
+async fn half_created_stanza_step(
+    data_dir: &str,
+    config: &WatcherConfig,
+    client: &reqwest::Client,
+    stats: &ArchiverStats,
+    kind: HalfStanzaKind,
+) {
+    let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    let repo_path = env::var("PGBACKREST_REPO1_PATH").unwrap_or_default();
+    match observe_half_stanza(&state_path, now_epoch(), config.half_stanza_confirm) {
+        HalfStanzaDecision::RecordFirstSighting => {
+            info!(
+                kind = kind.as_str(),
+                repo_path = %repo_path,
+                confirm_seconds = config.half_stanza_confirm,
+                "pgbackrest-watcher: half-created stanza: re-checking on a later poll before moving archiving to a fresh path"
+            );
+        }
+        HalfStanzaDecision::Wait { .. } => {}
+        HalfStanzaDecision::Migrate { age } => {
+            info!(
+                kind = kind.as_str(),
+                repo_path = %repo_path,
+                persisted_seconds = age,
+                confirm_seconds = config.half_stanza_confirm,
+                "pgbackrest-watcher: half-created stanza persisted; stanza-create cannot repair it — moving archiving to a fresh path, old path left untouched"
+            );
+            if !migrate_to_new_archive_path(data_dir, client, stats, "half-created-stanza").await {
+                warn!("pgbackrest-watcher: half-created stanza: migration did not complete; will retry");
+                return;
+            }
+            clear_half_stanza_sighting(&state_path);
+            // The fulls that failed against the half-created stanza say
+            // nothing about the fresh path; drop their backoff marker. (The
+            // catalog-adoption probe later this iteration reads the new path
+            // before its stanza exists and may stamp the short initial
+            // backoff; the next iteration's stanza-create makes it conclusive.)
+            let _ = write_state_field(&state_path, "last_full_failure_at", "");
+        }
+    }
+}
+
+/// State-file side of the persistence gate: reads the first-sighting epoch,
+/// decides, and records `now` as the first sighting when there is none. Split
+/// out (clock-injected) so it is unit-testable against a real temp file.
+fn observe_half_stanza(state_path: &str, now: i64, confirm_seconds: u64) -> HalfStanzaDecision {
+    let first_seen = read_state_field(state_path, HALF_STANZA_FIRST_SEEN_FIELD)
+        .and_then(|s| s.parse::<i64>().ok());
+    let decision = decide_half_stanza(first_seen, now, confirm_seconds);
+    if decision == HalfStanzaDecision::RecordFirstSighting {
+        let _ = write_state_field(state_path, HALF_STANZA_FIRST_SEEN_FIELD, &now.to_string());
+    }
+    decision
+}
+
+/// Ends the current run of half-created-stanza sightings. Returns whether
+/// one was on record.
+fn clear_half_stanza_sighting(state_path: &str) -> bool {
+    if read_state_field(state_path, HALF_STANZA_FIRST_SEEN_FIELD).is_none() {
+        return false;
+    }
+    let _ = write_state_field(state_path, HALF_STANZA_FIRST_SEEN_FIELD, "");
+    true
 }
 
 /// Periodically reconcile local `last_full_at` against the S3 catalog, and
@@ -1458,18 +1690,23 @@ async fn repo_max_for_wal(wal: &str, current: &str) -> Result<Option<String>> {
 /// S3; mono's PITR restore UI enumerates cluster-* histories so orphaned
 /// backups remain selectable. Epoch suffixes avoid collisions after repeated
 /// volume snapshot rollbacks to pre-self-heal PGDATA.
+///
+/// `reason` names the trigger in the log lines ("wal-regression", or
+/// "half-created-stanza" from `half_created_stanza_step`). Both triggers share
+/// every step, including the Patroni DCS broadcast in finalization.
 async fn migrate_to_new_archive_path(
     data_dir: &str,
     client: &reqwest::Client,
     stats: &ArchiverStats,
+    reason: &str,
 ) -> bool {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
     let Ok(old_path) = env::var("PGBACKREST_REPO1_PATH") else {
-        warn!("pgbackrest-watcher: wal-regression: PGBACKREST_REPO1_PATH unset (marker missing, no env override); cannot migrate");
+        warn!(reason = %reason, "pgbackrest-watcher: archive migration: PGBACKREST_REPO1_PATH unset (marker missing, no env override); cannot migrate");
         return false;
     };
     if old_path.is_empty() {
-        warn!("pgbackrest-watcher: wal-regression: PGBACKREST_REPO1_PATH empty; cannot migrate");
+        warn!(reason = %reason, "pgbackrest-watcher: archive migration: PGBACKREST_REPO1_PATH empty; cannot migrate");
         return false;
     }
 
@@ -1495,11 +1732,11 @@ async fn migrate_to_new_archive_path(
     };
 
     if old_path == new_path {
-        info!(new_path = %new_path, "pgbackrest-watcher: wal-regression: finalizing pending archive-path migration");
+        info!(new_path = %new_path, "pgbackrest-watcher: {reason}: finalizing pending archive-path migration");
         return finalize_wal_regression_migration(data_dir, client, &new_path).await;
     }
 
-    info!(old_path = %old_path, new_path = %new_path, "pgbackrest-watcher: wal-regression: migrating archive path; old backups preserved at former path");
+    info!(old_path = %old_path, new_path = %new_path, "pgbackrest-watcher: {reason}: migrating archive path; old backups preserved at former path");
 
     let failed_anchor = refresh_archiver_stats()
         .await
@@ -1520,7 +1757,7 @@ async fn migrate_to_new_archive_path(
     }
 
     if let Err(e) = apply_active_path(data_dir, &new_path) {
-        warn!(error = %e, new_path = %new_path, "pgbackrest-watcher: wal-regression: failed to apply new archive path; will retry");
+        warn!(error = %e, new_path = %new_path, "pgbackrest-watcher: {reason}: failed to apply new archive path; will retry");
         return false;
     }
 
@@ -1528,7 +1765,7 @@ async fn migrate_to_new_archive_path(
         return false;
     }
 
-    info!(new_path = %new_path, "pgbackrest-watcher: wal-regression: state reset; next iteration will initialize stanza and take full backup");
+    info!(new_path = %new_path, "pgbackrest-watcher: {reason}: state reset; next iteration will initialize stanza and take full backup");
     true
 }
 
@@ -1587,7 +1824,7 @@ async fn check_wal_regression(
         failed_count = stats.failed_count,
         "pgbackrest-watcher: wal-regression: detected (failed_wal <= catalog_max on same timeline) — self-healing"
     );
-    migrate_to_new_archive_path(data_dir, client, stats).await;
+    migrate_to_new_archive_path(data_dir, client, stats, "wal-regression").await;
     true
 }
 
@@ -1864,7 +2101,7 @@ async fn gap_recovery_step(
         probe_async_duplicate_error(data_dir, &catalog_max, stats.segments_per_log_file)
     {
         info!(dup_seg = %dup_seg, catalog_max = %catalog_max, "pgbackrest-watcher: wal-regression: async spool ArchiveDuplicateError — self-healing");
-        migrate_to_new_archive_path(data_dir, client, stats).await;
+        migrate_to_new_archive_path(data_dir, client, stats, "wal-regression").await;
         return;
     }
 
@@ -3248,5 +3485,184 @@ mod tests {
             "000000010000000000000003",
             256,
         ));
+    }
+
+    // ── half-created stanza ─────────────────────────────────────────────
+
+    use super::{
+        clear_half_stanza_sighting, decide_half_stanza, half_created_stanza_kind,
+        observe_half_stanza, stanza_create_error_excerpt, HalfStanzaDecision, HalfStanzaKind,
+        HALF_STANZA_FIRST_SEEN_FIELD,
+    };
+
+    /// Console output of a real pgBackRest 2.59.1 stanza-create against a repo
+    /// holding archive.info but no backup.info: the "command begin" line runs
+    /// far past 300 chars before the ERROR.
+    const HALF_STANZA_OUTPUT: &str = "P00   INFO: stanza-create command begin 2.59.1: --exec-id=123-abcdef01 --log-level-console=info --log-level-file=off --pg1-path=/var/lib/postgresql/data/pgdata --pg1-socket-path=/var/run/postgresql --repo1-path=/pgbackrest/cluster-7400000000000000001 --repo1-s3-bucket=bucket --repo1-s3-endpoint=storage.example --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-region=auto --repo1-s3-uri-style=path --repo1-type=s3 --stanza=main\n\
+P00   INFO: stanza-create for stanza 'main' on repo1\n\
+P00  ERROR: [055]: archive.info exists but backup.info is missing on repo1\n\
+            HINT: this may be a symptom of repository corruption!\n\
+P00   INFO: stanza-create command end: aborted with exception [055]\n";
+
+    #[test]
+    fn half_created_stanza_kind_detects_both_directions_on_repo1() {
+        assert_eq!(
+            half_created_stanza_kind(HALF_STANZA_OUTPUT),
+            Some(HalfStanzaKind::BackupInfoMissing)
+        );
+        assert_eq!(
+            half_created_stanza_kind(
+                "P00  ERROR: [055]: backup.info exists but archive.info is missing on repo1\n"
+            ),
+            Some(HalfStanzaKind::ArchiveInfoMissing)
+        );
+    }
+
+    #[test]
+    fn half_created_stanza_kind_ignores_repo2_and_other_errors() {
+        // A fork's source bucket (repo2) is not ours to move.
+        assert_eq!(
+            half_created_stanza_kind(
+                "P00  ERROR: [055]: archive.info exists but backup.info is missing on repo2\n"
+            ),
+            None
+        );
+        // A different rc=55 (FileMissingError) text is not the half-created stanza.
+        assert_eq!(
+            half_created_stanza_kind(
+                "P00  ERROR: [055]: unable to load info file '/pgbackrest/backup/main/backup.info' or '/pgbackrest/backup/main/backup.info.copy'\n"
+            ),
+            None
+        );
+        assert_eq!(
+            half_created_stanza_kind("P00  ERROR: [028]: backup and archive info files exist but do not match the database\n"),
+            None
+        );
+        assert_eq!(half_created_stanza_kind(""), None);
+    }
+
+    #[test]
+    fn stanza_create_error_excerpt_keeps_the_error_not_the_preamble() {
+        let excerpt = stanza_create_error_excerpt(HALF_STANZA_OUTPUT);
+        assert_eq!(
+            excerpt,
+            "P00  ERROR: [055]: archive.info exists but backup.info is missing on repo1 \
+             HINT: this may be a symptom of repository corruption!"
+        );
+        assert!(!excerpt.contains("command begin"));
+    }
+
+    #[test]
+    fn stanza_create_error_excerpt_falls_back_to_the_tail() {
+        let long = format!("{} tail-marker", "x".repeat(1000));
+        let excerpt = stanza_create_error_excerpt(&long);
+        assert!(excerpt.ends_with("tail-marker"));
+        assert_eq!(excerpt.chars().count(), 300);
+        assert_eq!(stanza_create_error_excerpt("short\noutput"), "short output");
+    }
+
+    #[test]
+    fn decide_half_stanza_first_sighting_is_recorded_not_acted_on() {
+        assert_eq!(
+            decide_half_stanza(None, 10_000, 60),
+            HalfStanzaDecision::RecordFirstSighting
+        );
+        // Garbage / future epochs restart the clock rather than migrating.
+        assert_eq!(
+            decide_half_stanza(Some(0), 10_000, 60),
+            HalfStanzaDecision::RecordFirstSighting
+        );
+        assert_eq!(
+            decide_half_stanza(Some(20_000), 10_000, 60),
+            HalfStanzaDecision::RecordFirstSighting
+        );
+    }
+
+    #[test]
+    fn decide_half_stanza_waits_inside_the_confirm_window() {
+        // Initial-poll cadence (5 s) sightings inside one normal poll wait.
+        assert_eq!(
+            decide_half_stanza(Some(10_000), 10_005, 60),
+            HalfStanzaDecision::Wait { age: 5 }
+        );
+        assert_eq!(
+            decide_half_stanza(Some(10_000), 10_059, 60),
+            HalfStanzaDecision::Wait { age: 59 }
+        );
+        // Same-second re-sighting (a stanza-create caught mid-write) waits.
+        assert_eq!(
+            decide_half_stanza(Some(10_000), 10_000, 60),
+            HalfStanzaDecision::Wait { age: 0 }
+        );
+    }
+
+    #[test]
+    fn decide_half_stanza_migrates_once_the_window_has_passed() {
+        assert_eq!(
+            decide_half_stanza(Some(10_000), 10_060, 60),
+            HalfStanzaDecision::Migrate { age: 60 }
+        );
+        assert_eq!(
+            decide_half_stanza(Some(10_000), 90_000, 60),
+            HalfStanzaDecision::Migrate { age: 80_000 }
+        );
+    }
+
+    #[test]
+    fn observe_half_stanza_persists_first_sighting_across_iterations() {
+        let (_dir, path) = temp_state_path();
+        assert_eq!(
+            observe_half_stanza(&path, 10_000, 60),
+            HalfStanzaDecision::RecordFirstSighting
+        );
+        assert_eq!(
+            read_state_field(&path, HALF_STANZA_FIRST_SEEN_FIELD).as_deref(),
+            Some("10000")
+        );
+        // A later iteration inside the window must not move the epoch.
+        assert_eq!(
+            observe_half_stanza(&path, 10_030, 60),
+            HalfStanzaDecision::Wait { age: 30 }
+        );
+        assert_eq!(
+            read_state_field(&path, HALF_STANZA_FIRST_SEEN_FIELD).as_deref(),
+            Some("10000")
+        );
+        assert_eq!(
+            observe_half_stanza(&path, 10_061, 60),
+            HalfStanzaDecision::Migrate { age: 61 }
+        );
+    }
+
+    #[test]
+    fn clear_half_stanza_sighting_restarts_the_clock() {
+        let (_dir, path) = temp_state_path();
+        assert!(!clear_half_stanza_sighting(&path));
+        observe_half_stanza(&path, 10_000, 60);
+        // A successful stanza-create between sightings clears it...
+        assert!(clear_half_stanza_sighting(&path));
+        assert_eq!(read_state_field(&path, HALF_STANZA_FIRST_SEEN_FIELD), None);
+        // ...so a sighting long after the first one starts over, not migrates.
+        assert_eq!(
+            observe_half_stanza(&path, 99_000, 60),
+            HalfStanzaDecision::RecordFirstSighting
+        );
+    }
+
+    #[test]
+    fn observe_half_stanza_leaves_other_state_fields_alone() {
+        let (_dir, path) = temp_state_path();
+        write_state_field(&path, "last_full_failure_at", "9000").unwrap();
+        write_state_field(&path, "wal_regression_orig_path", "/pgbackrest/cluster-1").unwrap();
+        observe_half_stanza(&path, 10_000, 60);
+        clear_half_stanza_sighting(&path);
+        assert_eq!(
+            read_state_field(&path, "last_full_failure_at").as_deref(),
+            Some("9000")
+        );
+        assert_eq!(
+            read_state_field(&path, "wal_regression_orig_path").as_deref(),
+            Some("/pgbackrest/cluster-1")
+        );
     }
 }
