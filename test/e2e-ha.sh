@@ -6738,6 +6738,196 @@ t_standalone_orphan_slot_reaper_retries_until_it_completes() {
   docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
+# Boot $IMAGE standalone with the archive env, on an existing or empty volume.
+# Extra `-e` flags after the volume. Returns 0 once the server accepts TCP.
+_boot_standalone_archiving() {
+  local name="$1" vol="$2"; shift 2
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  # shellcheck disable=SC2046
+  docker run -d --name "$name" --label "$HA_LABEL" --network "$NET" \
+    -v "${vol}:/var/lib/postgresql/data" \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -e POSTGRES_PASSWORD=test \
+    $(archive_env_fast_watcher) \
+    "$@" \
+    "$IMAGE" >/dev/null
+  local _i
+  for _i in $(seq 1 120); do
+    if docker exec "$name" pg_isready -U postgres -h localhost -q >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# The two archive-push failures a reverted leader logged on every WAL
+# segment before standalone mode ran the pgBackRest stack: no pgbackrest.conf
+# (relative %p with no pg1-path), and a repo1-path marker with no S3 repo.
+_standalone_archive_errors_absent() {
+  local name="$1"
+  ! logs_match "$name" "option 'pg1-path' must be specified when relative wal paths are used|unable to find a valid repository"
+}
+
+# HA → standalone revert with WAL_ARCHIVE_* still set. The former leader's
+# PGDATA keeps Patroni's archive_mode/archive_command, and the standalone
+# boot must run the same pgBackRest stack Patroni mode ran: archive-push
+# succeeds against the cluster's existing per-cluster repo path, and the
+# backup watcher (standalone leader gate, no DCS) takes a full backup.
+# WAL_BACKUP_FULL_INTERVAL_SECONDS=30 stands in for "the last full is weeks
+# old", which is the state every reverted leader is in.
+t_standalone_revert_resumes_archiving_and_backups() {
+  local t=t_standalone_revert_resumes_archiving_and_backups
+  local scope=t-revert-pitr-${PG_VERSION}
+  local sa="${scope}-standalone"
+  reset_bucket
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # shellcheck disable=SC2046
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher))
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || {
+    ko "$t" "no leader"
+    fail_dump "$t" "$n1" "$n2" "$n3"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_stanza_create "$leader" 90 || ! wait_for_initial_full "$leader" 240; then
+    ko "$t" "HA-era baseline (stanza + first full) never landed"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  local ha_repo_path
+  ha_repo_path=$(docker exec "$leader" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path 2>/dev/null)
+  local ha_fulls; ha_fulls=$(count_backups_of_type "$leader" full)
+
+  # Revert: every member stops (clean shutdown, like the redeploy a revert
+  # triggers) and the former leader's volume boots with PATRONI_ENABLED unset.
+  local vol="${leader}-vol" n
+  for n in "$n1" "$n2" "$n3"; do docker stop -t 30 "$n" >/dev/null 2>&1 || true; done
+  for n in "$n1" "$n2" "$n3"; do docker rm -f "$n" >/dev/null 2>&1 || true; done
+  if ! _boot_standalone_archiving "$sa" "$vol" -e WAL_BACKUP_FULL_INTERVAL_SECONDS=30; then
+    ko "$t" "reverted leader never came up standalone"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+
+  local archive_mode archive_command
+  archive_mode=$(psql_leader "$sa" -At -c "SHOW archive_mode")
+  archive_command=$(psql_leader "$sa" -At -c "SHOW archive_command")
+  if [ "$archive_mode" != "on" ] || ! assert_contains "$archive_command" "pgbackrest-archive-push-wrapper.sh" "archive_command"; then
+    ko "$t" "standalone archive settings not in effect (archive_mode=$archive_mode archive_command=$archive_command)"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+  if ! logs_contain "$sa" "standalone PITR sidecar started"; then
+    ko "$t" "the standalone PITR sidecar never started"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+
+  # Archive-push: a WAL switch must reach pg_stat_archiver as archived with
+  # no new failures, pushed by pgBackRest (not dropped by the wrapper). The
+  # counters survive the clean restart, so compare against this boot's start.
+  local before after failed_before failed
+  before=$(psql_leader "$sa" -At -c "SELECT archived_count FROM pg_stat_archiver")
+  failed_before=$(psql_leader "$sa" -At -c "SELECT failed_count FROM pg_stat_archiver")
+  psql_leader "$sa" -c "CREATE TABLE after_revert(id int); INSERT INTO after_revert VALUES (1); SELECT pg_switch_wal();" >/dev/null
+  local deadline=$(($(date +%s) + 120))
+  after="$before"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    after=$(psql_leader "$sa" -At -c "SELECT archived_count FROM pg_stat_archiver")
+    [ "${after:-0}" -gt "${before:-0}" ] && break
+    sleep 3
+  done
+  failed=$(psql_leader "$sa" -At -c "SELECT failed_count FROM pg_stat_archiver")
+  if [ "${after:-0}" -le "${before:-0}" ] || [ "${failed:-x}" != "${failed_before:-y}" ]; then
+    ko "$t" "archive-push did not succeed after the revert (archived $before -> $after, failed $failed_before -> $failed)"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+  if logs_contain "$sa" "pgbackrest-wrapper:.*dropping"; then
+    ko "$t" "the archive wrapper dropped WAL after the revert"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+
+  # A full backup lands from the standalone watcher, on the SAME per-cluster
+  # repo path the HA cluster used.
+  if ! wait_for_watcher_backup "$sa" full 300; then
+    ko "$t" "the standalone watcher never completed a full backup"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+  local sa_repo_path sa_fulls
+  sa_repo_path=$(docker exec "$sa" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path 2>/dev/null)
+  sa_fulls=$(count_backups_of_type "$sa" full)
+  if [ -z "$ha_repo_path" ] || [ "$sa_repo_path" != "$ha_repo_path" ]; then
+    ko "$t" "repo path moved across the revert (HA '$ha_repo_path', standalone '$sa_repo_path')"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+  if [ "${sa_fulls:-0}" -le "${ha_fulls:-0}" ]; then
+    ko "$t" "no new full in the catalog after the revert (HA-era $ha_fulls, now $sa_fulls)"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+  if ! _standalone_archive_errors_absent "$sa"; then
+    ko "$t" "archive-push logged the pre-fix configuration errors"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+  if logs_contain "$sa" "not patroni leader"; then
+    ko "$t" "the standalone watcher gated on Patroni's /leader"
+    fail_dump "$t" "$sa"
+    docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "reverted leader archives (archived $before -> $after, no new failures) and backed up (fulls $ha_fulls -> $sa_fulls) at $sa_repo_path"
+  docker rm -f "$sa" >/dev/null 2>&1
+  teardown_scope "$scope"
+}
+
+# A service that runs this image standalone from the start, with PITR
+# enabled on an empty volume: archiving is on from the first boot, the
+# sidecar bootstraps the stanza and writes the per-cluster marker once
+# initdb has produced pg_control, and the watcher takes the first full.
+t_standalone_fresh_volume_archives_and_backs_up() {
+  local t=t_standalone_fresh_volume_archives_and_backs_up
+  local vol="sapitr-vol-${PG_VERSION}" n="sapitr-pg-${PG_VERSION}"
+  reset_bucket
+  new_volume "$vol"
+  if ! _boot_standalone_archiving "$n" "$vol"; then
+    ko "$t" "standalone postgres never became ready"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  if [ "$(psql_leader "$n" -At -c "SHOW archive_mode")" != "on" ]; then
+    ko "$t" "archive_mode is not on for a fresh standalone with WAL_ARCHIVE_BUCKET set"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  if ! wait_for_stanza_create "$n" 120; then
+    ko "$t" "stanza-create never completed"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  local marker
+  marker=$(docker exec "$n" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path 2>/dev/null)
+  if ! printf '%s' "$marker" | grep -qE '^/pgbackrest/cluster-[0-9]+$'; then
+    ko "$t" "per-cluster repo-path marker missing or malformed ('$marker')"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  psql_leader "$n" -c "CREATE TABLE t(id int); INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
+  if ! wait_for_initial_full "$n" 300; then
+    ko "$t" "the standalone watcher never took the first full"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  local wal_count; wal_count=$(count_archived_wal_segments)
+  if [ "${wal_count:-0}" -lt 1 ]; then
+    ko "$t" "no WAL segment reached the bucket"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  ok "$t"
+  note "fresh standalone: marker=$marker, first full landed, $wal_count WAL segments archived"
+  docker rm -f "$n" >/dev/null 2>&1
+  docker volume rm -f "$vol" >/dev/null 2>&1 || true
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
@@ -6809,6 +6999,11 @@ ALL_TESTS=(
   # the reaper's pass retries until it completes once (refused login here),
   # and runs exactly once per boot
   t_standalone_orphan_slot_reaper_retries_until_it_completes
+  # standalone mode runs the pgBackRest stack when WAL_ARCHIVE_* is set: a
+  # reverted leader archives and backs up again, and a fresh standalone
+  # archives and takes its first full
+  t_standalone_revert_resumes_archiving_and_backups
+  t_standalone_fresh_volume_archives_and_backs_up
   # etcd wrapper: removed-member refusal wipes + re-joins within one wrapper
   # lifetime, whichever exit code the refusing run produced
   t_etcd_removed_member_wipe_rejoin

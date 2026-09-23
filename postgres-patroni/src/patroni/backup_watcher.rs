@@ -71,6 +71,13 @@
 //! and the iteration becomes a no-op. After failover the new leader's
 //! watcher takes over within one poll cycle.
 //!
+//! Standalone (postgres-wrapper without Patroni, see [`WatcherMode`]): there
+//! is no Patroni REST API and no DCS. The leader gate is the local server
+//! itself — primary means `pg_is_in_recovery()` is false over the local
+//! socket — and the steps that read or publish the active repo path through
+//! Patroni's DCS `/config` are skipped: the volume's `.pgbackrest_repo_path`
+//! marker is the only copy of the path, and there is no peer to tell.
+//!
 //! State persists at `$PGDATA/.pgbackrest_backup_state` (key=value lines,
 //! no JSON dep). The bucket-side `pgbackrest --stanza=main info` is the
 //! canonical source of truth for backup history; the local file is a
@@ -93,6 +100,50 @@ const PGBACKREST_CONF_FILE: &str = "/etc/pgbackrest/pgbackrest.conf";
 const PATRONI_LEADER_URL: &str = "http://localhost:8008/leader";
 const PATRONI_CONFIG_URL: &str = "http://localhost:8008/config";
 const PATRONI_REPO_PATH_CONFIG_KEY: &str = "pgbackrest_repo1_path";
+
+/// Which boot mode the watcher runs under. Decides how "am I the node that
+/// owns backups" is answered and whether the repo path is mirrored through
+/// Patroni's DCS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatcherMode {
+    /// patroni-runner: Patroni's `/leader` is the gate, DCS carries the
+    /// active repo path between members.
+    Patroni,
+    /// postgres-wrapper's standalone branch: a single server, no Patroni.
+    Standalone,
+}
+
+/// How a [`WatcherMode`] answers "is this node the one that takes backups".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaderProbe {
+    /// `GET http://localhost:8008/leader` returns 200.
+    PatroniRestApi,
+    /// `SELECT pg_is_in_recovery()` over the local socket returns false.
+    LocalPrimary,
+}
+
+impl WatcherMode {
+    fn leader_probe(self) -> LeaderProbe {
+        match self {
+            WatcherMode::Patroni => LeaderProbe::PatroniRestApi,
+            WatcherMode::Standalone => LeaderProbe::LocalPrimary,
+        }
+    }
+
+    /// Whether the active repo path is read from / published to Patroni's
+    /// DCS `/config`. Standalone has no DCS: the volume marker is the only
+    /// copy, so every DCS broadcast/adopt step is a no-op.
+    fn uses_dcs_repo_path(self) -> bool {
+        matches!(self, WatcherMode::Patroni)
+    }
+}
+
+/// What every step that may talk to Patroni needs: the REST client and the
+/// boot mode that decides whether it talks to Patroni at all.
+struct Coordinator {
+    http: reqwest::Client,
+    mode: WatcherMode,
+}
 
 /// Knobs read from env at startup. All durations in seconds.
 struct WatcherConfig {
@@ -229,6 +280,12 @@ const DEFAULT_SEGMENTS_PER_LOG_FILE: u64 = 256;
 /// + `.pgbackrest_gap_pending`), so a fresh task picks up the
 /// in-flight recovery state where the old one left off.
 pub fn spawn(data_dir: String) {
+    spawn_with_mode(data_dir, WatcherMode::Patroni);
+}
+
+/// [`spawn`] for an explicit boot mode. postgres-wrapper's standalone
+/// branch runs the watcher with [`WatcherMode::Standalone`].
+pub fn spawn_with_mode(data_dir: String, mode: WatcherMode) {
     if env::var("WAL_ARCHIVE_BUCKET")
         .ok()
         .filter(|s| !s.is_empty())
@@ -240,7 +297,7 @@ pub fn spawn(data_dir: String) {
     tokio::spawn(async move {
         loop {
             let dd = data_dir.clone();
-            let h = tokio::task::spawn(async move { run(dd).await });
+            let h = tokio::task::spawn(async move { run(dd, mode).await });
             match h.await {
                 Ok(Ok(())) => {
                     warn!("pgbackrest-watcher: run loop returned cleanly — respawning in 5s")
@@ -260,9 +317,10 @@ pub fn spawn(data_dir: String) {
     });
 }
 
-async fn run(data_dir: String) -> Result<()> {
+async fn run(data_dir: String, mode: WatcherMode) -> Result<()> {
     let config = WatcherConfig::from_env();
     info!(
+        mode = ?mode,
         poll = config.poll_interval,
         initial_poll = config.initial_poll_interval,
         full = config.full_interval,
@@ -277,7 +335,10 @@ async fn run(data_dir: String) -> Result<()> {
     // timeout because the API is local and any latency above that
     // probably means Patroni is wedged — we skip backups in that case
     // anyway via the "not leader" path.
-    let client = super::rest::client(Duration::from_secs(5))?;
+    let client = Coordinator {
+        http: super::rest::client(Duration::from_secs(5))?,
+        mode,
+    };
 
     loop {
         watcher_iteration(&data_dir, &config, &client).await;
@@ -291,7 +352,7 @@ async fn run(data_dir: String) -> Result<()> {
     }
 }
 
-async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqwest::Client) {
+async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &Coordinator) {
     // Sync per-cluster repo path on every iteration. The marker may not
     // exist on the very first iteration if patroni-runner's bootstrap
     // subshell hasn't run yet; later iterations pick it up.
@@ -305,17 +366,31 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &reqw
     }
 
     // Leader check — every iteration. Replica skips backups; new leader
-    // takes over within one poll cycle after failover.
-    match is_patroni_leader(client).await {
-        Ok(true) => {}
-        Ok(false) => {
-            info!("pgbackrest-watcher: iteration skipped (not patroni leader)");
-            return;
-        }
-        Err(e) => {
-            warn!(error = %e, "pgbackrest-watcher: iteration skipped (patroni /leader unreachable)");
-            return;
-        }
+    // takes over within one poll cycle after failover. Standalone: the
+    // local server being primary is the whole answer.
+    match client.mode.leader_probe() {
+        LeaderProbe::PatroniRestApi => match is_patroni_leader(client).await {
+            Ok(true) => {}
+            Ok(false) => {
+                info!("pgbackrest-watcher: iteration skipped (not patroni leader)");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "pgbackrest-watcher: iteration skipped (patroni /leader unreachable)");
+                return;
+            }
+        },
+        LeaderProbe::LocalPrimary => match pg_is_in_recovery().await {
+            Ok(false) => {}
+            Ok(true) => {
+                info!("pgbackrest-watcher: iteration skipped (standalone server is in recovery)");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "pgbackrest-watcher: iteration skipped (standalone primary probe failed)");
+                return;
+            }
+        },
     }
 
     // Standby check via pg_is_in_recovery() — second-line guarantee
@@ -409,8 +484,8 @@ async fn pg_isready() -> bool {
 /// Patroni's `/leader` returns HTTP 200 only on the leader; non-leaders
 /// (and unhealthy nodes) get 503. This is the canonical "am I leader"
 /// check used by HAProxy too.
-async fn is_patroni_leader(client: &reqwest::Client) -> Result<bool> {
-    let resp = client.get(PATRONI_LEADER_URL).send().await?;
+async fn is_patroni_leader(client: &Coordinator) -> Result<bool> {
+    let resp = client.http.get(PATRONI_LEADER_URL).send().await?;
     Ok(resp.status() == 200)
 }
 
@@ -1154,8 +1229,11 @@ fn apply_active_path(data_dir: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn patroni_dcs_repo_path(client: &reqwest::Client) -> Result<Option<String>> {
-    let resp = client.get(PATRONI_CONFIG_URL).send().await?;
+async fn patroni_dcs_repo_path(client: &Coordinator) -> Result<Option<String>> {
+    if !client.mode.uses_dcs_repo_path() {
+        return Ok(None);
+    }
+    let resp = client.http.get(PATRONI_CONFIG_URL).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("Patroni /config GET returned {}", resp.status());
     }
@@ -1168,13 +1246,21 @@ async fn patroni_dcs_repo_path(client: &reqwest::Client) -> Result<Option<String
         .map(ToOwned::to_owned))
 }
 
-async fn patch_patroni_dcs_repo_path(client: &reqwest::Client, path: &str) -> Result<()> {
+async fn patch_patroni_dcs_repo_path(client: &Coordinator, path: &str) -> Result<()> {
+    if !client.mode.uses_dcs_repo_path() {
+        return Ok(());
+    }
     let mut body = serde_json::Map::new();
     body.insert(
         PATRONI_REPO_PATH_CONFIG_KEY.to_string(),
         serde_json::Value::String(path.to_string()),
     );
-    let resp = client.patch(PATRONI_CONFIG_URL).json(&body).send().await?;
+    let resp = client
+        .http
+        .patch(PATRONI_CONFIG_URL)
+        .json(&body)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         anyhow::bail!("Patroni /config PATCH returned {}", resp.status());
     }
@@ -1207,10 +1293,10 @@ async fn reset_local_backup_state_for_new_archive_path(data_dir: &str) -> Result
     Ok(())
 }
 
-async fn converge_repo_path_with_patroni_dcs(
-    data_dir: &str,
-    client: &reqwest::Client,
-) -> Result<()> {
+async fn converge_repo_path_with_patroni_dcs(data_dir: &str, client: &Coordinator) -> Result<()> {
+    if !client.mode.uses_dcs_repo_path() {
+        return Ok(());
+    }
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
     if read_state_field(&state_path, "wal_regression_pending_new_path").is_some() {
         return Ok(());
@@ -1282,7 +1368,7 @@ fn clean_spool_status_files(data_dir: &str) -> Result<()> {
 /// iteration retries finalization rather than trusting stale `.ok/.error` files.
 async fn finalize_wal_regression_migration(
     data_dir: &str,
-    client: &reqwest::Client,
+    client: &Coordinator,
     path: &str,
 ) -> bool {
     info!("pgbackrest-watcher: wal-regression: kicking async daemon to pick up new repo1-path");
@@ -1335,7 +1421,7 @@ async fn finalize_wal_regression_migration(
 
 async fn finalize_pending_wal_regression_migration_if_needed(
     data_dir: &str,
-    client: &reqwest::Client,
+    client: &Coordinator,
 ) -> bool {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
     let Some(pending) = read_state_field(&state_path, "wal_regression_pending_new_path") else {
@@ -1460,7 +1546,7 @@ async fn repo_max_for_wal(wal: &str, current: &str) -> Result<Option<String>> {
 /// volume snapshot rollbacks to pre-self-heal PGDATA.
 async fn migrate_to_new_archive_path(
     data_dir: &str,
-    client: &reqwest::Client,
+    client: &Coordinator,
     stats: &ArchiverStats,
 ) -> bool {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
@@ -1538,7 +1624,7 @@ async fn migrate_to_new_archive_path(
 /// (`last_failed_epoch > last_archived_epoch`).
 async fn check_wal_regression(
     data_dir: &str,
-    client: &reqwest::Client,
+    client: &Coordinator,
     stats: &ArchiverStats,
     catalog_max: &str,
 ) -> bool {
@@ -1785,7 +1871,7 @@ fn decide_gap_recovery(inp: &GapRecoveryInputs) -> GapRecoveryAction {
 async fn gap_recovery_step(
     data_dir: &str,
     config: &WatcherConfig,
-    client: &reqwest::Client,
+    client: &Coordinator,
     stats: &ArchiverStats,
 ) {
     let now = now_epoch();
@@ -2356,7 +2442,67 @@ mod tests {
         segment_to_number, wal_has_async_archive_duplicate_error, AdoptDecision, GapRecoveryAction,
         GapRecoveryInputs,
     };
+    use super::{
+        converge_repo_path_with_patroni_dcs, patch_patroni_dcs_repo_path, patroni_dcs_repo_path,
+        Coordinator, LeaderProbe, WatcherMode, REPO_PATH_MARKER, STATE_FILENAME,
+    };
     use std::fs;
+
+    #[test]
+    fn patroni_mode_asks_patroni_standalone_asks_the_local_server() {
+        assert_eq!(
+            WatcherMode::Patroni.leader_probe(),
+            LeaderProbe::PatroniRestApi
+        );
+        assert_eq!(
+            WatcherMode::Standalone.leader_probe(),
+            LeaderProbe::LocalPrimary
+        );
+    }
+
+    #[test]
+    fn only_patroni_mode_mirrors_the_repo_path_through_dcs() {
+        assert!(WatcherMode::Patroni.uses_dcs_repo_path());
+        assert!(!WatcherMode::Standalone.uses_dcs_repo_path());
+    }
+
+    /// Standalone has no Patroni REST API. Every DCS step must return
+    /// without a request — the client here points nowhere real, so any
+    /// attempt would surface as an error — and must leave the volume's
+    /// repo-path marker and watcher state exactly as they were.
+    #[tokio::test]
+    async fn standalone_skips_every_dcs_step_and_keeps_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let marker = dir.path().join(REPO_PATH_MARKER);
+        let state = dir.path().join(STATE_FILENAME);
+        fs::write(&marker, "/pgbackrest/cluster-7000000000000000001\n").unwrap();
+        fs::write(&state, "last_full_at=1700000000\n").unwrap();
+
+        let coord = Coordinator {
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(200))
+                .build()
+                .unwrap(),
+            mode: WatcherMode::Standalone,
+        };
+        assert_eq!(patroni_dcs_repo_path(&coord).await.unwrap(), None);
+        patch_patroni_dcs_repo_path(&coord, "/pgbackrest/cluster-1")
+            .await
+            .unwrap();
+        converge_repo_path_with_patroni_dcs(data_dir, &coord)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "/pgbackrest/cluster-7000000000000000001\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&state).unwrap(),
+            "last_full_at=1700000000\n"
+        );
+    }
 
     /// Baseline `GapRecoveryInputs` for tests — every field at its
     /// "nothing happening" default. Individual tests override only the
