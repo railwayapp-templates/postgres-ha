@@ -5,7 +5,7 @@
 //!
 //! `sli etcd healthy=1 members=3 members_healthy=3 quorum=1`
 //!
-//! `healthy` is this member serving; `members` the members configured in
+//! (followed by ` region=<RAILWAY_REPLICA_REGION>`). `healthy` is this member serving; `members` the members configured in
 //! ETCD_INITIAL_CLUSTER; `quorum` whether the healthy ones are a majority.
 //! While any member is unhealthy it checks every second (logging on every
 //! change and every 20 seconds, with `seconds_degraded`), and the first line
@@ -18,6 +18,7 @@
 
 use crate::config::{parse_initial_cluster, peer_to_client_url, Config};
 use common::etcd_http_health;
+use common::sli::{region_from_env, region_token};
 use std::fmt;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -163,12 +164,13 @@ pub async fn sli_loop(config: Config, local: &'static str) {
         warn!("sli etcd: no usable ETCD_INITIAL_CLUSTER entry, not reporting");
         return;
     }
+    let region = region_token(region_from_env().as_deref());
     let mut reporter = Reporter::default();
     loop {
         let health = check(local, &members).await;
         let (line, wait) = reporter.observe(health, Instant::now());
         if let Some(line) = line {
-            info!("{line}");
+            info!("{line}{region}");
         }
         sleep(wait).await;
     }

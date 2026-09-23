@@ -5,10 +5,12 @@
 //! - Environment variable parsing helpers
 //! - Command execution utilities
 //! - Telemetry for reporting events to Railway
+//! - The fields every `sli` line shares
 
 pub mod command;
 pub mod config;
 pub mod logging;
+pub mod sli;
 pub mod telemetry;
 
 pub use command::{

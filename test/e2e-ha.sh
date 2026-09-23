@@ -5671,9 +5671,10 @@ t_haproxy_sli_probe_reports_the_path() {
   docker run -d --name "$h" --label "$HA_LABEL" --network "$NET" \
     -e "POSTGRES_NODES=${n1}:5432:8008,${n2}:5432:8008,${n3}:5432:8008" \
     -e "PGUSER=postgres" \
+    -e "RAILWAY_REPLICA_REGION=e2e-region" \
     "$HAPROXY_IMAGE" >/dev/null
 
-  if ! wait_for_log_line "$h" "sli haproxy primary_up=1 replicas_up=2 replicas_total=3 probe=ok latency_ms=" 90; then
+  if ! wait_for_log_line "$h" "sli haproxy primary_up=1 replicas_up=2 replicas_total=3 probe=ok latency_ms=[0-9]* region=e2e-region" 90; then
     ko "$t" "no ok sli line in front of a healthy cluster"
     fail_dump "$t" "$h"
     docker rm -f "$h" >/dev/null 2>&1 || true

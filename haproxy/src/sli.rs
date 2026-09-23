@@ -13,12 +13,16 @@
 //! no line. The line keeps the `sli haproxy primary_up=` prefix the engine
 //! already matches as a heartbeat.
 //!
+//! The line ends with ` region=<RAILWAY_REPLICA_REGION>`, so the control plane
+//! can tell a silent cluster from a region whose log lines stopped arriving.
+//!
 //! Probes run on 10-second wall-clock boundaries plus a per-replica offset in
 //! [0, 4 s), so a probe and its line (at most 5 s later) land in the same slot,
 //! and the fleet's lines spread over the slot instead of arriving at once.
 
 use crate::probe::{self, FailReason, Outcome, ProbeResult};
 use crate::signals;
+use common::sli::{region_from_env, region_token};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -211,6 +215,7 @@ fn wait_until(until: SystemTime) -> bool {
 /// shutting down is not the path failing.
 pub fn spawn(addr: SocketAddr, user: String, identity: String, backends: SharedBackends) {
     let offset = replica_offset(&identity);
+    let region = region_token(region_from_env().as_deref());
     info!(
         %addr,
         offset_ms = offset.as_millis() as u64,
@@ -236,7 +241,7 @@ pub fn spawn(addr: SocketAddr, user: String, identity: String, backends: SharedB
             }
             let (line, next) = prober.observe(current, result, started, SystemTime::now());
             if let Some(line) = line {
-                info!("{line}");
+                info!("{line}{region}");
             }
             next_at = match next {
                 Next::Scheduled => next_probe_at(SystemTime::now(), offset),
