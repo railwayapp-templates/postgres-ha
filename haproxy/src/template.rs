@@ -181,6 +181,9 @@ fn generate_stats_listener(config: &Config) -> String {
 listen stats
     bind :::8404 v4v6
     mode http
+    # The in-container monitor reads this page every 5s and the healthcheck
+    # every 10s; logging each request was most of this container's output.
+    no log
     acl LOCALHOST src 127.0.0.1 ::1 ::ffff:127.0.0.1
     http-request allow if LOCALHOST
     {remote_rule}
@@ -210,6 +213,8 @@ mod tests {
             check_downinter: "500ms".to_string(),
             health_port_override: None,
             stats_auth: None,
+            probe_user: "postgres".to_string(),
+            replica_identity: String::new(),
         }
     }
 
@@ -248,6 +253,8 @@ mod stats_tests {
             check_downinter: "500ms".into(),
             health_port_override: Some(8009),
             stats_auth,
+            probe_user: "postgres".into(),
+            replica_identity: String::new(),
         }
     }
 
@@ -285,6 +292,19 @@ mod stats_tests {
     fn stats_listener_keeps_its_bind_and_uri() {
         let cfg = generate_config(&test_config(None), &nodes());
         assert!(cfg.contains("listen stats\n    bind :::8404 v4v6\n    mode http\n"));
+    }
+
+    #[test]
+    fn stats_requests_are_not_access_logged() {
+        let cfg = generate_config(&test_config(None), &nodes());
+        let stats = cfg
+            .split("listen stats")
+            .nth(1)
+            .and_then(|rest| rest.split("\n\n").next())
+            .expect("stats listener present");
+        assert!(stats.contains("\n    no log\n"), "{stats}");
+        // Only the stats listener: the Postgres frontends keep `log global`.
+        assert_eq!(cfg.matches("no log").count(), 1);
         assert!(cfg.contains("stats uri /stats\n    stats refresh 10s\n"));
     }
 }

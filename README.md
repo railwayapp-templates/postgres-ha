@@ -530,6 +530,23 @@ Response:
 
 Access the HAProxy stats dashboard at `http://haproxy.railway.internal:8404/stats` for real-time backend health and connection metrics. From inside the HAProxy container the page is open on loopback; any other client authenticates with HTTP Basic auth using `HAPROXY_STATS_USER` / `HAPROXY_STATS_PASSWORD` (default: the `PGUSER` / `PGPASSWORD` the proxy already carries). With no password available, remote access is denied.
 
+Requests to the stats page are not access-logged (the entrypoint reads it every 5s).
+
+### Uptime SLI lines
+
+Each HAProxy replica opens a Postgres handshake on its own port 5432 every 10 seconds, without logging in, and logs the result:
+
+```
+sli haproxy primary_up=1 replicas_up=2 replicas_total=3 probe=ok latency_ms=3 region=us-west2
+sli haproxy primary_up=0 replicas_up=0 replicas_total=3 probe=fail reason=closed latency_ms=1
+sli haproxy primary_up=1 replicas_up=2 replicas_total=3 probe=fail reason=error sqlstate=53300 latency_ms=12
+sli haproxy primary_up=1 replicas_up=2 replicas_total=3 probe=ok latency_ms=4 rto_ms=11873
+```
+
+The server asking to authenticate is `ok`. An ErrorResponse is `fail` with its SQLSTATE (`53300` = too many clients). An accepted connection closed with no answer is `closed`. No answer within 5 s is `timeout`. After a failure the replica retries once a second until a handshake succeeds; it logs one line per 10-second slot meanwhile, and the first success carries `rto_ms`, the time from the first failed attempt. Every `sli` line ends with ` region=<RAILWAY_REPLICA_REGION>` when the platform sets it. A single-node deployment logs no `sli` line.
+
+Each etcd member logs `sli etcd healthy=1 members=3 members_healthy=3 quorum=1` every 20 seconds. While any member is unhealthy it checks every second, logs on every change (with `seconds_degraded`), and adds `recovery_ms` to the first line after recovery.
+
 ## Failover Behavior
 
 ### Automatic Failover (Primary Crashes)

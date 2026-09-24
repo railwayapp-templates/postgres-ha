@@ -7,13 +7,17 @@
 mod config;
 mod monitoring;
 mod nodes;
+mod probe;
 mod signals;
+mod sli;
 mod template;
 
 use anyhow::{Context, Result};
 use common::{init_logging, Telemetry, TelemetryEvent};
 use std::fs;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use config::Config;
@@ -85,5 +89,18 @@ fn main() -> Result<()> {
     // the grace period (see signals.rs).
     signals::install_forwarding(child.id());
 
-    run_monitoring_loop(child, &telemetry, single_node_mode)
+    // The uptime SLI's host probe: a login-free handshake on our own 5432,
+    // the customer's path through this replica. A lone node is not HA and is
+    // not measured (it logs no sli line at all).
+    let sli_backends: sli::SharedBackends = Arc::new(Mutex::new(None));
+    if !single_node_mode {
+        sli::spawn(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 5432)),
+            config.probe_user.clone(),
+            config.replica_identity.clone(),
+            sli_backends.clone(),
+        );
+    }
+
+    run_monitoring_loop(child, &telemetry, single_node_mode, sli_backends)
 }

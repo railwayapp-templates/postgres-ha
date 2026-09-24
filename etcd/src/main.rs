@@ -10,6 +10,7 @@
 mod bootstrap;
 mod cluster;
 mod config;
+mod sli;
 
 use anyhow::{Context, Result};
 use common::{etcd_http_health, init_logging, Telemetry, TelemetryEvent};
@@ -313,6 +314,13 @@ async fn main() -> Result<()> {
             local_liveness_watchdog(watchdog_config, watchdog_telemetry).await
         });
 
+        // The uptime SLI's redundancy report: this member's view of the
+        // cluster's health, one `sli etcd` line every 20s (every second while
+        // degraded, logged on change).
+        let sli_config = Config::from_env()?;
+        let sli_handle =
+            tokio::spawn(async move { sli::sli_loop(sli_config, LOCAL_CLIENT_ENDPOINT).await });
+
         let mut stop_signal = None;
         let status = tokio::select! {
             status = child.wait() => status?,
@@ -330,6 +338,7 @@ async fn main() -> Result<()> {
                 monitor_handle.abort();
                 defrag_handle.abort();
                 watchdog_handle.abort();
+                sli_handle.abort();
                 if let Some(pid) = child.id() {
                     let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
                 }
@@ -339,6 +348,7 @@ async fn main() -> Result<()> {
         monitor_handle.abort();
         defrag_handle.abort();
         watchdog_handle.abort();
+        sli_handle.abort();
         // Drain the rest of etcd's stderr (the reader ends at pipe EOF on exit) so
         // the corruption flag reflects the whole run before we read it.
         if let Some(reader) = stderr_reader {
