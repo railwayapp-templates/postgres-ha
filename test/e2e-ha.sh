@@ -5448,7 +5448,10 @@ t_etcd_removed_member_wipe_rejoin() {
     return
   fi
 
-  docker exec "$n1" etcdctl put rmv-canary survives >/dev/null 2>&1
+  if ! docker exec "$n1" etcdctl put rmv-canary survives >/dev/null 2>&1; then
+    ko "$t" "could not seed the canary before removing a member"
+    fail_dump "$t" "$n1"; return
+  fi
 
   # Remove n3's member id — the exact production failure: the removal lives
   # in the PEERS' raft state, so n3's local dir is orphaned from here on and
@@ -5487,9 +5490,17 @@ t_etcd_removed_member_wipe_rejoin() {
     fail_dump "$t" "$n3"
     return
   fi
-  local canary
-  canary=$(docker exec "$n1" etcdctl get rmv-canary --print-value-only \
-    --endpoints="http://${n3}:2379" 2>/dev/null)
+  # The peer's member list can report promotion before n3 has applied it.
+  # Until then n3 rejects linearizable reads as a learner. Wait for the
+  # canary through n3 itself, retaining the data-integrity assertion below.
+  local canary=""
+  deadline=$(($(date +%s) + 30))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    canary=$(docker exec "$n1" etcdctl get rmv-canary --print-value-only \
+      --endpoints="http://${n3}:2379" --command-timeout=5s 2>/dev/null)
+    [ "$canary" = "survives" ] && break
+    sleep 1
+  done
   if ! assert_eq "$canary" "survives" "canary readable via the re-joined member"; then
     ko "$t" "data not intact via re-joined member"
     fail_dump "$t" "$n3"
