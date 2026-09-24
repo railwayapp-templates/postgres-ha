@@ -4,6 +4,7 @@
 //! primary/replica status without depending on Patroni or etcd.
 
 mod config;
+mod credentials;
 mod postgres;
 mod routes;
 
@@ -56,6 +57,7 @@ const RESPAWN_DELAY: Duration = Duration::from_secs(5);
 /// serve failures respawn after a delay; telemetry is deduped per incident
 /// so a crash loop pages once, not once per respawn.
 pub fn spawn(config: HealthServerConfig, telemetry: Telemetry) {
+    tokio::spawn(credentials::reconcile(config.clone()));
     tokio::spawn(async move {
         let mut alerted_for_current_incident = false;
 

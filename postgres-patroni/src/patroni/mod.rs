@@ -32,3 +32,5 @@ pub use reconcile::reconcile_pgbackrest_archive_config;
 pub use self_heal::spawn as spawn_self_heal_watcher;
 pub use slot_recovery::spawn as spawn_slot_recovery_watcher;
 pub use yaml::{generate_patroni_config, update_pg_hba_for_replication};
+
+pub mod scram;
