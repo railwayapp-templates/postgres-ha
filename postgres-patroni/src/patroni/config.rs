@@ -738,11 +738,9 @@ impl Config {
             pitr_target_xid: env::var("POSTGRES_RECOVERY_TARGET_XID")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            archive_timeout_secs: env::var("POSTGRES_ARCHIVE_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(60),
+            archive_timeout_secs: crate::wal_archive::parse_archive_timeout_secs(
+                env::var("POSTGRES_ARCHIVE_TIMEOUT").ok().as_deref(),
+            ),
             basebackup_max_rate: resolve_basebackup_max_rate(
                 env::var("POSTGRES_BASEBACKUP_MAX_RATE").ok(),
             ),

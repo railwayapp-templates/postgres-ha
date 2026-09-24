@@ -52,7 +52,7 @@ use tracing::{info, warn};
 
 pub(crate) const PATRONI_REST: &str = "http://localhost:8008";
 const EXPECTED_ARCHIVE_MODE: &str = "on";
-const EXPECTED_ARCHIVE_COMMAND: &str = "/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p";
+const EXPECTED_ARCHIVE_COMMAND: &str = crate::wal_archive::ARCHIVE_PUSH_COMMAND;
 // Bounded poll before concluding Patroni's own dynamic-config sync missed
 // this node, rather than just being a loop_wait cycle behind a patch we
 // ourselves may have just issued moments ago. Only SUCCESSFUL reads count

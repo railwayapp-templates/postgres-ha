@@ -20,7 +20,9 @@ mod self_heal;
 mod slot_recovery;
 mod yaml;
 
-pub use backup_watcher::spawn as spawn_backup_watcher;
+pub use backup_watcher::{
+    spawn as spawn_backup_watcher, spawn_with_mode as spawn_backup_watcher_with_mode, WatcherMode,
+};
 pub use config::{Config, Credential, RestapiAddressSource};
 pub use credential_pin::{
     apply_credential_pin, credential_drift, credentials_from_env_requested, read_credential_pin,

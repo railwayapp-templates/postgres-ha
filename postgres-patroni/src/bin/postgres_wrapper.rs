@@ -11,8 +11,8 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 use postgres_patroni::{
     cert_expires_within, ensure_pg_stat_statements, is_patroni_enabled, is_valid_x509v3_cert,
-    major_upgrade, orphan_slots, pgdata, ssl_dir, sudo_command, volume_lock, volume_root,
-    EXPECTED_VOLUME_MOUNT_PATH,
+    major_upgrade, orphan_slots, pgdata, ssl_dir, standalone_pitr, sudo_command, volume_lock,
+    volume_root, EXPECTED_VOLUME_MOUNT_PATH,
 };
 use std::env;
 use std::io::Write;
@@ -94,6 +94,14 @@ async fn check_and_generate_ssl(telemetry: &Telemetry) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The standalone supervisor re-runs this binary (as postgres) for the
+    // PITR sidecar; see standalone_pitr and spawn_pitr_sidecar below.
+    if env::args().nth(1).as_deref() == Some(standalone_pitr::SIDECAR_ARG) {
+        let _guard = init_logging("standalone-pitr");
+        standalone_pitr::run_sidecar(pgdata()).await;
+        return Ok(());
+    }
+
     let _guard = init_logging("postgres-wrapper");
 
     let telemetry = Telemetry::from_env("postgres-ha");
@@ -375,8 +383,16 @@ async fn main() -> Result<()> {
         env::remove_var("PGHOST");
         env::remove_var("PGPORT");
 
-        let args: Vec<String> = env::args().skip(1).collect();
+        let mut args: Vec<String> = env::args().skip(1).collect();
         let log_to_stdout = bool::env_parse("LOG_TO_STDOUT", false);
+
+        // WAL archiving + backups when WAL_ARCHIVE_BUCKET is set: the same
+        // pgBackRest stack Patroni mode runs (see standalone_pitr). After the
+        // staged-PITR refusal and the standby.signal promotion above, before
+        // the server starts. Non-fatal by construction: on any problem it
+        // returns no flags and no sidecar, and the boot is today's boot.
+        let pitr = standalone_pitr::prepare(&pgdata, &volume_root(), &args, &telemetry);
+        args.extend(pitr.extra_args.iter().cloned());
 
         info!("Starting standalone PostgreSQL...");
 
@@ -399,10 +415,11 @@ async fn main() -> Result<()> {
         // Staying resident makes this process the container's long-lived
         // PID 1, so it also inherits every orphaned descendant; the
         // waitpid(-1) loop reaps them. Blanket reaping is safe here for the
-        // same reason patroni_runner's mini-init argues: this process has
-        // exactly one direct child left (every earlier subprocess was awaited
-        // to completion above), so waitpid(-1) can only ever collect that
-        // child or orphans. Terminal signals forward raw to the child
+        // same reason patroni_runner's mini-init argues: this process never
+        // runs a subprocess it awaits itself past this point (every earlier
+        // one was awaited to completion above), so waitpid(-1) can only ever
+        // collect this child, the PITR sidecar below (a std child the loop
+        // owns), or orphans. Terminal signals forward raw to the child
         // (async-signal-safe: atomic load + kill), and the child's exit
         // status is propagated as ours.
         let child = cmd
@@ -428,8 +445,8 @@ async fn main() -> Result<()> {
         // standalone that was never HA is not touched; runs beside the server
         // and judges only after a grace window for legitimate consumers to
         // reconnect. In-process over the local socket — no child process, so
-        // the waitpid(-1) loop below keeps its "exactly one direct child"
-        // invariant. See orphan_slots.rs.
+        // the waitpid(-1) loop below cannot steal an exit status it awaits.
+        // See orphan_slots.rs.
         if orphan_slots::pgdata_was_patroni_managed(&pgdata) {
             tokio::spawn(orphan_slots::reap_after_boot(
                 pgdata.clone(),
@@ -437,12 +454,35 @@ async fn main() -> Result<()> {
             ));
         }
 
+        // The PITR sidecar (stanza bootstrap + backup watcher) is a second
+        // direct child. The loop below collects it like any orphan and
+        // restarts it if it ever exits, so backups resume without a redeploy.
+        let mut sidecar = if pitr.run_sidecar {
+            spawn_pitr_sidecar(&telemetry)
+        } else {
+            None
+        };
+
         let child_pid = Pid::from_raw(child.id() as i32);
         loop {
             match waitpid(Pid::from_raw(-1), None) {
-                Ok(WaitStatus::Exited(pid, code)) if pid == child_pid => std::process::exit(code),
+                Ok(WaitStatus::Exited(pid, code)) if pid == child_pid => {
+                    stop_pitr_sidecar(sidecar);
+                    std::process::exit(code)
+                }
                 Ok(WaitStatus::Signaled(pid, sig, _)) if pid == child_pid => {
+                    stop_pitr_sidecar(sidecar);
                     std::process::exit(128 + sig as i32)
+                }
+                Ok(status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)))
+                    if Some(pid) == sidecar =>
+                {
+                    warn!(
+                        ?status,
+                        "standalone PITR sidecar exited; restarting it in 30s"
+                    );
+                    std::thread::sleep(PITR_SIDECAR_RESTART_DELAY);
+                    sidecar = spawn_pitr_sidecar(&telemetry);
                 }
                 // An orphan reaped — the point of standing here.
                 Ok(_) => {}
@@ -456,6 +496,50 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+const PITR_SIDECAR_RESTART_DELAY: Duration = Duration::from_secs(30);
+
+/// Start the standalone PITR sidecar: this binary again, as `postgres`, with
+/// [`standalone_pitr::SIDECAR_ARG`]. A std (not tokio) child on purpose — the
+/// supervisor's `waitpid(-1)` loop owns its exit status. Failure to start is
+/// reported and leaves the server running without backups.
+fn spawn_pitr_sidecar(telemetry: &Telemetry) -> Option<Pid> {
+    let exe = env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/usr/local/bin/postgres-wrapper".to_string());
+    let mut cmd = if nix::unistd::geteuid().is_root() {
+        let mut c = Command::new("gosu");
+        c.args(["postgres", exe.as_str()]);
+        c
+    } else {
+        Command::new(&exe)
+    };
+    cmd.arg(standalone_pitr::SIDECAR_ARG).stdin(Stdio::null());
+    match cmd.spawn() {
+        Ok(child) => {
+            info!(pid = child.id(), "standalone PITR sidecar started");
+            Some(Pid::from_raw(child.id() as i32))
+        }
+        Err(e) => {
+            let error = format!("failed to start the standalone PITR sidecar: {e}");
+            warn!("{error}");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "postgres-wrapper".to_string(),
+                error,
+                context: "standalone PITR sidecar (non-fatal; no backups this boot)".to_string(),
+            });
+            None
+        }
+    }
+}
+
+/// Stop the sidecar when the server is gone, so it never outlives the
+/// supervisor when this is not the container's PID 1.
+fn stop_pitr_sidecar(sidecar: Option<Pid>) {
+    if let Some(pid) = sidecar {
+        let _ = nix::sys::signal::kill(pid, Signal::SIGTERM);
     }
 }
 
