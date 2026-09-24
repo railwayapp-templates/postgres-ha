@@ -6848,6 +6848,247 @@ t_standalone_orphan_slot_reaper_retries_until_it_completes() {
   docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
+# The live rotation route. The control plane rotates the cluster's one
+# password in a fixed order: ALTER ROLE on the primary, etcd's root password,
+# then POST /credentials/rotate on the leader and on each replica, then the
+# variable. This test plays the control plane: it enforces both control-plane
+# credentials, rotates the roles and etcd by hand, drives the route with the
+# OLD REST credential and checks that every member ends on the new password
+# with the leader never losing the lock; that a bare or wrong credential is
+# refused (401) and a role not yet rotated is refused (409); that a retry is
+# harmless (200 "already"); and that a member that was down through all of
+# it adopts the new password at boot because etcd accepts the variables and
+# refuses its pin.
+t_ha_credentials_rotate_route() {
+  local t=t_ha_credentials_rotate_route
+  local scope=t-rotate-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope" -e "ETCD_ROOT_PASSWORD=test")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" -e "PATRONI_RESTAPI_PASSWORD=test")
+  local pin=/var/lib/postgresql/data/pgdata/.railway_credentials
+  local route=http://localhost:8009/credentials/rotate
+
+  local leader
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no leader elected with authentication enabled"
+    fail_dump "$t" "$n1" "$n2" "$n3" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "the replicas did not stream before the rotation"
+    fail_dump "$t" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+  # The member that sits out the rotation and the one rotated live.
+  local stopped="" replica=""
+  for n in "$n3" "$n2" "$n1"; do
+    if [ "$n" != "$leader" ] && [ -z "$stopped" ]; then stopped="$n"; continue; fi
+    if [ "$n" != "$leader" ] && [ -z "$replica" ]; then replica="$n"; fi
+  done
+  psql_leader "$leader" -v ON_ERROR_STOP=1 -c \
+    "CREATE TABLE rotate_probe (id int PRIMARY KEY); INSERT INTO rotate_probe VALUES (1)" >/dev/null || {
+      ko "$t" "could not write the probe row before the rotation"
+      teardown_scope "$scope"; return
+    }
+  local auth_status
+  auth_status=$(docker exec "${scope}-etcd-1" etcdctl --user=root:test auth status 2>/dev/null)
+  if ! echo "$auth_status" | grep -q "Authentication Status: true"; then
+    ko "$t" "etcd authentication is not enabled before the rotation: '$auth_status'"
+    fail_dump "$t" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  # Password-authenticated TCP login from a peer container (loopback is trust).
+  tcp_auth_ok() {
+    local target="$1" pw="$2" probe="$3"
+    docker exec "$probe" psql \
+      "host=$target port=5432 user=postgres password=$pw dbname=postgres connect_timeout=5" \
+      -tAc "SELECT 1" 2>/dev/null | grep -qx 1
+  }
+  rotate_call() {
+    # $1 container, $2 curl auth args (may be empty), prints "<code> <body>"
+    local c="$1"; shift
+    docker exec "$c" curl -s -w ' %{http_code}' "$@" -X POST "$route" \
+      -H 'Content-Type: application/json' -d '{"password":"rotated"}' 2>/dev/null
+  }
+
+  log "removing $stopped: it sits out the rotation"
+  docker rm -f "$stopped" >/dev/null 2>&1 || true
+
+  # Before ALTER ROLE the route must refuse: the roles do not carry the
+  # password yet, and switching the member would break its replication.
+  local out code
+  out=$(rotate_call "$replica" -u postgres:test); code="${out##* }"
+  if [ "$code" != "409" ]; then
+    ko "$t" "$replica: rotate before ALTER ROLE answered $code (want 409): $out"
+    fail_dump "$t" "$replica"
+    teardown_scope "$scope"; return
+  fi
+
+  log "rotating the roles on $leader and etcd's root password"
+  psql_leader "$leader" -v ON_ERROR_STOP=1 \
+    -c "ALTER ROLE postgres PASSWORD 'rotated'" \
+    -c "ALTER ROLE replicator PASSWORD 'rotated'" >/dev/null || {
+      ko "$t" "ALTER ROLE failed on the leader"
+      fail_dump "$t" "$leader"
+      teardown_scope "$scope"; return
+    }
+  if ! echo rotated | docker exec -i "${scope}-etcd-1" etcdctl --user=root:test user passwd root --interactive=false >/dev/null 2>&1; then
+    ko "$t" "could not change etcd's root password"
+    fail_dump "$t" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+  auth_status=$(docker exec "${scope}-etcd-1" etcdctl --user=root:rotated auth status 2>/dev/null)
+  if ! echo "$auth_status" | grep -q "Authentication Status: true"; then
+    ko "$t" "etcd does not accept the new root password: '$auth_status'"
+    fail_dump "$t" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  # The route is behind the REST credential: bare and wrong calls are refused.
+  out=$(rotate_call "$leader"); code="${out##* }"
+  if [ "$code" != "401" ]; then
+    ko "$t" "$leader: bare rotate answered $code (want 401)"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  out=$(rotate_call "$leader" -u postgres:wrong); code="${out##* }"
+  if [ "$code" != "401" ]; then
+    ko "$t" "$leader: rotate with a wrong credential answered $code (want 401)"
+    teardown_scope "$scope"; return
+  fi
+
+  # Leader first, with the OLD credential.
+  out=$(rotate_call "$leader" -u postgres:test); code="${out##* }"
+  if [ "$code" != "200" ] || ! echo "$out" | grep -q '"status":"rotated"'; then
+    ko "$t" "$leader: rotate answered $code: $out"
+    fail_dump "$t" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+  # Then the replica; 409 while the ALTER ROLE has not replayed on it yet.
+  local deadline=$(($(date +%s) + 120))
+  while :; do
+    out=$(rotate_call "$replica" -u postgres:test); code="${out##* }"
+    [ "$code" = "200" ] && break
+    if [ "$code" != "409" ] || [ "$(date +%s)" -ge "$deadline" ]; then
+      ko "$t" "$replica: rotate answered $code: $out"
+      fail_dump "$t" "$replica" "$leader"
+      teardown_scope "$scope"; return
+    fi
+    sleep 3
+  done
+
+  # A retry is harmless, and the old credential no longer opens the route.
+  out=$(rotate_call "$leader" -u postgres:rotated); code="${out##* }"
+  if [ "$code" != "200" ] || ! echo "$out" | grep -q '"status":"already"'; then
+    ko "$t" "$leader: repeated rotate answered $code: $out (want 200 already)"
+    teardown_scope "$scope"; return
+  fi
+  out=$(rotate_call "$leader" -u postgres:test); code="${out##* }"
+  if [ "$code" != "401" ]; then
+    ko "$t" "$leader: the old credential still opens the route ($code)"
+    teardown_scope "$scope"; return
+  fi
+
+  # The cluster runs on the new password: same leader, replica streaming,
+  # the new password logs in over TCP and the old one does not.
+  local leader_after
+  leader_after=$(wait_for_leader "$scope" 120) || {
+    ko "$t" "no leader after the rotation"
+    fail_dump "$t" "$leader" "$replica"
+    teardown_scope "$scope"; return
+  }
+  if [ "$leader_after" != "$leader" ]; then
+    ko "$t" "the leader moved during the rotation: $leader -> $leader_after"
+    fail_dump "$t" "$leader" "$replica"
+    teardown_scope "$scope"; return
+  fi
+  if ! wait_for_replication "$scope" 1 180; then
+    ko "$t" "$replica does not stream after the rotation"
+    fail_dump "$t" "$replica" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  if ! tcp_auth_ok "$leader" rotated "$replica"; then
+    ko "$t" "the new password does not authenticate over TCP"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  if tcp_auth_ok "$leader" test "$replica"; then
+    ko "$t" "the old password still authenticates over TCP"
+    teardown_scope "$scope"; return
+  fi
+  # Patroni itself enforces the new REST credential after the reload.
+  code=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' -u postgres:test -X DELETE http://localhost:8008/restart)
+  if [ "$code" != "401" ]; then
+    ko "$t" "$leader: Patroni still accepts the old REST password ($code)"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  code=$(docker exec "$leader" curl -s -o /dev/null -w '%{http_code}' -u postgres:rotated -X DELETE http://localhost:8008/restart)
+  if [ "$code" != "200" ] && [ "$code" != "404" ]; then
+    ko "$t" "$leader: Patroni refuses the new REST password ($code)"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  for n in "$leader" "$replica"; do
+    if [ "$(docker exec "$n" grep -c '"rotated"' "$pin" 2>/dev/null)" != "3" ]; then
+      ko "$t" "$n: the credential pin does not carry the new password for all three roles"
+      fail_dump "$t" "$n"
+      teardown_scope "$scope"; return
+    fi
+    if ! logs_contain "$n" "credentials rotated"; then
+      ko "$t" "$n never logged the rotation"
+      fail_dump "$t" "$n"
+      teardown_scope "$scope"; return
+    fi
+  done
+
+  # The member that sat out the rotation boots with the variables already
+  # moved (the control plane committed them) and its pin still on the old
+  # password. etcd accepts the variables and refuses the pin: it adopts.
+  log "starting $stopped with the rotated variables against its old volume"
+  run_patroni_node "$scope" "$etcd_hosts" "$stopped" \
+    -e "POSTGRES_PASSWORD=rotated" \
+    -e "PATRONI_SUPERUSER_PASSWORD=rotated" \
+    -e "PATRONI_REPLICATION_PASSWORD=rotated" \
+    -e "PATRONI_RESTAPI_PASSWORD=rotated"
+  if ! wait_for_pg_accepting "$stopped" 300; then
+    ko "$t" "$stopped never accepted connections after booting with the rotated variables"
+    fail_dump "$t" "$stopped" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+  if ! logs_contain "$stopped" "adopting the variables"; then
+    ko "$t" "$stopped did not adopt the rotated variables at boot"
+    fail_dump "$t" "$stopped"
+    teardown_scope "$scope"; return
+  fi
+  if logs_match "$stopped" "Etcd3 authentication failed|etcd rejected this member's credential|keeping the pinned credentials"; then
+    ko "$t" "$stopped kept the old pin or was refused by etcd"
+    fail_dump "$t" "$stopped"
+    teardown_scope "$scope"; return
+  fi
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "$stopped never streamed after adopting the rotated variables"
+    fail_dump "$t" "$stopped" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  local row
+  row=$(docker exec -u postgres "$stopped" psql -tAc "SELECT id FROM rotate_probe" 2>/dev/null | tr -d '[:space:]')
+  if [ "$row" != "1" ]; then
+    ko "$t" "$stopped did not replicate the probe row (got '$row')"
+    fail_dump "$t" "$stopped" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  if [ "$(docker exec "$stopped" grep -c '"rotated"' "$pin" 2>/dev/null)" != "3" ]; then
+    ko "$t" "$stopped: the pin was not rewritten from the rotated variables"
+    fail_dump "$t" "$stopped"
+    teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "leader=$leader kept the lock; $replica rotated live (409 before ALTER ROLE, 401 bare, 200 then already); $stopped adopted the rotated variables at boot"
+  teardown_scope "$scope"
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
@@ -6942,6 +7183,7 @@ ALL_TESTS=(
   t_ha_password_edit_stops_member_with_guidance
   t_ha_password_edit_stops_member_rest_only
   t_ha_scale_up_joins_authenticated_cluster
+  t_ha_credentials_rotate_route
 )
 
 usage() {

@@ -273,6 +273,14 @@ pub enum TelemetryEvent {
         grace_secs: u64,
     },
 
+    /// A member that was down during a password rotation adopted the
+    /// variables at boot: etcd accepted their password and refused the
+    /// pinned one.
+    CredentialsAdopted {
+        node: String,
+        variables: Vec<String>,
+    },
+
     // === Generic Events ===
     /// Component started
     ComponentStarted { component: String, version: String },
@@ -326,6 +334,7 @@ impl TelemetryEvent {
             Self::HaproxyStarted { .. } => "HAPROXY_STARTED",
             Self::HaproxyConfigGenerating { .. } => "HAPROXY_CONFIG_GENERATING",
             Self::StandaloneOrphanSlotsDropped { .. } => "STANDALONE_ORPHAN_SLOTS_DROPPED",
+            Self::CredentialsAdopted { .. } => "POSTGRES_HA_CREDENTIALS_ADOPTED",
             Self::ComponentStarted { .. } => "COMPONENT_STARTED",
             Self::ComponentError { .. } => "COMPONENT_ERROR",
         }
@@ -592,6 +601,13 @@ impl TelemetryEvent {
                     slots,
                     retained_wal_bytes,
                     grace_secs
+                )
+            }
+            Self::CredentialsAdopted { node, variables } => {
+                format!(
+                    "{} adopted the rotated credential variables at boot ({})",
+                    node,
+                    variables.join(", ")
                 )
             }
             Self::ComponentStarted { component, version } => {
