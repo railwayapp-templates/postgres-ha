@@ -9,6 +9,7 @@ use common::{init_logging, ConfigExt, RailwayEnv, Telemetry, TelemetryEvent};
 use nix::sys::signal::{SigHandler, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
+use postgres_patroni::pgbackrest::read_wal_level;
 use postgres_patroni::{
     cert_expires_within, ensure_pg_stat_statements, is_patroni_enabled, is_valid_x509v3_cert,
     major_upgrade, orphan_slots, pgdata, ssl_dir, sudo_command, volume_lock, volume_root,
@@ -375,7 +376,31 @@ async fn main() -> Result<()> {
         env::remove_var("PGHOST");
         env::remove_var("PGPORT");
 
-        let args: Vec<String> = env::args().skip(1).collect();
+        let mut args: Vec<String> = env::args().skip(1).collect();
+
+        // HA -> standalone is the reverse of the adoption path in
+        // patroni_runner, and it carries the same contract: a cluster that ran
+        // `wal_level=logical` must not come back as `replica`. Here the
+        // contract is not merely about preserving logical decoding — Postgres
+        // REFUSES TO START at all while a logical slot is on disk below
+        // `logical` ("logical replication slot ... exists, but wal_level <
+        // logical"). A reverted cluster carries exactly those slots until the
+        // orphan-slot reaper drops them, and the reaper can only run AFTER
+        // startup, so without this the database never comes up to be repaired.
+        // A caller that pinned its own wal_level keeps it.
+        let caller_pinned_wal_level = args.iter().any(|a| {
+            a.starts_with("wal_level=")
+                || a.starts_with("--wal-level=")
+                || a.starts_with("--wal_level=")
+        });
+        if !caller_pinned_wal_level && read_wal_level(&pgdata).as_deref() == Some("logical") {
+            info!(
+                "Data directory carries wal_level=logical; preserving it for standalone PostgreSQL"
+            );
+            args.push("-c".to_string());
+            args.push("wal_level=logical".to_string());
+        }
+
         let log_to_stdout = bool::env_parse("LOG_TO_STDOUT", false);
 
         info!("Starting standalone PostgreSQL...");

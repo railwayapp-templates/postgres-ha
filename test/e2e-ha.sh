@@ -6639,7 +6639,7 @@ _boot_standalone_on_volume() {
 # `name:active` for every replication slot, comma-joined and sorted.
 _slot_census() {
   docker exec "$1" psql -U postgres -h /var/run/postgresql -Atc \
-    "SELECT slot_name || ':' || active::text FROM pg_replication_slots ORDER BY slot_name" 2>/dev/null \
+    "SELECT slot_name || ':' || CASE WHEN active THEN 't' ELSE 'f' END FROM pg_replication_slots ORDER BY slot_name" 2>/dev/null \
     | paste -sd, -
 }
 
