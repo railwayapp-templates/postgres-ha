@@ -484,7 +484,10 @@ fn kill_switch_engaged() -> bool {
 /// major upgrade; stay out of the way, the post-switchover promotion will
 /// call us again).
 fn leader_gate(superuser: &str) -> std::result::Result<(), Skip> {
-    let out = run_psql(superuser, "SELECT pg_is_in_recovery()").map_err(|_| Skip::NotPrimary)?;
+    // run_psql keeps psql's table formatting; COPY gives us only the value,
+    // like the catalog queries below, so a writable primary reads as "f".
+    let out = run_psql(superuser, "COPY (SELECT pg_is_in_recovery()) TO STDOUT")
+        .map_err(|_| Skip::NotPrimary)?;
     if out.trim() != "f" {
         return Err(Skip::NotPrimary);
     }

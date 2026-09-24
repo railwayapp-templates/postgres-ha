@@ -6890,7 +6890,7 @@ t_ha_collation_mismatch_reindex_then_refresh() {
     fi
   done
 
-  local logs; logs="$(docker logs "$leader" 2>&1)"
+  local logs; logs="$(docker logs "$leader" 2>&1 | sed -E $'s/\033\\[[0-9;]*[mK]//g')"
   # Selection: the default-collation text index was rebuilt concurrently;
   # the uuid PK and the COLLATE "C" index were not touched.
   if ! grep -E 'collation-refresh: reindexed.*users_email_key' <<<"$logs" | grep -q 'concurrent=true'; then

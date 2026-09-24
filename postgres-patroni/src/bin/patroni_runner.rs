@@ -1759,11 +1759,19 @@ fn main() -> Result<()> {
     // Must run before the tokio runtime exists: fork() and threads don't mix.
     run_as_mini_init()?;
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("failed to build the tokio runtime")?
-        .block_on(async_main())
+        .context("failed to build the tokio runtime")?;
+    let result = runtime.block_on(async_main());
+    // async_main has already waited for Patroni (and PostgreSQL) to stop.
+    // A blocking collation repair may still be waiting for its leader gate
+    // or a psql child. Runtime::drop waits for those threads indefinitely,
+    // keeping PID 1 and the volume lock alive after the database is down.
+    // The process exits immediately after this; repair retries from the
+    // unrefreshed catalogs on the next boot or promotion.
+    runtime.shutdown_background();
+    result
 }
 
 /// Refresh collation versions once this node is confirmed primary. Patroni's
