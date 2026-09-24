@@ -1759,11 +1759,19 @@ fn main() -> Result<()> {
     // Must run before the tokio runtime exists: fork() and threads don't mix.
     run_as_mini_init()?;
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("failed to build the tokio runtime")?
-        .block_on(async_main())
+        .context("failed to build the tokio runtime")?;
+    let result = runtime.block_on(async_main());
+    // async_main has already waited for Patroni (and PostgreSQL) to stop.
+    // A blocking collation repair may still be waiting for its leader gate
+    // or a psql child. Runtime::drop waits for those threads indefinitely,
+    // keeping PID 1 and the volume lock alive after the database is down.
+    // The process exits immediately after this; repair retries from the
+    // unrefreshed catalogs on the next boot or promotion.
+    runtime.shutdown_background();
+    result
 }
 
 /// Refresh collation versions once this node is confirmed primary. Patroni's
@@ -1781,12 +1789,21 @@ fn main() -> Result<()> {
 /// WAL_ARCHIVE_BUCKET gate to piggyback on.
 ///
 /// Safe to double-run with an on_role_change-triggered refresh (e.g. right
-/// after an actual promotion): refresh_collation_versions's SQL already
-/// no-ops per-database once nothing is mismatched.
+/// after an actual promotion): refresh_collation_versions detects the
+/// mismatch from the catalogs and no-ops per-database once nothing is
+/// mismatched.
+///
+/// The refresh is not a quick stamp any more: when the image's libc moved
+/// under the volume it REINDEXes every affected index before refreshing
+/// (see bootstrap::collation), which can run for a long time on a big
+/// database. It is synchronous psql work, so it goes on a blocking thread
+/// rather than parking one of the runtime's async workers for the duration.
 fn spawn_collation_refresh() {
     tokio::spawn(async move {
         if wait_until_local_primary(Duration::from_secs(600)).await {
-            refresh_collation_versions();
+            if let Err(e) = tokio::task::spawn_blocking(refresh_collation_versions).await {
+                warn!(error = %e, "collation-refresh: task panicked");
+            }
         }
     });
 }
