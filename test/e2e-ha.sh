@@ -877,6 +877,16 @@ t_vanilla_boot() {
     return
   fi
 
+  # Patroni caches its dynamic configuration in PGDATA. The standalone boot's
+  # orphan-slot reaper (orphan_slots.rs) gates on this file as the proof that
+  # the data directory was Patroni-managed — if Patroni ever stops writing it,
+  # that reaper goes silent on every reverted cluster. Pin the assumption.
+  if ! docker exec "$leader" test -f /var/lib/postgresql/data/pgdata/patroni.dynamic.json; then
+    ko t_vanilla_boot "patroni.dynamic.json missing from the leader's PGDATA (the standalone orphan-slot reaper gates on it)"
+    teardown_scope "$scope"
+    return
+  fi
+
   ok t_vanilla_boot
   note "leader=$leader; replicas streaming; archiving disabled (vanilla HA)"
   teardown_scope "$scope"
@@ -6331,6 +6341,414 @@ t_ha_password_edit_stops_member_rest_only() {
   teardown_scope "$scope"
 }
 
+# A member added to a running cluster with control-plane authentication on
+# (etcd RBAC + Patroni REST auth) must authenticate to etcd with the same
+# credential its peers use, clone from the leader, stream, and enforce the
+# REST credential itself. No scenario covered a fourth member joining an
+# authenticated cluster; the three-member ones boot everything at once.
+#
+# The template's replica slots render PATRONI_WAIT_FOR_LEADER=true (mono
+# seed-postgres-templates.ts, the Postgres-2/-3 slots), which makes the runner
+# itself read the leader key from etcd before Patroni starts — the one path in
+# the runner that authenticates to etcd with a gateway token. The new member
+# carries it here, and the scenario asserts both that etcd is enforcing (so a
+# cluster that silently never enabled authentication cannot pass) and that the
+# runner's authenticated read found the leader.
+t_ha_scale_up_joins_authenticated_cluster() {
+  local t=t_ha_scale_up_joins_authenticated_cluster
+  local scope=t-scaleup-cpauth-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope" -e "ETCD_ROOT_PASSWORD=test")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" -e "PATRONI_RESTAPI_PASSWORD=test")
+  local n4="${scope}-pg-4"
+  cleanup_n4() { docker rm -f "$n4" >/dev/null 2>&1 || true; docker volume rm "${n4}-vol" >/dev/null 2>&1 || true; }
+
+  local leader
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no leader elected with authentication enabled"
+    fail_dump "$t" "$n1" "$n2" "$n3" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "the founding replicas did not stream"
+    fail_dump "$t" "$leader" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+  psql_leader "$leader" -v ON_ERROR_STOP=1 -c \
+    "CREATE TABLE scale_up_probe (id int PRIMARY KEY); INSERT INTO scale_up_probe VALUES (1)" >/dev/null || {
+      ko "$t" "could not write the probe row before the scale-up"
+      teardown_scope "$scope"; return
+    }
+
+  # etcd must be enforcing before the new member arrives: the entrypoint turns
+  # authentication on once the trio is healthy, and without this check the
+  # scenario would pass against an etcd that never did.
+  local auth_status
+  auth_status=$(docker exec "${scope}-etcd-1" etcdctl --user=root:test auth status 2>/dev/null)
+  if ! echo "$auth_status" | grep -q "Authentication Status: true"; then
+    ko "$t" "etcd authentication is not enabled before the scale-up: '$auth_status'"
+    fail_dump "$t" "${scope}-etcd-1"
+    teardown_scope "$scope"; return
+  fi
+
+  # The scale-up: a fresh volume, the variables the template renders on a
+  # replica slot (the credential references and PATRONI_WAIT_FOR_LEADER=true),
+  # on a cluster that already enforces both control-plane credentials.
+  log "adding $n4 to the authenticated cluster"
+  new_volume "${n4}-vol"
+  run_patroni_node "$scope" "$etcd_hosts" "$n4" \
+    -e "PATRONI_RESTAPI_PASSWORD=test" \
+    -e "PATRONI_WAIT_FOR_LEADER=true"
+
+  if ! wait_for_pg_accepting "$n4" 300; then
+    ko "$t" "$n4 never accepted connections after joining"
+    fail_dump "$t" "$n4" "$leader" "${scope}-etcd-1"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  # The runner's own authenticated etcd read: with PATRONI_WAIT_FOR_LEADER it
+  # fetches a gateway token and ranges the leader key before Patroni starts.
+  # A token etcd refused shows as the non-success warning and a five-minute
+  # wait instead of this line.
+  if ! logs_contain "$n4" "Cluster leader found, proceeding to start Patroni"; then
+    ko "$t" "$n4 did not find the leader in etcd through the runner's authenticated read"
+    fail_dump "$t" "$n4" "${scope}-etcd-1"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  if logs_contain "$n4" "etcd returned non-success status"; then
+    ko "$t" "$n4: etcd refused the runner's leader read (token not accepted)"
+    fail_dump "$t" "$n4" "${scope}-etcd-1"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  if ! wait_for_replication "$scope" 3 300; then
+    ko "$t" "$n4 never streamed from the leader"
+    fail_dump "$t" "$n4" "$leader"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  if ! docker exec "$leader" curl -sf http://localhost:8008/cluster 2>/dev/null | grep -q "\"name\":[[:space:]]*\"$n4\""; then
+    ko "$t" "$n4 is not listed as a member on the leader's /cluster"
+    fail_dump "$t" "$n4" "$leader"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  local row
+  row=$(docker exec -u postgres "$n4" psql -tAc "SELECT id FROM scale_up_probe" 2>/dev/null | tr -d '[:space:]')
+  if [ "$row" != "1" ]; then
+    ko "$t" "$n4 did not replicate the probe row (got '$row')"
+    fail_dump "$t" "$n4" "$leader"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+
+  # The new member enforces the REST credential like its peers: reads open,
+  # an unauthenticated write refused, the cluster credential accepted.
+  local code
+  code=$(docker exec "$n4" curl -s -o /dev/null -w '%{http_code}' http://localhost:8008/patroni)
+  if [ "$code" != "200" ]; then
+    ko "$t" "$n4: GET /patroni answered $code (reads must stay open)"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  code=$(docker exec "$n4" curl -s -o /dev/null -w '%{http_code}' -X POST \
+    http://localhost:8008/restart -d '{"schedule":"2999-01-01T00:00:00+00:00"}')
+  if [ "$code" != "401" ]; then
+    ko "$t" "$n4: unauthenticated POST /restart answered $code (want 401)"
+    fail_dump "$t" "$n4"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  # Patroni answers 200 when it removed a scheduled restart and 404 when none
+  # was pending (api.py do_DELETE_restart) — and the bare POST above was
+  # refused, so nothing is pending. Either code means the credential passed
+  # the check_access gate; a refused credential is 401.
+  code=$(docker exec "$n4" curl -s -o /dev/null -w '%{http_code}' -u postgres:test -X DELETE \
+    http://localhost:8008/restart)
+  if [ "$code" != "200" ] && [ "$code" != "404" ]; then
+    ko "$t" "$n4: authenticated DELETE /restart answered $code (want 200 or 404: past the credential check)"
+    fail_dump "$t" "$n4"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+  code=$(docker exec "$n4" curl -s -o /dev/null -w '%{http_code}' -u postgres:wrong -X DELETE \
+    http://localhost:8008/restart)
+  if [ "$code" != "401" ]; then
+    ko "$t" "$n4: DELETE /restart with a wrong password answered $code (want 401)"
+    fail_dump "$t" "$n4"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+
+  # And its etcd session is the authenticated one: no auth failure anywhere in its boot.
+  if logs_match "$n4" "Etcd3 authentication failed|etcd rejected this member's credential"; then
+    ko "$t" "$n4 logged an etcd authentication failure while joining"
+    fail_dump "$t" "$n4"
+    cleanup_n4; teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "leader=$leader; etcd enforcing; $n4 found the leader through an authenticated etcd read, joined, streams, and enforces the REST credential"
+  cleanup_n4
+  teardown_scope "$scope"
+}
+
+# Seed $vol with a vanilla PostgreSQL data dir carrying the replication-slot
+# population a reverted HA root inherits: two Patroni member slots (physical,
+# reserved — what the leader holds for `postgres-2`/`postgres-3`), one physical
+# slot an external consumer will hold open during the test, and a Fivetran-style
+# logical slot. wal_level=logical so the logical slot can exist. Some WAL is
+# written past the slots' restart_lsn so the reaper has a real retained size to
+# report. Clean shutdown, like the redeploy a revert triggers.
+_seed_pgdata_with_member_slots() {
+  local vol="$1" name="$2"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label "$HA_LABEL" --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -v "${vol}:/var/lib/postgresql/data" \
+    "postgres:${PG_VERSION}" \
+    -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10 >/dev/null
+  # TCP probe, never the socket — see _seed_standalone_pgdata.
+  local up=0 _i
+  for _i in $(seq 1 120); do
+    if docker exec "$name" pg_isready -U postgres -h localhost -q >/dev/null 2>&1; then up=1; break; fi
+    sleep 1
+  done
+  if [ "$up" != 1 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; return 1; fi
+  docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 -q \
+    -c "SELECT pg_create_physical_replication_slot('postgres_2', true);" \
+    -c "SELECT pg_create_physical_replication_slot('postgres_3', true);" \
+    -c "SELECT pg_create_physical_replication_slot('external_standby', true);" \
+    -c "SELECT pg_create_logical_replication_slot('fivetran_pgoutput_slot','pgoutput');" \
+    -c "CREATE TABLE churn AS SELECT g, repeat('x',500) AS v FROM generate_series(1,50000) g;" \
+    -c "CHECKPOINT;" \
+    >/dev/null || { docker rm -f "$name" >/dev/null 2>&1 || true; return 1; }
+  docker stop -t 30 "$name" >/dev/null
+  docker rm "$name" >/dev/null
+}
+
+# Boot $IMAGE standalone (PATRONI_ENABLED unset) on an already-seeded volume,
+# with a short orphan-slot grace so the verdict lands inside the test window.
+# Returns 0 once the server accepts TCP connections.
+_boot_standalone_on_volume() {
+  local name="$1" vol="$2"
+  docker run -d --name "$name" --label "$HA_LABEL" --network "$NET" \
+    -v "${vol}:/var/lib/postgresql/data" \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -e POSTGRES_PASSWORD=test \
+    -e POSTGRES_ORPHAN_SLOT_GRACE_SECONDS=20 \
+    "$IMAGE" >/dev/null
+  local _i
+  for _i in $(seq 1 120); do
+    if docker exec "$name" pg_isready -U postgres -h localhost -q >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# `name:active` for every replication slot, comma-joined and sorted.
+_slot_census() {
+  docker exec "$1" psql -U postgres -h /var/run/postgresql -Atc \
+    "SELECT slot_name || ':' || active::text FROM pg_replication_slots ORDER BY slot_name" 2>/dev/null \
+    | paste -sd, -
+}
+
+# A reverted HA cluster leaves the members' physical replication slots on the
+# former leader, and nothing drops them once Patroni is gone — each pins WAL
+# without bound (69 GB observed live on a near-empty volume, 2026-09-13). The
+# standalone boot must reap them, and ONLY them:
+#   - gated on Patroni's footprint (patroni.dynamic.json in PGDATA): the very
+#     same slots on a never-HA standalone are left alone (phase A);
+#   - a physical slot a consumer holds open (pg_receivewal here, a standby in
+#     life) survives — every slot is inactive at the instant of boot, so the
+#     verdict waits for the grace window (phase B);
+#   - a logical slot (customer CDC) is never touched.
+# Asserts on the reaper's own log lines, not just the end state, so the drop
+# is causally ours.
+t_standalone_reaps_orphaned_member_slots() {
+  local t=t_standalone_reaps_orphaned_member_slots
+  local vol="orphslots-vol-${PG_VERSION}" n="orphslots-pg-${PG_VERSION}"
+  local seed="orphslots-seed-${PG_VERSION}"
+  local all_idle="external_standby:f,fivetran_pgoutput_slot:f,postgres_2:f,postgres_3:f"
+  docker rm -f "$n" "$seed" >/dev/null 2>&1 || true
+  new_volume "$vol"
+  if ! _seed_pgdata_with_member_slots "$vol" "$seed"; then
+    ko "$t" "failed to seed pgdata with replication slots"
+    return
+  fi
+
+  # Phase A — never-HA data directory: no marker, nothing may be dropped.
+  if ! _boot_standalone_on_volume "$n" "$vol"; then
+    ko "$t" "phase A: standalone postgres never became ready"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  # Past the 20s grace with margin: if the gate were missing, the drops
+  # would have landed by now.
+  sleep 35
+  local census
+  census=$(_slot_census "$n")
+  if [ "$census" != "$all_idle" ]; then
+    ko "$t" "phase A: slots changed on a never-HA data directory (got '$census', want '$all_idle')"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  if logs_contain "$n" "orphan-slots:"; then
+    ko "$t" "phase A: the reaper ran without Patroni provenance"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  docker stop -t 30 "$n" >/dev/null
+  docker rm -f "$n" >/dev/null 2>&1
+
+  # Phase B — the same volume, now carrying Patroni's footprint, exactly as
+  # a reverted leader does. uid 999 = postgres in the official image.
+  if ! docker run --rm -v "$vol:/v" alpine sh -c \
+      'printf "%s" "{\"ttl\":30,\"loop_wait\":10,\"postgresql\":{\"use_slots\":true}}" > /v/pgdata/patroni.dynamic.json && chown 999:999 /v/pgdata/patroni.dynamic.json'; then
+    ko "$t" "could not write patroni.dynamic.json onto the volume"
+    return
+  fi
+  if ! _boot_standalone_on_volume "$n" "$vol"; then
+    ko "$t" "phase B: standalone postgres never became ready"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  # A legitimate consumer reconnecting after the restart: hold
+  # external_standby open before the grace window closes.
+  docker exec -d "$n" bash -c \
+    'mkdir -p /tmp/wal && exec pg_receivewal -D /tmp/wal -S external_standby -h /var/run/postgresql -U postgres --no-sync'
+  local attached=0 _i
+  for _i in $(seq 1 15); do
+    if [ "$(docker exec "$n" psql -U postgres -h /var/run/postgresql -Atc \
+          "SELECT active FROM pg_replication_slots WHERE slot_name='external_standby'" 2>/dev/null)" = "t" ]; then
+      attached=1; break
+    fi
+    sleep 1
+  done
+  if [ "$attached" != 1 ]; then
+    ko "$t" "phase B: pg_receivewal never attached to external_standby (test rig, not product)"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  # Causal assertion: the reaper's own drop lines for both member slots.
+  local reaped=0 deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$n" 2>&1 | grep "dropped orphaned replication slot" | grep -q "postgres_2" \
+       && docker logs "$n" 2>&1 | grep "dropped orphaned replication slot" | grep -q "postgres_3"; then
+      reaped=1; break
+    fi
+    sleep 3
+  done
+  if [ "$reaped" != 1 ]; then
+    ko "$t" "phase B: the reaper never logged dropping postgres_2 and postgres_3"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  census=$(_slot_census "$n")
+  local want="external_standby:t,fivetran_pgoutput_slot:f"
+  if [ "$census" != "$want" ]; then
+    ko "$t" "phase B: wrong slot population after the reap (got '$census', want '$want')"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  # The database is unharmed and writable after the drops.
+  if ! docker exec "$n" psql -U postgres -h /var/run/postgresql -v ON_ERROR_STOP=1 -q \
+      -c "INSERT INTO churn VALUES (-1, 'after-reap')" >/dev/null 2>&1; then
+    ko "$t" "phase B: database not writable after the reap"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  ok "$t"
+  note "never-HA boot left all 4 slots; Patroni-managed boot dropped postgres_2+postgres_3, kept the held-open physical slot and the logical slot"
+  docker rm -f "$n" >/dev/null 2>&1
+  docker volume rm -f "$vol" >/dev/null 2>&1 || true
+}
+
+# The reaper's pass must complete once per boot, however long PostgreSQL
+# takes to admit it: a reverted root still in crash recovery, or a login the
+# reaper cannot yet use, must not mean "orphans until the next redeploy"
+# (months, with WAL growing the whole time). Here POSTGRES_USER names a role
+# that does not exist — docker-entrypoint only reads it at initdb, so nothing
+# creates it — and every login is refused; the test creates the role once the
+# reaper has logged a retry, and the pass then completes. And exactly ONE
+# pass: the reaper is not periodic.
+t_standalone_orphan_slot_reaper_retries_until_it_completes() {
+  local t=t_standalone_orphan_slot_reaper_retries_until_it_completes
+  local vol="orphretry-vol-${PG_VERSION}" n="orphretry-pg-${PG_VERSION}"
+  local seed="orphretry-seed-${PG_VERSION}"
+  local all_idle="external_standby:f,fivetran_pgoutput_slot:f,postgres_2:f,postgres_3:f"
+  docker rm -f "$n" "$seed" >/dev/null 2>&1 || true
+  new_volume "$vol"
+  if ! _seed_pgdata_with_member_slots "$vol" "$seed"; then
+    ko "$t" "failed to seed pgdata with replication slots"
+    return
+  fi
+  if ! docker run --rm -v "$vol:/v" alpine sh -c \
+      'printf "%s" "{\"ttl\":30,\"loop_wait\":10,\"postgresql\":{\"use_slots\":true}}" > /v/pgdata/patroni.dynamic.json && chown 999:999 /v/pgdata/patroni.dynamic.json'; then
+    ko "$t" "could not write patroni.dynamic.json onto the volume"
+    return
+  fi
+  docker run -d --name "$n" --label "$HA_LABEL" --network "$NET" \
+    -v "${vol}:/var/lib/postgresql/data" \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -e POSTGRES_PASSWORD=test \
+    -e POSTGRES_USER=late_admin \
+    -e POSTGRES_ORPHAN_SLOT_GRACE_SECONDS=5 \
+    "$IMAGE" >/dev/null
+  local _i ready=0
+  for _i in $(seq 1 120); do
+    if docker exec "$n" pg_isready -U postgres -h localhost -q >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" != 1 ]; then
+    ko "$t" "standalone postgres never became ready"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  # Refused login → the reaper must be retrying, loudly, and touching nothing.
+  local retrying=0 deadline=$(($(date +%s) + 90))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if logs_contain "$n" "orphan-slots: pass did not complete; retrying"; then retrying=1; break; fi
+    sleep 2
+  done
+  if [ "$retrying" != 1 ]; then
+    ko "$t" "reaper never logged a retry while its login was refused"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  local census
+  census=$(_slot_census "$n")
+  if [ "$census" != "$all_idle" ]; then
+    ko "$t" "slots changed while the reaper could not log in (got '$census', want '$all_idle')"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  # Let it in. The next attempt (backoff ≤ 60s) connects, waits the 5s
+  # grace, and completes the pass — all three idle physical slots go, the
+  # logical slot stays.
+  if ! docker exec "$n" psql -U postgres -h /var/run/postgresql -v ON_ERROR_STOP=1 -q \
+      -c "CREATE ROLE late_admin SUPERUSER LOGIN" >/dev/null 2>&1; then
+    ko "$t" "could not create the late role (test rig, not product)"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  local completed=0; deadline=$(($(date +%s) + 180))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if logs_contain "$n" "orphan-slots: pass completed after retries"; then completed=1; break; fi
+    sleep 3
+  done
+  if [ "$completed" != 1 ]; then
+    ko "$t" "pass never completed after the role was created"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+  census=$(_slot_census "$n")
+  local want="fivetran_pgoutput_slot:f"
+  if [ "$census" != "$want" ]; then
+    ko "$t" "wrong slot population after the pass (got '$census', want '$want')"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  # One pass per boot, not periodic: past another backoff cap + grace, still
+  # exactly three drop lines and no second census line.
+  sleep 70
+  local drops idle_passes
+  drops=$(docker logs "$n" 2>&1 | grep -c "dropped orphaned replication slot")
+  idle_passes=$(docker logs "$n" 2>&1 | grep -c "no unclaimed physical replication slots")
+  if [ "$drops" != "3" ] || [ "$idle_passes" != "0" ]; then
+    ko "$t" "expected exactly one pass (3 drop lines, 0 idle passes); got drops=$drops idle_passes=$idle_passes"
+    fail_dump "$t" "$n"; docker rm -f "$n" >/dev/null 2>&1; return
+  fi
+
+  ok "$t"
+  note "login refused → retry lines, slots untouched; role created → one pass, 3 idle physical slots dropped, logical kept; no second pass in 70s"
+  docker rm -f "$n" >/dev/null 2>&1
+  docker volume rm -f "$vol" >/dev/null 2>&1 || true
+}
+
 ALL_TESTS=(
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
@@ -6395,6 +6813,13 @@ ALL_TESTS=(
   t_ha_adopt_preserves_logical
   t_ha_adopt_default_replica
   t_upgrade_lock_standalone_lifetime
+  # HA→standalone revert: the former leader's member slots are dropped after
+  # the consumer grace window; a never-HA data dir, a held-open physical slot
+  # and a logical slot are untouched
+  t_standalone_reaps_orphaned_member_slots
+  # the reaper's pass retries until it completes once (refused login here),
+  # and runs exactly once per boot
+  t_standalone_orphan_slot_reaper_retries_until_it_completes
   # etcd wrapper: removed-member refusal wipes + re-joins within one wrapper
   # lifetime, whichever exit code the refusing run produced
   t_etcd_removed_member_wipe_rejoin
@@ -6414,6 +6839,7 @@ ALL_TESTS=(
   t_ha_restapi_auth_unenforced_still_sends_credential
   t_ha_password_edit_stops_member_with_guidance
   t_ha_password_edit_stops_member_rest_only
+  t_ha_scale_up_joins_authenticated_cluster
 )
 
 usage() {

@@ -261,6 +261,18 @@ pub enum TelemetryEvent {
     /// HAProxy config generation starting
     HaproxyConfigGenerating { nodes: Vec<String> },
 
+    // === Standalone (PATRONI_ENABLED unset) Events ===
+    /// A reverted HA cluster's former leader, booting standalone, dropped the
+    /// physical replication slots its deleted members left behind. Each
+    /// pinned WAL without bound; `retained_wal_bytes` is what the drops
+    /// released for the next checkpoint to reclaim. Slots were judged only
+    /// after `grace_secs` with no consumer attached.
+    StandaloneOrphanSlotsDropped {
+        slots: Vec<String>,
+        retained_wal_bytes: u64,
+        grace_secs: u64,
+    },
+
     // === Generic Events ===
     /// Component started
     ComponentStarted { component: String, version: String },
@@ -313,6 +325,7 @@ impl TelemetryEvent {
             Self::EtcdLocalUnhealthy { .. } => "ETCD_LOCAL_UNHEALTHY",
             Self::HaproxyStarted { .. } => "HAPROXY_STARTED",
             Self::HaproxyConfigGenerating { .. } => "HAPROXY_CONFIG_GENERATING",
+            Self::StandaloneOrphanSlotsDropped { .. } => "STANDALONE_ORPHAN_SLOTS_DROPPED",
             Self::ComponentStarted { .. } => "COMPONENT_STARTED",
             Self::ComponentError { .. } => "COMPONENT_ERROR",
         }
@@ -567,6 +580,19 @@ impl TelemetryEvent {
             }
             Self::HaproxyConfigGenerating { nodes } => {
                 format!("Generating HAProxy config for: {:?}", nodes)
+            }
+            Self::StandaloneOrphanSlotsDropped {
+                slots,
+                retained_wal_bytes,
+                grace_secs,
+            } => {
+                format!(
+                    "standalone boot dropped {} orphaned replication slot(s) left by a reverted HA cluster ({:?}; {} bytes of WAL released; unclaimed for {}s)",
+                    slots.len(),
+                    slots,
+                    retained_wal_bytes,
+                    grace_secs
+                )
             }
             Self::ComponentStarted { component, version } => {
                 format!("{} v{} started", component, version)
