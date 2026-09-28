@@ -7087,7 +7087,8 @@ wait_for_full_in_current_repo() {
 # Damaged stanza repair must preserve old objects, create a new full, and
 # (under Patroni) survive leadership transfer through the shared DCS path.
 run_half_stanza_recovery_case() {
-  local missing="$1" mode="$2" t="$3" scope="t-half-${mode}-${PG_VERSION}"
+  local missing="$1" mode="$2" t="$3"
+  local scope="t-half-${mode}-${PG_VERSION}"
   local leader n1='' n2='' n3='' etcd_hosts='' sa="${scope}-standalone" vol="${scope}-vol"
   reset_bucket
   if [ "$mode" = ha ]; then
