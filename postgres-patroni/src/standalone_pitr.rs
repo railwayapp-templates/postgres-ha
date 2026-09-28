@@ -302,10 +302,17 @@ pub fn prepare(
 /// Body of the sidecar process: stanza bootstrap once the server is up and
 /// primary, then the standalone backup watcher. Runs until the container
 /// stops; both tasks retry on their own.
-pub async fn run_sidecar(pgdata: String) {
-    info!("standalone PITR sidecar: starting stanza bootstrap and backup watcher");
-    spawn_bootstrap_stanza_create();
-    spawn_backup_watcher_with_mode(pgdata, WatcherMode::Standalone);
+pub async fn run_sidecar(pgdata: String, archiving: bool) {
+    tokio::task::spawn_blocking(crate::bootstrap::refresh_standalone_collation_versions);
+
+    info!(
+        archiving,
+        "standalone sidecar: starting collation maintenance and optional backup watcher"
+    );
+    if archiving {
+        spawn_bootstrap_stanza_create();
+        spawn_backup_watcher_with_mode(pgdata, WatcherMode::Standalone);
+    }
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }

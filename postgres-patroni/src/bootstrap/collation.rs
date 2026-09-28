@@ -26,7 +26,7 @@
 //!
 //! - database default:
 //!   `pg_database.datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)`
-//! - named libc collations (`COLLATE "en_US"` columns):
+//! - named collations (`COLLATE "en_US"` columns):
 //!   `pg_collation.collversion IS DISTINCT FROM pg_collation_actual_version(oid)`
 //!   for `collprovider = 'c'`
 //!
@@ -35,11 +35,9 @@
 //! file. That matters in an HA cluster (see below) because a marker in the
 //! data dir would not travel to a promoted replica, but the catalog does.
 //!
-//! Scope: libc (`collprovider = 'c'`) only. `C`/`POSIX`/`ucs_basic` carry no
-//! version (both sides NULL, never a mismatch). ICU (`'i'`) and the builtin
-//! provider (`'b'`) are out of scope here — an ICU mismatch is logged loudly
-//! and deliberately NOT refreshed, so Postgres's per-connection WARNING stays
-//! visible until someone reindexes it by hand.
+//! Covers versioned libc and ICU collations, including PG13/14 named stamps.
+//! Predefined stale stamps also reveal default ordering changes whose database
+//! stamp was already blindly refreshed by older images.
 //!
 //! # HA / Patroni
 //!
@@ -122,30 +120,14 @@ const DATABASE_MISMATCH_SQL: &str = "COPY (SELECT d.datname, d.datlocprovider, \
        AND d.datcollversion IS DISTINCT FROM pg_database_collation_actual_version(d.oid) \
      ORDER BY d.datname) TO STDOUT WITH (DELIMITER E'\\t')";
 
-/// Named libc collations whose stored version differs from the installed
+/// Named collations whose stored version differs from the installed
 /// libc. pg_collation is per-database, so this runs inside each one.
-const LIBC_COLLATION_MISMATCH_SQL: &str = "COPY (SELECT format('%I.%I', n.nspname, c.collname), \
+const NAMED_COLLATION_MISMATCH_SQL: &str = "COPY (SELECT format('%I.%I', n.nspname, c.collname), \
      coalesce(c.collversion, ''), coalesce(pg_collation_actual_version(c.oid), '') \
      FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace \
-     WHERE c.collprovider = 'c' \
+     WHERE c.collversion IS NOT NULL \
        AND c.collversion IS DISTINCT FROM pg_collation_actual_version(c.oid) \
      ORDER BY 1) TO STDOUT WITH (DELIMITER E'\\t')";
-
-/// Count of indexes that depend on a mismatched ICU collation (default or
-/// named). Reported, never repaired here — see the module doc.
-const ICU_AFFECTED_INDEX_COUNT_SQL: &str = "COPY (WITH affected AS ( \
-       SELECT 100::oid AS colloid \
-       WHERE EXISTS (SELECT 1 FROM pg_database d WHERE d.datname = current_database() \
-                     AND d.datlocprovider = 'i' \
-                     AND d.datcollversion IS DISTINCT FROM pg_database_collation_actual_version(d.oid)) \
-       UNION \
-       SELECT c.oid FROM pg_collation c \
-       WHERE c.collprovider = 'i' \
-         AND c.collversion IS DISTINCT FROM pg_collation_actual_version(c.oid)) \
-     SELECT count(*) FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid \
-     WHERE ic.relkind = 'i' \
-       AND EXISTS (SELECT 1 FROM unnest(i.indcollation::oid[]) AS u(colloid) \
-                   WHERE u.colloid IN (SELECT colloid FROM affected))) TO STDOUT";
 
 /// Invalid leftovers of an interrupted `REINDEX ... CONCURRENTLY`. The
 /// manual: a `_ccnew` suffix is the transient index that never finished —
@@ -158,37 +140,43 @@ const CC_LEFTOVERS_SQL: &str = "COPY (SELECT format('%I.%I', n.nspname, ic.relna
        AND ic.relname ~ '_cc(new|old)[0-9]*$' \
      ORDER BY 1) TO STDOUT";
 
-/// Indexes to rebuild in the current database, smallest first (fast
-/// feedback in the log; the biggest one runs last), catalogs before user
-/// tables. Selected by `pg_index.indcollation`: a column that is not
-/// collatable stores 0 there, an explicit `COLLATE "C"` stores C's oid
-/// (never in the affected set — it has no version), and a default-collation
-/// text column stores 100 (`pg_catalog."default"`). `{with_default}` is
-/// spliced as SQL `true`/`false`: whether the database's own default
-/// collation is a mismatched libc one. Partitioned parents (`relkind 'I'`)
-/// are skipped — their leaves are listed themselves. Other sessions' temp
-/// indexes are skipped. Invalid indexes are skipped (a REINDEX would
-/// validate them behind their owner's back; the `_cc*` leftovers are
-/// handled separately above).
-const AFFECTED_INDEXES_SQL_TEMPLATE: &str = "COPY (WITH affected AS ( \
-       SELECT 100::oid AS colloid WHERE {with_default} \
-       UNION \
-       SELECT c.oid FROM pg_collation c \
-       WHERE c.collprovider = 'c' \
-         AND c.collversion IS DISTINCT FROM pg_collation_actual_version(c.oid)) \
-     SELECT format('%I.%I', n.nspname, ic.relname), \
-            CASE WHEN n.nspname = 'pg_catalog' OR i.indisexclusion THEN 'plain' ELSE 'concurrent' END, \
-            pg_relation_size(ic.oid) \
-     FROM pg_index i \
-     JOIN pg_class ic ON ic.oid = i.indexrelid \
-     JOIN pg_namespace n ON n.oid = ic.relnamespace \
-     WHERE ic.relkind = 'i' \
-       AND ic.relpersistence <> 't' \
-       AND i.indisvalid \
-       AND EXISTS (SELECT 1 FROM unnest(i.indcollation::oid[]) AS u(colloid) \
-                   WHERE u.colloid IN (SELECT colloid FROM affected)) \
-     ORDER BY (n.nspname = 'pg_catalog') DESC, pg_relation_size(ic.oid), 1) \
-     TO STDOUT WITH (DELIMITER E'\\t')";
+/// Key collations, named dependencies, and implicit-default expressions.
+/// pg_depend omits references to pinned objects (including default collation),
+/// so partial/expression indexes are conservatively included for default drift.
+const AFFECTED_INDEXES_SQL_TEMPLATE: &str = r#"COPY (WITH stale_stamped AS (
+ SELECT oid, collprovider FROM pg_collation
+ WHERE collversion IS NOT NULL
+ AND collversion IS DISTINCT FROM pg_collation_actual_version(oid)
+), dflt AS ({default_provider}), affected AS (
+ SELECT oid AS colloid FROM stale_stamped
+ UNION SELECT c.oid FROM pg_collation c, dflt d
+ WHERE c.collname = 'default' AND ({with_default} OR
+ (d.versioned AND d.p IN (SELECT collprovider FROM stale_stamped)))
+ UNION SELECT c.oid FROM pg_collation c
+ WHERE c.oid < 16384 AND c.collname <> 'default'
+ AND pg_collation_actual_version(c.oid) IS NOT NULL
+ AND c.collprovider IN (SELECT collprovider FROM stale_stamped)
+), suspect_indexes AS (
+ SELECT i.indexrelid AS oid FROM pg_index i,
+ unnest(i.indcollation::oid[]) AS u(colloid)
+ WHERE u.colloid IN (SELECT colloid FROM affected)
+ UNION SELECT d.objid FROM pg_depend d
+ WHERE d.classid = 'pg_class'::regclass
+ AND d.refclassid = 'pg_collation'::regclass
+ AND d.refobjid IN (SELECT colloid FROM affected)
+ UNION SELECT i.indexrelid FROM pg_index i
+ WHERE (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)
+ AND 100::oid IN (SELECT colloid FROM affected)
+)
+ SELECT format('%I.%I', n.nspname, ic.relname),
+ CASE WHEN n.nspname = 'pg_catalog' OR i.indisexclusion THEN 'plain' ELSE 'concurrent' END,
+ pg_relation_size(ic.oid)
+ FROM suspect_indexes s JOIN pg_index i ON i.indexrelid = s.oid
+ JOIN pg_class ic ON ic.oid = i.indexrelid
+ JOIN pg_namespace n ON n.oid = ic.relnamespace
+ WHERE ic.relkind = 'i' AND ic.relpersistence <> 't'
+ ORDER BY (n.nspname = 'pg_catalog') DESC, pg_relation_size(ic.oid), 1)
+ TO STDOUT WITH (DELIMITER E'\t')"#;
 
 /// One row of `DATABASE_MISMATCH_SQL`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +200,6 @@ pub struct AffectedIndex {
 /// Why the procedure did not run (all of these are logged, none is fatal).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Skip {
-    KillSwitch,
     NotPrimary,
     NotPatroniLeader,
     SwitchoverScheduled,
@@ -223,16 +210,36 @@ pub enum Skip {
 /// REINDEX the affected indexes, then REFRESH the recorded versions —
 /// leader only, idempotent, safe across failovers (see the module doc).
 ///
-/// No-op on PG < 15 (`datcollversion` and `REFRESH COLLATION VERSION` were
-/// introduced in PG 15) and when PG_VERSION can't be read (pre-initdb).
+/// No-op on PG < 13 (older libc catalogs do not carry version stamps) and when PG_VERSION can't be read (pre-initdb).
 /// Every failure is logged and swallowed: this must never take a node down.
 pub fn refresh_collation_versions() {
+    refresh_collation_versions_inner(false);
+}
+
+/// Called from the standalone maintenance sidecar, which owns its psql children.
+pub fn refresh_standalone_collation_versions() {
+    // TCP excludes docker-entrypoint's temporary initdb server.
+    for _ in 0..120 {
+        if Command::new("pg_isready")
+            .args(["-q", "-h", "127.0.0.1"])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            refresh_collation_versions_inner(true);
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    tracing::warn!("collation-refresh: standalone readiness timed out; retry on next boot");
+}
+
+fn refresh_collation_versions_inner(standalone: bool) {
     let pg_version_file = format!("{}/PG_VERSION", pgdata());
     let pg_major: u32 = match fs::read_to_string(&pg_version_file) {
         Ok(v) => v.trim().parse().unwrap_or(0),
         Err(_) => return,
     };
-    if pg_major < 15 {
+    if pg_major < 13 {
         return;
     }
 
@@ -244,11 +251,18 @@ pub fn refresh_collation_versions() {
         return;
     }
 
-    let superuser = match read_credentials() {
-        Ok(c) => c.superuser,
-        Err(e) => {
-            tracing::warn!(error = %e, "collation-refresh: could not read credentials");
-            return;
+    let superuser = if standalone {
+        std::env::var("POSTGRES_USER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "postgres".to_string())
+    } else {
+        match read_credentials() {
+            Ok(c) => c.superuser,
+            Err(e) => {
+                tracing::warn!(error = %e, "collation-refresh: could not read credentials");
+                return;
+            }
         }
     };
 
@@ -260,7 +274,7 @@ pub fn refresh_collation_versions() {
     // transient reasons a bounded grace instead of skipping a repair that
     // would then wait for the next boot. Switchover/pause are not
     // transient in that sense and return immediately.
-    if let Err(skip) = leader_gate_with_grace(&superuser, Duration::from_secs(60)) {
+    if let Err(skip) = leader_gate_with_grace(&superuser, Duration::from_secs(60), standalone) {
         tracing::info!(reason = ?skip, "collation-refresh: skipped (leader gate)");
         return;
     }
@@ -279,11 +293,15 @@ pub fn refresh_collation_versions() {
         .map(str::to_string)
         .collect();
 
-    let db_mismatches = match run_psql(&superuser, DATABASE_MISMATCH_SQL) {
-        Ok(out) => parse_database_mismatches(&out),
-        Err(e) => {
-            tracing::warn!(error = %e, "collation-refresh: database collation census failed");
-            return;
+    let db_mismatches = if pg_major < 15 {
+        Vec::new()
+    } else {
+        match run_psql(&superuser, DATABASE_MISMATCH_SQL) {
+            Ok(out) => parse_database_mismatches(&out),
+            Err(e) => {
+                tracing::warn!(error = %e, "collation-refresh: database collation census failed");
+                return;
+            }
         }
     };
 
@@ -291,7 +309,7 @@ pub fn refresh_collation_versions() {
     let mut failed = 0usize;
     for db in &databases {
         let default_mismatch = db_mismatches.iter().find(|m| &m.datname == db);
-        match repair_database(&superuser, db, default_mismatch) {
+        match repair_database(&superuser, db, default_mismatch, pg_major, standalone) {
             Ok(true) => repaired += 1,
             Ok(false) => {}
             Err(e) => {
@@ -324,17 +342,19 @@ pub fn refresh_collation_versions() {
 }
 
 /// Repair one database. Returns `Ok(true)` when something was reindexed and
-/// refreshed, `Ok(false)` when nothing was mismatched (or only ICU was),
+/// refreshed, `Ok(false)` when nothing was mismatched (),
 /// `Err` when a REINDEX failed — in which case NOTHING was refreshed.
 fn repair_database(
     superuser: &str,
     db: &str,
     default_mismatch: Option<&DatabaseMismatch>,
+    pg_major: u32,
+    standalone: bool,
 ) -> Result<bool> {
-    // Named libc collations that moved. pg_collation is per-database.
-    let libc_collations = run_psql_in_db(superuser, db, LIBC_COLLATION_MISMATCH_SQL)
-        .context("libc collation census")?;
-    let libc_collations: Vec<(String, String, String)> = libc_collations
+    // Named collations that moved. pg_collation is per-database.
+    let named_collations = run_psql_in_db(superuser, db, NAMED_COLLATION_MISMATCH_SQL)
+        .context("named collation census")?;
+    let named_collations: Vec<(String, String, String)> = named_collations
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| {
@@ -347,58 +367,19 @@ fn repair_database(
         })
         .collect();
 
-    // ICU: report, never silence.
-    if let Ok(out) = run_psql_in_db(superuser, db, ICU_AFFECTED_INDEX_COUNT_SQL) {
-        let n: u64 = out.trim().parse().unwrap_or(0);
-        if n > 0 {
-            tracing::warn!(
-                database = %db,
-                affected_indexes = n,
-                "collation-refresh: ICU collation version changed under {n} index(es); \
-                 NOT handled by this image — REINDEX them and run \
-                 ALTER COLLATION ... REFRESH VERSION / ALTER DATABASE ... REFRESH COLLATION VERSION \
-                 by hand. Postgres keeps warning until then."
-            );
-        }
-    }
-
-    let default_is_libc_mismatch = match default_mismatch {
-        Some(m) if m.provider == 'c' => {
-            tracing::warn!(
-                database = %db,
-                stored = %m.stored,
-                actual = %m.actual,
-                "collation-refresh: database default (libc) collation version changed — \
-                 indexes on collatable columns are unreliable until reindexed"
-            );
-            true
-        }
-        Some(m) => {
-            tracing::warn!(
-                database = %db,
-                provider = %m.provider,
-                stored = %m.stored,
-                actual = %m.actual,
-                "collation-refresh: database default collation version changed under a \
-                 non-libc provider; NOT refreshed by this image (see the ICU note above)"
-            );
-            false
-        }
-        None => false,
-    };
-
-    if !default_is_libc_mismatch && libc_collations.is_empty() {
+    let default_mismatch_present = default_mismatch.is_some();
+    if !default_mismatch_present && named_collations.is_empty() {
         return Ok(false);
     }
 
-    for (name, stored, actual) in &libc_collations {
+    for (name, stored, actual) in &named_collations {
         tracing::info!(database = %db, collation = %name, stored = %stored, actual = %actual,
-            "collation-refresh: named libc collation version changed");
+            "collation-refresh: named collation version changed");
     }
 
     // Re-check right before the first write of this database: the census
     // above may have taken a while on a cluster with many databases.
-    leader_gate(superuser).map_err(|s| anyhow!("leader gate: {s:?}"))?;
+    leader_gate(superuser, standalone).map_err(|s| anyhow!("leader gate: {s:?}"))?;
 
     // Interrupted-concurrent-reindex leftovers first (manual's procedure).
     let leftovers = run_psql_in_db(superuser, db, CC_LEFTOVERS_SQL).context("cc leftover scan")?;
@@ -409,7 +390,7 @@ fn repair_database(
             "collation-refresh: dropped invalid leftover of an interrupted REINDEX CONCURRENTLY");
     }
 
-    let sql = affected_indexes_sql(default_is_libc_mismatch);
+    let sql = affected_indexes_sql_for_major(default_mismatch_present, pg_major);
     let indexes = parse_affected_indexes(
         &run_psql_in_db(superuser, db, &sql).context("affected index census")?,
     );
@@ -418,7 +399,7 @@ fn repair_database(
         database = %db,
         indexes = indexes.len(),
         total_bytes,
-        "collation-refresh: reindexing indexes that depend on a changed libc collation \
+        "collation-refresh: reindexing indexes that depend on a changed collation \
          (BEFORE refreshing the recorded version)"
     );
 
@@ -426,7 +407,7 @@ fn repair_database(
         // A switchover or a lost leader lock between two indexes stops the
         // run here; nothing below has been refreshed, so the next leader
         // starts this database over.
-        leader_gate(superuser)
+        leader_gate(superuser, standalone)
             .map_err(|s| anyhow!("leader gate before {}: {s:?}", idx.qualified_name))?;
         let stmt = if idx.concurrent {
             format!("REINDEX INDEX CONCURRENTLY {}", idx.qualified_name)
@@ -447,7 +428,7 @@ fn repair_database(
     }
 
     // Only now — every dependent index is consistent with the running libc.
-    for (name, _, _) in &libc_collations {
+    for (name, _, _) in &named_collations {
         run_psql_in_db(
             superuser,
             db,
@@ -455,11 +436,11 @@ fn repair_database(
         )
         .with_context(|| format!("ALTER COLLATION {name} REFRESH VERSION"))?;
     }
-    if !libc_collations.is_empty() {
-        tracing::info!(database = %db, collations = libc_collations.len(),
-            "collation-refresh: refreshed named libc collation versions");
+    if !named_collations.is_empty() {
+        tracing::info!(database = %db, collations = named_collations.len(),
+            "collation-refresh: refreshed named collation versions");
     }
-    if default_is_libc_mismatch {
+    if default_mismatch_present {
         let stmt = format!(
             "ALTER DATABASE {} REFRESH COLLATION VERSION",
             super::quote_ident(db)
@@ -483,7 +464,7 @@ fn kill_switch_engaged() -> bool {
 /// paused (maintenance mode — a human is choreographing something, e.g. a
 /// major upgrade; stay out of the way, the post-switchover promotion will
 /// call us again).
-fn leader_gate(superuser: &str) -> std::result::Result<(), Skip> {
+fn leader_gate(superuser: &str, standalone: bool) -> std::result::Result<(), Skip> {
     // run_psql keeps psql's table formatting; COPY gives us only the value,
     // like the catalog queries below, so a writable primary reads as "f".
     let out = run_psql(superuser, "COPY (SELECT pg_is_in_recovery()) TO STDOUT")
@@ -496,7 +477,7 @@ fn leader_gate(superuser: &str) -> std::result::Result<(), Skip> {
     // the config file is the same evidence that binary already relies on.
     let under_patroni =
         crate::is_patroni_enabled() || std::path::Path::new(super::PATRONI_CONFIG).exists();
-    if !under_patroni {
+    if standalone || !under_patroni {
         return Ok(());
     }
     if curl_status(PATRONI_LEADER_URL).as_deref() != Some("200") {
@@ -518,10 +499,14 @@ fn leader_gate(superuser: &str) -> std::result::Result<(), Skip> {
 /// `leader_gate`, retried every 2s for up to `budget` while the reason is
 /// one that a promotion in progress makes transient (`NotPrimary`,
 /// `NotPatroniLeader`). Any other reason is returned at once.
-fn leader_gate_with_grace(superuser: &str, budget: Duration) -> std::result::Result<(), Skip> {
+fn leader_gate_with_grace(
+    superuser: &str,
+    budget: Duration,
+    standalone: bool,
+) -> std::result::Result<(), Skip> {
     let deadline = Instant::now() + budget;
     loop {
-        match leader_gate(superuser) {
+        match leader_gate(superuser, standalone) {
             Ok(()) => return Ok(()),
             Err(skip @ (Skip::NotPrimary | Skip::NotPatroniLeader))
                 if Instant::now() < deadline =>
@@ -588,11 +573,23 @@ pub fn patroni_is_paused(body: &str) -> bool {
 }
 
 /// Splice the database-default decision into the affected-index query.
+#[cfg(test)]
 pub fn affected_indexes_sql(with_default: bool) -> String {
-    AFFECTED_INDEXES_SQL_TEMPLATE.replace(
-        "{with_default}",
-        if with_default { "true" } else { "false" },
-    )
+    affected_indexes_sql_for_major(with_default, 15)
+}
+
+fn affected_indexes_sql_for_major(with_default: bool, pg_major: u32) -> String {
+    let provider = if pg_major >= 15 {
+        "SELECT datlocprovider AS p, pg_database_collation_actual_version(oid) IS NOT NULL AS versioned FROM pg_database WHERE datname = current_database()"
+    } else {
+        "SELECT 'c'::\"char\" AS p, datcollate NOT IN ('C', 'POSIX') AS versioned FROM pg_database WHERE datname = current_database()"
+    };
+    AFFECTED_INDEXES_SQL_TEMPLATE
+        .replace(
+            "{with_default}",
+            if with_default { "true" } else { "false" },
+        )
+        .replace("{default_provider}", provider)
 }
 
 /// Parse `DATABASE_MISMATCH_SQL` COPY output (tab-separated).
@@ -679,20 +676,17 @@ mod tests {
 
     #[test]
     fn affected_index_sql_splices_the_default_decision() {
-        assert!(affected_indexes_sql(true).contains("SELECT 100::oid AS colloid WHERE true"));
-        assert!(affected_indexes_sql(false).contains("SELECT 100::oid AS colloid WHERE false"));
+        assert!(affected_indexes_sql(true).contains("c.collname = 'default' AND (true OR"));
+        assert!(affected_indexes_sql(false).contains("c.collname = 'default' AND (false OR"));
         assert!(!affected_indexes_sql(true).contains("{with_default}"));
     }
 
     #[test]
-    fn reindex_selection_excludes_icu_and_unversioned_collations_by_construction() {
-        // The affected set is built only from collprovider = 'c' rows with a
-        // version delta plus (optionally) the default collation; C/POSIX
-        // have NULL on both sides and never enter it, ICU is a different
-        // provider letter.
-        let sql = affected_indexes_sql(false);
-        assert!(sql.contains("c.collprovider = 'c'"));
-        assert!(!sql.contains("collprovider = 'i'"));
+    fn pg13_query_avoids_pg15_database_catalog_columns() {
+        let sql = super::affected_indexes_sql_for_major(false, 13);
+        assert!(!sql.contains("datlocprovider"));
+        assert!(!sql.contains("pg_database_collation_actual_version"));
+        assert!(!sql.contains("{default_provider}"));
     }
 
     #[test]

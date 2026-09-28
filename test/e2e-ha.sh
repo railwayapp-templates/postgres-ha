@@ -7253,6 +7253,8 @@ t_ha_collation_mismatch_reindex_then_refresh() {
   if ! psql_leader "$leader" -v ON_ERROR_STOP=1 -q -c "
       CREATE TABLE users(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), email text NOT NULL UNIQUE, tag text COLLATE \"C\" ${country_col});
       CREATE INDEX users_tag_idx ON users(tag);
+      CREATE INDEX users_default_partial ON users(id) WHERE email > 'm';
+      CREATE INDEX users_default_expression ON users((email > 'm'));
       ${country_idx}
       INSERT INTO users(email, tag ${country_col:+, country}) SELECT 'u'||g||'@example.com', 't'||g ${country_col:+, 'c'||g} FROM generate_series(1, 2000) g;" >/dev/null 2>&1; then
     ko t_ha_collation_mismatch_reindex_then_refresh "fixture creation failed"
@@ -7341,6 +7343,12 @@ t_ha_collation_mismatch_reindex_then_refresh() {
   fi
   # Order: every REINDEX line precedes the refresh line.
   local last_reindex first_refresh
+  for idx in users_default_partial users_default_expression; do
+    if ! grep -qE "collation-refresh: reindexed.*$idx" <<<"$logs"; then
+      ko t_ha_collation_mismatch_reindex_then_refresh "implicit default index $idx was not rebuilt"
+      teardown_scope "$scope"; return
+    fi
+  done
   last_reindex=$(grep -nE 'collation-refresh: reindexed' <<<"$logs" | tail -1 | cut -d: -f1)
   first_refresh=$(grep -nE 'collation-refresh: refreshed database collation version' <<<"$logs" | head -1 | cut -d: -f1)
   if [ -z "$last_reindex" ] || [ -z "$first_refresh" ] || [ "$last_reindex" -ge "$first_refresh" ]; then
@@ -7389,11 +7397,41 @@ t_ha_collation_mismatch_reindex_then_refresh() {
   teardown_scope "$scope"
 }
 
+# Standalone also repairs collation, without a Patroni config or PITR bucket.
+t_standalone_collation_repairs_implicit_default() {
+  local t="${FUNCNAME[0]}" name="t-sa-collation-${PG_VERSION}" vol="t-sa-collation-${PG_VERSION}-vol"
+  docker volume create --label "$HA_LABEL" "$vol" >/dev/null
+  docker run -d --name "$name" --label "$HA_LABEL" --network "$NET" \
+    -v "$vol:/var/lib/postgresql/data" -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -e POSTGRES_USER=collation_owner -e POSTGRES_PASSWORD=test "$IMAGE" >/dev/null
+  local deadline=$(( $(date +%s) + 120 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    logs_contain "$name" 'collation-refresh: completed for all databases' && break
+    sleep 2
+  done
+  docker exec "$name" psql -U collation_owner -d postgres -v ON_ERROR_STOP=1 -c "CREATE TABLE implicit_default (id int, value text); CREATE INDEX implicit_default_partial ON implicit_default(id) WHERE value > 'm'; CREATE INDEX implicit_default_expr ON implicit_default((value > 'm')); UPDATE pg_database SET datcollversion='0.fake' WHERE datname=current_database();" >/dev/null || { ko "$t" 'fixture failed'; return; }
+  docker restart "$name" >/dev/null
+  deadline=$(( $(date +%s) + 120 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    logs_contain "$name" 'collation-refresh: refreshed database collation version' && break
+    sleep 2
+  done
+  local logs idx
+  logs=$(docker logs "$name" 2>&1)
+  for idx in implicit_default_partial implicit_default_expr; do
+    grep -qE "collation-refresh: reindexed.*$idx" <<<"$logs" || { ko "$t" "$idx not rebuilt"; fail_dump "$t" "$name"; return; }
+  done
+  logs_contain "$name" 'collation-refresh: refreshed database collation version' || { ko "$t" 'stamp not refreshed'; return; }
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+  ok "$t"
+}
 
 ALL_TESTS=(
   t_ha_half_stanza_preserves_path_across_failover
   t_standalone_half_stanza_takes_new_full
   t_standalone_invalid_repo_marker_is_rederived
+  t_standalone_collation_repairs_implicit_default
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
   # the image runs the Debian release the Dockerfile pins (libc under a
