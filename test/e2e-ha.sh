@@ -1101,8 +1101,15 @@ t_watcher_initial_full() {
   local scope=t-init-full-${PG_VERSION}
   reset_bucket
   local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  # Template-only overrides must reach the config renderer, but not pgBackRest:
+  # its unknown-option warnings otherwise corrupt even successful JSON output.
   # shellcheck disable=SC2046
-  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher))
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher) \
+    -e PGBACKREST_BACKUP_PROCESS_MAX=1 \
+    -e PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX=3 \
+    -e PGBACKREST_ARCHIVE_GET_PROCESS_MAX=3 \
+    -e PGBACKREST_RESTORE_PROCESS_MAX=24 \
+    -e PGBACKREST_DROP_THRESHOLD_MB=5120)
 
   local leader
   leader=$(wait_for_leader "$scope" 240) || {
@@ -1135,6 +1142,18 @@ t_watcher_initial_full() {
   local fulls; fulls=$(count_backups_of_type "$leader" full)
   if [ "$fulls" != "1" ]; then
     ko t_watcher_initial_full "expected 1 full in repo; got $fulls"
+    teardown_scope "$scope"
+    return
+  fi
+  if ! docker exec -u postgres "$leader" bash -e -o pipefail -c "$(_pgbackrest_env_preamble)
+    pgbackrest --stanza=main info --output=json | python3 -m json.tool >/dev/null
+    for setting in backup:1 archive-push:3 archive-get:3 restore:24; do
+      output=\$(pgbackrest help \"\${setting%:*}\" process-max)
+      grep -F \"current: \${setting#*:}\" <<<\"\$output\"
+    done
+  "; then
+    ko t_watcher_initial_full "template overrides corrupted JSON or command-specific worker counts"
+    fail_dump t_watcher_initial_full "$leader"
     teardown_scope "$scope"
     return
   fi
