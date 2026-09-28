@@ -117,8 +117,8 @@ run() {
 }
 
 exit_code() { cat "$TMPROOT/control/exit_code"; }
-pgbackrest_call_count() { [ -f "$TMPROOT/control/pgbackrest_calls.log" ] && wc -l < "$TMPROOT/control/pgbackrest_calls.log" || echo 0; }
-curl_call_count() { [ -f "$TMPROOT/control/curl_calls.log" ] && wc -l < "$TMPROOT/control/curl_calls.log" || echo 0; }
+pgbackrest_call_count() { [ -f "$TMPROOT/control/pgbackrest_calls.log" ] && awk 'END { print NR }' "$TMPROOT/control/pgbackrest_calls.log" || echo 0; }
+curl_call_count() { [ -f "$TMPROOT/control/curl_calls.log" ] && awk 'END { print NR }' "$TMPROOT/control/curl_calls.log" || echo 0; }
 marker_path() { echo "$TMPROOT/pgdata/.pgbackrest_repo_path"; }
 marker_content() { tr -d '\n\r' < "$(marker_path)" 2>/dev/null || echo "<absent>"; }
 
