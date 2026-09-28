@@ -342,7 +342,7 @@ fn refresh_collation_versions_inner(standalone: bool) {
 }
 
 /// Repair one database. Returns `Ok(true)` when something was reindexed and
-/// refreshed, `Ok(false)` when nothing was mismatched (),
+/// refreshed, `Ok(false)` when nothing was mismatched,
 /// `Err` when a REINDEX failed — in which case NOTHING was refreshed.
 fn repair_database(
     superuser: &str,
