@@ -1010,7 +1010,12 @@ async fn leader_oldest_segment(host: &str, port: i64, config: &Config) -> Option
             "-c",
             "SELECT name FROM pg_ls_waldir() WHERE name ~ '^[0-9A-Fa-f]{24}$'",
         ])
-        .env("PGPASSWORD", &config.superuser_pass)
+        .env(
+            "PGPASSWORD",
+            super::read_credential_pin(&config.data_dir)
+                .map(|p| p.superuser_pass)
+                .unwrap_or_else(|| config.superuser_pass.clone()),
+        )
         .env("PGCONNECT_TIMEOUT", "5")
         .env_remove("PGHOST")
         .env_remove("PGPORT")
@@ -1948,7 +1953,10 @@ async fn confirm_replay_stall(
 
 async fn issue_reinitialize(client: &reqwest::Client) -> Result<()> {
     let body = serde_json::json!({ "force": true });
-    let resp = client.post(PATRONI_REINIT_URL).json(&body).send().await?;
+    let resp = super::rest::authenticate(client.post(PATRONI_REINIT_URL))
+        .json(&body)
+        .send()
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();

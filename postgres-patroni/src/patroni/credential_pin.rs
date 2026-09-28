@@ -36,7 +36,8 @@
 use anyhow::{Context, Result};
 use common::{ConfigExt, Telemetry, TelemetryEvent};
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use tracing::{info, warn};
 
 use super::config::Config;
@@ -116,10 +117,19 @@ pub fn write_credential_pin(data_dir: &str, creds: &PinnedCredentials) -> Result
     let path = pin_path(data_dir);
     let tmp = format!("{path}.tmp");
     let json = serde_json::to_string_pretty(creds).context("serialize credential pin")?;
-    std::fs::write(&tmp, json).with_context(|| format!("write {tmp}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod {tmp}"))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp} -> {path}"))?;
+    std::fs::File::open(data_dir)?.sync_all()?;
     Ok(())
 }
 

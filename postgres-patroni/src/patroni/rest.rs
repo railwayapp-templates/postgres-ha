@@ -35,7 +35,34 @@ pub fn client_for(cred: Option<&Credential>, timeout: Duration) -> Result<reqwes
 /// A client for `http://localhost:8008` with the process's REST credential
 /// preset (none when no password is configured).
 pub fn client(timeout: Duration) -> Result<reqwest::Client> {
-    client_for(restapi_auth_from_env().as_ref(), timeout)
+    client_for(active_credential().as_ref(), timeout)
+}
+
+fn active_credential() -> Option<Credential> {
+    let mut credential = restapi_auth_from_env();
+    if let Ok(body) = std::fs::read_to_string("/etc/patroni/patroni.yml") {
+        if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&body) {
+            if let (Some(username), Some(password)) = (
+                yaml["restapi"]["authentication"]["username"].as_str(),
+                yaml["restapi"]["authentication"]["password"].as_str(),
+            ) {
+                credential = Some(Credential {
+                    username: username.into(),
+                    password: password.into(),
+                });
+            }
+        }
+    }
+    credential
+}
+
+/// Long-lived watchers retain their HTTP pool, but every mutation takes the
+/// currently adopted credential instead of the default header captured at boot.
+pub fn authenticate(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match active_credential().as_ref().and_then(basic_auth_header) {
+        Some(header) => request.header(AUTHORIZATION, header),
+        None => request,
+    }
 }
 
 /// Test support: a one-shot HTTP server on a random loopback port that answers
