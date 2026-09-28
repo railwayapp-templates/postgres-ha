@@ -67,6 +67,11 @@
 
 set -u
 
+repo_path_is_usable() {
+  case "$1" in /*) ;; *) return 1 ;; esac
+  case "$1" in *$'\n'*|*$'\r'*) return 1 ;; esac
+}
+
 WAL_FILE="${1:-}"
 WAL_DEST="${2:-}"
 if [ -z "$WAL_FILE" ] || [ -z "$WAL_DEST" ]; then
@@ -128,8 +133,8 @@ fi
 # names the path the first attempt really runs with.
 USED_PATH="${PGBACKREST_REPO1_PATH:-}"
 if [ -f "$MARKER" ]; then
-  MARKER_PATH=$(tr -d '\n\r' <"$MARKER")
-  [ -n "$MARKER_PATH" ] && USED_PATH="$MARKER_PATH"
+  MARKER_PATH=$(cat "$MARKER")
+  repo_path_is_usable "$MARKER_PATH" && USED_PATH="$MARKER_PATH"
 fi
 if [ -n "$USED_PATH" ]; then
   export PGBACKREST_REPO1_PATH="$USED_PATH"
@@ -141,7 +146,7 @@ rc=$?
 
 DCS_PATH=$(curl -sf --max-time 2 http://localhost:8008/config 2>/dev/null \
   | python3 -c 'import json,sys; v = json.load(sys.stdin).get("pgbackrest_repo1_path") or ""; print(v if isinstance(v, str) else "")' 2>/dev/null)
-if [ -n "$DCS_PATH" ] && [ "$DCS_PATH" != "$USED_PATH" ]; then
+if repo_path_is_usable "$DCS_PATH" && [ "$DCS_PATH" != "$USED_PATH" ]; then
   PGBACKREST_REPO1_PATH="$DCS_PATH" pgbackrest --stanza=main archive-get "$WAL_FILE" "$WAL_DEST"
   retry_rc=$?
   if [ "$retry_rc" -eq 0 ]; then

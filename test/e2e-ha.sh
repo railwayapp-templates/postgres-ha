@@ -7073,7 +7073,108 @@ t_standalone_fresh_volume_archives_and_backs_up() {
   docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
+# Read the current prefix's catalog; historical log lines survive restarts.
+wait_for_full_in_current_repo() {
+  local container="$1" deadline=$(( $(date +%s) + ${2:-180} )) count
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    count=$(count_backups_of_type "$container" full)
+    [ "${count:-0}" -gt 0 ] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# Damaged stanza repair must preserve old objects, create a new full, and
+# (under Patroni) survive leadership transfer through the shared DCS path.
+run_half_stanza_recovery_case() {
+  local missing="$1" mode="$2" t="$3" scope="t-half-${mode}-${PG_VERSION}"
+  local leader n1='' n2='' n3='' etcd_hosts='' sa="${scope}-standalone" vol="${scope}-vol"
+  reset_bucket
+  if [ "$mode" = ha ]; then
+    etcd_hosts=$(setup_etcd_cluster "$scope")
+    read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher) -e WAL_BACKUP_HALF_STANZA_CONFIRM_SECONDS=10)
+    leader=$(wait_for_leader "$scope" 240) || { ko "$t" 'no leader'; teardown_scope "$scope"; return; }
+    wait_for_replication "$scope" 2 240 || { ko "$t" 'no replicas'; teardown_scope "$scope"; return; }
+  else
+    docker volume create --label "$HA_LABEL" "$vol" >/dev/null
+    _boot_standalone_archiving "$sa" "$vol" -e WAL_BACKUP_HALF_STANZA_CONFIRM_SECONDS=10 || { ko "$t" 'no standalone startup'; return; }
+    leader="$sa"
+  fi
+  wait_for_stanza_create "$leader" 90 && wait_for_full_in_current_repo "$leader" 180 || { ko "$t" 'no baseline full'; return; }
+  local old new='' before after deadline
+  old=$(docker exec "$leader" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path)
+  if [ "$mode" = ha ]; then docker stop -t 30 "$n1" "$n2" "$n3" >/dev/null; else docker stop -t 30 "$sa" >/dev/null; fi
+  if [ "$missing" = backup.info ]; then
+    mc "mc rm -r --force local/${BUCKET}${old}/backup/main" >/dev/null
+  else
+    mc "mc rm --force local/${BUCKET}${old}/archive/main/archive.info local/${BUCKET}${old}/archive/main/archive.info.copy" >/dev/null
+  fi
+  before=$(mc "mc find local/${BUCKET}${old}" | sort)
+  if [ "$mode" = ha ]; then
+    docker start "$n1" "$n2" "$n3" >/dev/null
+    leader=$(wait_for_leader "$scope" 240) || { ko "$t" 'no restarted leader'; return; }
+  else docker start "$sa" >/dev/null; fi
+  deadline=$(( $(date +%s) + 180 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    new=$(docker exec "$leader" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path 2>/dev/null)
+    [ -n "$new" ] && [ "$new" != "$old" ] && break
+    sleep 2
+  done
+  if [ -z "$new" ] || [ "$new" = "$old" ]; then ko "$t" 'did not migrate damaged stanza'; fail_dump "$t" "$leader"; return; fi
+  wait_for_full_in_current_repo "$leader" 180 || { ko "$t" 'no full at repaired prefix'; fail_dump "$t" "$leader"; return; }
+  after=$(mc "mc find local/${BUCKET}${old}" | sort)
+  if [ -n "$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))" ]; then ko "$t" 'old objects were deleted'; return; fi
+  if [ "$mode" = ha ]; then
+    # Invalid DCS input must not undo the valid local repair.
+    docker exec "$leader" curl -sf -X PATCH -H 'Content-Type: application/json' -d '{"pgbackrest_repo1_path":"C:/invalid"}' http://localhost:8008/config >/dev/null
+    deadline=$(( $(date +%s) + 60 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      [ "$(docker exec "$leader" curl -sf http://localhost:8008/config | jq -r .pgbackrest_repo1_path)" = "$new" ] && break
+      sleep 2
+    done
+    [ "$(docker exec "$leader" curl -sf http://localhost:8008/config | jq -r .pgbackrest_repo1_path)" = "$new" ] || { ko "$t" 'invalid DCS path not repaired'; return; }
+    docker stop -t 30 "$leader" >/dev/null
+    leader=$(wait_for_leader "$scope" 240) || { ko "$t" 'failover failed'; return; }
+    deadline=$(( $(date +%s) + 90 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      [ "$(docker exec "$leader" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path 2>/dev/null)" = "$new" ] && break
+      sleep 2
+    done
+    [ "$(docker exec "$leader" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path)" = "$new" ] || { ko "$t" 'promoted node lost repaired path'; return; }
+    teardown_scope "$scope"
+  else docker rm -f "$sa" >/dev/null; docker volume rm "$vol" >/dev/null; fi
+  ok "$t"
+}
+
+t_ha_half_stanza_preserves_path_across_failover() {
+  run_half_stanza_recovery_case archive.info ha "${FUNCNAME[0]}"
+}
+t_standalone_half_stanza_takes_new_full() {
+  run_half_stanza_recovery_case backup.info standalone "${FUNCNAME[0]}"
+}
+
+t_standalone_invalid_repo_marker_is_rederived() {
+  local t="${FUNCNAME[0]}" name="t-invalid-marker-${PG_VERSION}" vol="t-invalid-marker-${PG_VERSION}-vol"
+  reset_bucket
+  docker volume create --label "$HA_LABEL" "$vol" >/dev/null
+  _boot_standalone_archiving "$name" "$vol" || { ko "$t" 'initial boot'; return; }
+  wait_for_full_in_current_repo "$name" 180 || { ko "$t" 'initial full'; return; }
+  docker stop -t 30 "$name" >/dev/null
+  docker run --rm -v "$vol:/v" --entrypoint sh "$IMAGE" -c "printf 'C:/invalid\n' > /v/pgdata/.pgbackrest_repo_path"
+  _boot_standalone_archiving "$name" "$vol" -e WAL_ARCHIVE_PATH=/repaired || { ko "$t" 'repaired boot'; return; }
+  local path
+  path=$(docker exec "$name" cat /var/lib/postgresql/data/pgdata/.pgbackrest_repo_path)
+  case "$path" in /repaired/cluster-*) ;; *) ko "$t" "unrepaired marker: $path"; return ;; esac
+  wait_for_stanza_create "$name" 90 && wait_for_full_in_current_repo "$name" 180 || { ko "$t" 'no full under repaired path'; return; }
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+  ok "$t"
+}
+
 ALL_TESTS=(
+  t_ha_half_stanza_preserves_path_across_failover
+  t_standalone_half_stanza_takes_new_full
+  t_standalone_invalid_repo_marker_is_rederived
   # ----- translated from postgres-ssl/test/e2e.sh -----
   t_vanilla_boot
   t_archiving_boot
