@@ -217,13 +217,9 @@ struct StallConfig {
     /// turning an indefinite hang into a retry within the hour.
     floor_seconds: u64,
     /// `WAL_BACKUP_STALL_MIN_BYTES_PER_SECOND` (default 4 MiB/s): scales the
-    /// window with the backup's size. pgBackRest refreshes the progress it
-    /// reports only when percent-complete moves by more than 10 points
-    /// (src/command/backup/backup.c, backupJobCallback:
-    /// `if (percentComplete - *currentPercentComplete > 10)` →
-    /// cmdLockWriteP), so reported bytes advance in ~11 % steps. The window is max(floor, 11 % of size / this
-    /// rate): only a backup copying slower than 4 MiB/s sustained could be
-    /// cut, and at that rate a 1 TiB backup would take three days.
+    /// window with the backup's size. pgBackRest stores percent-complete in
+    /// hundredths (100% == 10000); its >10 threshold is >0.10 percentage
+    /// points. Allow 0.11% at this rate, plus the phase floor above.
     min_bytes_per_second: u64,
     /// `WAL_BACKUP_STALL_POLL_SECONDS` (default 60): progress probe cadence.
     poll_seconds: u64,
@@ -849,27 +845,46 @@ fn parse_has_full(info_json: &str) -> Result<bool> {
 /// `None` on timeout (60 s), spawn failure, non-zero exit, or empty output —
 /// callers treat all of those as inconclusive.
 async fn pgbackrest_info_json() -> Option<String> {
-    let out = tokio::time::timeout(
-        Duration::from_secs(60),
-        Command::new("pgbackrest")
-            .args(["--stanza=main", "--repo=1", "info", "--output=json"])
-            .env_remove("PGHOST")
-            .env_remove("PGPORT")
-            .output(),
-    )
+    let mut command = Command::new("pgbackrest");
+    command
+        .args(["--stanza=main", "--repo=1", "info", "--output=json"])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT");
+    bounded_info_output(&mut command, Duration::from_secs(60)).await
+}
+
+/// Drain stdout while waiting, and kill/reap an expired probe explicitly.
+async fn bounded_info_output(command: &mut Command, limit: Duration) -> Option<String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut read = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let result = tokio::time::timeout(limit, async {
+        let status = child.wait().await.ok()?;
+        if !status.success() {
+            return None;
+        }
+        let bytes = (&mut read).await.ok()?.ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    })
     .await;
-    let out = match out {
-        Ok(Ok(o)) => o,
-        _ => return None,
-    };
-    if !out.status.success() {
-        return None;
+    match result {
+        Ok(Some(output)) if !output.trim().is_empty() => Some(output),
+        _ => {
+            read.abort();
+            let _ = child.kill().await;
+            None
+        }
     }
-    let info_json = String::from_utf8_lossy(&out.stdout).into_owned();
-    if info_json.trim().is_empty() {
-        return None;
-    }
-    Some(info_json)
 }
 
 /// Probe the S3 catalog for repo1 and classify into the three states above.
@@ -2525,14 +2540,14 @@ fn parse_backup_progress(info_json: &str) -> Option<BackupProgress> {
 }
 
 /// Effective stall window for a backup of `size` bytes (0 = not reported
-/// yet): max(floor, 11 % of size / min rate). See `StallConfig`.
+/// yet): max(floor, 0.11 % of size / min rate). See `StallConfig`.
 fn backup_stall_window(size: u64, cfg: &StallConfig) -> u64 {
-    let scaled = size / 100 * 11 / cfg.min_bytes_per_second.max(1);
+    let scaled = size / 10_000 * 11 / cfg.min_bytes_per_second.max(1);
     scaled.max(cfg.floor_seconds)
 }
 
 /// Pure stall bookkeeping: feed it every probe result, ask it whether the
-/// backup has stalled. A failed probe (`None`) never counts as progress.
+/// backup has stalled. An inconclusive probe resets the observation window.
 #[derive(Debug)]
 struct StallTracker {
     last: Option<BackupProgress>,
@@ -2553,6 +2568,11 @@ impl StallTracker {
                 self.last = Some(p);
                 self.last_progress_at = now;
             }
+        } else {
+            // Telemetry failure is not evidence that the backup stopped.
+            // Require a full fresh window after observations resume.
+            self.last = None;
+            self.last_progress_at = now;
         }
     }
 
@@ -2565,7 +2585,9 @@ impl StallTracker {
     }
 
     fn is_stalled(&self, now: i64, cfg: &StallConfig) -> bool {
-        cfg.floor_seconds > 0 && self.stalled_for(now) >= backup_stall_window(self.size(), cfg)
+        self.last.is_some()
+            && cfg.floor_seconds > 0
+            && self.stalled_for(now) >= backup_stall_window(self.size(), cfg)
     }
 }
 
@@ -4129,10 +4151,11 @@ mod stall_tests {
     fn window_is_floor_until_size_known_then_scales() {
         let c = cfg();
         assert_eq!(backup_stall_window(0, &c), 1800);
-        // A 112 GiB backup: one ~11 % progress step at 4 MiB/s ≈ 53 min.
-        assert_eq!(backup_stall_window(112 * GIB, &c), 3153);
-        // 1 TiB: ~8 h between progress steps is still not a stall.
-        assert_eq!(backup_stall_window(1024 * GIB, &c), 28835);
+        // Progress granularity is 0.11%, so ordinary backups keep the floor.
+        assert_eq!(backup_stall_window(112 * GIB, &c), 1800);
+        // A stalled 1 TiB backup must not wait eight hours.
+        assert_eq!(backup_stall_window(1024 * GIB, &c), 1800);
+        assert_eq!(backup_stall_window(100 * 1024 * GIB, &c), 28835);
         // Small backups keep the floor.
         assert_eq!(backup_stall_window(GIB, &c), 1800);
     }
@@ -4177,12 +4200,12 @@ mod stall_tests {
     #[test]
     fn progressing_backup_is_never_a_stall() {
         // A 2 TiB full copying at a slow 5 MiB/s, observed every minute for
-        // ~5 days: reported bytes only move in ~11 % steps (~12.8 h apart),
+        // ~5 days: reported bytes move in ~0.11 % steps,
         // yet it is never cut.
         let c = cfg();
         let size = 2048 * GIB;
         let rate = 5u64 << 20;
-        let step = size / 100 * 11;
+        let step = size / 10_000 * 11;
         let mut t = StallTracker::new(0);
         let mut now = 0i64;
         while (now as u64) * rate < size {
@@ -4194,14 +4217,39 @@ mod stall_tests {
     }
 
     #[test]
-    fn failed_probes_never_count_as_progress() {
+    fn failed_probes_reset_the_observation_window() {
         let c = cfg();
         let mut t = StallTracker::new(0);
         t.observe(60, copying(1, 10));
         for now in (120..=1860).step_by(60) {
             t.observe(now, None);
         }
-        assert!(t.is_stalled(1860, &c));
+        assert!(!t.is_stalled(1860, &c));
+        t.observe(1920, copying(1, 10));
+        assert!(!t.is_stalled(3719, &c));
+        t.observe(3720, copying(1, 10));
+        assert!(t.is_stalled(3720, &c));
+    }
+
+    #[tokio::test]
+    async fn expired_info_probe_is_killed_and_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "probe"])
+            .arg(&pidfile);
+        assert!(
+            super::bounded_info_output(&mut command, Duration::from_millis(300))
+                .await
+                .is_none()
+        );
+        let pid: u32 = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!alive(pid), "expired info process survived timeout");
     }
 
     #[test]
