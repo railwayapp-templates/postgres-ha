@@ -1135,7 +1135,7 @@ async fn log_catalog_probe_error() {
 async fn stanza_create_step(
     data_dir: &str,
     config: &WatcherConfig,
-    client: &reqwest::Client,
+    client: &Coordinator,
     stats: &ArchiverStats,
 ) {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
@@ -1316,7 +1316,7 @@ fn decide_half_stanza(
 async fn half_created_stanza_step(
     data_dir: &str,
     config: &WatcherConfig,
-    client: &reqwest::Client,
+    client: &Coordinator,
     stats: &ArchiverStats,
     kind: HalfStanzaKind,
 ) {
