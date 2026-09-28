@@ -1601,7 +1601,7 @@ async fn converge_repo_path_with_patroni_dcs(data_dir: &str, client: &Coordinato
 
     let active = env::var("PGBACKREST_REPO1_PATH")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| crate::pgbackrest::repo_path_is_usable(s));
     let dcs = patroni_dcs_repo_path(client).await?;
     match (active, dcs) {
         (Some(active), Some(dcs_path)) if active != dcs_path => {

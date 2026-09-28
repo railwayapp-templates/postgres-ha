@@ -7126,7 +7126,7 @@ run_half_stanza_recovery_case() {
   if [ -n "$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))" ]; then ko "$t" 'old objects were deleted'; return; fi
   if [ "$mode" = ha ]; then
     # Invalid DCS input must not undo the valid local repair.
-    docker exec "$leader" curl -sf -X PATCH -H 'Content-Type: application/json' -d '{"pgbackrest_repo1_path":"C:/invalid"}' http://localhost:8008/config >/dev/null
+    docker exec "$leader" curl -sf -u postgres:test -X PATCH -H 'Content-Type: application/json' -d '{"pgbackrest_repo1_path":"C:/invalid"}' http://localhost:8008/config >/dev/null
     deadline=$(( $(date +%s) + 60 ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
       [ "$(docker exec "$leader" curl -sf http://localhost:8008/config | jq -r .pgbackrest_repo1_path)" = "$new" ] && break
