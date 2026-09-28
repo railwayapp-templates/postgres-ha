@@ -7202,17 +7202,28 @@ t_ha_credentials_rotate_route() {
     fail_dump "$t" "$leader" "${scope}-etcd-1"
     teardown_scope "$scope"; return
   fi
+  # An election can change the leader while the replication wait runs. Pick
+  # the writable member again before making the fixture and assigning peers.
+  local probe_written=false probe_error=''
+  for _ in $(seq 1 30); do
+    leader=$(wait_for_leader "$scope" 10) || { sleep 2; continue; }
+    if probe_error=$(psql_leader "$leader" -v ON_ERROR_STOP=1 -c \
+      "CREATE TABLE IF NOT EXISTS rotate_probe (id int PRIMARY KEY); INSERT INTO rotate_probe VALUES (1) ON CONFLICT DO NOTHING" 2>&1); then
+      probe_written=true
+      break
+    fi
+    sleep 2
+  done
+  if [ "$probe_written" != true ]; then
+    ko "$t" "could not write the probe row before the rotation: $probe_error"
+    teardown_scope "$scope"; return
+  fi
   # The member that sits out the rotation and the one rotated live.
   local stopped="" replica=""
   for n in "$n3" "$n2" "$n1"; do
     if [ "$n" != "$leader" ] && [ -z "$stopped" ]; then stopped="$n"; continue; fi
     if [ "$n" != "$leader" ] && [ -z "$replica" ]; then replica="$n"; fi
   done
-  psql_leader "$leader" -v ON_ERROR_STOP=1 -c \
-    "CREATE TABLE rotate_probe (id int PRIMARY KEY); INSERT INTO rotate_probe VALUES (1)" >/dev/null || {
-      ko "$t" "could not write the probe row before the rotation"
-      teardown_scope "$scope"; return
-    }
   local auth_status
   auth_status=$(docker exec "${scope}-etcd-1" etcdctl --user=root:test auth status 2>/dev/null)
   if ! echo "$auth_status" | grep -q "Authentication Status: true"; then
