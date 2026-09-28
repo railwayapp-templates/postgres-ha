@@ -61,6 +61,12 @@ pub fn wal_archive_enabled() -> bool {
 /// has only repo1 (the service's archive bucket). Mirrors postgres-ssl
 /// PR #49.
 pub fn translate_wal_env_to_pgbackrest() {
+    let configured = env::var("WAL_ARCHIVE_PATH").unwrap_or_default();
+    if !configured.is_empty() && !crate::pgbackrest::repo_path_is_usable(&configured) {
+        warn!("pgbackrest: invalid WAL_ARCHIVE_PATH; using /pgbackrest");
+        env::set_var("WAL_ARCHIVE_PATH", "/pgbackrest");
+    }
+
     let archive = env::var("WAL_ARCHIVE_BUCKET")
         .ok()
         .filter(|s| !s.is_empty());

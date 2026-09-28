@@ -1659,7 +1659,6 @@ async fn async_main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .is_some()
         && Path::new(&format!("{}/global/pg_control", config.data_dir)).exists()
-        && !Path::new(&format!("{}/.pgbackrest_repo_path", config.data_dir)).exists()
     {
         let repo_path = derive_pgbackrest_repo_path(&config.data_dir);
         info!(

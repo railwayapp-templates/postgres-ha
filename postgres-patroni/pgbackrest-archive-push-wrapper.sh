@@ -49,6 +49,11 @@
 
 set -u
 
+repo_path_is_usable() {
+  case "$1" in /*) ;; *) return 1 ;; esac
+  case "$1" in *$'\n'*|*$'\r'*) return 1 ;; esac
+}
+
 WAL_FILE="${1:-}"
 if [ -z "$WAL_FILE" ]; then
   echo "pgbackrest-wrapper: missing WAL file argument" >&2
@@ -84,8 +89,10 @@ PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 # collide on stanza identity. With it, archive-push targets
 # ${WAL_ARCHIVE_PATH}/cluster-<sysid>.
 if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
-  PGBACKREST_REPO1_PATH=$(cat "$PGDATA/.pgbackrest_repo_path")
-  export PGBACKREST_REPO1_PATH
+  marker_path=$(cat "$PGDATA/.pgbackrest_repo_path")
+  if repo_path_is_usable "$marker_path"; then
+    export PGBACKREST_REPO1_PATH="$marker_path"
+  fi
 fi
 
 # pgBackRest 2.58 rejects --repo on archive-push (it pushes to whatever

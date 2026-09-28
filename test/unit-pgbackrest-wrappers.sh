@@ -149,29 +149,29 @@ t_replica_restore_bucket_unset_noop() {
 
 t_replica_restore_dcs_path_wins_over_marker_and_env() {
   setup
-  echo "s3-path-from-marker" > "$(marker_path)"
-  dcs_json_for "s3-path-from-dcs"
-  echo "s3-path-from-dcs" > "$TMPROOT/control/success_path"
-  WAL_ARCHIVE_BUCKET=bucket PGBACKREST_REPO1_PATH=s3-path-from-env run "$RESTORE_WRAPPER"
+  echo "/s3-path-from-marker" > "$(marker_path)"
+  dcs_json_for "/s3-path-from-dcs"
+  echo "/s3-path-from-dcs" > "$TMPROOT/control/success_path"
+  WAL_ARCHIVE_BUCKET=bucket PGBACKREST_REPO1_PATH=/s3-path-from-env run "$RESTORE_WRAPPER"
   local rc; rc=$(exit_code)
   if [ "$rc" != "0" ]; then ko "$FUNCNAME" "expected exit 0, got $rc; output: $(cat "$TMPROOT/control/output")"; teardown; return; fi
-  if ! grep -q "call: s3-path-from-dcs" "$TMPROOT/control/pgbackrest_calls.log"; then
+  if ! grep -q "call: /s3-path-from-dcs" "$TMPROOT/control/pgbackrest_calls.log"; then
     ko "$FUNCNAME" "pgbackrest was not called with the DCS-resolved path: $(cat "$TMPROOT/control/pgbackrest_calls.log")"; teardown; return
   fi
-  assert_eq "$(marker_content)" "s3-path-from-dcs" "marker must be rewritten to the path actually used" || { ko "$FUNCNAME" "marker mismatch"; teardown; return; }
+  assert_eq "$(marker_content)" "/s3-path-from-dcs" "marker must be rewritten to the path actually used" || { ko "$FUNCNAME" "marker mismatch"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
 
 t_replica_restore_falls_back_to_marker_when_dcs_unreachable() {
   setup
-  echo "s3-path-from-marker" > "$(marker_path)"
+  echo "/s3-path-from-marker" > "$(marker_path)"
   touch "$TMPROOT/control/dcs_unreachable"
-  echo "s3-path-from-marker" > "$TMPROOT/control/success_path"
+  echo "/s3-path-from-marker" > "$TMPROOT/control/success_path"
   WAL_ARCHIVE_BUCKET=bucket run "$RESTORE_WRAPPER"
   local rc; rc=$(exit_code)
   if [ "$rc" != "0" ]; then ko "$FUNCNAME" "expected exit 0, got $rc; output: $(cat "$TMPROOT/control/output")"; teardown; return; fi
-  if ! grep -q "call: s3-path-from-marker" "$TMPROOT/control/pgbackrest_calls.log"; then
+  if ! grep -q "call: /s3-path-from-marker" "$TMPROOT/control/pgbackrest_calls.log"; then
     ko "$FUNCNAME" "pgbackrest was not called with the marker path"; teardown; return
   fi
   ok "$FUNCNAME"
@@ -184,20 +184,20 @@ t_replica_restore_falls_back_to_env_default_and_writes_marker_on_success() {
   # from python3's perspective), env default is what pgbackrest is told to
   # accept — proving success writes the marker even on the env-default path.
   : > "$TMPROOT/control/dcs_response"
-  echo "bucket-root" > "$TMPROOT/control/success_path"
-  WAL_ARCHIVE_BUCKET=bucket PGBACKREST_REPO1_PATH=bucket-root run "$RESTORE_WRAPPER"
+  echo "/bucket-root" > "$TMPROOT/control/success_path"
+  WAL_ARCHIVE_BUCKET=bucket PGBACKREST_REPO1_PATH=/bucket-root run "$RESTORE_WRAPPER"
   local rc; rc=$(exit_code)
   if [ "$rc" != "0" ]; then ko "$FUNCNAME" "expected exit 0, got $rc; output: $(cat "$TMPROOT/control/output")"; teardown; return; fi
-  assert_eq "$(marker_content)" "bucket-root" "env-default success must still write the marker" || { ko "$FUNCNAME" "marker mismatch"; teardown; return; }
+  assert_eq "$(marker_content)" "/bucket-root" "env-default success must still write the marker" || { ko "$FUNCNAME" "marker mismatch"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
 
 t_replica_restore_null_dcs_value_falls_through_to_marker() {
   setup
-  echo "s3-path-from-marker" > "$(marker_path)"
+  echo "/s3-path-from-marker" > "$(marker_path)"
   printf '{"pgbackrest_repo1_path":null}' > "$TMPROOT/control/dcs_response"
-  echo "s3-path-from-marker" > "$TMPROOT/control/success_path"
+  echo "/s3-path-from-marker" > "$TMPROOT/control/success_path"
   WAL_ARCHIVE_BUCKET=bucket run "$RESTORE_WRAPPER"
   local rc; rc=$(exit_code)
   if [ "$rc" != "0" ]; then ko "$FUNCNAME" "a JSON null pgbackrest_repo1_path must fall through to the marker, got rc=$rc: $(cat "$TMPROOT/control/output")"; teardown; return; fi
@@ -207,13 +207,13 @@ t_replica_restore_null_dcs_value_falls_through_to_marker() {
 
 t_replica_restore_failure_never_writes_marker() {
   setup
-  echo "old-marker-value" > "$(marker_path)"
-  dcs_json_for "some-path"
+  echo "/old-marker-value" > "$(marker_path)"
+  dcs_json_for "/some-path"
   echo "2" > "$TMPROOT/control/fail_code"   # no success_path -> pgbackrest always fails
   WAL_ARCHIVE_BUCKET=bucket run "$RESTORE_WRAPPER"
   local rc; rc=$(exit_code)
   assert_eq "$rc" "2" "the wrapper must propagate pgbackrest's real exit code" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
-  assert_eq "$(marker_content)" "old-marker-value" "a failed restore must never overwrite an existing marker" || { ko "$FUNCNAME" "marker was overwritten on failure"; teardown; return; }
+  assert_eq "$(marker_content)" "/old-marker-value" "a failed restore must never overwrite an existing marker" || { ko "$FUNCNAME" "marker was overwritten on failure"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
@@ -221,8 +221,8 @@ t_replica_restore_failure_never_writes_marker() {
 t_replica_restore_creates_missing_pgdata_dir() {
   setup
   rm -rf "$TMPROOT/pgdata"   # wiped-volume scenario: not even the dir exists
-  dcs_json_for "some-path"
-  echo "some-path" > "$TMPROOT/control/success_path"
+  dcs_json_for "/some-path"
+  echo "/some-path" > "$TMPROOT/control/success_path"
   WAL_ARCHIVE_BUCKET=bucket run "$RESTORE_WRAPPER"
   local rc; rc=$(exit_code)
   if [ "$rc" != "0" ]; then ko "$FUNCNAME" "expected exit 0, got $rc: $(cat "$TMPROOT/control/output")"; teardown; return; fi
@@ -233,8 +233,8 @@ t_replica_restore_creates_missing_pgdata_dir() {
 
 t_replica_restore_marker_written_atomically_no_tmp_leftover() {
   setup
-  dcs_json_for "some-path"
-  echo "some-path" > "$TMPROOT/control/success_path"
+  dcs_json_for "/some-path"
+  echo "/some-path" > "$TMPROOT/control/success_path"
   WAL_ARCHIVE_BUCKET=bucket run "$RESTORE_WRAPPER"
   local rc; rc=$(exit_code)
   if [ "$rc" != "0" ]; then ko "$FUNCNAME" "expected exit 0, got $rc"; teardown; return; fi
@@ -277,8 +277,8 @@ t_archive_get_usage_error_on_missing_args() {
 
 t_archive_get_marker_hit_never_queries_dcs() {
   setup
-  echo "correct-path" > "$(marker_path)"
-  echo "correct-path" > "$TMPROOT/control/success_path"
+  echo "/correct-path" > "$(marker_path)"
+  echo "/correct-path" > "$TMPROOT/control/success_path"
   WAL_ARCHIVE_BUCKET=bucket run "$ARCHIVE_GET_WRAPPER" "000000010000000000000001" "/tmp/dest"
   local rc; rc=$(exit_code)
   if [ "$rc" != "0" ]; then ko "$FUNCNAME" "expected exit 0, got $rc: $(cat "$TMPROOT/control/output")"; teardown; return; fi
@@ -291,11 +291,11 @@ t_archive_get_marker_hit_never_queries_dcs() {
 t_archive_get_empty_marker_falls_back_to_env_default() {
   setup
   : > "$(marker_path)"   # present but empty — truncated write / fresh file
-  echo "env-default-path" > "$TMPROOT/control/success_path"
-  WAL_ARCHIVE_BUCKET=bucket PGBACKREST_REPO1_PATH=env-default-path run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  echo "/env-default-path" > "$TMPROOT/control/success_path"
+  WAL_ARCHIVE_BUCKET=bucket PGBACKREST_REPO1_PATH=/env-default-path run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   local rc; rc=$(exit_code)
   if [ "$rc" != "0" ]; then ko "$FUNCNAME" "expected exit 0, got $rc: $(cat "$TMPROOT/control/output")"; teardown; return; fi
-  if ! grep -q "call: env-default-path" "$TMPROOT/control/pgbackrest_calls.log"; then
+  if ! grep -q "call: /env-default-path" "$TMPROOT/control/pgbackrest_calls.log"; then
     ko "$FUNCNAME" "an empty marker must fall back to the inherited env default, not run with an empty path"; teardown; return
   fi
   ok "$FUNCNAME"
@@ -304,29 +304,29 @@ t_archive_get_empty_marker_falls_back_to_env_default() {
 
 t_archive_get_stale_marker_falls_back_to_dcs_and_rewrites() {
   setup
-  echo "stale-marker-path" > "$(marker_path)"
-  dcs_json_for "current-dcs-path"
-  echo "current-dcs-path" > "$TMPROOT/control/success_path"
+  echo "/stale-marker-path" > "$(marker_path)"
+  dcs_json_for "/current-dcs-path"
+  echo "/current-dcs-path" > "$TMPROOT/control/success_path"
   WAL_ARCHIVE_BUCKET=bucket run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   local rc; rc=$(exit_code)
   if [ "$rc" != "0" ]; then ko "$FUNCNAME" "expected exit 0, got $rc: $(cat "$TMPROOT/control/output")"; teardown; return; fi
   assert_eq "$(pgbackrest_call_count)" "2" "must try the marker path, miss, then retry at the DCS path" || { ko "$FUNCNAME" "call count mismatch: $(cat "$TMPROOT/control/pgbackrest_calls.log")"; teardown; return; }
   assert_eq "$(curl_call_count)" "1" "must consult DCS exactly once after the marker miss" || { ko "$FUNCNAME" "curl call count mismatch"; teardown; return; }
-  assert_eq "$(marker_content)" "current-dcs-path" "marker must be rewritten to the DCS-resolved path that actually worked" || { ko "$FUNCNAME" "marker not rewritten"; teardown; return; }
+  assert_eq "$(marker_content)" "/current-dcs-path" "marker must be rewritten to the DCS-resolved path that actually worked" || { ko "$FUNCNAME" "marker not rewritten"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
 
 t_archive_get_genuine_miss_dcs_agrees_no_second_attempt() {
   setup
-  echo "current-path" > "$(marker_path)"
-  dcs_json_for "current-path"   # DCS agrees with the marker: a real miss, not staleness
+  echo "/current-path" > "$(marker_path)"
+  dcs_json_for "/current-path"   # DCS agrees with the marker: a real miss, not staleness
   echo "1" > "$TMPROOT/control/fail_code"   # pgbackrest miss semantics: exit 1
   WAL_ARCHIVE_BUCKET=bucket run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   local rc; rc=$(exit_code)
   assert_eq "$rc" "1" "a genuine miss (segment not archived yet) must return pgbackrest's miss code" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
   assert_eq "$(pgbackrest_call_count)" "1" "when DCS agrees with the marker there is nothing to retry — must not call pgbackrest a second time" || { ko "$FUNCNAME" "unexpected retry: $(cat "$TMPROOT/control/pgbackrest_calls.log")"; teardown; return; }
-  assert_eq "$(marker_content)" "current-path" "marker must be untouched on a genuine miss" || { ko "$FUNCNAME" "marker changed unexpectedly"; teardown; return; }
+  assert_eq "$(marker_content)" "/current-path" "marker must be untouched on a genuine miss" || { ko "$FUNCNAME" "marker changed unexpectedly"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
@@ -384,8 +384,8 @@ t_archive_get_success_resets_breaker() {
   echo "103" > "$TMPROOT/control/fail_code"
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
-  echo "env-path" > "$TMPROOT/control/success_path"
-  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 PGBACKREST_REPO1_PATH=env-path run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
+  echo "/env-path" > "$TMPROOT/control/success_path"
+  WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 PGBACKREST_REPO1_PATH=/env-path run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   assert_eq "$(exit_code)" "0" "recovered endpoint must serve the segment" || { ko "$FUNCNAME" "success rc"; teardown; return; }
   if [ -f "$(breaker_path)" ]; then ko "$FUNCNAME" "success must clear the breaker"; teardown; return; fi
   ok "$FUNCNAME"
@@ -458,7 +458,7 @@ t_archive_get_legacy_count_only_breaker_restarts() {
 
 t_archive_get_dcs_unreachable_on_miss_returns_original_failure() {
   setup
-  echo "marker-path" > "$(marker_path)"
+  echo "/marker-path" > "$(marker_path)"
   touch "$TMPROOT/control/dcs_unreachable"
   echo "5" > "$TMPROOT/control/fail_code"
   WAL_ARCHIVE_BUCKET=bucket run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
@@ -477,14 +477,14 @@ t_archive_get_double_miss_returns_retry_exit_code() {
   # untouched); the distinct-code case is covered by
   # t_archive_get_dcs_retry_miss_clears_breaker below.
   setup
-  echo "marker-path" > "$(marker_path)"
-  dcs_json_for "dcs-path"
+  echo "/marker-path" > "$(marker_path)"
+  dcs_json_for "/dcs-path"
   echo "9" > "$TMPROOT/control/fail_code"   # no success_path -> every attempt fails with 9
   WAL_ARCHIVE_BUCKET=bucket run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   local rc; rc=$(exit_code)
   assert_eq "$rc" "9" "double-miss must surface the failing exit code" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
   assert_eq "$(pgbackrest_call_count)" "2" "must attempt both marker and DCS paths before giving up" || { ko "$FUNCNAME" "call count mismatch"; teardown; return; }
-  assert_eq "$(marker_content)" "marker-path" "a failed retry must never rewrite the marker" || { ko "$FUNCNAME" "marker changed on failed retry"; teardown; return; }
+  assert_eq "$(marker_content)" "/marker-path" "a failed retry must never rewrite the marker" || { ko "$FUNCNAME" "marker changed on failed retry"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
@@ -499,23 +499,42 @@ t_archive_get_dcs_retry_miss_clears_breaker() {
   # path's 103 would count a healthy catching-up standby toward the
   # connectivity trip on every not-yet-archived segment.
   setup
-  echo "marker-path" > "$(marker_path)"
-  dcs_json_for "dcs-path"
+  echo "/marker-path" > "$(marker_path)"
+  dcs_json_for "/dcs-path"
   echo "103" > "$TMPROOT/control/fail_code"      # stale-path attempt: connectivity-class
-  echo "dcs-path" > "$TMPROOT/control/miss_path" # DCS retry: repo answers, file absent
+  echo "/dcs-path" > "$TMPROOT/control/miss_path" # DCS retry: repo answers, file absent
   # Pre-seed a breaker count to prove the miss CLEARS it, not just fails to bump it.
   printf '2 %s\n' "$(date +%s)" > "$(breaker_path)"
   WAL_ARCHIVE_BUCKET=bucket run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   assert_eq "$(exit_code)" "1" "the DCS retry's genuine miss must win over the stale path's 103" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
   assert_eq "$(pgbackrest_call_count)" "2" "must attempt both marker and DCS paths" || { ko "$FUNCNAME" "call count mismatch"; teardown; return; }
   if [ -f "$(breaker_path)" ]; then ko "$FUNCNAME" "a DCS-path miss proves connectivity and must clear the breaker"; teardown; return; fi
-  assert_eq "$(marker_content)" "marker-path" "a miss can't vouch for the path; marker must not be rewritten" || { ko "$FUNCNAME" "marker changed on miss"; teardown; return; }
+  assert_eq "$(marker_content)" "/marker-path" "a miss can't vouch for the path; marker must not be rewritten" || { ko "$FUNCNAME" "marker changed on miss"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }
 
 # =============================================================================
+t_invalid_marker_and_dcs_never_override_valid_env() {
+  local wrapper bad
+  for wrapper in "$RESTORE_WRAPPER" "$ARCHIVE_GET_WRAPPER"; do
+    for bad in 'C:/invalid' 'relative' $'/valid\n/second' $'/valid\r'; do
+      setup
+      printf '%s' "$bad" > "$(marker_path)"
+      python3 -c 'import json,sys; print(json.dumps({"pgbackrest_repo1_path":sys.argv[1]}))' "$bad" > "$TMPROOT/control/dcs_response"
+      echo /env-valid > "$TMPROOT/control/success_path"
+      WAL_ARCHIVE_BUCKET=bucket PGBACKREST_REPO1_PATH=/env-valid run "$wrapper" wal /tmp/dest
+      if [ "$(exit_code)" != 0 ]; then
+        ko "$FUNCNAME" "$wrapper adopted invalid path: $(cat "$TMPROOT/control/output")"; teardown; return
+      fi
+      teardown
+    done
+  done
+  ok "$FUNCNAME"
+}
+
 ALL_TESTS=(
+  t_invalid_marker_and_dcs_never_override_valid_env
   t_replica_restore_bucket_unset_noop
   t_replica_restore_dcs_path_wins_over_marker_and_env
   t_replica_restore_falls_back_to_marker_when_dcs_unreachable

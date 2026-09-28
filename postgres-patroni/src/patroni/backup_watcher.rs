@@ -518,7 +518,7 @@ fn sync_repo_path_from_marker(data_dir: &str) {
     let marker = format!("{data_dir}/{REPO_PATH_MARKER}");
     if let Ok(value) = fs::read_to_string(&marker) {
         let trimmed = value.trim();
-        if !trimmed.is_empty() {
+        if crate::pgbackrest::repo_path_is_usable(trimmed) {
             env::set_var("PGBACKREST_REPO1_PATH", trimmed);
         }
     }
@@ -1508,8 +1508,8 @@ fn rewrite_pgbackrest_conf_path(data_dir: &str, path: &str) -> Result<()> {
 /// atomically (read by archive-push on every WAL), rewrites pgbackrest.conf for
 /// bare-shell diagnostics, and updates this watcher's process env. Idempotent.
 fn apply_active_path(data_dir: &str, path: &str) -> Result<()> {
-    if path.is_empty() {
-        anyhow::bail!("empty repo path");
+    if !crate::pgbackrest::repo_path_is_usable(path) {
+        anyhow::bail!("unusable repo path");
     }
     let marker = repo_path_marker(data_dir);
     let tmp = format!("{marker}.{}", std::process::id());
@@ -1539,7 +1539,7 @@ async fn patroni_dcs_repo_path(client: &Coordinator) -> Result<Option<String>> {
         .get(PATRONI_REPO_PATH_CONFIG_KEY)
         .and_then(|v| v.as_str())
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| crate::pgbackrest::repo_path_is_usable(s))
         .map(ToOwned::to_owned))
 }
 
@@ -1601,7 +1601,7 @@ async fn converge_repo_path_with_patroni_dcs(data_dir: &str, client: &Coordinato
 
     let active = env::var("PGBACKREST_REPO1_PATH")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| crate::pgbackrest::repo_path_is_usable(s));
     let dcs = patroni_dcs_repo_path(client).await?;
     match (active, dcs) {
         (Some(active), Some(dcs_path)) if active != dcs_path => {

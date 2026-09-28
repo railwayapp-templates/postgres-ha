@@ -45,6 +45,11 @@
 
 set -u
 
+repo_path_is_usable() {
+  case "$1" in /*) ;; *) return 1 ;; esac
+  case "$1" in *$'\n'*|*$'\r'*) return 1 ;; esac
+}
+
 PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
 MARKER="$PGDATA/.pgbackrest_repo_path"
 
@@ -55,10 +60,10 @@ fi
 
 REPO_PATH=$(curl -sf --max-time 5 http://localhost:8008/config 2>/dev/null \
   | python3 -c 'import json,sys; v = json.load(sys.stdin).get("pgbackrest_repo1_path") or ""; print(v if isinstance(v, str) else "")' 2>/dev/null)
-if [ -z "$REPO_PATH" ] && [ -f "$MARKER" ]; then
-  REPO_PATH=$(tr -d '\n\r' <"$MARKER")
+if ! repo_path_is_usable "$REPO_PATH" && [ -f "$MARKER" ]; then
+  REPO_PATH=$(cat "$MARKER")
 fi
-if [ -n "$REPO_PATH" ]; then
+if repo_path_is_usable "$REPO_PATH"; then
   export PGBACKREST_REPO1_PATH="$REPO_PATH"
 fi
 

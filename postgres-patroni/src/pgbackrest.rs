@@ -137,13 +137,60 @@ max_connections setting:              200
 }
 
 fn write_pgbackrest_repo_path_marker(marker: &str, path: &str) {
-    if let Err(e) = fs::write(marker, format!("{path}\n")) {
-        warn!(error = %e, marker = %marker, "pgbackrest: failed to write repo-path marker");
-        return;
+    let tmp = format!("{marker}.{}.tmp", std::process::id());
+    let write = || -> std::io::Result<()> {
+        fs::write(&tmp, format!("{path}\n"))?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o640))?;
+        fs::rename(&tmp, marker)
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp);
+        warn!(error = %e, marker = %marker, "pgbackrest: failed to atomically write repo-path marker");
     }
-    if let Err(e) = fs::set_permissions(marker, std::fs::Permissions::from_mode(0o640)) {
-        warn!(error = %e, marker = %marker, "pgbackrest: failed to set marker permissions");
+}
+
+/// A repo prefix must be absolute and occupy a single config/marker line.
+pub fn repo_path_is_usable(path: &str) -> bool {
+    path.starts_with('/') && !path.contains(['\n', '\r'])
+}
+
+pub fn archive_base_path(value: &str) -> &str {
+    if repo_path_is_usable(value) {
+        value
+    } else {
+        "/pgbackrest"
     }
+}
+
+/// Invalid prefixes cannot have archived data. Clear local success/cache state
+/// before replacing their marker so stale timestamps or spool acks cannot make
+/// the new archive look protected. Never remove bucket objects.
+fn reset_invalid_repo_state(data_dir: &str) -> std::io::Result<()> {
+    for name in [".pgbackrest_backup_state", ".pgbackrest_gap_pending"] {
+        match fs::remove_file(format!("{data_dir}/{name}")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let spool = format!("{data_dir}/pgbackrest-spool/archive/main/out");
+    match fs::read_dir(spool) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if matches!(
+                    path.extension().and_then(|v| v.to_str()),
+                    Some("ok" | "error")
+                ) {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
 }
 
 /// Resolve the effective repo1-path for archiving. Uses the per-cluster
@@ -151,7 +198,7 @@ fn write_pgbackrest_repo_path_marker(marker: &str, path: &str) {
 /// wiped, container redeployed against the same WAL_ARCHIVE_BUCKET) lets
 /// the new cluster's history coexist with the old at distinct sub-prefixes.
 ///
-/// 1. Marker file present → trust it. Idempotent across boots; survives
+/// 1. Usable marker present → trust it; rederive an invalid one. Idempotent across boots; survives
 ///    container restarts; wiped with the volume.
 /// 2. pg_control exists, marker absent → derive `<base>/cluster-<sysid>`,
 ///    write marker.
@@ -160,17 +207,20 @@ fn write_pgbackrest_repo_path_marker(marker: &str, path: &str) {
 /// Returns base path on the theoretically-unreachable read failure rather
 /// than panicking.
 pub fn derive_pgbackrest_repo_path(data_dir: &str) -> String {
-    let user_path = env::var("WAL_ARCHIVE_PATH")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/pgbackrest".to_string());
+    let configured = env::var("WAL_ARCHIVE_PATH").unwrap_or_default();
+    let user_path = archive_base_path(&configured).to_string();
     let marker = format!("{data_dir}/.pgbackrest_repo_path");
 
     if let Ok(existing) = fs::read_to_string(&marker) {
         let trimmed = existing.trim();
-        if !trimmed.is_empty() {
+        if repo_path_is_usable(trimmed) {
             return trimmed.to_string();
         }
+        if let Err(e) = reset_invalid_repo_state(data_dir) {
+            warn!(error = %e, "pgbackrest: cannot clear invalid repo-path state; retrying on next bootstrap");
+            return user_path;
+        }
+        warn!("pgbackrest: re-deriving an unusable repo-path marker");
     }
 
     let Some(sysid) = read_postgres_sysid(data_dir) else {
@@ -182,4 +232,55 @@ pub fn derive_pgbackrest_repo_path(data_dir: &str) -> String {
     let cluster_path = format!("{trimmed_base}/cluster-{sysid}");
     write_pgbackrest_repo_path_marker(&marker, &cluster_path);
     cluster_path
+}
+
+#[cfg(test)]
+mod repo_path_tests {
+    use super::*;
+    #[test]
+    fn accepts_only_absolute_single_line_paths() {
+        for path in [
+            "",
+            "relative",
+            "C:/Program Files/Git/pgbackrest",
+            "/a\nb",
+            "/a\rb",
+        ] {
+            assert!(!repo_path_is_usable(path));
+            assert_eq!(archive_base_path(path), "/pgbackrest");
+        }
+        assert!(repo_path_is_usable("/pgbackrest/cluster-1-2"));
+    }
+    #[test]
+    fn valid_migrated_marker_wins_without_pg_control() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".pgbackrest_repo_path"),
+            "/old/cluster-1-2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            derive_pgbackrest_repo_path(dir.path().to_str().unwrap()),
+            "/old/cluster-1-2"
+        );
+    }
+    #[test]
+    fn invalid_marker_reset_removes_only_local_backup_state_and_acks() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("pgbackrest-spool/archive/main/out");
+        fs::create_dir_all(&spool).unwrap();
+        for name in ["old.ok", "old.error", "keep"] {
+            fs::write(spool.join(name), "x").unwrap();
+        }
+        fs::write(
+            dir.path().join(".pgbackrest_backup_state"),
+            "last_full_at=1\n",
+        )
+        .unwrap();
+        reset_invalid_repo_state(dir.path().to_str().unwrap()).unwrap();
+        assert!(!dir.path().join(".pgbackrest_backup_state").exists());
+        assert!(!spool.join("old.ok").exists());
+        assert!(!spool.join("old.error").exists());
+        assert!(spool.join("keep").exists());
+    }
 }
