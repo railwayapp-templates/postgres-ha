@@ -22,13 +22,13 @@
 //!
 //! # Detection
 //!
-//! Two catalog checks, both against the OS libc this container runs:
+//! Two catalog checks against the collation libraries this container runs:
 //!
 //! - database default:
 //!   `pg_database.datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)`
 //! - named collations (`COLLATE "en_US"` columns):
 //!   `pg_collation.collversion IS DISTINCT FROM pg_collation_actual_version(oid)`
-//!   for `collprovider = 'c'`
+//!   for `collprovider IN ('c', 'i')`
 //!
 //! The catalogs ARE the state: once the refresh has run, neither query
 //! returns a row, so this whole procedure is idempotent and needs no marker
@@ -233,6 +233,19 @@ pub fn refresh_standalone_collation_versions() {
     tracing::warn!("collation-refresh: standalone readiness timed out; retry on next boot");
 }
 
+fn standalone_superuser<'a>(
+    was_patroni: bool,
+    postgres_user: Option<&'a str>,
+    patroni_user: Option<&'a str>,
+) -> &'a str {
+    let configured = if was_patroni {
+        patroni_user
+    } else {
+        postgres_user
+    };
+    configured.filter(|s| !s.is_empty()).unwrap_or("postgres")
+}
+
 fn refresh_collation_versions_inner(standalone: bool) {
     let pg_version_file = format!("{}/PG_VERSION", pgdata());
     let pg_major: u32 = match fs::read_to_string(&pg_version_file) {
@@ -252,10 +265,14 @@ fn refresh_collation_versions_inner(standalone: bool) {
     }
 
     let superuser = if standalone {
-        std::env::var("POSTGRES_USER")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "postgres".to_string())
+        // A reverted HA volume keeps Patroni's superuser; POSTGRES_USER
+        // is the application role there, unlike a freshly initialized standalone.
+        standalone_superuser(
+            crate::orphan_slots::pgdata_was_patroni_managed(&pgdata()),
+            std::env::var("POSTGRES_USER").ok().as_deref(),
+            std::env::var("PATRONI_SUPERUSER_USERNAME").ok().as_deref(),
+        )
+        .to_string()
     } else {
         match read_credentials() {
             Ok(c) => c.superuser,
@@ -633,6 +650,20 @@ pub fn parse_affected_indexes(out: &str) -> Vec<AffectedIndex> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_maintenance_uses_the_superuser_that_initialized_the_volume() {
+        assert_eq!(
+            standalone_superuser(false, Some("owner"), Some("ha_owner")),
+            "owner"
+        );
+        assert_eq!(
+            standalone_superuser(true, Some("app"), Some("ha_owner")),
+            "ha_owner"
+        );
+        assert_eq!(standalone_superuser(true, Some("app"), None), "postgres");
+        assert_eq!(standalone_superuser(false, Some(""), None), "postgres");
+    }
 
     #[test]
     fn database_census_parses_provider_and_versions() {
