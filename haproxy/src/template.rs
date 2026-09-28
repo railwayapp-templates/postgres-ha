@@ -213,8 +213,6 @@ mod tests {
             check_downinter: "500ms".to_string(),
             health_port_override: None,
             stats_auth: None,
-            probe_user: "postgres".to_string(),
-            replica_identity: String::new(),
         }
     }
 
@@ -253,8 +251,6 @@ mod stats_tests {
             check_downinter: "500ms".into(),
             health_port_override: Some(8009),
             stats_auth,
-            probe_user: "postgres".into(),
-            replica_identity: String::new(),
         }
     }
 

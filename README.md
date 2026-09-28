@@ -533,20 +533,11 @@ Access the HAProxy stats dashboard at `http://haproxy.railway.internal:8404/stat
 
 Requests to the stats page are not access-logged (the entrypoint reads it every 5s).
 
-### Uptime SLI lines
+### Uptime diagnostics
 
-Each HAProxy replica opens a Postgres handshake on its own port 5432 every 10 seconds, without logging in, and logs the result:
+The existing local stats poll emits `sli haproxy primary_up=… replicas_up=… replicas_total=…` when backend counts change and at most once a minute while they remain unchanged. It adds no database connections. A single-node deployment emits no SLI line.
 
-```
-sli haproxy primary_up=1 replicas_up=2 replicas_total=3 probe=ok latency_ms=3 region=us-west2
-sli haproxy primary_up=0 replicas_up=0 replicas_total=3 probe=fail reason=closed latency_ms=1
-sli haproxy primary_up=1 replicas_up=2 replicas_total=3 probe=fail reason=error sqlstate=53300 latency_ms=12
-sli haproxy primary_up=1 replicas_up=2 replicas_total=3 probe=ok latency_ms=4 rto_ms=11873
-```
-
-The server asking to authenticate is `ok`. An ErrorResponse is `fail` with its SQLSTATE (`53300` = too many clients). An accepted connection closed with no answer is `closed`. No answer within 5 s is `timeout`. After a failure the replica retries once a second until a handshake succeeds; it logs one line per 10-second slot meanwhile, and the first success carries `rto_ms`, the time from the first failed attempt. Every `sli` line ends with ` region=<RAILWAY_REPLICA_REGION>` when the platform sets it. A single-node deployment logs no `sli` line.
-
-Each etcd member logs `sli etcd healthy=1 members=3 members_healthy=3 quorum=1` every 20 seconds. While any member is unhealthy it checks every second, logs on every change (with `seconds_degraded`), and adds `recovery_ms` to the first line after recovery.
+These lines describe HAProxy's backend view; they are not an authenticated availability report. Platform-side monitoring determines membership and confirms failures over the customer path. No additional SLI polling loop runs in etcd, and failures do not increase the monitoring cadence.
 
 ## Failover Behavior
 
