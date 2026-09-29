@@ -92,7 +92,9 @@
 use super::{read_credentials, run_psql, run_psql_in_db};
 use crate::pgdata;
 use anyhow::{anyhow, Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use std::fs;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -133,12 +135,31 @@ const NAMED_COLLATION_MISMATCH_SQL: &str = "COPY (SELECT format('%I.%I', n.nspna
 /// manual: a `_ccnew` suffix is the transient index that never finished —
 /// drop it and reindex again; a `_ccold` suffix is the original that could
 /// not be dropped after a successful swap — just drop it.
+///
+/// A REINDEX CONCURRENTLY that is still running looks exactly like a
+/// leftover (its `_ccnew` index is invalid until the swap), so anything a
+/// backend is currently building is excluded via
+/// `pg_stat_progress_create_index`: dropping it would block on the
+/// builder's session lock and then fail once the swap renames it. That is
+/// what a user's own REINDEX or pg_repack looks like from here, and what
+/// this node's other entry point looks like if the file lock ever fails.
 const CC_LEFTOVERS_SQL: &str = "COPY (SELECT format('%I.%I', n.nspname, ic.relname) \
      FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid \
      JOIN pg_namespace n ON n.oid = ic.relnamespace \
      WHERE NOT i.indisvalid AND ic.relkind = 'i' \
        AND ic.relname ~ '_cc(new|old)[0-9]*$' \
+       AND NOT EXISTS (SELECT 1 FROM pg_stat_progress_create_index p \
+                       WHERE p.index_relid = ic.oid) \
      ORDER BY 1) TO STDOUT";
+
+/// One repair at a time per node. patroni-runner's boot pass and the
+/// on_role_change callback can both fire for the same promotion; two runs
+/// would REINDEX the same list twice and each would see the other's
+/// in-flight `_ccnew` index. The standalone sidecar restarts also land
+/// here. flock on a file in the socket dir, which every entry point can
+/// reach (root and `postgres` alike); the lock dies with the process, so
+/// a killed callback never leaves it held.
+const RUN_LOCK_PATH: &str = "/var/run/postgresql/.collation-refresh.lock";
 
 /// Key collations, named dependencies, and implicit-default expressions.
 /// pg_depend omits references to pinned objects (including default collation),
@@ -264,6 +285,22 @@ fn refresh_collation_versions_inner(standalone: bool) {
         return;
     }
 
+    let _run_lock = match acquire_run_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            tracing::info!(
+                "collation-refresh: another repair is already running on this node — skipping \
+                 this pass; it either finishes the job or the catalogs still show the mismatch \
+                 on the next boot or promotion"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "collation-refresh: could not take the run lock");
+            return;
+        }
+    };
+
     let superuser = if standalone {
         // A reverted HA volume keeps Patroni's superuser; POSTGRES_USER
         // is the application role there, unlike a freshly initialized standalone.
@@ -307,7 +344,7 @@ fn refresh_collation_versions_inner(standalone: bool) {
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(str::to_string)
+        .map(copy_unescape)
         .collect();
 
     let db_mismatches = if pg_major < 15 {
@@ -377,7 +414,7 @@ fn repair_database(
         .filter_map(|l| {
             let mut f = l.split('\t');
             Some((
-                f.next()?.to_string(),
+                copy_unescape(f.next()?),
                 f.next()?.to_string(),
                 f.next()?.to_string(),
             ))
@@ -401,6 +438,7 @@ fn repair_database(
     // Interrupted-concurrent-reindex leftovers first (manual's procedure).
     let leftovers = run_psql_in_db(superuser, db, CC_LEFTOVERS_SQL).context("cc leftover scan")?;
     for idx in leftovers.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let idx = copy_unescape(idx);
         run_psql_in_db(superuser, db, &format!("DROP INDEX {idx}"))
             .with_context(|| format!("drop invalid concurrent-reindex leftover {idx}"))?;
         tracing::warn!(database = %db, index = %idx,
@@ -466,6 +504,53 @@ fn repair_database(
         tracing::info!(database = %db, "collation-refresh: refreshed database collation version");
     }
     Ok(true)
+}
+
+/// `Some(lock)` when this process now owns the per-node run lock, `None`
+/// when another repair holds it. World-writable so whichever user creates
+/// it first (root runner, `postgres` callback or sidecar) does not lock the
+/// others out of opening it; flock itself needs only an open descriptor.
+fn acquire_run_lock() -> Result<Option<Flock<fs::File>>> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o666)
+        .open(RUN_LOCK_PATH)
+        .or_else(|_| fs::OpenOptions::new().read(true).open(RUN_LOCK_PATH))
+        .with_context(|| format!("open {RUN_LOCK_PATH}"))?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, e)) => Err(anyhow!("flock {RUN_LOCK_PATH}: {e}")),
+    }
+}
+
+/// Undo `COPY ... TO STDOUT` text-format escaping. COPY writes a backslash
+/// before `\\`, the delimiter, and the control characters below; an index
+/// or database name containing any of them would otherwise be fed back to
+/// REINDEX misspelled, and that database would fail every pass forever.
+pub fn copy_unescape(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('v') => out.push('\u{b}'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn kill_switch_engaged() -> bool {
@@ -615,7 +700,7 @@ pub fn parse_database_mismatches(out: &str) -> Vec<DatabaseMismatch> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| {
             let mut f = l.split('\t');
-            let datname = f.next()?.to_string();
+            let datname = copy_unescape(f.next()?);
             let provider = f.next()?.chars().next().unwrap_or('?');
             let stored = f.next()?.to_string();
             let actual = f.next()?.to_string();
@@ -635,7 +720,7 @@ pub fn parse_affected_indexes(out: &str) -> Vec<AffectedIndex> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| {
             let mut f = l.split('\t');
-            let qualified_name = f.next()?.to_string();
+            let qualified_name = copy_unescape(f.next()?);
             let concurrent = f.next()? == "concurrent";
             let size_bytes = f.next()?.trim().parse().unwrap_or(0);
             Some(AffectedIndex {
@@ -718,6 +803,52 @@ mod tests {
         assert!(!sql.contains("datlocprovider"));
         assert!(!sql.contains("pg_database_collation_actual_version"));
         assert!(!sql.contains("{default_provider}"));
+    }
+
+    #[test]
+    fn copy_output_escapes_are_undone_before_names_reach_reindex() {
+        // What COPY TO STDOUT emits for index names holding a backslash,
+        // a tab and a newline (verified against PG17).
+        assert_eq!(
+            copy_unescape(r#"public."back\\slash_idx""#),
+            r#"public."back\slash_idx""#
+        );
+        assert_eq!(copy_unescape(r#"public."tab\tidx""#), "public.\"tab\tidx\"");
+        assert_eq!(copy_unescape(r#"a\nb"#), "a\nb");
+        assert_eq!(copy_unescape("plain.name"), "plain.name");
+        assert_eq!(copy_unescape(r#"trailing\"#), r#"trailing\"#);
+        let rows = parse_affected_indexes("public.\"back\\\\slash_idx\"\tconcurrent\t1\n");
+        assert_eq!(rows[0].qualified_name, r#"public."back\slash_idx""#);
+    }
+
+    #[test]
+    fn leftover_scan_skips_indexes_a_backend_is_still_building() {
+        // An in-flight REINDEX CONCURRENTLY has an invalid `_ccnew` index
+        // too; only pg_stat_progress_create_index tells it apart.
+        assert!(CC_LEFTOVERS_SQL.contains("pg_stat_progress_create_index"));
+        assert!(CC_LEFTOVERS_SQL.contains("p.index_relid = ic.oid"));
+    }
+
+    #[test]
+    fn run_lock_is_exclusive_per_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let open = || {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap()
+        };
+        let first = Flock::lock(open(), FlockArg::LockExclusiveNonblock).unwrap();
+        assert!(matches!(
+            Flock::lock(open(), FlockArg::LockExclusiveNonblock),
+            Err((_, nix::errno::Errno::EWOULDBLOCK))
+        ));
+        drop(first);
+        assert!(Flock::lock(open(), FlockArg::LockExclusiveNonblock).is_ok());
     }
 
     #[test]
