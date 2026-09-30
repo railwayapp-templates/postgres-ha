@@ -1150,8 +1150,8 @@ t_watcher_initial_full() {
   fi
   if ! docker exec -u postgres "$leader" bash -e -o pipefail -c "$(_pgbackrest_env_preamble)
     pgbackrest --stanza=main info --output=json | python3 -m json.tool >/dev/null
-    env PGBACKREST_START_FAST=y pgbackrest help backup start-fast | grep -F 'current: y'
-    env -u PGBACKREST_START_FAST pgbackrest help backup start-fast | grep -F 'current: n'
+    env PGBACKREST_START_FAST=y pgbackrest help backup start-fast | grep -F 'current: true'
+    env -u PGBACKREST_START_FAST pgbackrest help backup start-fast | grep -F 'current: false'
     for setting in backup:1 archive-push:3 archive-get:3 restore:24; do
       output=\$(pgbackrest help \"\${setting%:*}\" process-max)
       grep -F \"current: \${setting#*:}\" <<<\"\$output\"
