@@ -733,7 +733,7 @@ fn blank_credential_vars(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'stati
 /// so parallel prefetch directly shortens catch-up (this conf serves the
 /// standby archive fallback; staged replay reads the recovery-source
 /// conf, which mirrors these settings); restore is unbounded (DB is down) up to
-/// pgBackRest's plateau around 32 workers. Backup is capped at 2: volume
+/// pgBackRest's plateau around 32 workers. Backup defaults to one reader: volume
 /// read throughput does not scale with vCPU, so extra readers only deepen
 /// the volume's request queue — starving live queries and any member
 /// mid-rewind or mid-clone that is reading from this node.

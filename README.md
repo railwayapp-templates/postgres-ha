@@ -98,8 +98,22 @@ Image-level tuning knobs:
 | `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `5120`, matching `archive-push-queue-max`). Outside the `PGBACKREST_*` namespace because pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
 | `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
 | `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
-| `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 2)`. Set `1` to reduce backup concurrency independently of archiving and restores. |
+| `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default `1`, independent of vCPU, to reduce contention with live queries on IOPS-limited volumes. Explicit overrides still win. |
 | `PGBACKREST_RESTORE_PROCESS_MAX` | parallel workers for `restore`. Default auto-sized as `clamp(cpus, 1, 32)`. |
+| `PGBACKREST_START_FAST` | native pgBackRest option. Default `n` in the image config: spread the backup-start checkpoint instead of forcing a fast one. Set `y` to opt into the previous behavior. |
+
+Full and differential backups use one worker and `start-fast=n` by default.
+This reduces reader concurrency and checkpoint write bursts; it is not a hard
+IOPS or bytes/sec cap, and one reader can still saturate a busy volume. Backups
+can take longer to start and finish. WAL shipping, archive-get, restore worker
+counts, backup cadence and retention are unchanged. Redeploy to pick up the
+new defaults; an existing explicit override continues to apply.
+
+The default 30-minute pgBackRest `db-timeout` and backup stall window allow
+for the normal checkpoint wait. If you use unusually long or slow checkpoints,
+align `PGBACKREST_DB_TIMEOUT`, `PGBACKREST_PROTOCOL_TIMEOUT` (greater than
+`db-timeout`) and `WAL_BACKUP_STALL_SECONDS` with that wait. Do not shorten the
+stall window below the expected checkpoint duration.
 
 The four worker overrides are template settings, not native pgBackRest
 environment options. `patroni-runner` renders them into command-specific
@@ -114,7 +128,8 @@ and `archive_timeout` (default `60`, override via `POSTGRES_ARCHIVE_TIMEOUT`)
 into the Patroni-generated cluster config, and renders
 `/etc/pgbackrest/pgbackrest.conf` with operator-policy defaults
 (`archive-async=y`, `archive-push-queue-max=5GiB`, per-command
-`process-max` sized off cgroup-detected vCPU, `compress-type=zst`,
+`process-max` (backup defaults to `1`; other commands scale with vCPU),
+`start-fast=n`, `compress-type=zst`,
 `spool-path=$PGDATA/pgbackrest-spool` so segments staged but not yet
 pushed survive container restarts).
 

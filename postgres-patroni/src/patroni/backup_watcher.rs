@@ -209,7 +209,7 @@ struct StallConfig {
     /// `WAL_BACKUP_STALL_SECONDS` (default 1800 = 30 min; 0 disables the
     /// watchdog): the floor of the window. It covers the phases in which
     /// pgBackRest reports no byte progress at all — pg_backup_start
-    /// (start-fast=y: one immediate checkpoint), removing a non-resumable
+    /// (start-fast=n: allow a spread checkpoint), removing a non-resumable
     /// earlier attempt from the bucket, building and saving the manifest, and
     /// the tail after the last progress write (pg_backup_stop plus the
     /// archive-timeout wait for the closing WAL). Seconds to minutes on a

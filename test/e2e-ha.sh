@@ -829,8 +829,10 @@ teardown_scope() {
 # as `$(archive_env)` after `setup_patroni_cluster scope etcd_hosts`.
 # `printf` (not `echo`) avoids bash's tendency to swallow the leading
 # `-e` as a flag.
+# Timing-sensitive tests opt into fast checkpoints. The initial-full test
+# also checks the default with the native override removed.
 archive_env() {
-  printf -- '-e WAL_ARCHIVE_BUCKET=%s -e WAL_ARCHIVE_ENDPOINT=http://%s:9000 -e WAL_ARCHIVE_REGION=us-east-1 -e WAL_ARCHIVE_KEY=%s -e WAL_ARCHIVE_SECRET=%s -e WAL_ARCHIVE_PATH=/pgbackrest -e PGBACKREST_REPO1_S3_URI_STYLE=path' \
+  printf -- '-e WAL_ARCHIVE_BUCKET=%s -e WAL_ARCHIVE_ENDPOINT=http://%s:9000 -e WAL_ARCHIVE_REGION=us-east-1 -e WAL_ARCHIVE_KEY=%s -e WAL_ARCHIVE_SECRET=%s -e WAL_ARCHIVE_PATH=/pgbackrest -e PGBACKREST_REPO1_S3_URI_STYLE=path -e PGBACKREST_START_FAST=y' \
     "$BUCKET" "$MINIO" "$MINIO_USER" "$MINIO_PASS"
 }
 
@@ -1105,7 +1107,7 @@ t_watcher_initial_full() {
   # its unknown-option warnings otherwise corrupt even successful JSON output.
   # shellcheck disable=SC2046
   read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher) \
-    -e PGBACKREST_BACKUP_PROCESS_MAX=1 \
+    -e PGBACKREST_START_FAST=n \
     -e PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX=3 \
     -e PGBACKREST_ARCHIVE_GET_PROCESS_MAX=3 \
     -e PGBACKREST_RESTORE_PROCESS_MAX=24 \
@@ -1124,9 +1126,10 @@ t_watcher_initial_full() {
     return
   }
 
+  # Exercise a real full with spread checkpoints; allow the normal checkpoint wait.
   psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
-  if ! wait_for_watcher_backup "$leader" full 120; then
-    ko t_watcher_initial_full "watcher did not take initial full within 120s"
+  if ! wait_for_watcher_backup "$leader" full 420; then
+    ko t_watcher_initial_full "watcher did not take initial full within 420s"
     fail_dump t_watcher_initial_full "$leader"
     teardown_scope "$scope"
     return
@@ -1147,6 +1150,8 @@ t_watcher_initial_full() {
   fi
   if ! docker exec -u postgres "$leader" bash -e -o pipefail -c "$(_pgbackrest_env_preamble)
     pgbackrest --stanza=main info --output=json | python3 -m json.tool >/dev/null
+    env PGBACKREST_START_FAST=y pgbackrest help backup start-fast | grep -F 'current: true'
+    env -u PGBACKREST_START_FAST pgbackrest help backup start-fast | grep -F 'current: false'
     for setting in backup:1 archive-push:3 archive-get:3 restore:24; do
       output=\$(pgbackrest help \"\${setting%:*}\" process-max)
       grep -F \"current: \${setting#*:}\" <<<\"\$output\"
