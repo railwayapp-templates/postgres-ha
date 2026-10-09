@@ -1147,6 +1147,8 @@ t_watcher_initial_full() {
   fi
   if ! docker exec -u postgres "$leader" bash -e -o pipefail -c "$(_pgbackrest_env_preamble)
     pgbackrest --stanza=main info --output=json | python3 -m json.tool >/dev/null
+    env PGBACKREST_START_FAST=y pgbackrest help backup start-fast | grep -Fx \"current: true\"
+    env -u PGBACKREST_START_FAST pgbackrest help backup start-fast | grep -Fx \"current: false\"
     for setting in backup:1 archive-push:3 archive-get:3 restore:24; do
       output=\$(pgbackrest help \"\${setting%:*}\" process-max)
       grep -F \"current: \${setting#*:}\" <<<\"\$output\"
@@ -1160,6 +1162,65 @@ t_watcher_initial_full() {
   ok t_watcher_initial_full
   note "initial full landed on leader=$leader"
   teardown_scope "$scope"
+}
+
+# The watcher adds --start-fast when a spread backup-start checkpoint could
+# reach pgBackRest's db-timeout (2 x completion_target x checkpoint_timeout,
+# see backup_start_fast_arg), and leaves the decision to the operator when
+# PGBACKREST_START_FAST is set.
+t_backup_start_fast_when_checkpoint_outlasts_db_timeout() {
+  local t=t_backup_start_fast_when_checkpoint_outlasts_db_timeout
+  local scope=t-start-fast-${PG_VERSION}
+  local line="backup start: a spread checkpoint could wait up to 2160s"
+  local n1 n2 n3 leader etcd_hosts
+  for mode in heuristic explicit; do
+    reset_bucket
+    etcd_hosts=$(setup_etcd_cluster "$scope")
+    # shellcheck disable=SC2046
+    if [ "$mode" = explicit ]; then
+      read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher) \
+        -e PGBACKREST_START_FAST=n)
+    else
+      read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts" $(archive_env_fast_watcher))
+    fi
+    leader=$(wait_for_leader "$scope" 240) || {
+      ko "$t" "no leader ($mode)"
+      fail_dump "$t" "$n1" "$n2" "$n3"
+      teardown_scope "$scope"
+      return
+    }
+    # 20min x 0.9 x 2 = 2160s > 1800s db-timeout. Reloadable, so no restart.
+    psql_leader "$leader" -c "ALTER SYSTEM SET checkpoint_timeout = '20min';" \
+      -c "SELECT pg_reload_conf();" >/dev/null
+    wait_for_stanza_create "$leader" 90 || {
+      ko "$t" "no stanza-create ($mode)"
+      teardown_scope "$scope"
+      return
+    }
+    psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
+    if ! wait_for_watcher_backup "$leader" full 120; then
+      ko "$t" "watcher did not take initial full within 120s ($mode)"
+      fail_dump "$t" "$leader"
+      teardown_scope "$scope"
+      return
+    fi
+    if [ "$mode" = heuristic ]; then
+      if ! docker logs "$leader" 2>&1 | grep -qF "$line"; then
+        ko "$t" "watcher did not switch to --start-fast for checkpoint_timeout=20min"
+        fail_dump "$t" "$leader"
+        teardown_scope "$scope"
+        return
+      fi
+    elif docker logs "$leader" 2>&1 | grep -qF "backup start: a spread checkpoint"; then
+      ko "$t" "watcher overrode an explicit PGBACKREST_START_FAST"
+      fail_dump "$t" "$leader"
+      teardown_scope "$scope"
+      return
+    fi
+    teardown_scope "$scope"
+  done
+  ok "$t"
+  note "--start-fast chosen for checkpoint_timeout=20min; explicit PGBACKREST_START_FAST left alone"
 }
 
 t_watcher_periodic_full() {
@@ -7181,6 +7242,7 @@ ALL_TESTS=(
   t_archiving_boot
   t_pitr_happy_path
   t_watcher_initial_full
+  t_backup_start_fast_when_checkpoint_outlasts_db_timeout
   t_watcher_periodic_full
   t_watcher_periodic_diff
   t_watcher_gap_recovery_full

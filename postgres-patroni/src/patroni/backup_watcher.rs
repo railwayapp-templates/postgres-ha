@@ -209,7 +209,8 @@ struct StallConfig {
     /// `WAL_BACKUP_STALL_SECONDS` (default 1800 = 30 min; 0 disables the
     /// watchdog): the floor of the window. It covers the phases in which
     /// pgBackRest reports no byte progress at all — pg_backup_start
-    /// (start-fast=y: one immediate checkpoint), removing a non-resumable
+    /// (start-fast=n: a spread checkpoint, or an immediate one when
+    /// `backup_start_fast_arg` adds --start-fast), removing a non-resumable
     /// earlier attempt from the bucket, building and saving the manifest, and
     /// the tail after the last progress write (pg_backup_stop plus the
     /// archive-timeout wait for the closing WAL). Seconds to minutes on a
@@ -242,6 +243,117 @@ impl StallConfig {
             kill_grace_seconds: env_u64("WAL_BACKUP_STALL_KILL_GRACE_SECONDS", 60),
         }
     }
+}
+
+/// pgBackRest's `db-timeout` default, in seconds; it bounds `pg_backup_start`.
+const PGBACKREST_DB_TIMEOUT_DEFAULT_SECONDS: u64 = 1800;
+
+/// `PGBACKREST_DB_TIMEOUT` as seconds: a plain number or one with an s/m/h
+/// suffix (what pgBackRest accepts). Anything else is `None`.
+fn parse_db_timeout_seconds(raw: Option<&str>) -> Option<u64> {
+    let raw = raw?.trim();
+    let (num, mult) = if let Some(n) = raw.strip_suffix('h') {
+        (n, 3600)
+    } else if let Some(n) = raw.strip_suffix('m') {
+        (n, 60)
+    } else {
+        (raw.strip_suffix('s').unwrap_or(raw), 1)
+    };
+    num.parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// Bound the backup-start wait must stay under: pgBackRest's db-timeout or
+/// the stall watchdog floor, whichever is lower. A disabled watchdog (0)
+/// does not bound it.
+fn backup_start_wait_limit_seconds(db_timeout_env: Option<&str>, stall_floor_seconds: u64) -> u64 {
+    let db_timeout =
+        parse_db_timeout_seconds(db_timeout_env).unwrap_or(PGBACKREST_DB_TIMEOUT_DEFAULT_SECONDS);
+    if stall_floor_seconds > 0 {
+        db_timeout.min(stall_floor_seconds)
+    } else {
+        db_timeout
+    }
+}
+
+/// Pure verdict: a spread backup-start checkpoint that could wait
+/// `wait_seconds` needs `--start-fast` under a `limit_seconds` bound.
+fn needs_start_fast(wait_seconds: u64, limit_seconds: u64) -> bool {
+    wait_seconds >= limit_seconds
+}
+
+/// Worst-case seconds `pg_backup_start(fast => false)` can wait on this
+/// server: 2 × checkpoint_completion_target × checkpoint_timeout, rounded
+/// up. Without start-fast Postgres spreads the backup-start checkpoint over
+/// completion_target × checkpoint_timeout however little is dirty (measured
+/// on 16: 275 MB dirty, checkpoint_timeout=60s → 55 s wait, 0.5 s with
+/// fast), and a request that lands while a spread checkpoint is already
+/// running waits for that one and then for its own.
+async fn spread_checkpoint_wait_seconds() -> Result<u64> {
+    let out = Command::new("psql")
+        .args([
+            "-U",
+            "postgres",
+            "-h",
+            "/var/run/postgresql",
+            "-tAXq",
+            "-c",
+            "SELECT ceil(2 * t.setting::numeric * c.setting::numeric)::bigint \
+             FROM pg_settings t, pg_settings c \
+             WHERE t.name = 'checkpoint_timeout' \
+             AND c.name = 'checkpoint_completion_target'",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "checkpoint settings query failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim()
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("checkpoint settings query returned {:?}: {e}", text.trim()))
+}
+
+/// Extra `pgbackrest backup` argument for how the backup is opened.
+///
+/// `pg_backup_start` runs under pgBackRest's db-timeout (1800 s) and the
+/// stall watchdog sees no byte progress while it waits for the checkpoint,
+/// so a checkpoint_timeout long enough to push the worst case past either
+/// limit would make every backup fail before it copies a byte. When the
+/// server's settings say so this returns `--start-fast` (one immediate
+/// checkpoint) and logs why. An operator who set `PGBACKREST_START_FAST` has
+/// decided already: pgBackRest reads that variable directly and it wins
+/// over the config file, so the watcher stays out of it. Unknown settings
+/// (a failed query) change nothing. Mirrors postgres-ssl's
+/// `decide_backup_start_fast`.
+async fn backup_start_fast_arg(cfg: &StallConfig) -> Option<&'static str> {
+    if env::var_os("PGBACKREST_START_FAST").is_some() {
+        return None;
+    }
+    let wait = match spread_checkpoint_wait_seconds().await {
+        Ok(w) => w,
+        Err(e) => {
+            debug!(error = %e, "pgbackrest-watcher: backup start: checkpoint settings unavailable; starting as configured");
+            return None;
+        }
+    };
+    let limit = backup_start_wait_limit_seconds(
+        env::var("PGBACKREST_DB_TIMEOUT").ok().as_deref(),
+        cfg.floor_seconds,
+    );
+    if !needs_start_fast(wait, limit) {
+        return None;
+    }
+    info!(
+        wait_seconds = wait,
+        limit_seconds = limit,
+        "pgbackrest-watcher: backup start: a spread checkpoint could wait up to {wait}s (2 x checkpoint_completion_target x checkpoint_timeout), reaching the {limit}s backup-start limit; starting with --start-fast (set PGBACKREST_START_FAST=y or n to decide explicitly)"
+    );
+    Some("--start-fast")
 }
 
 impl WatcherConfig {
@@ -2646,13 +2758,18 @@ async fn run_backup_supervised(
     backup_type: &str,
     cfg: &StallConfig,
 ) -> std::io::Result<std::process::ExitStatus> {
+    let type_arg = format!("--type={backup_type}");
+    let mut args = vec![
+        "--stanza=main",
+        "backup",
+        type_arg.as_str(),
+        "--no-expire-auto",
+    ];
+    if let Some(flag) = backup_start_fast_arg(cfg).await {
+        args.push(flag);
+    }
     let mut child = Command::new("pgbackrest")
-        .args([
-            "--stanza=main",
-            "backup",
-            &format!("--type={backup_type}"),
-            "--no-expire-auto",
-        ])
+        .args(&args)
         .env_remove("PGHOST")
         .env_remove("PGPORT")
         .spawn()?;
@@ -4059,6 +4176,45 @@ P00   INFO: stanza-create command end: aborted with exception [055]\n";
             read_state_field(&path, "wal_regression_orig_path").as_deref(),
             Some("/pgbackrest/cluster-1")
         );
+    }
+}
+
+#[cfg(test)]
+mod start_fast_tests {
+    use super::{backup_start_wait_limit_seconds, needs_start_fast, parse_db_timeout_seconds};
+
+    #[test]
+    fn db_timeout_parses_seconds_and_suffixes() {
+        assert_eq!(parse_db_timeout_seconds(Some("1800")), Some(1800));
+        assert_eq!(parse_db_timeout_seconds(Some("900s")), Some(900));
+        assert_eq!(parse_db_timeout_seconds(Some("45m")), Some(2700));
+        assert_eq!(parse_db_timeout_seconds(Some("2h")), Some(7200));
+        assert_eq!(parse_db_timeout_seconds(None), None);
+        assert_eq!(parse_db_timeout_seconds(Some("")), None);
+        assert_eq!(parse_db_timeout_seconds(Some("m")), None);
+        assert_eq!(parse_db_timeout_seconds(Some("1800.5")), None);
+    }
+
+    #[test]
+    fn limit_is_the_lower_of_db_timeout_and_stall_floor() {
+        assert_eq!(backup_start_wait_limit_seconds(None, 1800), 1800);
+        assert_eq!(backup_start_wait_limit_seconds(None, 600), 600);
+        assert_eq!(backup_start_wait_limit_seconds(None, 0), 1800);
+        assert_eq!(backup_start_wait_limit_seconds(Some("1h"), 0), 3600);
+        assert_eq!(backup_start_wait_limit_seconds(Some("1h"), 1800), 1800);
+        assert_eq!(backup_start_wait_limit_seconds(Some("junk"), 0), 1800);
+    }
+
+    #[test]
+    fn start_fast_once_the_spread_wait_reaches_the_limit() {
+        // 2 x 0.9 x checkpoint_timeout: 5min -> 540, 16min -> 1728, 17min -> 1836.
+        assert!(!needs_start_fast(540, 1800));
+        assert!(!needs_start_fast(1728, 1800));
+        assert!(needs_start_fast(1836, 1800));
+        assert!(needs_start_fast(2160, 1800));
+        // A 600 s stall floor bounds a 400s checkpoint_timeout (720) but not 5min.
+        assert!(!needs_start_fast(540, 600));
+        assert!(needs_start_fast(720, 600));
     }
 }
 

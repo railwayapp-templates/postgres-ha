@@ -283,6 +283,30 @@ pub fn env_or_clamp(var: &str, default: u32) -> u32 {
     parse_process_max(env::var(var).ok().as_deref(), default)
 }
 
+/// Per-command `process-max` defaults for a container with `cpus` vCPU,
+/// before the `PGBACKREST_*_PROCESS_MAX` overrides. Pure so the sizing is
+/// unit-testable without touching env.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessMaxDefaults {
+    pub push: u32,
+    pub get: u32,
+    pub backup: u32,
+    pub restore: u32,
+}
+
+/// archive-push / archive-get: `clamp(cpus/8, 2, 8)`. backup: one reader,
+/// whatever the vCPU count — volume IOPS do not scale with vCPU and every
+/// extra reader competes with live queries for the same disk (mirrors
+/// postgres-ssl #151). restore: the DB is down, so `clamp(cpus, 1, 32)`.
+pub fn process_max_defaults(cpus: i64) -> ProcessMaxDefaults {
+    ProcessMaxDefaults {
+        push: clamp(cpus / 8, 2, 8),
+        get: clamp(cpus / 8, 2, 8),
+        backup: 1,
+        restore: clamp(cpus, 1, 32),
+    }
+}
+
 /// pg_wal drop ceiling (MiB) and pgBackRest archive-push spool ceiling (MiB).
 /// Both scale DOWN from the absolute default (5120) on small volumes — never
 /// up. On volumes ≥10 GiB the absolute holds.
@@ -345,10 +369,11 @@ pub fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> 
     let conf_path = "/etc/pgbackrest/pgbackrest.conf";
 
     let cpus = detect_cpus().max(1) as i64;
-    let push_max = env_or_clamp("PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX", clamp(cpus / 8, 2, 8));
-    let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", clamp(cpus / 8, 2, 8));
-    let backup_max = env_or_clamp("PGBACKREST_BACKUP_PROCESS_MAX", clamp(cpus / 4, 1, 2));
-    let restore_max = env_or_clamp("PGBACKREST_RESTORE_PROCESS_MAX", clamp(cpus, 1, 32));
+    let defaults = process_max_defaults(cpus);
+    let push_max = env_or_clamp("PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX", defaults.push);
+    let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", defaults.get);
+    let backup_max = env_or_clamp("PGBACKREST_BACKUP_PROCESS_MAX", defaults.backup);
+    let restore_max = env_or_clamp("PGBACKREST_RESTORE_PROCESS_MAX", defaults.restore);
 
     info!(
         cpus = cpus,
@@ -442,7 +467,7 @@ fn build_pgbackrest_conf(params: &PgbackrestConfParams) -> String {
          spool-path={spool_dir}\n\
          compress-type=zst\n\
          compress-level=3\n\
-         start-fast=y\n\
+         start-fast=n\n\
          \n\
          [global:archive-push]\n\
          process-max={push_max}\n\
@@ -734,6 +759,41 @@ mod tests {
                 "cpus={cpus}: expected archive-get process-max={expected_get_max} in:\n{conf}"
             );
         }
+    }
+
+    #[test]
+    fn backup_process_max_defaults_to_one_at_every_cpu_size() {
+        // Volume IOPS do not scale with vCPU: the backup reader count stays
+        // at 1 while the other commands keep their cpu-derived defaults.
+        for cpus in [1i64, 4, 16, 64, 256] {
+            let d = process_max_defaults(cpus);
+            assert_eq!(d.backup, 1, "cpus={cpus}");
+            assert_eq!(d.push, clamp(cpus / 8, 2, 8), "cpus={cpus}");
+            assert_eq!(d.get, clamp(cpus / 8, 2, 8), "cpus={cpus}");
+            assert_eq!(d.restore, clamp(cpus, 1, 32), "cpus={cpus}");
+        }
+        // Explicit overrides still win and stay command-scoped.
+        assert_eq!(
+            parse_process_max(Some("4"), process_max_defaults(256).backup),
+            4
+        );
+    }
+
+    #[test]
+    fn pgbackrest_conf_spreads_the_backup_start_checkpoint() {
+        let conf = build_pgbackrest_conf(&PgbackrestConfParams {
+            data_dir: "/pgdata",
+            queue_max_mib: 5120,
+            push_max: 2,
+            get_max: 2,
+            backup_max: 1,
+            restore_max: 4,
+            retention_full: 4,
+            retention_diff: 14,
+        });
+        assert!(conf.contains("[global]\n"));
+        assert!(conf.contains("\nstart-fast=n\n"), "{conf}");
+        assert!(!conf.contains("start-fast=y"), "{conf}");
     }
 
     #[test]
