@@ -174,7 +174,7 @@ pub async fn run_monitoring_loop(
         warn!(
             max_startup_timeout = config.max_startup_timeout,
             wal_archive_stall_confirm_secs,
-            "max_startup_timeout is shorter than the WAL archive-stall confirmation dwell — the Stalled-branch reinit can fire with less zero-progress time than the Waiting branch requires; raise max_startup_timeout or WAL_ARCHIVE_STALL_CONFIRM_SECONDS to restore the intended margin"
+            "PATRONI_MAX_STARTUP_TIMEOUT is shorter than WAL_ARCHIVE_STALL_CONFIRM_SECONDS, so a stalled replica can be reinitialized sooner than intended. Raise PATRONI_MAX_STARTUP_TIMEOUT or lower WAL_ARCHIVE_STALL_CONFIRM_SECONDS."
         );
     }
     // Short-timeout client for polling Patroni's local REST API for WAL

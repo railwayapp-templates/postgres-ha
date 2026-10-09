@@ -1009,7 +1009,7 @@ pub async fn reconcile_pgbackrest_archive_config(
     match merge_reconcile_patches(archive_patch, failsafe_patch) {
         Some(patch) => {
             send_patch(&client, &patch).await?;
-            info!(enabled, "DCS config reconciled with env-driven intent");
+            info!(enabled, "etcd config reconciled with env-driven intent");
         }
         None => {
             info!(

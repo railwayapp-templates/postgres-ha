@@ -80,7 +80,7 @@ Operator-facing env contract:
 | `WAL_ARCHIVE_REGION` | bucket region |
 | `WAL_ARCHIVE_KEY` / `WAL_ARCHIVE_SECRET` | bucket credentials |
 | `WAL_ARCHIVE_PATH` | path prefix where archive-push writes (default `/pgbackrest`) |
-| `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored cluster; `archive-get` reads source WAL from here during replay. Set by backboard on restore; not normally a manual knob. |
+| `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored cluster; `archive-get` reads source WAL from here during replay. Set by Railway on restore; not normally a manual knob. |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 | `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
 | `POSTGRES_BASEBACKUP_MAX_RATE` | `--max-rate` for pg_basebackup replica creation (default `20M`; explicit `k`/`M` suffix required, `32k`..`1024M`; invalid values fall back to the default). Raise for an emergency fast re-seed at the cost of leader disk contention. |
@@ -251,7 +251,7 @@ Each cluster archives under a sub-prefix derived from its
 `${WAL_ARCHIVE_PATH}/cluster-<system_identifier>`. The path is
 persisted in `$PGDATA/.pgbackrest_repo_path` so the archive-push
 wrapper, the backup watcher, `pgbackrest stanza-create`, and out-of-
-band invocations (e.g. mono's PITR coverage probe over SSH) all
+band invocations (such as Railway's PITR coverage probe over SSH) all
 converge on the same value. `patroni-runner` rewrites the rendered
 `/etc/pgbackrest/pgbackrest.conf`'s `repo1-path=` line once
 `pg_control` is on disk, so an SSH-driven `pgbackrest info` (which
@@ -269,9 +269,9 @@ stays at `cluster-<old_sysid>`, and both histories coexist.
 
 `WAL_RECOVER_FROM_PATH` on a restored cluster must point at the
 specific source-side `cluster-<sysid>` sub-prefix the user wants to
-restore from — `pgbackrest restore` reads from one path. Backboard
-discovers per-cluster sub-prefixes by listing the bucket and surfaces
-them as separate "histories" in the restore UI.
+restore from — `pgbackrest restore` reads from one path. Railway reads
+the bucket's per-cluster sub-prefixes and shows them as separate
+"histories" in the restore UI.
 
 ### Retention
 
@@ -300,7 +300,7 @@ window before the oldest full ages out.
 
 ## Major version upgrades
 
-A major upgrade is driven from outside this image: the control plane pauses
+A major upgrade is driven from outside this image: Railway pauses
 Patroni failover, stops the leader, runs a one-shot job image carrying both
 majors' binaries against the leader's volume, repins the service image, then
 rebuilds each replica from the upgraded primary and resumes failover.
@@ -309,7 +309,7 @@ While that window is open the job marks the volume with
 `.railway-major-upgrade.json` at the **volume root** (PGDATA is replaced
 wholesale by `pg_upgrade`, so a marker inside it would not survive). The image
 consults that marker in three places, because each of them destroys data if it
-ignores it and none of them can see the control plane:
+ignores it and none of them can see Railway:
 
 | Guard | Without it |
 |-------|-----------|

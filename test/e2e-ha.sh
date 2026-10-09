@@ -1532,14 +1532,14 @@ t_ha_replica_watcher_no_op() {
   psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
   wait_for_initial_full "$leader" 120 || { ko t_ha_replica_watcher_no_op "no initial full on leader"; fail_dump t_ha_replica_watcher_no_op "$leader"; teardown_scope "$scope"; return; }
 
-  # Replicas: each must have logged "iteration skipped (not patroni leader)" at least once.
+  # Replicas: each must have logged "iteration skipped (not the primary)" at least once.
   local skipped_total=0
   for n in "$n1" "$n2" "$n3"; do
     if [ "$n" = "$leader" ]; then continue; fi
     local skipped
-    skipped=$(docker logs "$n" 2>&1 | grep -c "pgbackrest-watcher: iteration skipped (not patroni leader)" || true)
+    skipped=$(docker logs "$n" 2>&1 | grep -c "pgbackrest-watcher: iteration skipped (not the primary)" || true)
     if [ "$skipped" -lt 1 ]; then
-      ko t_ha_replica_watcher_no_op "replica $n never logged 'iteration skipped (not patroni leader)'"
+      ko t_ha_replica_watcher_no_op "replica $n never logged 'iteration skipped (not the primary)'"
       fail_dump t_ha_replica_watcher_no_op "$n"
       teardown_scope "$scope"
       return

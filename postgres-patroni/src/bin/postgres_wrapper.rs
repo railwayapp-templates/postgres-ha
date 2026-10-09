@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
             telemetry.send(TelemetryEvent::ComponentError {
                 component: "postgres-wrapper".to_string(),
                 error: reason,
-                context: "standalone boot refused: staged PITR has not completed".to_string(),
+                context: "standalone boot".to_string(),
             });
             std::process::exit(1);
         }
@@ -548,12 +548,13 @@ fn spawn_pitr_sidecar(telemetry: &Telemetry) -> Option<Pid> {
             Some(Pid::from_raw(child.id() as i32))
         }
         Err(e) => {
-            let error = format!("failed to start the standalone PITR sidecar: {e}");
+            let error =
+                format!("failed to start the standalone PITR sidecar: {e}; no backups this boot");
             warn!("{error}");
             telemetry.send(TelemetryEvent::ComponentError {
                 component: "postgres-wrapper".to_string(),
                 error,
-                context: "standalone PITR sidecar (non-fatal; no backups this boot)".to_string(),
+                context: "standalone PITR sidecar".to_string(),
             });
             None
         }

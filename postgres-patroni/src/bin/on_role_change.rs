@@ -60,7 +60,7 @@ fn main() {
             {
                 let data_dir = pgdata();
                 let repo_path = derive_pgbackrest_repo_path(&data_dir);
-                info!(repo_path = %repo_path, "pgbackrest: repo-path marker refreshed on master promotion");
+                info!(repo_path = %repo_path, "pgbackrest: repo-path marker refreshed on promotion to primary");
             }
 
             refresh_collation_versions();
