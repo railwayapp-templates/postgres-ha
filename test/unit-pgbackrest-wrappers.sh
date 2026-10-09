@@ -351,7 +351,7 @@ t_archive_get_connectivity_breaker_trips_at_threshold() {
   WAL_ARCHIVE_BUCKET=bucket WAL_ARCHIVE_GET_CONNECTIVITY_TRIP=3 run "$ARCHIVE_GET_WRAPPER" "wal" "/tmp/dest"
   assert_eq "$(exit_code)" "126" "failure 3/3 must trip the breaker with exit 126 (>125 = FATAL)" || { ko "$FUNCNAME" "run3 rc"; teardown; return; }
   if [ -f "$(breaker_path)" ]; then ko "$FUNCNAME" "trip must reset the counter file"; teardown; return; fi
-  grep -q "connectivity breaker tripped" "$TMPROOT/control/output" || { ko "$FUNCNAME" "trip must log its reason"; teardown; return; }
+  grep -q "stopping so the restore retries" "$TMPROOT/control/output" || { ko "$FUNCNAME" "trip must log its reason"; teardown; return; }
   ok "$FUNCNAME"
   teardown
 }

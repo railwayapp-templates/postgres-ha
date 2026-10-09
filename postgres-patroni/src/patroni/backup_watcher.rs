@@ -353,16 +353,16 @@ pub fn spawn_with_mode(data_dir: String, mode: WatcherMode) {
             let h = tokio::task::spawn(async move { run(dd, mode).await });
             match h.await {
                 Ok(Ok(())) => {
-                    warn!("pgbackrest-watcher: run loop returned cleanly — respawning in 5s")
+                    warn!("pgbackrest-watcher: returned unexpectedly; restarting in 5s")
                 }
                 Ok(Err(e)) => {
-                    warn!(error = %e, "pgbackrest-watcher: run loop errored — respawning in 5s")
+                    warn!(error = %e, "pgbackrest-watcher: failed; restarting in 5s")
                 }
                 Err(e) if e.is_panic() => {
-                    warn!(panic = ?e, "pgbackrest-watcher: run loop panicked — respawning in 5s")
+                    warn!(panic = ?e, "pgbackrest-watcher: panicked; restarting in 5s")
                 }
                 Err(e) => {
-                    warn!(error = %e, "pgbackrest-watcher: join error — respawning in 5s")
+                    warn!(error = %e, "pgbackrest-watcher: task was cancelled; restarting in 5s")
                 }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -425,11 +425,11 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &Coor
         LeaderProbe::PatroniRestApi => match is_patroni_leader(client).await {
             Ok(true) => {}
             Ok(false) => {
-                info!("pgbackrest-watcher: iteration skipped (not patroni leader)");
+                info!("pgbackrest-watcher: iteration skipped (not the primary)");
                 return;
             }
             Err(e) => {
-                warn!(error = %e, "pgbackrest-watcher: iteration skipped (patroni /leader unreachable)");
+                warn!(error = %e, "pgbackrest-watcher: iteration skipped (could not check whether this node is the primary)");
                 return;
             }
         },
@@ -468,7 +468,7 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &Coor
     }
 
     if let Err(e) = converge_repo_path_with_patroni_dcs(data_dir, client).await {
-        warn!(error = %e, "pgbackrest-watcher: failed to converge repo path with Patroni DCS");
+        warn!(error = %e, "pgbackrest-watcher: failed to converge repo path with etcd");
     }
 
     if !config.heartbeat_disabled {
@@ -1603,16 +1603,16 @@ async fn converge_repo_path_with_patroni_dcs(data_dir: &str, client: &Coordinato
     let dcs = patroni_dcs_repo_path(client).await?;
     match (active, dcs) {
         (Some(active), Some(dcs_path)) if active != dcs_path => {
-            info!(active = %active, dcs_path = %dcs_path, "pgbackrest-watcher: adopting repo path from Patroni DCS");
+            info!(active = %active, dcs_path = %dcs_path, "pgbackrest-watcher: adopting repo path from etcd");
             reset_local_backup_state_for_new_archive_path(data_dir).await?;
             apply_active_path(data_dir, &dcs_path)?;
         }
         (Some(active), None) => {
             patch_patroni_dcs_repo_path(client, &active).await?;
-            info!(repo_path = %active, "pgbackrest-watcher: seeded repo path into Patroni DCS");
+            info!(repo_path = %active, "pgbackrest-watcher: seeded repo path into etcd");
         }
         (None, Some(dcs_path)) => {
-            info!(dcs_path = %dcs_path, "pgbackrest-watcher: adopting repo path from Patroni DCS");
+            info!(dcs_path = %dcs_path, "pgbackrest-watcher: adopting repo path from etcd");
             reset_local_backup_state_for_new_archive_path(data_dir).await?;
             apply_active_path(data_dir, &dcs_path)?;
         }
@@ -1698,7 +1698,7 @@ async fn finalize_wal_regression_migration(
         return false;
     }
     if let Err(e) = patch_patroni_dcs_repo_path(client, path).await {
-        warn!(error = %e, "pgbackrest-watcher: wal-regression: failed to publish repo path to Patroni DCS; will retry finalization");
+        warn!(error = %e, "pgbackrest-watcher: wal-regression: failed to publish repo path to etcd; will retry finalization");
         return false;
     }
 

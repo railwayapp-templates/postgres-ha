@@ -177,9 +177,8 @@ fn report(telemetry: &Telemetry, error: String) {
     warn!("standalone PITR: {error}");
     telemetry.send(TelemetryEvent::ComponentError {
         component: "postgres-wrapper".to_string(),
-        error,
-        context: "standalone PITR setup (non-fatal; the database boots without archiving)"
-            .to_string(),
+        error: format!("{error}; the database boots without archiving"),
+        context: "standalone PITR setup".to_string(),
     });
 }
 

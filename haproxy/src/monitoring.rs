@@ -101,7 +101,7 @@ pub fn run_monitoring_loop(
                 // Handle primary backend
                 if primary == 0 {
                     if !no_primary_alerted {
-                        warn!("No healthy primary backend - cluster has no leader");
+                        warn!("no healthy primary backend — cluster has no primary");
                         telemetry.send(TelemetryEvent::DcsUnavailable {
                             node: "haproxy".to_string(),
                             scope: "postgresql_primary_backend".to_string(),

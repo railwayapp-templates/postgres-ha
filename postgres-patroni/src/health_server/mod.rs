@@ -72,19 +72,19 @@ pub fn spawn(config: HealthServerConfig, telemetry: Telemetry) {
                 Ok(Ok(())) => {
                     // axum::serve only returns on a graceful-shutdown signal
                     // we never send — unexpected, but the answer is the same.
-                    warn!("health server returned cleanly — respawning in 5s");
+                    warn!("health server returned unexpectedly; restarting in 5s");
                     "run loop returned cleanly".to_string()
                 }
                 Ok(Err(e)) => {
-                    warn!(error = %e, "health server bind/serve failed — respawning in 5s");
+                    warn!(error = %e, "health server failed; restarting in 5s");
                     format!("bind/serve failed: {e:#}")
                 }
                 Err(e) if e.is_panic() => {
-                    warn!(panic = ?e, "health server panicked — respawning in 5s");
+                    warn!(panic = ?e, "health server panicked; restarting in 5s");
                     "task panicked".to_string()
                 }
                 Err(e) => {
-                    warn!(error = %e, "health server task cancelled — respawning in 5s");
+                    warn!(error = %e, "health server task was cancelled; restarting in 5s");
                     "task cancelled".to_string()
                 }
             };

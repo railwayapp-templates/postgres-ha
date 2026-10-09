@@ -1532,14 +1532,14 @@ t_ha_replica_watcher_no_op() {
   psql_leader "$leader" -c "SELECT pg_switch_wal();" >/dev/null
   wait_for_initial_full "$leader" 120 || { ko t_ha_replica_watcher_no_op "no initial full on leader"; fail_dump t_ha_replica_watcher_no_op "$leader"; teardown_scope "$scope"; return; }
 
-  # Replicas: each must have logged "iteration skipped (not patroni leader)" at least once.
+  # Replicas: each must have logged "iteration skipped (not the primary)" at least once.
   local skipped_total=0
   for n in "$n1" "$n2" "$n3"; do
     if [ "$n" = "$leader" ]; then continue; fi
     local skipped
-    skipped=$(docker logs "$n" 2>&1 | grep -c "pgbackrest-watcher: iteration skipped (not patroni leader)" || true)
+    skipped=$(docker logs "$n" 2>&1 | grep -c "pgbackrest-watcher: iteration skipped (not the primary)" || true)
     if [ "$skipped" -lt 1 ]; then
-      ko t_ha_replica_watcher_no_op "replica $n never logged 'iteration skipped (not patroni leader)'"
+      ko t_ha_replica_watcher_no_op "replica $n never logged 'iteration skipped (not the primary)'"
       fail_dump t_ha_replica_watcher_no_op "$n"
       teardown_scope "$scope"
       return
@@ -2750,7 +2750,7 @@ t_ha_wal_archive_stall_dwell_gates_reinit() {
   fi
   # The breaker must have fired along the way: with the endpoint dead, the
   # eternal-starting state is exactly what it exists to break.
-  if ! logs_contain "$replica" "connectivity breaker tripped"; then
+  if ! logs_contain "$replica" "stopping so the restore retries"; then
     ko t_ha_wal_archive_stall_dwell_gates_reinit "expected the archive-get connectivity breaker to have tripped at least once with S3 down"
     fail_dump t_ha_wal_archive_stall_dwell_gates_reinit "$replica"
     teardown_scope "$scope"
@@ -3107,7 +3107,7 @@ t_ha_selfheal_stands_down_during_upgrade() {
 
   local deadline=$(($(date +%s) + 90)) saw_standdown=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if logs_match "$replica" "standing down"; then
+    if logs_match "$replica" "paused while a major version upgrade owns this volume"; then
       saw_standdown=1
       break
     fi
@@ -7018,7 +7018,7 @@ t_standalone_revert_resumes_archiving_and_backups() {
     fail_dump "$t" "$sa"
     docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return
   fi
-  if logs_contain "$sa" "not patroni leader"; then
+  if logs_contain "$sa" "iteration skipped (not the primary)"; then
     ko "$t" "the standalone watcher gated on Patroni's /leader"
     fail_dump "$t" "$sa"
     docker rm -f "$sa" >/dev/null 2>&1; teardown_scope "$scope"; return

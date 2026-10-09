@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 /// All telemetry events that can be sent to Railway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,8 +373,8 @@ impl TelemetryEvent {
             }
             Self::DcsUnavailable { node, scope } => {
                 format!(
-                    "DCS unavailable - {} demoted, cluster {} has no leader (write outage)",
-                    node, scope
+                    "Cluster {} has no primary: {} sees no healthy primary (write outage)",
+                    scope, node
                 )
             }
             Self::ReplicaUnavailable {
@@ -431,15 +431,12 @@ impl TelemetryEvent {
                 last_reason,
             } => {
                 format!(
-                    "Self-heal: giving up on {} after {} attempts (last: {}); manual intervention required",
+                    "Self-heal: giving up on {} after {} attempts (last: {}). This node needs attention: contact support.",
                     node, attempts, last_reason
                 )
             }
             Self::MajorUpgradeBootRefused { node, reason } => {
-                format!(
-                    "Boot refused on {} by the major-upgrade guard: {}",
-                    node, reason
-                )
+                format!("Boot refused on {}: {}", node, reason)
             }
             Self::MajorUpgradeReseedWiped {
                 node,
@@ -448,7 +445,7 @@ impl TelemetryEvent {
                 to_major,
             } => {
                 format!(
-                    "Reseed marker consumed on {}: wiped major {} data so Patroni re-clones from leader {} on major {}",
+                    "Reseed marker consumed on {}: wiped major {} data so Patroni re-clones from primary {} on major {}",
                     node, from_major, leader, to_major
                 )
             }
@@ -458,7 +455,7 @@ impl TelemetryEvent {
                 marker_age_secs,
             } => {
                 format!(
-                    "Self-heal watcher on {} standing down: a major upgrade owns this volume (marker phase: {}, age: {}) — if no upgrade workflow is active, the marker is stale and must be removed to restore self-healing",
+                    "Self-heal on {} is paused while a major version upgrade owns this volume (marker phase: {}, age: {}). If no upgrade is running, delete .railway-major-upgrade.json at the volume root and redeploy to restore self-healing.",
                     node,
                     phase,
                     marker_age_secs
@@ -468,7 +465,7 @@ impl TelemetryEvent {
             }
             Self::IncompleteCloneWiped { node, leader } => {
                 format!(
-                    "Wiped incomplete-clone data dir on {} (non-empty, missing pg_control) — re-cloning from leader {}",
+                    "Wiped incomplete-clone data dir on {} (non-empty, missing pg_control) — re-cloning from primary {}",
                     node, leader
                 )
             }
@@ -608,6 +605,60 @@ impl TelemetryEvent {
     }
 }
 
+/// How loud an event is in the node's own log. Events that mean the
+/// database is down, refused to boot, or needs someone to act are errors;
+/// degraded-but-recovering states are warnings; the rest is routine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Info,
+    Warn,
+    Error,
+}
+
+impl TelemetryEvent {
+    pub fn severity(&self) -> Severity {
+        match self {
+            Self::BootstrapFailed { .. }
+            | Self::ProcessDied { .. }
+            | Self::DcsUnavailable { .. }
+            | Self::SelfHealReinitRequestFailed { .. }
+            | Self::SelfHealGaveUp { .. }
+            | Self::MajorUpgradeBootRefused { .. }
+            | Self::IncompleteCloneWipeCapped { .. }
+            | Self::EtcdStartupFailed { .. }
+            | Self::EtcdPromotionFailed { .. }
+            | Self::ComponentError { .. } => Severity::Error,
+            Self::HealthCheckFailed { .. }
+            | Self::ReplicaUnavailable { .. }
+            | Self::SelfHealReinitTriggered { .. }
+            | Self::MajorUpgradeReseedWiped { .. }
+            | Self::SelfHealUpgradeStanddown { .. }
+            | Self::IncompleteCloneWiped { .. }
+            | Self::ArchiveConfigDrifted { .. }
+            | Self::ArchiveConfigForced { .. }
+            | Self::EtcdStaleMemberRemoved { .. }
+            | Self::EtcdDataCleared { .. }
+            | Self::EtcdRecoveryMode { .. }
+            | Self::EtcdDefragFailed { .. }
+            | Self::EtcdDataDirWiped { .. }
+            | Self::EtcdLocalUnhealthy { .. }
+            | Self::StandaloneOrphanSlotsDropped { .. } => Severity::Warn,
+            Self::PostgresFailover { .. }
+            | Self::PostgresRejoined { .. }
+            | Self::BootstrapStarted { .. }
+            | Self::BootstrapCompleted { .. }
+            | Self::SslRenewed { .. }
+            | Self::SelfHealRecovered { .. }
+            | Self::EtcdBootstrap { .. }
+            | Self::EtcdNodeJoined { .. }
+            | Self::EtcdNodePromoted { .. }
+            | Self::HaproxyStarted { .. }
+            | Self::HaproxyConfigGenerating { .. }
+            | Self::ComponentStarted { .. } => Severity::Info,
+        }
+    }
+}
+
 /// Telemetry client for sending events to Railway.
 #[derive(Clone)]
 pub struct Telemetry {
@@ -677,10 +728,14 @@ impl Telemetry {
     /// alone can't tell success from rejection — `classify` reads the body.
     pub fn send(&self, event: TelemetryEvent) {
         let event_type = event.event_type();
-        info!(event = %event_type, "{}", event.message());
+        match event.severity() {
+            Severity::Error => error!(event = %event_type, "{}", event.message()),
+            Severity::Warn => warn!(event = %event_type, "{}", event.message()),
+            Severity::Info => info!(event = %event_type, "{}", event.message()),
+        }
 
         if !self.enabled {
-            tracing::debug!(event = %event_type, "telemetry disabled off-Railway");
+            debug!(event = %event_type, "telemetry disabled off-Railway");
             return;
         }
         let payload = self.build_payload(&event);
@@ -698,20 +753,20 @@ impl Telemetry {
                     let body = resp.text().unwrap_or_default();
                     match classify(status.as_u16(), &body) {
                         SendOutcome::Sent => {
-                            info!(event = %event_type, attempt, "telemetry sent")
+                            debug!(event = %event_type, attempt, "telemetry sent")
                         }
                         SendOutcome::Rejected(why) => {
-                            warn!(event = %event_type, %status, reason = %why, body = %truncate(&body), "telemetry rejected")
+                            debug!(event = %event_type, %status, reason = %why, body = %truncate(&body), "telemetry rejected")
                         }
                     }
                     return;
                 }
                 Err(e) if attempt < SEND_ATTEMPTS => {
-                    warn!(event = %event_type, attempt, error = %e, "telemetry send failed, retrying");
+                    debug!(event = %event_type, attempt, error = %e.without_url(), "telemetry send failed, retrying");
                     std::thread::sleep(RETRY_DELAY);
                 }
                 Err(e) => {
-                    warn!(event = %event_type, attempt, error = %e, "telemetry send failed")
+                    debug!(event = %event_type, attempt, error = %e.without_url(), "telemetry send failed")
                 }
             }
         }

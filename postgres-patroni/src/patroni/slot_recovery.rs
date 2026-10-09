@@ -236,7 +236,7 @@ async fn recreate_lost_slots(
 
     for slot in lost {
         if !members.contains(&slot) {
-            info!(slot = %slot, "slot-recovery: lost slot is not a cluster member slot — leaving it for the operator");
+            info!(slot = %slot, "slot-recovery: lost slot does not belong to a cluster node; leaving it in place");
             continue;
         }
         if repair_is_backed_off(

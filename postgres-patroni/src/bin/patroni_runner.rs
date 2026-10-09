@@ -524,14 +524,14 @@ fn wipe_pgdata_contents(data_dir: &str) -> Result<()> {
 fn report_marker_removal_failure(telemetry: &Telemetry, e: &std::io::Error, when: &str) {
     error!(
         error = %e,
-        "failed to remove the reseed marker {when}; the self-heal watcher stands down while it exists — if no upgrade is running, remove it manually to restore self-healing"
+        "failed to remove the reseed marker {when}. Self-healing on this node is paused while it exists. If no upgrade is running, delete .railway-major-upgrade.json at the volume root and redeploy."
     );
     telemetry.send(TelemetryEvent::ComponentError {
         component: "patroni-runner".to_string(),
-        error: format!("failed to remove the reseed marker {when}: {e}"),
-        context:
-            "the leftover marker keeps the self-heal watcher standing down until it is removed"
-                .to_string(),
+        error: format!(
+            "failed to remove the reseed marker {when}: {e}. Self-healing on this node is paused while it exists. If no upgrade is running, delete .railway-major-upgrade.json at the volume root and redeploy."
+        ),
+        context: "reseed marker removal".to_string(),
     });
 }
 
@@ -1493,11 +1493,10 @@ async fn async_main() -> Result<()> {
         telemetry.send(TelemetryEvent::ComponentError {
             component: "patroni-runner".to_string(),
             error: format!(
-                "no usable Railway container IPv6 on the interface; restapi.connect_address is {}",
+                "no usable Railway container IPv6 on the interface; restapi.connect_address is {}. Other nodes resolve the private domain through Patroni's 600 s cache, so a switchover to this node can answer 412 for up to ten minutes after it redeploys",
                 config.restapi_connect_address
             ),
-            context: "other members resolve the private domain through Patroni's 600 s cache: switchover to this node can answer 412 for up to ten minutes after it redeploys"
-                .to_string(),
+            context: "rest api address".to_string(),
         });
     }
 

@@ -967,17 +967,17 @@ async fn leader_pg_endpoint(client: &reqwest::Client) -> Option<(String, i64)> {
         Ok(resp) => match resp.json().await {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "self-heal: /cluster JSON parse failed — cannot locate leader for WAL probe");
+                warn!(error = %e, "self-heal: /cluster JSON parse failed — cannot locate the primary for the WAL probe");
                 return None;
             }
         },
         Err(e) => {
-            warn!(error = %e, "self-heal: /cluster request failed — cannot locate leader for WAL probe");
+            warn!(error = %e, "self-heal: /cluster request failed — cannot locate the primary for the WAL probe");
             return None;
         }
     };
     let Some(leader) = cluster.members.iter().find(|m| m.role == "leader") else {
-        warn!("self-heal: no leader member in /cluster — cannot run WAL-availability probe");
+        warn!("self-heal: no primary in /cluster — cannot run the WAL-availability probe");
         return None;
     };
     let Some(host) = leader.host.clone() else {
@@ -1029,7 +1029,7 @@ async fn leader_oldest_segment(host: &str, port: i64, config: &Config) -> Option
         Ok(Ok(out)) => out,
         Ok(Err(_)) => return None,
         Err(_) => {
-            warn!(host, "self-heal: leader pg_ls_waldir query timed out");
+            warn!(host, "self-heal: primary pg_ls_waldir query timed out");
             return None;
         }
     };
@@ -1336,7 +1336,7 @@ async fn iteration(
             info!(
                 phase = %phase,
                 marker_age_secs = ?marker_age_secs,
-                "self-heal: major upgrade in progress on this volume — standing down"
+                "self-heal: paused while a major version upgrade owns this volume"
             );
             telemetry.send(TelemetryEvent::SelfHealUpgradeStanddown {
                 node: env::var("PATRONI_NAME").unwrap_or_else(|_| "unknown".to_string()),

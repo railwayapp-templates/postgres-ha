@@ -113,7 +113,7 @@ finish() {
   fi
   if [ "$fails" -ge "$TRIP_THRESHOLD" ]; then
     rm -f "$BREAKER" 2>/dev/null || true
-    echo "pgbackrest-archive-get-wrapper: archive endpoint unreachable for ${fails} consecutive invocations (last rc=${rc}) — connectivity breaker tripped, exiting 126 so recovery crash-loops instead of waiting on a dead archive forever" >&2
+    echo "pgbackrest-archive-get-wrapper: archive unreachable for ${fails} consecutive attempts (last rc=${rc}); stopping so the restore retries" >&2
     exit 126
   fi
   printf '%s %s\n' "$fails" "$now" >"$BREAKER" 2>/dev/null || true
