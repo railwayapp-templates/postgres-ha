@@ -347,7 +347,9 @@ pub fn render_pgbackrest_conf(data_dir: &str, queue_max_mib: u32) -> Result<()> 
     let cpus = detect_cpus().max(1) as i64;
     let push_max = env_or_clamp("PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX", clamp(cpus / 8, 2, 8));
     let get_max = env_or_clamp("PGBACKREST_ARCHIVE_GET_PROCESS_MAX", clamp(cpus / 8, 2, 8));
-    let backup_max = env_or_clamp("PGBACKREST_BACKUP_PROCESS_MAX", clamp(cpus / 4, 1, 2));
+    // Volume IOPS do not scale with vCPU. Keep one backup reader by default
+    // so larger CPU plans do not deepen the live database's disk queue.
+    let backup_max = env_or_clamp("PGBACKREST_BACKUP_PROCESS_MAX", 1);
     let restore_max = env_or_clamp("PGBACKREST_RESTORE_PROCESS_MAX", clamp(cpus, 1, 32));
 
     info!(
@@ -442,7 +444,7 @@ fn build_pgbackrest_conf(params: &PgbackrestConfParams) -> String {
          spool-path={spool_dir}\n\
          compress-type=zst\n\
          compress-level=3\n\
-         start-fast=y\n\
+         start-fast=n\n\
          \n\
          [global:archive-push]\n\
          process-max={push_max}\n\
@@ -752,6 +754,7 @@ mod tests {
         assert!(conf.contains("[global:archive-get]\nprocess-max=4\n"));
         assert!(conf.contains("[global:backup]\nprocess-max=2\n"));
         assert!(conf.contains("[global:restore]\nprocess-max=32\n"));
+        assert!(conf.contains("start-fast=n\n"));
         assert!(conf.contains("repo1-retention-full=4\n"));
         assert!(conf.contains("repo1-retention-diff=14\n"));
     }
