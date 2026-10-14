@@ -3,8 +3,10 @@
 //! Handles leader election, recovery detection, and cluster initialization.
 
 use crate::cluster::{
-    add_self_to_cluster, check_cluster_health, clear_directory, get_current_cluster,
-    get_member_list, has_local_data, promote_self, remove_stale_self,
+    add_as_learner, add_self_to_cluster, check_cluster_health, clear_directory, find_self,
+    get_member_list, get_voting_member_endpoint, has_local_data, is_name_collision,
+    member_sharing_my_name, promote_self, refuse_name_collision, remove_stale_self,
+    shared_name_message, PromoteOutcome, SelfIdentity,
 };
 use crate::config::{get_leader_endpoint, parse_initial_cluster, peer_to_client_url, Config};
 use anyhow::{anyhow, Result};
@@ -143,19 +145,85 @@ pub async fn clean_stale_data(config: &Config, telemetry: &Telemetry) -> Result<
 
 const MAX_PROMOTION_RETRIES: u32 = 180; // 15 minutes at 5 second intervals
 
+/// Pace of promotion attempts once `MAX_PROMOTION_RETRIES` have failed on a
+/// member that is not allowed to exit for them (see [`after_failed_promotion`]).
+const SLOW_PROMOTION_RETRY: Duration = Duration::from_secs(60);
+
+/// What to do after a failed promotion attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromotionRetry {
+    /// Try again on the next cycle.
+    Now,
+    /// Try again after `SLOW_PROMOTION_RETRY`.
+    Slowly,
+    /// Exit so the restart wipes the half-joined data dir and joins again.
+    Exit,
+}
+
+/// A node that joined as a learner in this run has no bootstrap marker yet:
+/// when promotion keeps failing, exiting lets the restart wipe the half-joined
+/// data dir and join again. A node that completed bootstrap earlier (a restart
+/// with the marker present) is never wiped for this; it keeps retrying, once
+/// a minute after the cap, so a learner left behind by an older image is
+/// promoted as soon as etcd accepts it.
+pub(crate) fn after_failed_promotion(joined_as_learner: bool, attempts: u32) -> PromotionRetry {
+    if attempts < MAX_PROMOTION_RETRIES {
+        PromotionRetry::Now
+    } else if joined_as_learner {
+        PromotionRetry::Exit
+    } else {
+        PromotionRetry::Slowly
+    }
+}
+
+/// The bootstrap marker means "this member is a full voting member". A node
+/// that joined as a learner may write it only once its own entry (found by
+/// member ID or peer URL) is confirmed voting.
+pub(crate) fn may_write_marker(joined_as_learner: bool, voter_confirmed: bool) -> bool {
+    !joined_as_learner || voter_confirmed
+}
+
+/// Warn once when another member carries this node's name at another peer
+/// URL. Such a pair predates the join-time refusal; this node still works
+/// (it identifies itself by peer URL), the operator should still rename it.
+async fn warn_if_name_shared(config: &Config, me: &SelfIdentity, telemetry: &Telemetry) {
+    let Ok(Some(endpoint)) = get_voting_member_endpoint(&config.initial_cluster).await else {
+        return;
+    };
+    let Ok(members) = get_member_list(&endpoint).await else {
+        return;
+    };
+    if let Some(other) = member_sharing_my_name(&members, me, false) {
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "etcd".to_string(),
+            error: shared_name_message(me, other),
+            context: "ETCD_NAME shared with another member".to_string(),
+        });
+    }
+}
+
 /// Monitor and mark bootstrap complete
 ///
+/// On every start, whatever the bootstrap path, this confirms that this
+/// node's own member entry (found by member ID or peer URL, never by a name
+/// another member may share) is a voting member, and promotes it when it is
+/// still a learner. A restarted learner therefore retries promotion instead
+/// of staying a learner forever.
+///
 /// IMPORTANT: This function runs in a spawned task. On fatal errors (health check
-/// failure or promotion exhaustion), it calls exit(1) directly to crash the process.
-/// This triggers container restart, and clean_stale_data() will clear incomplete
-/// bootstrap data (no marker = data gets wiped) ensuring clean recovery.
+/// failure or promotion exhaustion of a fresh join), it calls exit(1) directly to
+/// crash the process. This triggers container restart, and clean_stale_data() will
+/// clear incomplete bootstrap data (no marker = data gets wiped) ensuring clean recovery.
 pub async fn monitor_and_mark_bootstrap(
     config: &Config,
     joined_as_learner: bool,
+    member_id: Option<String>,
     telemetry: Telemetry,
 ) {
-    let mut promoted = false;
+    let me = SelfIdentity::from_config(config, member_id);
+    let mut voter_confirmed = false;
     let mut promotion_attempts = 0u32;
+    let mut next_promotion_attempt = Instant::now();
     let mut auth_enabled = config.root_password.is_none();
 
     loop {
@@ -176,27 +244,36 @@ pub async fn monitor_and_mark_bootstrap(
             }
         };
 
-        if is_healthy {
-            // Turn on authentication once this member is a voting participant
-            // of a healthy cluster. Idempotent on the etcd side, so every
-            // member may attempt it; the first to succeed settles it.
-            if !auth_enabled && (!joined_as_learner || promoted) {
-                match ensure_auth_enabled(config.root_password.as_deref().unwrap_or_default()).await
-                {
-                    Ok(()) => auth_enabled = true,
-                    Err(e) => warn!(error = %e, "etcd auth enable failed; retrying next cycle"),
-                }
-            }
+        if !is_healthy {
+            continue;
+        }
 
-            if joined_as_learner && !promoted {
+        // Turn on authentication once this member is a voting participant
+        // of a healthy cluster. Idempotent on the etcd side, so every
+        // member may attempt it; the first to succeed settles it.
+        if !auth_enabled && may_write_marker(joined_as_learner, voter_confirmed) {
+            match ensure_auth_enabled(config.root_password.as_deref().unwrap_or_default()).await {
+                Ok(()) => auth_enabled = true,
+                Err(e) => warn!(error = %e, "etcd auth enable failed; retrying next cycle"),
+            }
+        }
+
+        if !voter_confirmed && Instant::now() >= next_promotion_attempt {
+            if joined_as_learner {
                 info!("Healthy, attempting promotion");
-                match promote_self(&config.initial_cluster, &config.etcd_name, &telemetry).await {
-                    Ok(_) => {
-                        promoted = true;
+            }
+            match promote_self(&config.initial_cluster, &me, &telemetry).await {
+                Ok(outcome) => {
+                    voter_confirmed = true;
+                    if outcome == PromoteOutcome::Promoted && !joined_as_learner {
+                        warn!("This member was still a learner after a restart and has now been promoted");
                     }
-                    Err(e) => {
-                        promotion_attempts += 1;
-                        if promotion_attempts >= MAX_PROMOTION_RETRIES {
+                    warn_if_name_shared(config, &me, &telemetry).await;
+                }
+                Err(e) => {
+                    promotion_attempts += 1;
+                    match after_failed_promotion(joined_as_learner, promotion_attempts) {
+                        PromotionRetry::Exit => {
                             // Promotion exhausted - crash to trigger recovery
                             // On restart, clean_stale_data() will clear data since no bootstrap marker
                             telemetry.send(TelemetryEvent::EtcdPromotionFailed {
@@ -212,30 +289,54 @@ pub async fn monitor_and_mark_bootstrap(
                             );
                             std::process::exit(1);
                         }
-                        warn!(
-                            error = %e,
-                            attempt = promotion_attempts,
-                            max = MAX_PROMOTION_RETRIES,
-                            "Promotion failed, will retry"
-                        );
+                        PromotionRetry::Now => {
+                            warn!(
+                                error = %e,
+                                attempt = promotion_attempts,
+                                max = MAX_PROMOTION_RETRIES,
+                                "Promotion failed, will retry"
+                            );
+                        }
+                        PromotionRetry::Slowly => {
+                            if promotion_attempts == MAX_PROMOTION_RETRIES {
+                                telemetry.send(TelemetryEvent::EtcdPromotionFailed {
+                                    node: config.etcd_name.clone(),
+                                    attempts: promotion_attempts,
+                                    max_attempts: MAX_PROMOTION_RETRIES,
+                                    error: e.to_string(),
+                                });
+                            }
+                            warn!(
+                                error = %e,
+                                attempt = promotion_attempts,
+                                retry_in_secs = SLOW_PROMOTION_RETRY.as_secs(),
+                                "Could not confirm this member is a voting member; retrying"
+                            );
+                            next_promotion_attempt = Instant::now() + SLOW_PROMOTION_RETRY;
+                        }
                     }
                 }
             }
+        }
 
-            let marker_path = config.bootstrap_marker();
-            if !bootstrap_marker_present(&marker_path) && (!joined_as_learner || promoted) {
-                if let Err(e) = fs::write(&marker_path, "1").await {
-                    telemetry.send(TelemetryEvent::ComponentError {
-                        component: "etcd".to_string(),
-                        error: e.to_string(),
-                        context: "writing bootstrap marker".to_string(),
-                    });
-                    tracing::error!(error = %e, "Failed to write bootstrap marker - exiting");
-                    std::process::exit(1);
-                }
-                info!("Bootstrap marked complete");
-                break;
+        let marker_path = config.bootstrap_marker();
+        let marker_present = bootstrap_marker_present(&marker_path);
+        if !marker_present && may_write_marker(joined_as_learner, voter_confirmed) {
+            if let Err(e) = fs::write(&marker_path, "1").await {
+                telemetry.send(TelemetryEvent::ComponentError {
+                    component: "etcd".to_string(),
+                    error: e.to_string(),
+                    context: "writing bootstrap marker".to_string(),
+                });
+                tracing::error!(error = %e, "Failed to write bootstrap marker - exiting");
+                std::process::exit(1);
             }
+            info!("Bootstrap marked complete");
+        }
+
+        // The marker is present or was just written: nothing left to watch.
+        if voter_confirmed {
+            break;
         }
     }
 }
@@ -284,6 +385,9 @@ pub struct BootstrapParams {
     pub initial_cluster: String,
     pub initial_cluster_state: String,
     pub joined_as_learner: bool,
+    /// This node's member ID when the bootstrap learned it (from
+    /// `member add`); the monitor then finds its entry by ID.
+    pub member_id: Option<String>,
 }
 
 /// Determine bootstrap parameters for the leader node
@@ -299,6 +403,7 @@ pub async fn bootstrap_as_leader(
             initial_cluster: config.initial_cluster.clone(),
             initial_cluster_state: "existing".to_string(),
             joined_as_learner: false,
+            member_id: None,
         }));
     }
 
@@ -334,62 +439,36 @@ pub async fn bootstrap_as_leader(
             reason: "Leader volume lost, cluster exists".to_string(),
         });
 
-        // Use the node's own advertise URL directly instead of looking up in initial_cluster
-        let my_peer_url = &config.initial_advertise_peer_urls;
+        let me = SelfIdentity::from_config(config, None);
 
-        if let Err(e) = remove_stale_self(
-            &existing_endpoint,
-            &config.etcd_name,
-            my_peer_url,
-            telemetry,
-        )
-        .await
-        {
+        // Never join under a name a voting member already holds: the node
+        // could not tell itself apart from that member afterwards.
+        let members = match get_member_list(&existing_endpoint).await {
+            Ok(members) => members,
+            Err(e) => {
+                warn!(error = %e, "Failed to list members during recovery");
+                return Ok(None); // Signal retry needed
+            }
+        };
+        refuse_name_collision(&members, &me, telemetry)?;
+
+        if let Err(e) = remove_stale_self(&existing_endpoint, &me, telemetry).await {
             warn!(error = %e, "Failed to remove stale self, continuing anyway");
         }
 
-        let output = etcdctl(&[
-            "member",
-            "add",
-            &config.etcd_name,
-            "--learner",
-            &format!("--peer-urls={}", my_peer_url),
-            &format!("--endpoints={}", existing_endpoint),
-        ])
-        .await;
-
-        match output {
-            Ok(out) => {
+        match add_as_learner(config, &existing_endpoint, &me).await {
+            Ok(joined) => {
                 telemetry.send(TelemetryEvent::EtcdNodeJoined {
                     node: config.etcd_name.clone(),
                     joined_as: "learner".to_string(),
                 });
 
-                let mut cluster_str = String::new();
-                for line in out.lines() {
-                    if line.contains("ETCD_INITIAL_CLUSTER=") {
-                        if let Some(c) = line
-                            .split("ETCD_INITIAL_CLUSTER=")
-                            .nth(1)
-                            .map(|s| s.trim_matches('"').to_string())
-                        {
-                            cluster_str = c;
-                            break;
-                        }
-                    }
-                }
-
-                if cluster_str.is_empty() {
-                    cluster_str =
-                        get_current_cluster(&existing_endpoint, &config.etcd_name, my_peer_url)
-                            .await?;
-                }
-
-                info!(cluster = %cluster_str, "Joining as learner (recovery)");
+                info!(cluster = %joined.initial_cluster, "Joining as learner (recovery)");
                 return Ok(Some(BootstrapParams {
-                    initial_cluster: cluster_str,
+                    initial_cluster: joined.initial_cluster,
                     initial_cluster_state: "existing".to_string(),
                     joined_as_learner: true,
+                    member_id: joined.member_id,
                 }));
             }
             Err(e) => {
@@ -416,6 +495,7 @@ pub async fn bootstrap_as_leader(
         initial_cluster: single_node_cluster,
         initial_cluster_state: "new".to_string(),
         joined_as_learner: false,
+        member_id: None,
     }))
 }
 
@@ -432,6 +512,7 @@ pub async fn bootstrap_as_follower(
             initial_cluster: config.initial_cluster.clone(),
             initial_cluster_state: "existing".to_string(),
             joined_as_learner: false,
+            member_id: None,
         }));
     }
 
@@ -445,18 +526,21 @@ pub async fn bootstrap_as_follower(
     };
 
     match add_self_to_cluster(config, &healthy_peer, &endpoint, telemetry).await {
-        Ok(cluster_str) => {
-            info!(cluster = %cluster_str, via = %healthy_peer, "Joining as learner");
+        Ok(joined) => {
+            info!(cluster = %joined.initial_cluster, via = %healthy_peer, "Joining as learner");
             telemetry.send(TelemetryEvent::EtcdNodeJoined {
                 node: config.etcd_name.clone(),
                 joined_as: "learner".to_string(),
             });
             Ok(Some(BootstrapParams {
-                initial_cluster: cluster_str,
+                initial_cluster: joined.initial_cluster,
                 initial_cluster_state: "existing".to_string(),
                 joined_as_learner: true,
+                member_id: joined.member_id,
             }))
         }
+        // A name collision is a configuration error: retrying cannot fix it.
+        Err(e) if is_name_collision(&e) => Err(e),
         Err(e) => {
             warn!(error = %e, "Failed to add as learner");
             Ok(None) // Signal retry needed
@@ -500,9 +584,17 @@ async fn is_this_node_leader() -> bool {
 /// Transfer etcd leadership to a voting follower so this node can defrag safely.
 async fn move_leader_away(config: &Config) -> Result<()> {
     let members = get_member_list("127.0.0.1:2379").await?;
-    let follower = members
-        .iter()
-        .find(|m| !m.is_learner && m.name != config.etcd_name);
+    // Exclude this node by its own entry (peer URL), not by name: another
+    // member may share the name and is a valid target.
+    let me = SelfIdentity::from_config(config, None);
+    let my_id = find_self(&members, &me).map(|(m, _)| m.id.clone());
+    let follower = members.iter().find(|m| {
+        !m.is_learner
+            && match &my_id {
+                Some(id) => &m.id != id,
+                None => m.name != config.etcd_name,
+            }
+    });
 
     match follower {
         Some(m) => {
@@ -679,6 +771,45 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(present);
+    }
+
+    #[test]
+    fn a_learner_never_writes_the_marker_before_it_is_confirmed_voting() {
+        // onyx-staging etcd-3 (ETCD_NAME=etcd-2) wrote its marker while still
+        // a learner: the name lookup found the voting etcd-2 and reported
+        // "Already a voting member". The marker now waits for this node's own
+        // entry to be confirmed voting.
+        assert!(!may_write_marker(true, false));
+        assert!(may_write_marker(true, true));
+        // A bootstrap leader or a restart with the marker never joined as a
+        // learner in this run; its marker gating is unchanged.
+        assert!(may_write_marker(false, false));
+    }
+
+    #[test]
+    fn a_fresh_learner_retries_promotion_until_the_cap_then_exits() {
+        for attempts in 1..MAX_PROMOTION_RETRIES {
+            assert_eq!(after_failed_promotion(true, attempts), PromotionRetry::Now);
+        }
+        assert_eq!(
+            after_failed_promotion(true, MAX_PROMOTION_RETRIES),
+            PromotionRetry::Exit
+        );
+    }
+
+    #[test]
+    fn a_restarted_member_keeps_retrying_promotion_and_never_exits_for_it() {
+        // Data dir and marker present: exiting would not wipe anything, it
+        // would only crash-loop. It keeps trying, once a minute after the cap.
+        assert_eq!(after_failed_promotion(false, 1), PromotionRetry::Now);
+        assert_eq!(
+            after_failed_promotion(false, MAX_PROMOTION_RETRIES),
+            PromotionRetry::Slowly
+        );
+        assert_eq!(
+            after_failed_promotion(false, MAX_PROMOTION_RETRIES * 50),
+            PromotionRetry::Slowly
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@ use bootstrap::{
     bootstrap_as_follower, bootstrap_as_leader, bootstrap_marker_present, check_existing_cluster,
     clean_stale_data, defrag_loop, local_liveness_watchdog, monitor_and_mark_bootstrap,
 };
-use cluster::{clear_directory, has_local_data, start_etcd};
+use cluster::{clear_directory, has_local_data, is_name_collision, start_etcd};
 use config::{get_bootstrap_leader, Config};
 
 /// etcd panics on startup when a peer's commit index exceeds this member's last
@@ -57,6 +57,101 @@ fn is_raft_corruption_line(line: &str) -> bool {
 fn is_removed_member_line(line: &str) -> bool {
     line.contains("the member has been permanently removed from the cluster")
         || line.contains("data-dir used by this member must be removed")
+}
+
+/// etcd's gRPC gateway (`ETCD_ENABLE_GRPC_GATEWAY=true`, the HTTP/JSON API
+/// Patroni's etcd3 client talks to) relays each streaming call (Watch,
+/// LeaseKeepAlive) to gRPC and logs through grpclog's default logger, which
+/// etcd points at stderr in Go's `log` format: `2026/10/13 11:42:27 ERROR:
+/// Failed to send request: EOF` (etcd v3.6.6 `api/etcdserverpb/gw/rpc.pb.gw.go`,
+/// `request_Watch_Watch_0` / `request_Lease_LeaseKeepAlive_0`). The line is
+/// written every time the server ends a stream the client is still writing
+/// to, so a client that reopens a rejected watch in a tight loop produces it
+/// thousands of times a minute: a learner rejecting Patroni's watches
+/// ("rpc not supported for learner") logged it twice every ~50 ms, ~7M lines a
+/// day per member. Only these exact gateway messages are throttled (an
+/// allowlist); every other line passes through untouched.
+const GATEWAY_STREAM_NOISE: &[&str] = &[
+    "ERROR: Failed to send request: ",
+    "ERROR: Failed to terminate client stream: ",
+];
+
+/// How often a throttled gateway line is let through.
+const GATEWAY_NOISE_WINDOW: Duration = Duration::from_secs(60);
+
+/// The throttling key of a gateway stream line: the message without Go's
+/// `YYYY/MM/DD HH:MM:SS ` prefix. None for every line that is not one of
+/// `GATEWAY_STREAM_NOISE`.
+fn gateway_noise_key(line: &str) -> Option<&str> {
+    let message = match line.get(..20) {
+        Some(prefix) if is_go_log_timestamp(prefix) => &line[20..],
+        _ => line,
+    };
+    GATEWAY_STREAM_NOISE
+        .iter()
+        .any(|p| message.starts_with(p))
+        .then_some(message)
+}
+
+/// `2026/10/13 11:42:27 ` (Go `log.LstdFlags`, followed by a space).
+fn is_go_log_timestamp(prefix: &str) -> bool {
+    let b = prefix.as_bytes();
+    b.len() == 20
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'/',
+            10 | 19 => *c == b' ',
+            13 | 16 => *c == b':',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// What to do with one throttled line.
+#[derive(Debug, PartialEq, Eq)]
+enum Throttle {
+    /// Write it. `suppressed` repeats were dropped since it was last written.
+    Emit { first: bool, suppressed: u64 },
+    /// Drop it.
+    Drop,
+}
+
+/// Lets each key through at most once per window and counts what it drops.
+struct LineThrottle {
+    window: Duration,
+    seen: std::collections::HashMap<String, (std::time::Instant, u64)>,
+}
+
+impl LineThrottle {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            seen: std::collections::HashMap::new(),
+        }
+    }
+
+    fn admit(&mut self, key: &str, now: std::time::Instant) -> Throttle {
+        match self.seen.get_mut(key) {
+            None => {
+                self.seen.insert(key.to_string(), (now, 0));
+                Throttle::Emit {
+                    first: true,
+                    suppressed: 0,
+                }
+            }
+            Some((since, dropped)) if now.duration_since(*since) >= self.window => {
+                let suppressed = *dropped;
+                *since = now;
+                *dropped = 0;
+                Throttle::Emit {
+                    first: false,
+                    suppressed,
+                }
+            }
+            Some((_, dropped)) => {
+                *dropped += 1;
+                Throttle::Drop
+            }
+        }
+    }
 }
 
 /// Whether an etcd exit ends supervision as a clean shutdown.
@@ -243,6 +338,13 @@ async fn main() -> Result<()> {
                 }
                 continue;
             }
+            Err(e) if is_name_collision(&e) => {
+                // A configuration error no retry can fix. The refusal was
+                // already logged and reported; exit so the deployment shows
+                // the crash with that message as its last words.
+                error!("{e}");
+                std::process::exit(1);
+            }
             Err(e) => {
                 // Always send telemetry for actual errors (not just "not ready")
                 telemetry.send(TelemetryEvent::EtcdStartupFailed {
@@ -274,12 +376,35 @@ async fn main() -> Result<()> {
             tokio::spawn(async move {
                 let mut stderr_out = tokio::io::stderr();
                 let mut lines = BufReader::new(stderr).lines();
+                let mut gateway_noise = LineThrottle::new(GATEWAY_NOISE_WINDOW);
                 while let Ok(Some(line)) = lines.next_line().await {
                     if is_raft_corruption_line(&line) {
                         corrupt_flag.store(true, Ordering::Relaxed);
                     }
                     if is_removed_member_line(&line) {
                         removed_flag.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(key) = gateway_noise_key(&line) {
+                        match gateway_noise.admit(key, std::time::Instant::now()) {
+                            Throttle::Drop => continue,
+                            Throttle::Emit { first, suppressed } => {
+                                if suppressed > 0 {
+                                    info!(
+                                        repeats = suppressed,
+                                        window_secs = GATEWAY_NOISE_WINDOW.as_secs(),
+                                        line = %key,
+                                        "etcd gRPC gateway repeated this line; repeats suppressed"
+                                    );
+                                }
+                                if first {
+                                    info!(
+                                        line = %key,
+                                        window_secs = GATEWAY_NOISE_WINDOW.as_secs(),
+                                        "etcd's gRPC gateway logs this line each time the server ends a client stream; it is written at most once per window from now on"
+                                    );
+                                }
+                            }
+                        }
                     }
                     // Tee to our stderr so etcd's logs still reach the container.
                     let _ = stderr_out.write_all(format!("{}\n", line).as_bytes()).await;
@@ -295,8 +420,15 @@ async fn main() -> Result<()> {
         let monitor_config = Config::from_env()?;
         let monitor_telemetry = telemetry.clone();
         let joined_as_learner = params.joined_as_learner;
+        let member_id = params.member_id.clone();
         let monitor_handle = tokio::spawn(async move {
-            monitor_and_mark_bootstrap(&monitor_config, joined_as_learner, monitor_telemetry).await
+            monitor_and_mark_bootstrap(
+                &monitor_config,
+                joined_as_learner,
+                member_id,
+                monitor_telemetry,
+            )
+            .await
         });
 
         let defrag_config = Config::from_env()?;
@@ -466,9 +598,89 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        exit_code_for, exit_is_clean, is_healthcheck_invocation, is_raft_corruption_line,
-        is_removed_member_line,
+        exit_code_for, exit_is_clean, gateway_noise_key, is_healthcheck_invocation,
+        is_raft_corruption_line, is_removed_member_line, LineThrottle, Throttle,
     };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn gateway_send_eof_line_is_recognised_with_or_without_timestamp() {
+        let line = "2026/10/13 11:42:27 ERROR: Failed to send request: EOF";
+        assert_eq!(
+            gateway_noise_key(line),
+            Some("ERROR: Failed to send request: EOF")
+        );
+        assert_eq!(
+            gateway_noise_key("ERROR: Failed to send request: EOF"),
+            Some("ERROR: Failed to send request: EOF")
+        );
+        assert_eq!(
+            gateway_noise_key("2026/10/13 11:42:27 ERROR: Failed to terminate client stream: EOF"),
+            Some("ERROR: Failed to terminate client stream: EOF")
+        );
+    }
+
+    #[test]
+    fn only_the_gateway_stream_lines_are_throttled() {
+        assert_eq!(
+            gateway_noise_key("2026/10/13 11:42:27 ERROR: Failed to decode request: bad json"),
+            None
+        );
+        assert_eq!(
+            gateway_noise_key("2026/10/13 11:42:27 WARNING: Failed to send request: EOF"),
+            None
+        );
+        assert_eq!(
+            gateway_noise_key(r#"{"level":"warn","msg":"Failed to send request: EOF"}"#),
+            None
+        );
+        assert_eq!(
+            gateway_noise_key("panic: tocommit(7) is out of range"),
+            None
+        );
+        assert_eq!(gateway_noise_key(""), None);
+    }
+
+    #[test]
+    fn throttle_lets_one_line_per_window_through_and_counts_the_rest() {
+        let mut t = LineThrottle::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let key = "ERROR: Failed to send request: EOF";
+        assert_eq!(
+            t.admit(key, t0),
+            Throttle::Emit {
+                first: true,
+                suppressed: 0
+            }
+        );
+        // Twice every 50 ms for the rest of the minute: all dropped.
+        let mut dropped = 0;
+        for i in 1..2400u64 {
+            assert_eq!(
+                t.admit(key, t0 + Duration::from_millis(i * 25)),
+                Throttle::Drop
+            );
+            dropped += 1;
+        }
+        assert_eq!(
+            t.admit(key, t0 + Duration::from_secs(60)),
+            Throttle::Emit {
+                first: false,
+                suppressed: dropped
+            }
+        );
+        // A different message has its own window.
+        assert_eq!(
+            t.admit(
+                "ERROR: Failed to terminate client stream: EOF",
+                t0 + Duration::from_secs(61)
+            ),
+            Throttle::Emit {
+                first: true,
+                suppressed: 0
+            }
+        );
+    }
 
     #[test]
     fn healthcheck_mode_is_the_first_argument_only() {
