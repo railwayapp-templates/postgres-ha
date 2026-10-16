@@ -9,7 +9,7 @@ mod config;
 mod extensions;
 mod sql;
 
-pub use collation::refresh_collation_versions;
+pub use collation::{refresh_collation_versions, refresh_standalone_collation_versions};
 pub use config::{read_credentials, Credentials, PATRONI_CONFIG};
 pub use extensions::reconcile_pg_stat_statements;
 pub use sql::{

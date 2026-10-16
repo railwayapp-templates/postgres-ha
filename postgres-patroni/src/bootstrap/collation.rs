@@ -1,62 +1,891 @@
-//! Collation version refresh
+//! Collation version mismatch repair: REINDEX first, then REFRESH.
 //!
-//! Mirrors postgres-ssl's wrapper.sh fork_collation_refresh. Container image rebuilds
-//! (any minor version bump, not just a major one) can ship a newer glibc while the
-//! volume's databases still carry the old collation version stamp — postgres emits a
-//! WARNING on every connection to an affected database until it's refreshed.
+//! # Why this exists
 //!
-//! Must run on the primary: ALTER DATABASE fails with a read-only-transaction error on
-//! a replica. The corrected pg_database.datcollversion then reaches replicas through
-//! normal WAL streaming — no per-replica action needed, since a replica's own mismatch
-//! check compares that (replicated) stored value against its own locally-observed
-//! glibc, and both sides converge once every node in the cluster runs the same image.
+//! A container image rebuild can move the base distro under a volume — the
+//! 2026-08-29 `postgres-ssl:16` digest bump went Debian 12 (glibc 2.36) →
+//! Debian 13 (glibc 2.41) because its Dockerfile floated `FROM postgres:16`.
+//! glibc's collation order changes between those versions, and every btree
+//! index over a collatable column (`text`, `varchar`, `citext`, ...) is
+//! physically sorted in the OLD order. Under the new libc, index lookups miss
+//! rows that are still in the heap: FK checks fail on rows that exist,
+//! `WHERE email = $1` returns nothing, and a customer read it as ~170k lost
+//! records. The wrapper then ran `ALTER DATABASE ... REFRESH COLLATION
+//! VERSION` — which only rewrites the stamp in `pg_database` and silences
+//! Postgres's own WARNING — without reindexing, so the one signal that
+//! something was wrong disappeared while the indexes stayed broken.
+//!
+//! Postgres's documented procedure for a collation library change is:
+//! REINDEX every index that depends on the changed collation, THEN refresh
+//! the recorded version. This module does exactly that, in that order, and
+//! refuses to refresh anything it did not first repair.
+//!
+//! # Detection
+//!
+//! Two catalog checks against the collation libraries this container runs:
+//!
+//! - database default:
+//!   `pg_database.datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)`
+//! - named collations (`COLLATE "en_US"` columns):
+//!   `pg_collation.collversion IS DISTINCT FROM pg_collation_actual_version(oid)`
+//!   for `collprovider IN ('c', 'i')`
+//!
+//! The catalogs ARE the state: once the refresh has run, neither query
+//! returns a row, so this whole procedure is idempotent and needs no marker
+//! file. That matters in an HA cluster (see below) because a marker in the
+//! data dir would not travel to a promoted replica, but the catalog does.
+//!
+//! Covers versioned libc and ICU collations, including PG13/14 named stamps.
+//! Predefined stale stamps also reveal default ordering changes whose database
+//! stamp was already blindly refreshed by older images.
+//!
+//! # HA / Patroni
+//!
+//! Everything here runs on the LEADER only. `REINDEX` writes new index
+//! relfiles and the swap commits through WAL, so replicas receive the
+//! rebuilt indexes by streaming; `ALTER DATABASE` is DDL and fails read-only
+//! on a standby anyway. Before the run, and again before every single
+//! `REINDEX`, the leader gate re-checks `pg_is_in_recovery() = false` AND
+//! (under Patroni) `GET /leader` = 200, no `scheduled_switchover` in
+//! `GET /cluster`, and the cluster not paused. A node that loses the lock
+//! mid-run stops at the next index; Patroni's demotion restarts its postgres
+//! anyway, which kills the in-flight REINDEX session.
+//!
+//! Failover mid-way: a promoted replica sees the leader's catalog state
+//! through WAL — databases already refreshed no longer match and are
+//! skipped; a database whose reindex was interrupted still matches (its
+//! stamp was never refreshed, because refresh only follows a fully
+//! successful reindex), so the new leader redoes that database from the
+//! top. That repeats some work but never leaves a refreshed-but-unrepaired
+//! database behind, which is the invariant that matters. The same catalog
+//! gate is why two nodes can never both run it: only one holds the leader
+//! lock, and the loser's session dies with its demotion.
+//!
+//! Rolling image update (replicas rebuilt on the new glibc first, then the
+//! leader): a replica on glibc 2.41 streaming from a leader on 2.36 holds
+//! indexes sorted by 2.36 rules and reads them with 2.41 rules — its
+//! read-only queries can miss rows for the duration of the rollout, and
+//! nothing on the replica can fix that (a standby cannot REINDEX). The fix
+//! arrives when the LEADER is redeployed on 2.41, boots, detects the
+//! mismatch, and reindexes: the rebuilt indexes replicate to every standby.
+//! Conversely, any straggler replica still on 2.36 after that point reads
+//! 2.41-ordered indexes with 2.36 rules until its own redeploy lands. Both
+//! windows are inherent to a libc change under a streaming cluster; the
+//! image pins its base distro per major precisely so this path is only ever
+//! taken deliberately, never by a same-tag digest bump.
+//!
+//! # Concurrency and locks
+//!
+//! User indexes are rebuilt with `REINDEX INDEX CONCURRENTLY` (no write
+//! lock on the table). System-catalog indexes and exclusion-constraint
+//! indexes cannot be rebuilt concurrently and get a plain `REINDEX INDEX`
+//! (brief SHARE lock; catalog indexes are tiny). Invalid `*_ccnew*` /
+//! `*_ccold*` leftovers of an earlier interrupted concurrent reindex are
+//! dropped first, per the Postgres manual's recovery procedure for exactly
+//! that situation. Any REINDEX failure aborts that database WITHOUT
+//! refreshing it, so the next boot or promotion retries it.
+//!
+//! Kill switch: `COLLATION_REINDEX_DISABLED=1` skips the whole procedure and
+//! leaves Postgres's mismatch WARNING in place. There is intentionally no
+//! "refresh without reindex" mode.
 
-use super::{read_credentials, run_psql};
+use super::{read_credentials, run_psql, run_psql_in_db};
 use crate::pgdata;
+use anyhow::{anyhow, Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use std::fs;
+use std::os::unix::fs::OpenOptionsExt;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-const REFRESH_ALL_DATABASES_SQL: &str = r#"
-DO $body$
-DECLARE
-  db record;
-BEGIN
-  FOR db IN
-    SELECT datname FROM pg_database
-    WHERE datallowconn AND datname <> 'template0'
-  LOOP
-    BEGIN
-      EXECUTE format('ALTER DATABASE %I REFRESH COLLATION VERSION', db.datname);
-    EXCEPTION WHEN OTHERS THEN
-      NULL;
-    END;
-  END LOOP;
-END
-$body$;
-"#;
+/// Set to `1`/`true` to disable the reindex+refresh procedure entirely.
+pub const KILL_SWITCH_ENV: &str = "COLLATION_REINDEX_DISABLED";
 
-/// Refresh collation versions on all connectable databases. No-op on PG < 15
-/// (`ALTER DATABASE ... REFRESH COLLATION VERSION` was introduced in PG 15) and when
-/// PG_VERSION can't be read (pre-initdb).
+const PATRONI_LEADER_URL: &str = "http://localhost:8008/leader";
+const PATRONI_CLUSTER_URL: &str = "http://localhost:8008/cluster";
+const PATRONI_SELF_URL: &str = "http://localhost:8008/patroni";
+
+/// Every connectable database (template1 included: it is connectable, its
+/// catalog indexes are reindexed in a blink, and refreshing it stops the
+/// WARNING on `CREATE DATABASE`). template0 is never connectable.
+const LIST_DATABASES_SQL: &str = "COPY (SELECT datname FROM pg_database \
+     WHERE datallowconn AND datname <> 'template0' ORDER BY datname) TO STDOUT";
+
+/// Database-default collation census, run once from the maintenance
+/// database: name, locale provider, stored version, actual version — for
+/// every database whose stored stamp differs from what this container's
+/// libc reports. Same predicate as the postgres-ssl sibling.
+const DATABASE_MISMATCH_SQL: &str = "COPY (SELECT d.datname, d.datlocprovider, \
+     coalesce(d.datcollversion, ''), coalesce(pg_database_collation_actual_version(d.oid), '') \
+     FROM pg_database d \
+     WHERE d.datallowconn AND d.datname <> 'template0' \
+       AND d.datcollversion IS DISTINCT FROM pg_database_collation_actual_version(d.oid) \
+     ORDER BY d.datname) TO STDOUT WITH (DELIMITER E'\\t')";
+
+/// Named collations whose stored version differs from the installed
+/// libc. pg_collation is per-database, so this runs inside each one.
+const NAMED_COLLATION_MISMATCH_SQL: &str = "COPY (SELECT format('%I.%I', n.nspname, c.collname), \
+     coalesce(c.collversion, ''), coalesce(pg_collation_actual_version(c.oid), '') \
+     FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace \
+     WHERE c.collversion IS NOT NULL \
+       AND c.collversion IS DISTINCT FROM pg_collation_actual_version(c.oid) \
+     ORDER BY 1) TO STDOUT WITH (DELIMITER E'\\t')";
+
+/// Invalid leftovers of an interrupted `REINDEX ... CONCURRENTLY`. The
+/// manual: a `_ccnew` suffix is the transient index that never finished —
+/// drop it and reindex again; a `_ccold` suffix is the original that could
+/// not be dropped after a successful swap — just drop it.
+///
+/// A REINDEX CONCURRENTLY that is still running looks exactly like a
+/// leftover (its `_ccnew` index is invalid until the swap), so anything a
+/// backend is currently building is excluded via
+/// `pg_stat_progress_create_index`: dropping it would block on the
+/// builder's session lock and then fail once the swap renames it. That is
+/// what a user's own REINDEX or pg_repack looks like from here, and what
+/// this node's other entry point looks like if the file lock ever fails.
+const CC_LEFTOVERS_SQL: &str = "COPY (SELECT format('%I.%I', n.nspname, ic.relname) \
+     FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid \
+     JOIN pg_namespace n ON n.oid = ic.relnamespace \
+     WHERE NOT i.indisvalid AND ic.relkind = 'i' \
+       AND ic.relname ~ '_cc(new|old)[0-9]*$' \
+       AND NOT EXISTS (SELECT 1 FROM pg_stat_progress_create_index p \
+                       WHERE p.index_relid = ic.oid) \
+     ORDER BY 1) TO STDOUT";
+
+/// One repair at a time per node. patroni-runner's boot pass and the
+/// on_role_change callback can both fire for the same promotion; two runs
+/// would REINDEX the same list twice and each would see the other's
+/// in-flight `_ccnew` index. The standalone sidecar restarts also land
+/// here. flock on a file in the socket dir, which every entry point can
+/// reach (root and `postgres` alike); the lock dies with the process, so
+/// a killed callback never leaves it held.
+const RUN_LOCK_PATH: &str = "/var/run/postgresql/.collation-refresh.lock";
+
+/// Key collations, named dependencies, and implicit-default expressions.
+/// pg_depend omits references to pinned objects (including default collation),
+/// so partial/expression indexes are conservatively included for default drift.
+const AFFECTED_INDEXES_SQL_TEMPLATE: &str = r#"COPY (WITH stale_stamped AS (
+ SELECT oid, collprovider FROM pg_collation
+ WHERE collversion IS NOT NULL
+ AND collversion IS DISTINCT FROM pg_collation_actual_version(oid)
+), dflt AS ({default_provider}), affected AS (
+ SELECT oid AS colloid FROM stale_stamped
+ UNION SELECT c.oid FROM pg_collation c, dflt d
+ WHERE c.collname = 'default' AND ({with_default} OR
+ (d.versioned AND d.p IN (SELECT collprovider FROM stale_stamped)))
+ UNION SELECT c.oid FROM pg_collation c
+ WHERE c.oid < 16384 AND c.collname <> 'default'
+ AND pg_collation_actual_version(c.oid) IS NOT NULL
+ AND c.collprovider IN (SELECT collprovider FROM stale_stamped)
+), suspect_indexes AS (
+ SELECT i.indexrelid AS oid FROM pg_index i,
+ unnest(i.indcollation::oid[]) AS u(colloid)
+ WHERE u.colloid IN (SELECT colloid FROM affected)
+ UNION SELECT d.objid FROM pg_depend d
+ WHERE d.classid = 'pg_class'::regclass
+ AND d.refclassid = 'pg_collation'::regclass
+ AND d.refobjid IN (SELECT colloid FROM affected)
+ UNION SELECT i.indexrelid FROM pg_index i
+ WHERE (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)
+ AND 100::oid IN (SELECT colloid FROM affected)
+)
+ SELECT format('%I.%I', n.nspname, ic.relname),
+ CASE WHEN n.nspname = 'pg_catalog' OR i.indisexclusion THEN 'plain' ELSE 'concurrent' END,
+ pg_relation_size(ic.oid)
+ FROM suspect_indexes s JOIN pg_index i ON i.indexrelid = s.oid
+ JOIN pg_class ic ON ic.oid = i.indexrelid
+ JOIN pg_namespace n ON n.oid = ic.relnamespace
+ WHERE ic.relkind = 'i' AND ic.relpersistence <> 't'
+ ORDER BY (n.nspname = 'pg_catalog') DESC, pg_relation_size(ic.oid), 1)
+ TO STDOUT WITH (DELIMITER E'\t')"#;
+
+/// One row of `DATABASE_MISMATCH_SQL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseMismatch {
+    pub datname: String,
+    /// `c` libc, `i` ICU, `b` builtin (PG17+).
+    pub provider: char,
+    pub stored: String,
+    pub actual: String,
+}
+
+/// One row of `AFFECTED_INDEXES_SQL_TEMPLATE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AffectedIndex {
+    /// `schema.index`, already identifier-quoted by `format('%I.%I')`.
+    pub qualified_name: String,
+    pub concurrent: bool,
+    pub size_bytes: u64,
+}
+
+/// Why the procedure did not run (all of these are logged, none is fatal).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Skip {
+    NotPrimary,
+    NotPatroniLeader,
+    SwitchoverScheduled,
+    ClusterPaused,
+}
+
+/// Repair collation version mismatches on all connectable databases:
+/// REINDEX the affected indexes, then REFRESH the recorded versions —
+/// leader only, idempotent, safe across failovers (see the module doc).
+///
+/// No-op on PG < 13 (older libc catalogs do not carry version stamps) and when PG_VERSION can't be read (pre-initdb).
+/// Every failure is logged and swallowed: this must never take a node down.
 pub fn refresh_collation_versions() {
+    refresh_collation_versions_inner(false);
+}
+
+/// Called from the standalone maintenance sidecar, which owns its psql children.
+pub fn refresh_standalone_collation_versions() {
+    // TCP excludes docker-entrypoint's temporary initdb server.
+    for _ in 0..120 {
+        if Command::new("pg_isready")
+            .args(["-q", "-h", "127.0.0.1"])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            refresh_collation_versions_inner(true);
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    tracing::warn!("collation-refresh: standalone readiness timed out; retry on next boot");
+}
+
+fn standalone_superuser<'a>(
+    was_patroni: bool,
+    postgres_user: Option<&'a str>,
+    patroni_user: Option<&'a str>,
+) -> &'a str {
+    let configured = if was_patroni {
+        patroni_user
+    } else {
+        postgres_user
+    };
+    configured.filter(|s| !s.is_empty()).unwrap_or("postgres")
+}
+
+fn refresh_collation_versions_inner(standalone: bool) {
     let pg_version_file = format!("{}/PG_VERSION", pgdata());
     let pg_major: u32 = match fs::read_to_string(&pg_version_file) {
         Ok(v) => v.trim().parse().unwrap_or(0),
         Err(_) => return,
     };
-    if pg_major < 15 {
+    if pg_major < 13 {
         return;
     }
 
-    let superuser = match read_credentials() {
-        Ok(c) => c.superuser,
+    if kill_switch_engaged() {
+        tracing::warn!(
+            "collation-refresh: {KILL_SWITCH_ENV} is set — skipping; any collation \
+             version mismatch stays unrepaired and Postgres keeps warning about it"
+        );
+        return;
+    }
+
+    let _run_lock = match acquire_run_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            tracing::info!(
+                "collation-refresh: another repair is already running on this node — skipping \
+                 this pass; it either finishes the job or the catalogs still show the mismatch \
+                 on the next boot or promotion"
+            );
+            return;
+        }
         Err(e) => {
-            tracing::warn!(error = %e, "collation-refresh: could not read credentials");
+            tracing::warn!(error = %e, "collation-refresh: could not take the run lock");
             return;
         }
     };
 
-    match run_psql(&superuser, REFRESH_ALL_DATABASES_SQL) {
-        Ok(_) => tracing::info!("collation-refresh: completed for all databases"),
-        Err(e) => tracing::warn!(error = %e, "collation-refresh: failed"),
+    let superuser = if standalone {
+        // A reverted HA volume keeps Patroni's superuser; POSTGRES_USER
+        // is the application role there, unlike a freshly initialized standalone.
+        standalone_superuser(
+            crate::orphan_slots::pgdata_was_patroni_managed(&pgdata()),
+            std::env::var("POSTGRES_USER").ok().as_deref(),
+            std::env::var("PATRONI_SUPERUSER_USERNAME").ok().as_deref(),
+        )
+        .to_string()
+    } else {
+        match read_credentials() {
+            Ok(c) => c.superuser,
+            Err(e) => {
+                tracing::warn!(error = %e, "collation-refresh: could not read credentials");
+                return;
+            }
+        }
+    };
+
+    // Callers only get here when they believe this node is (becoming) the
+    // primary: patroni-runner after pg_is_in_recovery() flipped, and the
+    // on_role_change callback right after promotion. Patroni's REST view
+    // can lag that by a moment (a 503 on /leader that clears within
+    // seconds), and the callback fires exactly once — so give the
+    // transient reasons a bounded grace instead of skipping a repair that
+    // would then wait for the next boot. Switchover/pause are not
+    // transient in that sense and return immediately.
+    if let Err(skip) = leader_gate_with_grace(&superuser, Duration::from_secs(60), standalone) {
+        tracing::info!(reason = ?skip, "collation-refresh: skipped (leader gate)");
+        return;
+    }
+
+    let databases = match run_psql(&superuser, LIST_DATABASES_SQL) {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!(error = %e, "collation-refresh: could not list databases");
+            return;
+        }
+    };
+    let databases: Vec<String> = databases
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(copy_unescape)
+        .collect();
+
+    let db_mismatches = if pg_major < 15 {
+        Vec::new()
+    } else {
+        match run_psql(&superuser, DATABASE_MISMATCH_SQL) {
+            Ok(out) => parse_database_mismatches(&out),
+            Err(e) => {
+                tracing::warn!(error = %e, "collation-refresh: database collation census failed");
+                return;
+            }
+        }
+    };
+
+    let mut repaired = 0usize;
+    let mut failed = 0usize;
+    for db in &databases {
+        let default_mismatch = db_mismatches.iter().find(|m| &m.datname == db);
+        match repair_database(&superuser, db, default_mismatch, pg_major, standalone) {
+            Ok(true) => repaired += 1,
+            Ok(false) => {}
+            Err(e) => {
+                failed += 1;
+                tracing::error!(
+                    database = %db,
+                    error = %e,
+                    "collation-refresh: database left UNREFRESHED — its collation version \
+                     mismatch is still recorded and this will be retried on the next boot \
+                     or promotion"
+                );
+            }
+        }
+    }
+
+    if failed == 0 {
+        tracing::info!(
+            databases = databases.len(),
+            repaired,
+            "collation-refresh: completed for all databases"
+        );
+    } else {
+        tracing::warn!(
+            databases = databases.len(),
+            repaired,
+            failed,
+            "collation-refresh: completed with failures"
+        );
+    }
+}
+
+/// Repair one database. Returns `Ok(true)` when something was reindexed and
+/// refreshed, `Ok(false)` when nothing was mismatched,
+/// `Err` when a REINDEX failed — in which case NOTHING was refreshed.
+fn repair_database(
+    superuser: &str,
+    db: &str,
+    default_mismatch: Option<&DatabaseMismatch>,
+    pg_major: u32,
+    standalone: bool,
+) -> Result<bool> {
+    // Named collations that moved. pg_collation is per-database.
+    let named_collations = run_psql_in_db(superuser, db, NAMED_COLLATION_MISMATCH_SQL)
+        .context("named collation census")?;
+    let named_collations: Vec<(String, String, String)> = named_collations
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            Some((
+                copy_unescape(f.next()?),
+                f.next()?.to_string(),
+                f.next()?.to_string(),
+            ))
+        })
+        .collect();
+
+    let default_mismatch_present = default_mismatch.is_some();
+    if !default_mismatch_present && named_collations.is_empty() {
+        return Ok(false);
+    }
+
+    for (name, stored, actual) in &named_collations {
+        tracing::info!(database = %db, collation = %name, stored = %stored, actual = %actual,
+            "collation-refresh: named collation version changed");
+    }
+
+    // Re-check right before the first write of this database: the census
+    // above may have taken a while on a cluster with many databases.
+    leader_gate(superuser, standalone).map_err(|s| anyhow!("leader gate: {s:?}"))?;
+
+    // Interrupted-concurrent-reindex leftovers first (manual's procedure).
+    let leftovers = run_psql_in_db(superuser, db, CC_LEFTOVERS_SQL).context("cc leftover scan")?;
+    for idx in leftovers.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let idx = copy_unescape(idx);
+        run_psql_in_db(superuser, db, &format!("DROP INDEX {idx}"))
+            .with_context(|| format!("drop invalid concurrent-reindex leftover {idx}"))?;
+        tracing::warn!(database = %db, index = %idx,
+            "collation-refresh: dropped invalid leftover of an interrupted REINDEX CONCURRENTLY");
+    }
+
+    let sql = affected_indexes_sql_for_major(default_mismatch_present, pg_major);
+    let indexes = parse_affected_indexes(
+        &run_psql_in_db(superuser, db, &sql).context("affected index census")?,
+    );
+    let total_bytes: u64 = indexes.iter().map(|i| i.size_bytes).sum();
+    tracing::info!(
+        database = %db,
+        indexes = indexes.len(),
+        total_bytes,
+        "collation-refresh: reindexing indexes that depend on a changed collation \
+         (BEFORE refreshing the recorded version)"
+    );
+
+    for (n, idx) in indexes.iter().enumerate() {
+        // A switchover or a lost leader lock between two indexes stops the
+        // run here; nothing below has been refreshed, so the next leader
+        // starts this database over.
+        leader_gate(superuser, standalone)
+            .map_err(|s| anyhow!("leader gate before {}: {s:?}", idx.qualified_name))?;
+        let stmt = if idx.concurrent {
+            format!("REINDEX INDEX CONCURRENTLY {}", idx.qualified_name)
+        } else {
+            format!("REINDEX INDEX {}", idx.qualified_name)
+        };
+        let started = Instant::now();
+        run_psql_in_db(superuser, db, &stmt).with_context(|| stmt.clone())?;
+        tracing::info!(
+            database = %db,
+            index = %idx.qualified_name,
+            concurrent = idx.concurrent,
+            size_bytes = idx.size_bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            progress = format!("{}/{}", n + 1, indexes.len()),
+            "collation-refresh: reindexed"
+        );
+    }
+
+    // Only now — every dependent index is consistent with the running libc.
+    for (name, _, _) in &named_collations {
+        run_psql_in_db(
+            superuser,
+            db,
+            &format!("ALTER COLLATION {name} REFRESH VERSION"),
+        )
+        .with_context(|| format!("ALTER COLLATION {name} REFRESH VERSION"))?;
+    }
+    if !named_collations.is_empty() {
+        tracing::info!(database = %db, collations = named_collations.len(),
+            "collation-refresh: refreshed named collation versions");
+    }
+    if default_mismatch_present {
+        let stmt = format!(
+            "ALTER DATABASE {} REFRESH COLLATION VERSION",
+            super::quote_ident(db)
+        );
+        run_psql(superuser, &stmt).with_context(|| stmt.clone())?;
+        tracing::info!(database = %db, "collation-refresh: refreshed database collation version");
+    }
+    Ok(true)
+}
+
+/// `Some(lock)` when this process now owns the per-node run lock, `None`
+/// when another repair holds it. World-writable so whichever user creates
+/// it first (root runner, `postgres` callback or sidecar) does not lock the
+/// others out of opening it; flock itself needs only an open descriptor.
+fn acquire_run_lock() -> Result<Option<Flock<fs::File>>> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o666)
+        .open(RUN_LOCK_PATH)
+        .or_else(|_| fs::OpenOptions::new().read(true).open(RUN_LOCK_PATH))
+        .with_context(|| format!("open {RUN_LOCK_PATH}"))?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, e)) => Err(anyhow!("flock {RUN_LOCK_PATH}: {e}")),
+    }
+}
+
+/// Undo `COPY ... TO STDOUT` text-format escaping. COPY writes a backslash
+/// before `\\`, the delimiter, and the control characters below; an index
+/// or database name containing any of them would otherwise be fed back to
+/// REINDEX misspelled, and that database would fail every pass forever.
+pub fn copy_unescape(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('v') => out.push('\u{b}'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn kill_switch_engaged() -> bool {
+    matches!(
+        std::env::var(KILL_SWITCH_ENV).as_deref().map(str::trim),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
+/// May this node run DDL/REINDEX right now? `pg_is_in_recovery()` must be
+/// false; under Patroni the local REST API must also say this member holds
+/// the leader lock, no switchover is scheduled and the cluster is not
+/// paused (maintenance mode — a human is choreographing something, e.g. a
+/// major upgrade; stay out of the way, the post-switchover promotion will
+/// call us again).
+fn leader_gate(superuser: &str, standalone: bool) -> std::result::Result<(), Skip> {
+    // run_psql keeps psql's table formatting; COPY gives us only the value,
+    // like the catalog queries below, so a writable primary reads as "f".
+    let out = run_psql(superuser, "COPY (SELECT pg_is_in_recovery()) TO STDOUT")
+        .map_err(|_| Skip::NotPrimary)?;
+    if out.trim() != "f" {
+        return Err(Skip::NotPrimary);
+    }
+    // PATRONI_ENABLED, or the rendered Patroni config on disk: the
+    // on_role_change callback runs in Patroni's (trimmed) environment, and
+    // the config file is the same evidence that binary already relies on.
+    let under_patroni =
+        crate::is_patroni_enabled() || std::path::Path::new(super::PATRONI_CONFIG).exists();
+    if standalone || !under_patroni {
+        return Ok(());
+    }
+    if curl_status(PATRONI_LEADER_URL).as_deref() != Some("200") {
+        return Err(Skip::NotPatroniLeader);
+    }
+    if let Some(cluster) = curl_body(PATRONI_CLUSTER_URL) {
+        if cluster_has_scheduled_switchover(&cluster) {
+            return Err(Skip::SwitchoverScheduled);
+        }
+    }
+    if let Some(me) = curl_body(PATRONI_SELF_URL) {
+        if patroni_is_paused(&me) {
+            return Err(Skip::ClusterPaused);
+        }
+    }
+    Ok(())
+}
+
+/// `leader_gate`, retried every 2s for up to `budget` while the reason is
+/// one that a promotion in progress makes transient (`NotPrimary`,
+/// `NotPatroniLeader`). Any other reason is returned at once.
+fn leader_gate_with_grace(
+    superuser: &str,
+    budget: Duration,
+    standalone: bool,
+) -> std::result::Result<(), Skip> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match leader_gate(superuser, standalone) {
+            Ok(()) => return Ok(()),
+            Err(skip @ (Skip::NotPrimary | Skip::NotPatroniLeader))
+                if Instant::now() < deadline =>
+            {
+                tracing::debug!(reason = ?skip, "collation-refresh: leader gate not open yet, waiting");
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            Err(skip) => return Err(skip),
+        }
+    }
+}
+
+/// GET endpoints of the local Patroni REST API are unauthenticated (the
+/// image's own HEALTHCHECK relies on that). `curl` rather than reqwest
+/// because this runs both from a plain synchronous binary (on-role-change)
+/// and from inside patroni-runner's tokio runtime, where a blocking HTTP
+/// client would have to be kept off the async workers.
+fn curl_status(url: &str) -> Option<String> {
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "5",
+            url,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn curl_body(url: &str) -> Option<String> {
+    let out = Command::new("curl")
+        .args(["-sf", "--max-time", "5", url])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// `GET /cluster` carries a top-level `scheduled_switchover` object while
+/// one is pending.
+pub fn cluster_has_scheduled_switchover(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("scheduled_switchover").cloned())
+        .map(|s| !s.is_null())
+        .unwrap_or(false)
+}
+
+/// `GET /patroni` carries `"pause": true` while the cluster is in
+/// maintenance mode.
+pub fn patroni_is_paused(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("pause").and_then(|p| p.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Splice the database-default decision into the affected-index query.
+#[cfg(test)]
+pub fn affected_indexes_sql(with_default: bool) -> String {
+    affected_indexes_sql_for_major(with_default, 15)
+}
+
+fn affected_indexes_sql_for_major(with_default: bool, pg_major: u32) -> String {
+    let provider = if pg_major >= 15 {
+        "SELECT datlocprovider AS p, pg_database_collation_actual_version(oid) IS NOT NULL AS versioned FROM pg_database WHERE datname = current_database()"
+    } else {
+        "SELECT 'c'::\"char\" AS p, datcollate NOT IN ('C', 'POSIX') AS versioned FROM pg_database WHERE datname = current_database()"
+    };
+    AFFECTED_INDEXES_SQL_TEMPLATE
+        .replace(
+            "{with_default}",
+            if with_default { "true" } else { "false" },
+        )
+        .replace("{default_provider}", provider)
+}
+
+/// Parse `DATABASE_MISMATCH_SQL` COPY output (tab-separated).
+pub fn parse_database_mismatches(out: &str) -> Vec<DatabaseMismatch> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let datname = copy_unescape(f.next()?);
+            let provider = f.next()?.chars().next().unwrap_or('?');
+            let stored = f.next()?.to_string();
+            let actual = f.next()?.to_string();
+            Some(DatabaseMismatch {
+                datname,
+                provider,
+                stored,
+                actual,
+            })
+        })
+        .collect()
+}
+
+/// Parse `AFFECTED_INDEXES_SQL_TEMPLATE` COPY output (tab-separated).
+pub fn parse_affected_indexes(out: &str) -> Vec<AffectedIndex> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let qualified_name = copy_unescape(f.next()?);
+            let concurrent = f.next()? == "concurrent";
+            let size_bytes = f.next()?.trim().parse().unwrap_or(0);
+            Some(AffectedIndex {
+                qualified_name,
+                concurrent,
+                size_bytes,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_maintenance_uses_the_superuser_that_initialized_the_volume() {
+        assert_eq!(
+            standalone_superuser(false, Some("owner"), Some("ha_owner")),
+            "owner"
+        );
+        assert_eq!(
+            standalone_superuser(true, Some("app"), Some("ha_owner")),
+            "ha_owner"
+        );
+        assert_eq!(standalone_superuser(true, Some("app"), None), "postgres");
+        assert_eq!(standalone_superuser(false, Some(""), None), "postgres");
+    }
+
+    #[test]
+    fn database_census_parses_provider_and_versions() {
+        let out = "railway\tc\t2.36\t2.41\nicudb\ti\t153.112\t\n";
+        let rows = parse_database_mismatches(out);
+        assert_eq!(
+            rows,
+            vec![
+                DatabaseMismatch {
+                    datname: "railway".into(),
+                    provider: 'c',
+                    stored: "2.36".into(),
+                    actual: "2.41".into(),
+                },
+                DatabaseMismatch {
+                    datname: "icudb".into(),
+                    provider: 'i',
+                    stored: "153.112".into(),
+                    actual: "".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn affected_index_census_orders_and_flags_plain_vs_concurrent() {
+        let out = "pg_catalog.pg_seclabel_object_index\tplain\t8192\n\
+                   public.users_email_key\tconcurrent\t1048576\n\
+                   public.\"Weird Name\"\tconcurrent\t16384\n";
+        let rows = parse_affected_indexes(out);
+        assert_eq!(rows.len(), 3);
+        assert!(!rows[0].concurrent);
+        assert_eq!(
+            rows[0].qualified_name,
+            "pg_catalog.pg_seclabel_object_index"
+        );
+        assert!(rows[1].concurrent);
+        assert_eq!(rows[1].size_bytes, 1_048_576);
+        assert_eq!(rows[2].qualified_name, "public.\"Weird Name\"");
+    }
+
+    #[test]
+    fn affected_index_sql_splices_the_default_decision() {
+        assert!(affected_indexes_sql(true).contains("c.collname = 'default' AND (true OR"));
+        assert!(affected_indexes_sql(false).contains("c.collname = 'default' AND (false OR"));
+        assert!(!affected_indexes_sql(true).contains("{with_default}"));
+    }
+
+    #[test]
+    fn pg13_query_avoids_pg15_database_catalog_columns() {
+        let sql = super::affected_indexes_sql_for_major(false, 13);
+        assert!(!sql.contains("datlocprovider"));
+        assert!(!sql.contains("pg_database_collation_actual_version"));
+        assert!(!sql.contains("{default_provider}"));
+    }
+
+    #[test]
+    fn copy_output_escapes_are_undone_before_names_reach_reindex() {
+        // What COPY TO STDOUT emits for index names holding a backslash,
+        // a tab and a newline (verified against PG17).
+        assert_eq!(
+            copy_unescape(r#"public."back\\slash_idx""#),
+            r#"public."back\slash_idx""#
+        );
+        assert_eq!(copy_unescape(r#"public."tab\tidx""#), "public.\"tab\tidx\"");
+        assert_eq!(copy_unescape(r#"a\nb"#), "a\nb");
+        assert_eq!(copy_unescape("plain.name"), "plain.name");
+        assert_eq!(copy_unescape(r#"trailing\"#), r#"trailing\"#);
+        let rows = parse_affected_indexes("public.\"back\\\\slash_idx\"\tconcurrent\t1\n");
+        assert_eq!(rows[0].qualified_name, r#"public."back\slash_idx""#);
+    }
+
+    #[test]
+    fn leftover_scan_skips_indexes_a_backend_is_still_building() {
+        // An in-flight REINDEX CONCURRENTLY has an invalid `_ccnew` index
+        // too; only pg_stat_progress_create_index tells it apart.
+        assert!(CC_LEFTOVERS_SQL.contains("pg_stat_progress_create_index"));
+        assert!(CC_LEFTOVERS_SQL.contains("p.index_relid = ic.oid"));
+    }
+
+    #[test]
+    fn run_lock_is_exclusive_per_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let open = || {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap()
+        };
+        let first = Flock::lock(open(), FlockArg::LockExclusiveNonblock).unwrap();
+        assert!(matches!(
+            Flock::lock(open(), FlockArg::LockExclusiveNonblock),
+            Err((_, nix::errno::Errno::EWOULDBLOCK))
+        ));
+        drop(first);
+        assert!(Flock::lock(open(), FlockArg::LockExclusiveNonblock).is_ok());
+    }
+
+    #[test]
+    fn switchover_detection_reads_patroni_cluster_json() {
+        assert!(cluster_has_scheduled_switchover(
+            r#"{"members":[],"scheduled_switchover":{"at":"2026-09-20T10:00:00+00:00","from":"a","to":"b"}}"#
+        ));
+        assert!(!cluster_has_scheduled_switchover(r#"{"members":[]}"#));
+        assert!(!cluster_has_scheduled_switchover(
+            r#"{"members":[],"scheduled_switchover":null}"#
+        ));
+        assert!(!cluster_has_scheduled_switchover("not json"));
+    }
+
+    #[test]
+    fn pause_detection_reads_patroni_self_json() {
+        assert!(patroni_is_paused(
+            r#"{"state":"running","role":"master","pause":true}"#
+        ));
+        assert!(!patroni_is_paused(r#"{"state":"running","role":"master"}"#));
+        assert!(!patroni_is_paused("garbage"));
+    }
+
+    #[test]
+    fn kill_switch_accepts_truthy_values_only() {
+        let _guard = crate::patroni::rest::test_support::ENV_LOCK.lock().unwrap();
+        for (v, expect) in [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("0", false),
+            ("", false),
+        ] {
+            std::env::set_var(KILL_SWITCH_ENV, v);
+            assert_eq!(kill_switch_engaged(), expect, "value {v:?}");
+        }
+        std::env::remove_var(KILL_SWITCH_ENV);
+        assert!(!kill_switch_engaged());
     }
 }
