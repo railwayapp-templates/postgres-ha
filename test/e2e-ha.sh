@@ -5345,6 +5345,17 @@ t_ha_adopt_default_replica() {
     fail_dump t_ha_adopt_default_replica "$node"; teardown_scope "$scope"; return
   fi
 
+  # An adopted volume is a cluster from the boot that adopts it: Patroni never
+  # bootstraps it, so post_bootstrap never pins its credentials. The runner
+  # must pin the variables on that same boot (2026-10-22: every
+  # template-created cluster booted unpinned and refused rotation), so the
+  # pin exists now, before any restart.
+  local pin=/var/lib/postgresql/data/pgdata/.railway_credentials
+  if ! docker exec "$node" test -f "$pin"; then
+    ko t_ha_adopt_default_replica "adopting boot left no credential pin at $pin"
+    fail_dump t_ha_adopt_default_replica "$node"; teardown_scope "$scope"; return
+  fi
+
   ok t_ha_adopt_default_replica
   note "adopted wal_level=replica stayed replica (no fleet-wide logical tax)"
   teardown_scope "$scope"
