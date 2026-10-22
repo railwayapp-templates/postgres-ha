@@ -15,7 +15,7 @@ use std::{io::Write, os::unix::fs::OpenOptionsExt, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
-use tracing::info;
+use tracing::{info, warn};
 
 const CONFIG: &str = "/etc/patroni/patroni.yml";
 static ROTATION: Mutex<()> = Mutex::const_new(());
@@ -244,7 +244,9 @@ fn is_auth_failure(error: &anyhow::Error) -> bool {
 /// from before the etcd root password carry no `etcd3.password`; nothing in
 /// a rotation touches their DCS.
 fn etcd_authenticated(yaml: &serde_yaml::Value) -> bool {
-    yaml["etcd3"]["password"].as_str().is_some_and(|p| !p.is_empty())
+    yaml["etcd3"]["password"]
+        .as_str()
+        .is_some_and(|p| !p.is_empty())
 }
 
 pub async fn rotate(
@@ -302,13 +304,49 @@ pub async fn rotate(
             Json(json!({"error":"invalid password"})),
         );
     }
+    let operation = format!("{:?}", request.operation).to_lowercase();
+    let secrets = [
+        request.new_password.clone(),
+        request.current_password.clone(),
+    ];
     match tokio::time::timeout(Duration::from_secs(35), apply(&config, yaml, request)).await {
         Ok(Ok(value)) => (StatusCode::OK, Json(value)),
-        _ => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error":"credential rotation could not be verified"})),
-        ),
+        Ok(Err(error)) => {
+            let reason = refusal_reason(&error, &secrets);
+            warn!(operation, reason, "credential operation refused");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    json!({"error": format!("credential rotation could not be verified: {reason}")}),
+                ),
+            )
+        }
+        Err(_) => {
+            warn!(operation, "credential operation timed out");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"credential rotation could not be verified: timed out"})),
+            )
+        }
     }
+}
+
+/// One short line naming why an operation was refused, so the control plane
+/// and the logs can say which check failed. The chain's outermost message is
+/// the check (`role password differs`, `cluster credentials are not coupled`);
+/// a driver error below it names the server's complaint. Never a credential:
+/// every password the request carried is cut out before the line leaves.
+fn refusal_reason(error: &anyhow::Error, secrets: &[String]) -> String {
+    let mut reason = error
+        .chain()
+        .map(|e| e.to_string().replace(['\n', '\r'], " "))
+        .filter(|m| !m.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(": ");
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        reason = reason.replace(secret.as_str(), "<redacted>");
+    }
+    reason.chars().take(200).collect()
 }
 
 async fn apply(
@@ -726,6 +764,20 @@ mod tests {
         assert_eq!(pin, pin_of("pinned"));
         // The handler's constant-time comparison still rejects the wrong
         // credential afterwards; resolve_pin only says what to compare to.
+    }
+
+    #[test]
+    fn a_refusal_names_the_check_and_the_cause_but_never_a_password() {
+        let secret = "hunter2-very-secret";
+        let error = anyhow::anyhow!("db error: FATAL: password {secret} rejected\nsecond line")
+            .context("role password differs");
+        let reason = refusal_reason(&error, &[secret.to_string(), String::new()]);
+        assert_eq!(
+            reason,
+            "role password differs: db error: FATAL: password <redacted> rejected second line"
+        );
+        let long = anyhow::anyhow!("{}", "x".repeat(500));
+        assert_eq!(refusal_reason(&long, &[]).len(), 200);
     }
 
     #[tokio::test]
