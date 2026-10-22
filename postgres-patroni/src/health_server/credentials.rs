@@ -240,6 +240,13 @@ fn is_auth_failure(error: &anyhow::Error) -> bool {
         })
 }
 
+/// Whether this member's Patroni talks to etcd with a credential. Clusters
+/// from before the etcd root password carry no `etcd3.password`; nothing in
+/// a rotation touches their DCS.
+fn etcd_authenticated(yaml: &serde_yaml::Value) -> bool {
+    yaml["etcd3"]["password"].as_str().is_some_and(|p| !p.is_empty())
+}
+
 pub async fn rotate(
     State(config): State<HealthServerConfig>,
     headers: HeaderMap,
@@ -341,17 +348,25 @@ async fn apply(
                 dynamic["failsafe_mode"] == true && dynamic["pause"] != true,
                 "failsafe disabled or maintenance active"
             );
-            anyhow::ensure!(
-                yaml["etcd3"]["username"].as_str() == Some("root"),
-                "unsupported etcd identity"
-            );
-            for value in [
+            // A cluster whose etcd runs without authentication (templates
+            // before the etcd root password) has no DCS credential to couple
+            // or rotate; the control plane leaves its etcd alone.
+            if etcd_authenticated(&yaml) {
+                anyhow::ensure!(
+                    yaml["etcd3"]["username"].as_str() == Some("root"),
+                    "unsupported etcd identity"
+                );
+            }
+            let mut coupled = vec![
                 &yaml["postgresql"]["authentication"]["superuser"]["password"],
                 &yaml["postgresql"]["authentication"]["replication"]["password"],
                 &yaml["postgresql"]["app_user"]["password"],
-                &yaml["etcd3"]["password"],
                 &yaml["restapi"]["authentication"]["password"],
-            ] {
+            ];
+            if etcd_authenticated(&yaml) {
+                coupled.push(&yaml["etcd3"]["password"]);
+            }
+            for value in coupled {
                 anyhow::ensure!(
                     value.as_str() == Some(&request.new_password),
                     "cluster credentials are not coupled"
@@ -423,7 +438,9 @@ async fn apply(
                 }
             }
             yaml["postgresql"]["app_user"]["password"] = request.new_password.clone().into();
-            yaml["etcd3"]["password"] = request.new_password.clone().into();
+            if etcd_authenticated(&yaml) {
+                yaml["etcd3"]["password"] = request.new_password.clone().into();
+            }
             yaml["restapi"]["authentication"]["password"] = request.new_password.clone().into();
             if !yaml["ctl"]["authentication"].is_null() {
                 yaml["ctl"]["authentication"]["password"] = request.new_password.clone().into();
@@ -575,28 +592,32 @@ pub(super) async fn reconcile(config: HealthServerConfig) {
             );
             let mut request: Rotation =
                 serde_json::from_slice(&std::fs::read(format!("{dir}/.railway_rotation"))?)?;
+            let etcd_done = !etcd_authenticated(&yaml)
+                || yaml["etcd3"]["password"].as_str() == Some(&request.new_password);
             if read_credential_pin(dir).is_some_and(|p| p.superuser_pass == request.new_password)
-                && yaml["etcd3"]["password"].as_str() == Some(&request.new_password)
+                && etcd_done
             {
                 return Ok::<(), anyhow::Error>(());
             }
             let user = text(&yaml["postgresql"]["authentication"]["superuser"]["username"])?;
             connect(&config, user, &request.new_password).await?;
-            let hosts = text(&yaml["etcd3"]["hosts"])?;
-            let credential = crate::patroni::Credential {
-                username: "root".into(),
-                password: request.new_password.clone(),
-            };
-            anyhow::ensure!(
-                crate::patroni::etcd_preflight::probe_etcd_credential(
-                    hosts,
-                    &credential,
-                    Duration::from_secs(2)
-                )
-                .await
-                    == crate::patroni::etcd_preflight::EtcdAuthProbe::Accepted,
-                "DCS not committed"
-            );
+            if etcd_authenticated(&yaml) {
+                let hosts = text(&yaml["etcd3"]["hosts"])?;
+                let credential = crate::patroni::Credential {
+                    username: "root".into(),
+                    password: request.new_password.clone(),
+                };
+                anyhow::ensure!(
+                    crate::patroni::etcd_preflight::probe_etcd_credential(
+                        hosts,
+                        &credential,
+                        Duration::from_secs(2)
+                    )
+                    .await
+                        == crate::patroni::etcd_preflight::EtcdAuthProbe::Accepted,
+                    "DCS not committed"
+                );
+            }
             request.operation = Operation::Member;
             apply(&config, yaml, request).await?;
             Ok(())
