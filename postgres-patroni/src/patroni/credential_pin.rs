@@ -19,8 +19,11 @@
 //! mode 0600, owned by postgres like everything else in PGDATA) and, on every
 //! later boot of a volume that carries a cluster, they override whatever the
 //! variables say — with a loud warning and a telemetry event, so the drift is
-//! visible. A fresh volume (first boot, conversion, scale-up) takes the
-//! variables as-is, exactly as before.
+//! visible. A fresh volume (first boot, scale-up) takes the variables as-is,
+//! exactly as before. A volume adopted from vanilla data
+//! (`PATRONI_ADOPT_EXISTING_DATA=true`) is a cluster from the boot that adopts
+//! it: Patroni never bootstraps it, so `post_bootstrap` never pins it, and the
+//! runner adopts the variables as its pin on that same boot instead.
 //!
 //! The pin lives inside PGDATA on purpose: `pg_basebackup` and pgBackRest copy
 //! it into clones and backups, so a replica seeded from a pinned leader boots
@@ -143,9 +146,10 @@ pub fn credentials_from_env_requested() -> bool {
 
 /// Reconcile `config`'s passwords with the pin on this volume. See the module
 /// doc for the contract. `has_cluster_data` is the runner's "pg_control +
-/// bootstrap marker" test — a volume that carries a Patroni-bootstrapped
-/// cluster, as opposed to an empty volume or stale data about to be cloned
-/// over. `credentials_from_env` is [`credentials_from_env_requested`].
+/// bootstrap marker (written earlier, or by this boot's adoption)" test — a
+/// volume that carries a Patroni-managed cluster, as opposed to an empty
+/// volume or stale data about to be cloned over. `credentials_from_env` is
+/// [`credentials_from_env_requested`].
 pub fn apply_credential_pin(
     config: &mut Config,
     has_cluster_data: bool,
@@ -433,6 +437,29 @@ mod tests {
         assert_eq!(config.repl_pass, "repl-active");
         assert_eq!(config.app_pass, "app-active");
         assert_eq!(read_credential_pin(data_dir), Some(pinned));
+    }
+
+    #[test]
+    fn volume_adopted_this_boot_pins_the_variables_before_patroni_starts() {
+        // PATRONI_ADOPT_EXISTING_DATA=true over vanilla data: the runner just
+        // wrote the bootstrap marker, Patroni will adopt (not bootstrap) the
+        // data, and post_bootstrap will never run — so the pin has to come
+        // from this call, on this boot, or the converted cluster and every
+        // replica cloned from it run unpinned until a restart.
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let mut config = config_at(data_dir);
+        config.adopt_existing_data = true;
+        assert_eq!(read_credential_pin(data_dir), None);
+        assert_eq!(
+            apply_credential_pin(&mut config, true, false, &telemetry()),
+            PinOutcome::Adopted
+        );
+        let pinned = read_credential_pin(data_dir).expect("pin written on the adopting boot");
+        assert_eq!(pinned, PinnedCredentials::from_config(&config));
+        assert_eq!(pinned.superuser_pass, "su-env");
+        assert_eq!(pinned.repl_pass, "repl-env");
+        assert_eq!(pinned.app_pass, "app-env");
     }
 
     #[test]

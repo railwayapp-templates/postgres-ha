@@ -637,6 +637,22 @@ async fn handle_reseed_marker(
 }
 
 /// The drifted-variable list as a telemetry field.
+/// Whether the volume carries a cluster whose credentials must be pinned, for
+/// `apply_credential_pin`'s `has_cluster_data`. A bootstrapped volume has
+/// pg_control and the bootstrap marker. A volume adopted THIS boot
+/// (`PATRONI_ADOPT_EXISTING_DATA=true` over vanilla data) has the marker only
+/// because the adoption branch just wrote it; `has_marker` was read before
+/// that write and still says false. That volume is a cluster all the same:
+/// Patroni adopts it instead of bootstrapping, so `post_bootstrap`, which
+/// pins the credentials on a real bootstrap, never runs for it. Without the
+/// adoption term here, every template-created cluster booted unpinned (found
+/// 2026-10-22): the leader pinned only on its second boot, replicas cloned
+/// from it in between carried neither pin nor marker, and the rotation
+/// endpoint refused them all with "credential pin unavailable".
+fn volume_carries_cluster(has_pg_control: bool, has_marker: bool, adopted_this_boot: bool) -> bool {
+    has_pg_control && (has_marker || adopted_this_boot)
+}
+
 fn drifted_summary(drifted: &[&str]) -> String {
     if drifted.is_empty() {
         "none recorded".to_string()
@@ -1591,7 +1607,8 @@ async fn async_main() -> Result<()> {
     let has_pg_control = Path::new(&pg_control_path).exists();
     let has_marker = Path::new(&bootstrap_marker).exists();
 
-    if config.adopt_existing_data && has_pg_control && !has_marker {
+    let adopted_this_boot = config.adopt_existing_data && has_pg_control && !has_marker;
+    if adopted_this_boot {
         info!("PATRONI_ADOPT_EXISTING_DATA=true - migrating from vanilla PostgreSQL");
         fs::write(&bootstrap_marker, "").context("Failed to create bootstrap marker")?;
     } else if has_pg_control && has_marker {
@@ -1608,7 +1625,7 @@ async fn async_main() -> Result<()> {
     // would only break replication/rewind against the leader (see
     // patroni::credential_pin). Must run before generate_patroni_config and
     // before anything else reads config.*_pass.
-    let has_cluster_data = has_pg_control && has_marker;
+    let has_cluster_data = volume_carries_cluster(has_pg_control, has_marker, adopted_this_boot);
     let pin_outcome = apply_credential_pin(
         &mut config,
         has_cluster_data,
@@ -1936,10 +1953,25 @@ mod tests {
         build_pitr_managed_block, clear_clone_wipe_attempts, clone_wipe_ledger_path,
         configure_pitr_recovery, data_dir_nonempty, pgdata_is_dedicated_subdir,
         read_clone_wipe_attempts, record_clone_wipe_attempt, should_wipe_incomplete_clone,
-        strip_pitr_managed_block, wipe_has_safe_clone_source, wipe_pgdata_contents, Config,
-        RecoverySourceConfParams, RestapiAddressSource, MAX_CLONE_WIPE_ATTEMPTS,
-        PITR_MANAGED_MARKER,
+        strip_pitr_managed_block, volume_carries_cluster, wipe_has_safe_clone_source,
+        wipe_pgdata_contents, Config, RecoverySourceConfParams, RestapiAddressSource,
+        MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
     };
+
+    #[test]
+    fn a_volume_adopted_this_boot_counts_as_cluster_data_for_the_pin() {
+        // Bootstrapped earlier: pg_control + marker.
+        assert!(volume_carries_cluster(true, true, false));
+        // Adopted this boot: the marker was just written, but has_marker was
+        // read before the write. The pin must still be adopted now, or the
+        // conversion boots unpinned (post_bootstrap never runs on adoption).
+        assert!(volume_carries_cluster(true, false, true));
+        // Stale data without a marker, not adopted: about to be cloned over.
+        assert!(!volume_carries_cluster(true, false, false));
+        // No data at all: fresh volume, whatever the flags say.
+        assert!(!volume_carries_cluster(false, false, true));
+        assert!(!volume_carries_cluster(false, true, false));
+    }
 
     #[test]
     fn blank_credential_variables_are_withheld_from_patroni_set_ones_are_not() {

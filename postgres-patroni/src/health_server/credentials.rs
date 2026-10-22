@@ -15,6 +15,7 @@ use std::{io::Write, os::unix::fs::OpenOptionsExt, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
+use tracing::info;
 
 const CONFIG: &str = "/etc/patroni/patroni.yml";
 static ROTATION: Mutex<()> = Mutex::const_new(());
@@ -25,7 +26,7 @@ pub struct Rotation {
     new_password: String,
     current_password: String,
 }
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Operation {
     Preflight,
@@ -121,6 +122,124 @@ async fn roles_match(
     Ok(true)
 }
 
+/// The user the control plane authenticates as; the password is the pinned
+/// superuser password.
+const ROTATION_USER: &str = "railway";
+
+/// The decoded Basic credential (`user:password`) of a request, if any.
+fn supplied_credential(headers: &HeaderMap) -> Option<Vec<u8>> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+        .and_then(|(_, token)| base64::engine::general_purpose::STANDARD.decode(token).ok())
+}
+
+/// The password of a decoded `railway:<password>` credential.
+fn supplied_password(credential: &[u8]) -> Option<&str> {
+    std::str::from_utf8(credential)
+        .ok()?
+        .strip_prefix(ROTATION_USER)?
+        .strip_prefix(':')
+}
+
+/// Whether an operation may establish a missing pin from the credential the
+/// request presents. Only the read-only ends of a rotation qualify: Preflight,
+/// where the password presented is by contract the one the roles carry, and
+/// Verify, which proves the roles' state before anything is trusted. The
+/// mutating steps keep refusing without a pin.
+fn may_establish_pin(operation: &Operation) -> bool {
+    matches!(operation, Operation::Preflight | Operation::Verify)
+}
+
+/// The pin a rotation request authenticates against.
+///
+/// A volume without a pin used to refuse every rotation with 503. That left
+/// the clusters that never got one stranded: replicas cloned from a leader
+/// that booted unpinned (the adoption gap fixed in the runner) carry neither
+/// pin nor bootstrap marker, so no later boot adopts one — only a re-clone
+/// would. For [`may_establish_pin`] operations the pin is instead established
+/// from the credential the request presents, once `verify` has proven, from
+/// the roles' stored verifiers, that the superuser, replication and app roles
+/// all carry that password. The coupled pin is then exactly what
+/// post_bootstrap would have written. A credential the roles do not carry is
+/// unauthorized, the same answer a pinned node gives; a verifier that cannot
+/// run (Postgres down) leaves the node unavailable, never unauthorized.
+async fn resolve_pin<F, Fut>(
+    data_dir: &str,
+    operation: &Operation,
+    credential: Option<&[u8]>,
+    verify: F,
+) -> Result<PinnedCredentials, StatusCode>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    if let Some(pin) = read_credential_pin(data_dir) {
+        return Ok(pin);
+    }
+    if !may_establish_pin(operation) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let password = credential
+        .and_then(supplied_password)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    match verify(password.to_string()).await {
+        Ok(true) => {}
+        Ok(false) => return Err(StatusCode::UNAUTHORIZED),
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+    let pin = PinnedCredentials {
+        superuser_pass: password.to_string(),
+        repl_pass: password.to_string(),
+        app_pass: password.to_string(),
+    };
+    write_credential_pin(data_dir, &pin).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    info!(
+        data_dir,
+        operation = ?operation,
+        "no credential pin on this volume — established it from the rotation credential \
+         the roles were verified to carry"
+    );
+    Ok(pin)
+}
+
+/// Prove, from the stored verifiers, that every rotation role carries
+/// `password`: the `verify` of [`resolve_pin`] in production.
+async fn roles_carry(
+    config: &HealthServerConfig,
+    yaml: &serde_yaml::Value,
+    password: String,
+) -> Result<bool> {
+    let user = text(&yaml["postgresql"]["authentication"]["superuser"]["username"])?;
+    let replication_user = text(&yaml["postgresql"]["authentication"]["replication"]["username"])?;
+    let app_user = text(&yaml["postgresql"]["app_user"]["username"])?;
+    // Loopback is `trust` on the rendered pg_hba, so the login below normally
+    // succeeds whatever the password and the verifiers decide. On a tightened
+    // pg_hba the server itself refuses a wrong password: that is the same
+    // "roles do not carry it" answer, not an outage.
+    let client = match connect(config, user, &password).await {
+        Ok(client) => client,
+        Err(e) if is_auth_failure(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    roles_match(&client, &[user, replication_user, app_user], &password).await
+}
+
+/// Whether a connection error is Postgres refusing the credential
+/// (SQLSTATE 28P01 invalid_password or 28000 invalid_authorization_specification).
+fn is_auth_failure(error: &anyhow::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    error
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|db| {
+            *db.code() == SqlState::INVALID_PASSWORD
+                || *db.code() == SqlState::INVALID_AUTHORIZATION_SPECIFICATION
+        })
+}
+
 pub async fn rotate(
     State(config): State<HealthServerConfig>,
     headers: HeaderMap,
@@ -137,19 +256,30 @@ pub async fn rotate(
         }
     };
     let dir = yaml["postgresql"]["data_dir"].as_str().unwrap_or("");
-    let Some(pin) = read_credential_pin(dir) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error":"credential pin unavailable"})),
-        );
+    let supplied = supplied_credential(&headers);
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(10),
+        resolve_pin(dir, &request.operation, supplied.as_deref(), |password| {
+            roles_carry(&config, &yaml, password)
+        }),
+    )
+    .await;
+    let pin = match resolved {
+        Ok(Ok(pin)) => pin,
+        Ok(Err(StatusCode::UNAUTHORIZED)) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":"unauthorized"})),
+            )
+        }
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"credential pin unavailable"})),
+            )
+        }
     };
-    let expected = format!("railway:{}", pin.superuser_pass);
-    let supplied = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.split_once(' '))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
-        .and_then(|(_, token)| base64::engine::general_purpose::STANDARD.decode(token).ok());
+    let expected = format!("{ROTATION_USER}:{}", pin.superuser_pass);
     if !supplied.is_some_and(|s| bool::from(s.as_slice().ct_eq(expected.as_bytes()))) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -525,6 +655,155 @@ mod tests {
             assert!(!roles_match(&client, &["postgres"], previous).await.unwrap());
         }
     }
+    fn pin_of(password: &str) -> PinnedCredentials {
+        PinnedCredentials {
+            superuser_pass: password.into(),
+            repl_pass: password.into(),
+            app_pass: password.into(),
+        }
+    }
+    fn basic(user: &str, password: &str) -> Vec<u8> {
+        format!("{user}:{password}").into_bytes()
+    }
+    fn basic_header(user: &str, password: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let token = base64::engine::general_purpose::STANDARD.encode(basic(user, password));
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn supplied_credential_decodes_basic_only() {
+        let headers = basic_header("railway", "p:w:d");
+        let credential = supplied_credential(&headers).unwrap();
+        assert_eq!(credential, basic("railway", "p:w:d"));
+        // The password keeps every colon after the user's.
+        assert_eq!(supplied_password(&credential), Some("p:w:d"));
+        assert_eq!(supplied_password(b"someone:else"), None);
+        assert_eq!(supplied_password(b"railway"), None);
+        assert_eq!(supplied_password(b"railway-ish:pw"), None);
+        let mut bearer = HeaderMap::new();
+        bearer.insert(header::AUTHORIZATION, "Bearer abc".parse().unwrap());
+        assert_eq!(supplied_credential(&bearer), None);
+        assert_eq!(supplied_credential(&HeaderMap::new()), None);
+    }
+
+    #[tokio::test]
+    async fn an_existing_pin_is_returned_without_verifying_anything() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        write_credential_pin(dir, &pin_of("pinned")).unwrap();
+        let credential = basic("railway", "wrong");
+        let pin = resolve_pin(dir, &Operation::Preflight, Some(&credential), |_| async {
+            panic!("verifier must not run when a pin exists")
+        })
+        .await
+        .unwrap();
+        assert_eq!(pin, pin_of("pinned"));
+        // The handler's constant-time comparison still rejects the wrong
+        // credential afterwards; resolve_pin only says what to compare to.
+    }
+
+    #[tokio::test]
+    async fn preflight_establishes_a_missing_pin_from_a_verified_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        assert_eq!(read_credential_pin(dir), None);
+        let credential = basic("railway", "carried");
+        let pin = resolve_pin(
+            dir,
+            &Operation::Preflight,
+            Some(&credential),
+            |password| async move {
+                assert_eq!(password, "carried");
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+        // Coupled, exactly as post_bootstrap would have pinned it, and on disk
+        // for every later request and boot.
+        assert_eq!(pin, pin_of("carried"));
+        assert_eq!(read_credential_pin(dir), Some(pin_of("carried")));
+    }
+
+    #[tokio::test]
+    async fn verify_establishes_a_missing_pin_too() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        let credential = basic("railway", "carried");
+        let pin = resolve_pin(dir, &Operation::Verify, Some(&credential), |_| async {
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        assert_eq!(pin, pin_of("carried"));
+        assert_eq!(read_credential_pin(dir), Some(pin_of("carried")));
+    }
+
+    #[tokio::test]
+    async fn mutating_operations_keep_refusing_without_a_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        let credential = basic("railway", "carried");
+        for operation in [Operation::Prepare, Operation::Database, Operation::Member] {
+            let outcome = resolve_pin(dir, &operation, Some(&credential), |_| async {
+                panic!("verifier must not run for {operation:?}")
+            })
+            .await;
+            assert_eq!(
+                outcome,
+                Err(StatusCode::SERVICE_UNAVAILABLE),
+                "{operation:?}"
+            );
+        }
+        assert_eq!(read_credential_pin(dir), None);
+    }
+
+    #[tokio::test]
+    async fn a_credential_the_roles_do_not_carry_is_unauthorized_and_pins_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        let credential = basic("railway", "edited-variable");
+        let outcome = resolve_pin(dir, &Operation::Preflight, Some(&credential), |_| async {
+            Ok(false)
+        })
+        .await;
+        assert_eq!(outcome, Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(read_credential_pin(dir), None);
+
+        // No credential, or one for another user: nothing to verify.
+        assert_eq!(
+            resolve_pin(dir, &Operation::Preflight, None, |_| async { Ok(true) }).await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        let other = basic("someone", "carried");
+        assert_eq!(
+            resolve_pin(dir, &Operation::Preflight, Some(&other), |_| async {
+                Ok(true)
+            })
+            .await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(read_credential_pin(dir), None);
+    }
+
+    #[tokio::test]
+    async fn a_verifier_that_cannot_run_is_unavailable_not_unauthorized() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        let credential = basic("railway", "carried");
+        let outcome = resolve_pin(dir, &Operation::Verify, Some(&credential), |_| async {
+            anyhow::bail!("connection refused")
+        })
+        .await;
+        assert_eq!(outcome, Err(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(read_credential_pin(dir), None);
+    }
+
     #[test]
     fn quotes_sql_and_pgpass_without_interpolation() {
         assert_eq!(quote_identifier("odd\"role"), "\"odd\"\"role\"");
