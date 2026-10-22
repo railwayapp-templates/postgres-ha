@@ -215,8 +215,29 @@ async fn roles_carry(
     let user = text(&yaml["postgresql"]["authentication"]["superuser"]["username"])?;
     let replication_user = text(&yaml["postgresql"]["authentication"]["replication"]["username"])?;
     let app_user = text(&yaml["postgresql"]["app_user"]["username"])?;
-    let client = connect(config, user, &password).await?;
+    // Loopback is `trust` on the rendered pg_hba, so the login below normally
+    // succeeds whatever the password and the verifiers decide. On a tightened
+    // pg_hba the server itself refuses a wrong password: that is the same
+    // "roles do not carry it" answer, not an outage.
+    let client = match connect(config, user, &password).await {
+        Ok(client) => client,
+        Err(e) if is_auth_failure(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    };
     roles_match(&client, &[user, replication_user, app_user], &password).await
+}
+
+/// Whether a connection error is Postgres refusing the credential
+/// (SQLSTATE 28P01 invalid_password or 28000 invalid_authorization_specification).
+fn is_auth_failure(error: &anyhow::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    error
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|db| {
+            *db.code() == SqlState::INVALID_PASSWORD
+                || *db.code() == SqlState::INVALID_AUTHORIZATION_SPECIFICATION
+        })
 }
 
 pub async fn rotate(
