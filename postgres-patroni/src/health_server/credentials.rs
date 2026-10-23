@@ -15,7 +15,7 @@ use std::{io::Write, os::unix::fs::OpenOptionsExt, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
-use tracing::info;
+use tracing::{info, warn};
 
 const CONFIG: &str = "/etc/patroni/patroni.yml";
 static ROTATION: Mutex<()> = Mutex::const_new(());
@@ -244,7 +244,41 @@ fn is_auth_failure(error: &anyhow::Error) -> bool {
 /// from before the etcd root password carry no `etcd3.password`; nothing in
 /// a rotation touches their DCS.
 fn etcd_authenticated(yaml: &serde_yaml::Value) -> bool {
-    yaml["etcd3"]["password"].as_str().is_some_and(|p| !p.is_empty())
+    yaml["etcd3"]["password"]
+        .as_str()
+        .is_some_and(|p| !p.is_empty())
+}
+
+/// Where this member keeps its REST credential. A member that enforces REST
+/// authentication (`PATRONI_RESTAPI_PASSWORD` set) renders it under
+/// `restapi.authentication`; one that only sends it, as every cluster from
+/// before that variable does, renders it under `ctl.authentication`. Rotation
+/// updates the block the member has and never adds one: adding
+/// `restapi.authentication` would start enforcing on the next reload.
+fn rest_auth_section(yaml: &serde_yaml::Value) -> Option<&'static str> {
+    ["restapi", "ctl"].into_iter().find(|section| {
+        yaml[section]["authentication"]["password"]
+            .as_str()
+            .is_some()
+    })
+}
+
+/// The credential fields a rotation keeps in lockstep, as this member renders
+/// them: the Postgres roles, the REST credential wherever it lives, and the
+/// etcd root password only when Patroni authenticates to etcd.
+fn coupled_credentials(yaml: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
+    let mut coupled = vec![
+        &yaml["postgresql"]["authentication"]["superuser"]["password"],
+        &yaml["postgresql"]["authentication"]["replication"]["password"],
+        &yaml["postgresql"]["app_user"]["password"],
+    ];
+    if let Some(section) = rest_auth_section(yaml) {
+        coupled.push(&yaml[section]["authentication"]["password"]);
+    }
+    if etcd_authenticated(yaml) {
+        coupled.push(&yaml["etcd3"]["password"]);
+    }
+    coupled
 }
 
 pub async fn rotate(
@@ -302,13 +336,49 @@ pub async fn rotate(
             Json(json!({"error":"invalid password"})),
         );
     }
+    let operation = format!("{:?}", request.operation).to_lowercase();
+    let secrets = [
+        request.new_password.clone(),
+        request.current_password.clone(),
+    ];
     match tokio::time::timeout(Duration::from_secs(35), apply(&config, yaml, request)).await {
         Ok(Ok(value)) => (StatusCode::OK, Json(value)),
-        _ => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error":"credential rotation could not be verified"})),
-        ),
+        Ok(Err(error)) => {
+            let reason = refusal_reason(&error, &secrets);
+            warn!(operation, reason, "credential operation refused");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    json!({"error": format!("credential rotation could not be verified: {reason}")}),
+                ),
+            )
+        }
+        Err(_) => {
+            warn!(operation, "credential operation timed out");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"credential rotation could not be verified: timed out"})),
+            )
+        }
     }
+}
+
+/// One short line naming why an operation was refused, so the control plane
+/// and the logs can say which check failed. The chain's outermost message is
+/// the check (`role password differs`, `cluster credentials are not coupled`);
+/// a driver error below it names the server's complaint. Never a credential:
+/// every password the request carried is cut out before the line leaves.
+fn refusal_reason(error: &anyhow::Error, secrets: &[String]) -> String {
+    let mut reason = error
+        .chain()
+        .map(|e| e.to_string().replace(['\n', '\r'], " "))
+        .filter(|m| !m.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(": ");
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        reason = reason.replace(secret.as_str(), "<redacted>");
+    }
+    reason.chars().take(200).collect()
 }
 
 async fn apply(
@@ -357,16 +427,7 @@ async fn apply(
                     "unsupported etcd identity"
                 );
             }
-            let mut coupled = vec![
-                &yaml["postgresql"]["authentication"]["superuser"]["password"],
-                &yaml["postgresql"]["authentication"]["replication"]["password"],
-                &yaml["postgresql"]["app_user"]["password"],
-                &yaml["restapi"]["authentication"]["password"],
-            ];
-            if etcd_authenticated(&yaml) {
-                coupled.push(&yaml["etcd3"]["password"]);
-            }
-            for value in coupled {
+            for value in coupled_credentials(&yaml) {
                 anyhow::ensure!(
                     value.as_str() == Some(&request.new_password),
                     "cluster credentials are not coupled"
@@ -428,9 +489,18 @@ async fn apply(
                 .await?,
                 "role password not replicated"
             );
-            let rest_user = text(&yaml["restapi"]["authentication"]["username"])?.to_string();
-            let old_rest_password =
-                text(&yaml["restapi"]["authentication"]["password"])?.to_string();
+            // Without an enforced REST credential Patroni accepts any
+            // Authorization on /reload; the superuser name and an empty
+            // password are then only what the request carries.
+            let rest = rest_auth_section(&yaml);
+            let rest_user = match rest {
+                Some(section) => text(&yaml[section]["authentication"]["username"])?.to_string(),
+                None => user.clone(),
+            };
+            let old_rest_password = match rest {
+                Some(section) => text(&yaml[section]["authentication"]["password"])?.to_string(),
+                None => String::new(),
+            };
             for role in ["superuser", "replication", "rewind"] {
                 if !yaml["postgresql"]["authentication"][role].is_null() {
                     yaml["postgresql"]["authentication"][role]["password"] =
@@ -441,9 +511,11 @@ async fn apply(
             if etcd_authenticated(&yaml) {
                 yaml["etcd3"]["password"] = request.new_password.clone().into();
             }
-            yaml["restapi"]["authentication"]["password"] = request.new_password.clone().into();
-            if !yaml["ctl"]["authentication"].is_null() {
-                yaml["ctl"]["authentication"]["password"] = request.new_password.clone().into();
+            for section in ["restapi", "ctl"] {
+                if !yaml[section]["authentication"].is_null() {
+                    yaml[section]["authentication"]["password"] =
+                        request.new_password.clone().into();
+                }
             }
             let passfile = text(&yaml["postgresql"]["pgpass"])?;
             let entries = [&replication_user, &user, &app_user]
@@ -726,6 +798,42 @@ mod tests {
         assert_eq!(pin, pin_of("pinned"));
         // The handler's constant-time comparison still rejects the wrong
         // credential afterwards; resolve_pin only says what to compare to.
+    }
+
+    const ENFORCED: &str = "restapi:\n  authentication:\n    username: \"postgres\"\n    password: \"pw\"\netcd3:\n  username: \"root\"\n  password: \"pw\"\npostgresql:\n  authentication:\n    superuser: {username: postgres, password: \"pw\"}\n    replication: {username: postgres, password: \"pw\"}\n  app_user: {username: postgres, password: \"pw\"}\n";
+    const LEGACY: &str = "restapi:\n  listen: \":::8008\"\nctl:\n  authentication:\n    username: \"postgres\"\n    password: \"pw\"\netcd3:\n  username: \"root\"\n  password: \"pw\"\npostgresql:\n  authentication:\n    superuser: {username: postgres, password: \"pw\"}\n    replication: {username: postgres, password: \"pw\"}\n  app_user: {username: postgres, password: \"pw\"}\n";
+
+    #[test]
+    fn the_rest_credential_is_coupled_wherever_this_member_keeps_it() {
+        let enforced: serde_yaml::Value = serde_yaml::from_str(ENFORCED).unwrap();
+        let legacy: serde_yaml::Value = serde_yaml::from_str(LEGACY).unwrap();
+        assert_eq!(rest_auth_section(&enforced), Some("restapi"));
+        assert_eq!(rest_auth_section(&legacy), Some("ctl"));
+        for yaml in [&enforced, &legacy] {
+            let coupled = coupled_credentials(yaml);
+            assert_eq!(coupled.len(), 5, "roles, rest and etcd");
+            assert!(coupled.iter().all(|v| v.as_str() == Some("pw")));
+        }
+        // A member that enforces nothing and sends nothing has no REST field
+        // to keep in step; the roles and etcd still are.
+        let mut bare = legacy.clone();
+        bare["ctl"] = serde_yaml::Value::Null;
+        assert_eq!(rest_auth_section(&bare), None);
+        assert_eq!(coupled_credentials(&bare).len(), 4);
+    }
+
+    #[test]
+    fn a_refusal_names_the_check_and_the_cause_but_never_a_password() {
+        let secret = "hunter2-very-secret";
+        let error = anyhow::anyhow!("db error: FATAL: password {secret} rejected\nsecond line")
+            .context("role password differs");
+        let reason = refusal_reason(&error, &[secret.to_string(), String::new()]);
+        assert_eq!(
+            reason,
+            "role password differs: db error: FATAL: password <redacted> rejected second line"
+        );
+        let long = anyhow::anyhow!("{}", "x".repeat(500));
+        assert_eq!(refusal_reason(&long, &[]).len(), 200);
     }
 
     #[tokio::test]
