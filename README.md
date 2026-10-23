@@ -481,10 +481,12 @@ preloads it next to `pg_stat_statements`: the Patroni bootstrap seeds
 `shared_preload_libraries: pg_stat_statements,pgaudit` into DCS, and every
 node boot reconciles the two into DCS on clusters bootstrapped before (the
 same path that keeps the archive params and `failsafe_mode` current). The
-GUC is postmaster-scoped, so on such a cluster Patroni flags
-`pending_restart` and the next member restart loads it — a redeploy's
-rolling restart included. Preloaded with `pgaudit.log` unset it logs nothing
-and costs nothing; turning auditing on is
+GUC is postmaster-scoped: the member whose boot wrote the DCS patch restarts
+its own Postgres in place to load it (a replica keeps streaming, a leader
+keeps its lock), and the members that were not restarted stay
+`pending_restart` until their next restart — a redeploy's rolling restart
+included. Preloaded with `pgaudit.log` unset it logs nothing and costs
+nothing; turning auditing on is
 
 ```bash
 psql -c "CREATE EXTENSION pgaudit"            # on the primary; the catalog replicates

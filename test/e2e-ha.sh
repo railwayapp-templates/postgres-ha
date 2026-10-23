@@ -1632,8 +1632,9 @@ t_ha_track_commit_timestamp_seeded() {
 # find it already there) and is inert until pgaudit.log is set. A fresh
 # cluster has it on every member; a cluster seeded before pgaudit (DCS says
 # pg_stat_statements alone) gets it reconciled into DCS by the next member
-# boot (reconcile.rs) and loaded by the next restart — postmaster-scoped, so
-# Patroni only flags pending_restart.
+# boot (reconcile.rs); that member then restarts itself in place to load it
+# (it started from the pre-patch value), while the members that did not
+# restart stay pending_restart until their next restart.
 t_ha_pgaudit_preloaded_by_image() {
   local t=t_ha_pgaudit_preloaded_by_image
   local scope=t-pgaudit-${PG_VERSION}
@@ -1705,7 +1706,23 @@ t_ha_pgaudit_preloaded_by_image() {
   logs_match "$replica" "DCS shared_preload_libraries lacks an image library" \
     || { ko "$t" "the reconcile did not report the preload drift"; fail_dump "$t" "$replica"; teardown_scope "$scope"; return; }
 
-  # Postmaster-scoped: loaded by the next restart of each member.
+  # The member that wrote the patch restarts its own postgres in place and
+  # comes back with the library loaded — no operator restart for it.
+  deadline=$(($(date +%s) + 180)); found=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    libs=$(docker exec -u postgres "$replica" psql -tAc "SHOW shared_preload_libraries" 2>/dev/null)
+    if [ "$libs" = "pg_stat_statements,pgaudit" ]; then found=1; break; fi
+    sleep 3
+  done
+  [ "$found" = "1" ] || { ko "$t" "the patch-writing member did not restart itself with pgaudit loaded (SHOW: '$libs')"; fail_dump "$t" "$replica"; teardown_scope "$scope"; return; }
+  logs_match "$replica" "restarted this member in place to load the image preload libraries" \
+    || { ko "$t" "the self restart was not reported"; fail_dump "$t" "$replica"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko "$t" "replicas did not stream after the self restart"; fail_dump "$t" "$leader"; teardown_scope "$scope"; return; }
+
+  # Postmaster-scoped: the other members load it on their next restart. (Here
+  # they never unloaded it — SHOW reports the running postmaster, and only the
+  # restarted replica ever started from the pre-pgaudit value — so this is the
+  # operator's restart being harmless, not the loading itself.)
   if ! docker exec "$leader" patronictl -c /etc/patroni/patroni.yml restart "$scope" --force >/dev/null 2>&1; then
     ko "$t" "patronictl restart failed"; fail_dump "$t" "$leader"; teardown_scope "$scope"; return
   fi
@@ -1718,7 +1735,7 @@ t_ha_pgaudit_preloaded_by_image() {
   done
 
   ok "$t"
-  note "leader=$leader; fresh cluster preloaded pgaudit on all members; audit line logged; catalog replicated to $replica; pre-pgaudit DCS reconciled by a member boot and loaded by the restart"
+  note "leader=$leader; fresh cluster preloaded pgaudit on all members; audit line logged; catalog replicated to $replica; pre-pgaudit DCS reconciled by $replica's boot, which restarted itself; the rest loaded it on the restart"
   teardown_scope "$scope"
 }
 

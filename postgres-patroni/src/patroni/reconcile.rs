@@ -40,6 +40,14 @@
 //! 3-simultaneous-restart cluster flap. The dashboard PITR enable/disable
 //! flow owns the rolling-restart choreography. This reconcile only ensures
 //! DCS cannot drift from env-var intent.
+//!
+//! The one exception is the image preload list (`shared_preload_libraries`,
+//! see `compute_preload_reconcile_patch`): no dashboard flow owns it, and the
+//! node that writes that patch started its own postmaster from the pre-patch
+//! value, so it alone would stay `pending_restart` — and if it is the leader,
+//! `CREATE EXTENSION pgaudit` keeps failing there until some later redeploy.
+//! That node restarts itself in place through Patroni (`restart_self_for_preload`):
+//! one write per cluster means one restart per cluster, never three.
 
 use super::Config;
 use anyhow::{Context, Result};
@@ -254,6 +262,64 @@ fn compute_preload_reconcile_patch(current: Option<&str>) -> Option<String> {
         return None;
     }
     Some(libs.join(","))
+}
+
+/// After this node wrote a preload patch, its own postmaster started from
+/// the pre-patch DCS value and runs without the library until a restart;
+/// members that boot later start from the patched value. Patroni marks this
+/// member `pending_restart` once it applies the patched config (its next HA
+/// loop), and `POST /restart` with `restart_pending` restarts postgres in
+/// place — a replica keeps streaming afterwards, a leader keeps its lock (no
+/// failover), the same in-place restart `patronictl restart` performs. Only
+/// the node that wrote the patch restarts, and the patch is written once per
+/// cluster, so this cannot become the 3-simultaneous-restart flap the archive
+/// reconcile avoids. Best-effort: a failure here leaves the member exactly
+/// where it would otherwise be (`pending_restart` until its next redeploy),
+/// so it is logged, never propagated.
+async fn restart_self_for_preload(client: &reqwest::Client) {
+    const WAIT_PENDING_ATTEMPTS: u32 = 30;
+    const WAIT_PENDING_INTERVAL: Duration = Duration::from_secs(3);
+    let mut pending = false;
+    for _ in 0..WAIT_PENDING_ATTEMPTS {
+        let status: Option<Value> = match client.get(format!("{PATRONI_REST}/patroni")).send().await
+        {
+            Ok(resp) => resp.json().await.ok(),
+            Err(_) => None,
+        };
+        if status
+            .as_ref()
+            .and_then(|s| s.get("pending_restart"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            pending = true;
+            break;
+        }
+        tokio::time::sleep(WAIT_PENDING_INTERVAL).await;
+    }
+    if !pending {
+        info!(
+            "preload reconcile: this member did not report pending_restart within the wait — leaving it to its next restart"
+        );
+        return;
+    }
+    let result = super::rest::authenticate(client.post(format!("{PATRONI_REST}/restart")))
+        .json(&json!({ "restart_pending": true }))
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            info!("preload reconcile: restarted this member in place to load the image preload libraries");
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, body = %body.chars().take(200).collect::<String>(), "preload reconcile: Patroni refused the in-place restart; the member stays pending_restart until its next restart");
+        }
+        Err(e) => {
+            warn!(error = %e, "preload reconcile: could not ask Patroni for the in-place restart; the member stays pending_restart until its next restart");
+        }
+    }
 }
 
 /// Fold the preload value into the `PATCH /config` body the other axes
@@ -1067,6 +1133,7 @@ pub async fn reconcile_pgbackrest_archive_config(
         );
     }
 
+    let wrote_preload = preload_patch.is_some();
     match merge_preload_patch(
         merge_reconcile_patches(archive_patch, failsafe_patch),
         preload_patch,
@@ -1074,6 +1141,9 @@ pub async fn reconcile_pgbackrest_archive_config(
         Some(patch) => {
             send_patch(&client, &patch).await?;
             info!(enabled, "etcd config reconciled with env-driven intent");
+            if wrote_preload {
+                restart_self_for_preload(&client).await;
+            }
         }
         None => {
             info!(
