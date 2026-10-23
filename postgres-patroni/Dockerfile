@@ -75,9 +75,11 @@ ARG PGVECTOR_PKG_VERSION=0.8.*
 # rebuild to drift across. Within a branch, patch releases ship empty catalog
 # upgrade scripts (1.7->1.7.1, 16.0->16.1 are both bare \echo guards), so a
 # refreshed .so under an older catalog is the same bugfix stream the pgvector
-# wildcard admits. It is installed but not preloaded: pgaudit refuses to load
-# anywhere but shared_preload_libraries, which in Patroni mode lives in DCS,
-# so enabling it is an operator act (see README "Extensions").
+# wildcard admits. The image preloads it next to pg_stat_statements (DCS seed
+# in patroni/yaml.rs, reconciled into DCS on every node boot for older
+# clusters; init-ssl.sh + postgres-wrapper in standalone mode): pgaudit
+# refuses to load any other way, and preloaded with pgaudit.log unset it is
+# inert, so CREATE EXTENSION pgaudit simply works (see README "Extensions").
 
 ARG POSTGRES_VERSION
 # CI passes its content key here (see the build workflow's content gate):

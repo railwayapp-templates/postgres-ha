@@ -224,6 +224,52 @@ fn merge_reconcile_patches(archive: Option<Value>, failsafe: Option<bool>) -> Op
     }
 }
 
+/// The image's preload libraries (`crate::IMAGE_PRELOAD_LIBRARIES`) must be
+/// in DCS's `shared_preload_libraries` on every cluster, not only the ones
+/// bootstrapped after yaml.rs seeded them — bootstrap.dcs is first-init-only,
+/// the same blindness as the archive params. Pure: the current DCS value in,
+/// the value to write out, `None` when nothing is missing. Keeps the
+/// operator's own entries and their order and appends the missing image
+/// libraries. The GUC is PGC_POSTMASTER: Patroni flags `pending_restart`
+/// and the next member restart (a redeploy's rolling restart included)
+/// loads it — no restart is issued here, for the same reason as archive_mode.
+fn compute_preload_reconcile_patch(current: Option<&str>) -> Option<String> {
+    let mut libs: Vec<String> = current
+        .unwrap_or("")
+        .split(',')
+        .map(|lib| {
+            lib.trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_string()
+        })
+        .filter(|lib| !lib.is_empty())
+        .collect();
+    let before = libs.len();
+    for lib in crate::IMAGE_PRELOAD_LIBRARIES {
+        if !libs.iter().any(|l| l == lib) {
+            libs.push(lib.to_string());
+        }
+    }
+    if libs.len() == before {
+        return None;
+    }
+    Some(libs.join(","))
+}
+
+/// Fold the preload value into the `PATCH /config` body the other axes
+/// produced (under `postgresql.parameters`, next to the archive params), so
+/// a node drifted on several axes still writes DCS once.
+fn merge_preload_patch(patch: Option<Value>, preload: Option<String>) -> Option<Value> {
+    match preload {
+        None => patch,
+        Some(libs) => {
+            let mut merged = patch.unwrap_or_else(|| json!({}));
+            merged["postgresql"]["parameters"]["shared_preload_libraries"] = json!(libs);
+            Some(merged)
+        }
+    }
+}
+
 /// How long `ensure_restore_command_cleared` polls for the effective GUC to
 /// read empty after an archive disable before giving up on this reconcile
 /// pass. Generous relative to what it waits on (leader election settling,
@@ -1006,7 +1052,25 @@ pub async fn reconcile_pgbackrest_archive_config(
         );
     }
 
-    match merge_reconcile_patches(archive_patch, failsafe_patch) {
+    // The image's preload libraries live in postgresql.parameters like the
+    // archive params, with the same first-init-only seed; see
+    // compute_preload_reconcile_patch for why no restart follows.
+    let current_preload = params
+        .and_then(|m| m.get("shared_preload_libraries"))
+        .and_then(|v| v.as_str());
+    let preload_patch = compute_preload_reconcile_patch(current_preload);
+    if let Some(wanted) = &preload_patch {
+        warn!(
+            current = ?current_preload,
+            wanted,
+            "DCS shared_preload_libraries lacks an image library — reconciling (postmaster-scoped: loads on each member's next restart)"
+        );
+    }
+
+    match merge_preload_patch(
+        merge_reconcile_patches(archive_patch, failsafe_patch),
+        preload_patch,
+    ) {
         Some(patch) => {
             send_patch(&client, &patch).await?;
             info!(enabled, "etcd config reconciled with env-driven intent");
@@ -1014,7 +1078,7 @@ pub async fn reconcile_pgbackrest_archive_config(
         None => {
             info!(
                 enabled,
-                "DCS archive and failsafe config already match env-driven intent"
+                "DCS archive, failsafe and preload config already match env-driven intent"
             );
         }
     }
@@ -1202,6 +1266,85 @@ mod tests {
             archive
         );
         assert!(merge_reconcile_patches(None, None).is_none());
+    }
+
+    #[test]
+    fn preload_matching_is_noop() {
+        assert_eq!(
+            compute_preload_reconcile_patch(Some("pg_stat_statements,pgaudit")),
+            None
+        );
+        assert_eq!(
+            compute_preload_reconcile_patch(Some("auto_explain, pgaudit ,pg_stat_statements")),
+            None,
+            "order and spacing are the operator's; only membership matters"
+        );
+    }
+
+    #[test]
+    fn preload_seeded_before_pgaudit_gets_it_appended() {
+        // The whole reason this axis exists: a cluster bootstrapped when
+        // yaml.rs seeded pg_stat_statements alone keeps that DCS value
+        // forever, and CREATE EXTENSION pgaudit refuses on it.
+        assert_eq!(
+            compute_preload_reconcile_patch(Some("pg_stat_statements")).as_deref(),
+            Some("pg_stat_statements,pgaudit")
+        );
+        assert_eq!(
+            compute_preload_reconcile_patch(None).as_deref(),
+            Some("pg_stat_statements,pgaudit")
+        );
+        assert_eq!(
+            compute_preload_reconcile_patch(Some("")).as_deref(),
+            Some("pg_stat_statements,pgaudit")
+        );
+    }
+
+    #[test]
+    fn preload_keeps_operator_entries_first() {
+        assert_eq!(
+            compute_preload_reconcile_patch(Some("auto_explain")).as_deref(),
+            Some("auto_explain,pg_stat_statements,pgaudit")
+        );
+        assert_eq!(
+            compute_preload_reconcile_patch(Some("'pg_stat_statements', \"timescaledb\""))
+                .as_deref(),
+            Some("pg_stat_statements,timescaledb,pgaudit"),
+            "quoted entries are unquoted, never dropped or doubled"
+        );
+    }
+
+    #[test]
+    fn preload_rides_under_postgresql_parameters_next_to_the_archive_params() {
+        let archive = compute_archive_reconcile_patch(true, 60, &EMPTY).unwrap();
+        let merged = merge_preload_patch(
+            merge_reconcile_patches(Some(archive), Some(true)),
+            Some("pg_stat_statements,pgaudit".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            merged["postgresql"]["parameters"]["shared_preload_libraries"],
+            "pg_stat_statements,pgaudit"
+        );
+        assert_eq!(
+            merged["postgresql"]["parameters"]["archive_mode"],
+            EXPECTED_ARCHIVE_MODE
+        );
+        assert_eq!(merged["failsafe_mode"], true);
+
+        // Alone, it still builds the nested shape from nothing.
+        let alone =
+            merge_preload_patch(None, Some("pg_stat_statements,pgaudit".to_string())).unwrap();
+        assert_eq!(
+            alone,
+            json!({"postgresql": {"parameters": {"shared_preload_libraries": "pg_stat_statements,pgaudit"}}})
+        );
+        assert!(merge_preload_patch(None, None).is_none());
+        let archive = compute_archive_reconcile_patch(true, 60, &EMPTY).unwrap();
+        assert_eq!(
+            merge_preload_patch(Some(archive.clone()), None).unwrap(),
+            archive
+        );
     }
 
     #[test]

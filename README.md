@@ -472,25 +472,29 @@ Control-plane credentials (see [Control-plane authentication](#control-plane-aut
 
 Besides Postgres's contrib modules, the image ships pgvector and pgaudit
 (PGDG's `postgresql-<major>-pgvector` and `postgresql-<major>-pgaudit`), the
-same set as the standalone postgres-ssl image. pgaudit is opt-in: it refuses
-to load anywhere but `shared_preload_libraries`, which in Patroni mode lives
-in DCS, so enable it from any node:
+same set as the standalone postgres-ssl image. Both are a `CREATE EXTENSION`
+away on the primary (`vector`, `pgaudit`), from psql or the dashboard's
+Extensions card.
+
+pgaudit refuses to load any way but `shared_preload_libraries`, so the image
+preloads it next to `pg_stat_statements`: the Patroni bootstrap seeds
+`shared_preload_libraries: pg_stat_statements,pgaudit` into DCS, and every
+node boot reconciles the two into DCS on clusters bootstrapped before (the
+same path that keeps the archive params and `failsafe_mode` current). The
+GUC is postmaster-scoped, so on such a cluster Patroni flags
+`pending_restart` and the next member restart loads it — a redeploy's
+rolling restart included. Preloaded with `pgaudit.log` unset it logs nothing
+and costs nothing; turning auditing on is
 
 ```bash
-patronictl -c /etc/patroni/patroni.yml edit-config --force \
-  -p "shared_preload_libraries=pg_stat_statements,pgaudit"
-# postmaster-scoped: Patroni only flags pending_restart. Restart one member at
-# a time (replicas first) to keep the primary up.
-patronictl -c /etc/patroni/patroni.yml restart <cluster> <member> --force
+psql -c "CREATE EXTENSION pgaudit"            # on the primary; the catalog replicates
+patronictl -c /etc/patroni/patroni.yml edit-config --force -p "pgaudit.log=ddl, role"
 ```
 
-then `CREATE EXTENSION pgaudit` on the primary and set the audit classes the
-same way (`-p "pgaudit.log=ddl, role"`, reload-scoped). Keep
-`pg_stat_statements` in the list: the image preloads it and the dashboard's
-Stats tab reads its view. The preload must reach every member — the
-extension's catalog replicates, and a replica promoted without pgaudit
-preloaded refuses its first DDL with `pgaudit must be loaded via
-shared_preload_libraries`.
+`pgaudit.log` is reload-scoped, so Patroni applies it without a restart.
+Audit lines land in each member's server log. If you edit
+`shared_preload_libraries` yourself, keep both image libraries in the list;
+a member started without them is repaired on its next boot.
 
 ### Scaling HAProxy
 

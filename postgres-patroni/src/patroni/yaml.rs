@@ -197,7 +197,7 @@ bootstrap:
         max_replication_slots: 10
         max_connections: 500
         password_encryption: scram-sha-256
-        shared_preload_libraries: pg_stat_statements
+        shared_preload_libraries: pg_stat_statements,pgaudit
 {pgbackrest_archive_params}
   initdb:
     - encoding: UTF8

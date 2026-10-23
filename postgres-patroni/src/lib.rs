@@ -55,49 +55,77 @@ pub async fn sudo_command(args: &[&str]) -> Result<()> {
     }
 }
 
-/// Add pg_stat_statements to shared_preload_libraries in a config file
-fn add_pg_stat_statements(config_file: &Path) -> Result<()> {
-    let content = fs::read_to_string(config_file)?;
+/// The libraries the image itself preloads on every volume: pg_stat_statements
+/// because the dashboard's Stats tab reads its view, and pgaudit because it
+/// refuses to load any other way (its `_PG_init` errors outside
+/// shared_preload_libraries, so `CREATE EXTENSION pgaudit` — the dashboard's
+/// Install button — only works when it is already here) while costing nothing
+/// until `pgaudit.log` is set. Standalone mode writes them into the config
+/// files below; Patroni mode seeds the same list into DCS at bootstrap
+/// (patroni/yaml.rs) and reconciles it into DCS on every node boot
+/// (patroni/reconcile.rs) for clusters bootstrapped before.
+pub const IMAGE_PRELOAD_LIBRARIES: [&str; 2] = ["pg_stat_statements", "pgaudit"];
 
-    // Find the last shared_preload_libraries line and extract its value
-    let current_libs: Option<String> = content
+fn is_preload_assignment(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("shared_preload_libraries")
+        .map(|rest| rest.trim_start().starts_with('='))
+        .unwrap_or(false)
+}
+
+/// The effective value of the LAST shared_preload_libraries assignment in a
+/// config file's contents, as bare library names: quotes of both kinds and
+/// whitespace stripped, trailing comment dropped. Empty when there is no
+/// assignment. The quote stripping is what makes ALTER SYSTEM's single-string
+/// form (`'"a,b"'`, which Postgres reads as ONE library named `a,b`) come out
+/// as `a` and `b` here.
+fn preload_libraries(contents: &str) -> Vec<String> {
+    contents
         .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            trimmed.starts_with("shared_preload_libraries")
-        })
+        .filter(|line| is_preload_assignment(line))
         .next_back()
-        .and_then(|line| {
-            // Extract value after '=' - handles quoted ('val', "val") and unquoted (val) formats
-            line.split('=').nth(1).map(|v| {
-                v.trim()
-                    .trim_start_matches(['\'', '"'])
-                    .trim_end_matches(['\'', '"'])
-                    .trim()
-                    .to_string()
-            })
+        .map(|line| {
+            let value = line.splitn(2, '=').nth(1).unwrap_or("");
+            let value = value.split('#').next().unwrap_or("");
+            value
+                .split(',')
+                .map(|lib| {
+                    lib.chars()
+                        .filter(|c| !c.is_whitespace() && *c != '\'' && *c != '"')
+                        .collect::<String>()
+                })
+                .filter(|lib| !lib.is_empty())
+                .collect()
         })
-        .filter(|s| !s.is_empty());
+        .unwrap_or_default()
+}
 
-    let new_setting = match current_libs {
-        Some(libs) => format!("shared_preload_libraries = '{},pg_stat_statements'\n", libs),
-        None => "shared_preload_libraries = 'pg_stat_statements'\n".to_string(),
-    };
-
-    // Append the new setting to the config file
-    let mut new_content = content;
-    if !new_content.ends_with('\n') {
-        new_content.push('\n');
+/// Append an assignment that keeps the file's current list and adds `lib`.
+fn add_preload_library(config_file: &Path, lib: &str) -> Result<()> {
+    let mut content = fs::read_to_string(config_file)?;
+    let mut libs = preload_libraries(&content);
+    libs.push(lib.to_string());
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
     }
-    new_content.push_str(&new_setting);
-
-    fs::write(config_file, new_content)?;
+    content.push_str(&format!(
+        "shared_preload_libraries = '{}'\n",
+        libs.join(",")
+    ));
+    fs::write(config_file, content)?;
     Ok(())
 }
 
-/// Ensure pg_stat_statements is configured in shared_preload_libraries
-/// This handles databases created before this setting was added
-pub fn ensure_pg_stat_statements(pgdata: &str) -> Result<()> {
+/// Ensure every image preload library is in shared_preload_libraries (standalone
+/// mode). postgresql.conf always carries the list (init-ssl.sh wrote it; a volume
+/// initialized before a library was added gets it appended here).
+/// postgresql.auto.conf is only touched when it already assigns the GUC: an
+/// ALTER SYSTEM there overrides postgresql.conf as a whole, so an operator list
+/// without the image's libraries would silently drop them. Membership is
+/// checked per list element — `pgaudit.log = 'ddl'` on another line of
+/// auto.conf must not read as pgaudit being preloaded.
+pub fn ensure_image_preload_libraries(pgdata: &str) -> Result<()> {
     let postgres_conf = Path::new(pgdata).join("postgresql.conf");
     let auto_conf = Path::new(pgdata).join("postgresql.auto.conf");
 
@@ -106,29 +134,112 @@ pub fn ensure_pg_stat_statements(pgdata: &str) -> Result<()> {
         return Ok(());
     }
 
-    let conf_content = fs::read_to_string(&postgres_conf)?;
-
-    // Skip if pg_stat_statements is already configured
-    if conf_content.contains("pg_stat_statements") {
-        return Ok(());
-    }
-
-    info!("Adding pg_stat_statements to shared_preload_libraries...");
-    add_pg_stat_statements(&postgres_conf)?;
-
-    // Only update auto.conf if it has shared_preload_libraries set (which would override postgresql.conf)
-    // and doesn't already have pg_stat_statements
-    if auto_conf.exists() {
-        let auto_content = fs::read_to_string(&auto_conf)?;
-        let has_shared_preload = auto_content
-            .lines()
-            .any(|line| line.trim().starts_with("shared_preload_libraries"));
-        let has_pg_stat = auto_content.contains("pg_stat_statements");
-
-        if has_shared_preload && !has_pg_stat {
-            add_pg_stat_statements(&auto_conf)?;
+    for (file, only_when_assigned) in [(&postgres_conf, false), (&auto_conf, true)] {
+        if !file.exists() {
+            continue;
+        }
+        if only_when_assigned && !fs::read_to_string(file)?.lines().any(is_preload_assignment) {
+            continue;
+        }
+        for lib in IMAGE_PRELOAD_LIBRARIES {
+            let current = preload_libraries(&fs::read_to_string(file)?);
+            if current.iter().any(|l| l == lib) {
+                continue;
+            }
+            info!(library = lib, file = %file.display(), "Adding image preload library to shared_preload_libraries");
+            add_preload_library(file, lib)?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod preload_tests {
+    use super::*;
+
+    fn pgdata(conf: &str, auto: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("postgresql.conf"), conf).unwrap();
+        if let Some(auto) = auto {
+            fs::write(dir.path().join("postgresql.auto.conf"), auto).unwrap();
+        }
+        dir
+    }
+
+    fn value(dir: &tempfile::TempDir, file: &str) -> Vec<String> {
+        preload_libraries(&fs::read_to_string(dir.path().join(file)).unwrap())
+    }
+
+    #[test]
+    fn fresh_volume_is_left_alone() {
+        let dir = pgdata(
+            "#shared_preload_libraries = ''\nshared_preload_libraries = 'pg_stat_statements,pgaudit'\n",
+            Some("max_connections = '500'\n"),
+        );
+        ensure_image_preload_libraries(dir.path().to_str().unwrap()).unwrap();
+        let conf = fs::read_to_string(dir.path().join("postgresql.conf")).unwrap();
+        assert_eq!(conf.matches("shared_preload_libraries").count(), 2);
+        let auto = fs::read_to_string(dir.path().join("postgresql.auto.conf")).unwrap();
+        assert!(!auto.contains("shared_preload_libraries"));
+    }
+
+    #[test]
+    fn legacy_volume_gets_the_missing_library_appended_to_its_list() {
+        let dir = pgdata(
+            "shared_preload_libraries = 'pg_stat_statements'\t# comment\n",
+            None,
+        );
+        ensure_image_preload_libraries(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            value(&dir, "postgresql.conf"),
+            ["pg_stat_statements", "pgaudit"]
+        );
+    }
+
+    #[test]
+    fn operator_library_is_kept_ahead_of_the_image_ones() {
+        let dir = pgdata("shared_preload_libraries = 'auto_explain'\n", None);
+        ensure_image_preload_libraries(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            value(&dir, "postgresql.conf"),
+            ["auto_explain", "pg_stat_statements", "pgaudit"]
+        );
+    }
+
+    #[test]
+    fn operator_auto_conf_list_is_repaired_by_element_not_by_substring() {
+        let dir = pgdata(
+            "shared_preload_libraries = 'pg_stat_statements,pgaudit'\n",
+            Some("pgaudit.log = 'ddl'\nshared_preload_libraries = 'pg_stat_statements'\n"),
+        );
+        ensure_image_preload_libraries(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            value(&dir, "postgresql.auto.conf"),
+            ["pg_stat_statements", "pgaudit"]
+        );
+        let conf = fs::read_to_string(dir.path().join("postgresql.conf")).unwrap();
+        assert_eq!(conf.matches("shared_preload_libraries").count(), 1);
+    }
+
+    #[test]
+    fn alter_system_renderings_normalize_to_the_same_list() {
+        assert_eq!(
+            preload_libraries("shared_preload_libraries = 'pg_stat_statements, pgaudit'\n"),
+            ["pg_stat_statements", "pgaudit"]
+        );
+        assert_eq!(
+            preload_libraries("shared_preload_libraries = '\"pg_stat_statements,pgaudit\"'\n"),
+            ["pg_stat_statements", "pgaudit"]
+        );
+        assert!(preload_libraries("shared_preload_libraries = ''\n").is_empty());
+        assert!(preload_libraries("#shared_preload_libraries = 'x'\n").is_empty());
+    }
+
+    #[test]
+    fn uninitialized_volume_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_image_preload_libraries(dir.path().to_str().unwrap()).unwrap();
+        assert!(!dir.path().join("postgresql.conf").exists());
+    }
 }
