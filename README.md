@@ -12,6 +12,7 @@ This template deploys a production-ready, highly-available PostgreSQL cluster on
 - **Automatic recovery** - failed nodes rejoin as replicas
 - **Health monitoring** - Patroni REST API for cluster status
 - **Multi-version support** - PostgreSQL 14, 15, 16, 17, and 18
+- **pgvector and pgaudit** bundled (pgaudit opt-in, see [Extensions](#extensions))
 
 ## Architecture
 
@@ -466,6 +467,30 @@ Control-plane credentials (see [Control-plane authentication](#control-plane-aut
 | `PATRONI_RESTAPI_USERNAME` | Postgres nodes | Username for the above (default: the superuser name). |
 | `ETCD_ROOT_PASSWORD` | etcd nodes | etcd enables authentication with a `root` user holding this password. The template sets it to the cluster's superuser password. |
 | `PATRONI_ETCD3_USERNAME` / `PATRONI_ETCD3_PASSWORD` | Postgres nodes | Credential Patroni presents to etcd (default: `root` / the superuser password). |
+
+### Extensions
+
+Besides Postgres's contrib modules, the image ships pgvector and pgaudit
+(PGDG's `postgresql-<major>-pgvector` and `postgresql-<major>-pgaudit`), the
+same set as the standalone postgres-ssl image. pgaudit is opt-in: it refuses
+to load anywhere but `shared_preload_libraries`, which in Patroni mode lives
+in DCS, so enable it from any node:
+
+```bash
+patronictl -c /etc/patroni/patroni.yml edit-config --force \
+  -p "shared_preload_libraries=pg_stat_statements,pgaudit"
+# postmaster-scoped: Patroni only flags pending_restart. Restart one member at
+# a time (replicas first) to keep the primary up.
+patronictl -c /etc/patroni/patroni.yml restart <cluster> <member> --force
+```
+
+then `CREATE EXTENSION pgaudit` on the primary and set the audit classes the
+same way (`-p "pgaudit.log=ddl, role"`, reload-scoped). Keep
+`pg_stat_statements` in the list: the image preloads it and the dashboard's
+Stats tab reads its view. The preload must reach every member — the
+extension's catalog replicates, and a replica promoted without pgaudit
+preloaded refuses its first DDL with `pgaudit must be loaded via
+shared_preload_libraries`.
 
 ### Scaling HAProxy
 

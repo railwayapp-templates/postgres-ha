@@ -1626,6 +1626,79 @@ t_ha_track_commit_timestamp_seeded() {
 # stanza-create, AND /etc/pgbackrest/pgbackrest.conf's repo1-path is
 # rewritten with the per-cluster sub-prefix. Pins port commit 4b52dc9
 # (postgres-ssl PR #50 equivalent).
+# pgaudit ships in the image but stays opt-in: it refuses to load anywhere
+# but shared_preload_libraries, and in Patroni mode that GUC lives in DCS
+# (bootstrap.dcs seeds pg_stat_statements alone), so enabling it is the
+# operator path exercised here — patronictl edit-config the preload list
+# (keeping pg_stat_statements, whose view the dashboard's Stats tab reads),
+# a member restart (postmaster-scoped GUC: Patroni only flags
+# pending_restart), CREATE EXTENSION on the leader. The preload must reach
+# every member: the extension's catalog replicates, and a replica promoted
+# without pgaudit preloaded would refuse its first DDL.
+t_ha_pgaudit_preload_via_dcs() {
+  local t=t_ha_pgaudit_preload_via_dcs
+  local scope=t-pgaudit-${PG_VERSION}
+  local etcd_hosts; etcd_hosts=$(setup_etcd_cluster "$scope")
+  read -r n1 n2 n3 < <(setup_patroni_cluster "$scope" "$etcd_hosts")
+
+  local leader
+  leader=$(wait_for_leader "$scope" 240) || { ko "$t" "no leader elected"; fail_dump "$t" "$n1" "$n2" "$n3"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko "$t" "replicas did not stream"; fail_dump "$t" "$leader"; teardown_scope "$scope"; return; }
+
+  local available
+  available=$(psql_leader "$leader" -At -c "SELECT count(*) FROM pg_available_extensions WHERE name = 'pgaudit'" 2>/dev/null)
+  assert_eq "$available" "1" "pgaudit is installable" || { ko "$t" ""; fail_dump "$t" "$leader"; teardown_scope "$scope"; return; }
+
+  if ! docker exec "$leader" patronictl -c /etc/patroni/patroni.yml edit-config --force \
+       -p "shared_preload_libraries=pg_stat_statements,pgaudit" >/dev/null 2>&1; then
+    ko "$t" "patronictl edit-config failed"; fail_dump "$t" "$leader"; teardown_scope "$scope"; return
+  fi
+  if ! docker exec "$leader" patronictl -c /etc/patroni/patroni.yml restart "$scope" --force >/dev/null 2>&1; then
+    ko "$t" "patronictl restart failed"; fail_dump "$t" "$leader"; teardown_scope "$scope"; return
+  fi
+  leader=$(wait_for_leader "$scope" 240) || { ko "$t" "no leader after the restart"; fail_dump "$t" "$n1" "$n2" "$n3"; teardown_scope "$scope"; return; }
+  wait_for_replication "$scope" 2 240 || { ko "$t" "replicas did not stream after the restart"; fail_dump "$t" "$leader"; teardown_scope "$scope"; return; }
+
+  local member libs
+  for member in "$n1" "$n2" "$n3"; do
+    wait_for_pg_accepting "$member" 120 || { ko "$t" "$member not accepting after the restart"; fail_dump "$t" "$member"; teardown_scope "$scope"; return; }
+    libs=$(docker exec -u postgres "$member" psql -tAc "SHOW shared_preload_libraries" 2>/dev/null)
+    assert_eq "$libs" "pg_stat_statements,pgaudit" "preload list on $member" || { ko "$t" ""; fail_dump "$t" "$member"; teardown_scope "$scope"; return; }
+  done
+
+  # One session: the SET scopes pgaudit.log to it, and the CREATE TABLE is
+  # the DDL it must log (pgaudit's SESSION line goes to the server log).
+  if ! psql_leader "$leader" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION pgaudit" \
+       -c "SET pgaudit.log = 'ddl'; CREATE TABLE pgaudit_canary (id int)" >/dev/null 2>&1; then
+    ko "$t" "CREATE EXTENSION pgaudit / audited DDL failed on the leader"; fail_dump "$t" "$leader"; teardown_scope "$scope"; return
+  fi
+  local deadline=$(($(date +%s) + 30)) found=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if logs_match "$leader" "AUDIT: SESSION,.*,DDL,CREATE TABLE,TABLE,public.pgaudit_canary"; then found=1; break; fi
+    sleep 1
+  done
+  [ "$found" = "1" ] || { ko "$t" "no pgaudit SESSION line for the CREATE TABLE in the leader's log"; fail_dump "$t" "$leader"; teardown_scope "$scope"; return; }
+
+  # The catalog replicates: a replica sees the extension, and (preloaded
+  # above) could take over without refusing DDL.
+  local replica=""
+  for member in "$n1" "$n2" "$n3"; do
+    if [ "$member" != "$leader" ]; then replica="$member"; break; fi
+  done
+  deadline=$(($(date +%s) + 60)); found=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$(docker exec -u postgres "$replica" psql -tAc "SELECT count(*) FROM pg_extension WHERE extname = 'pgaudit'" 2>/dev/null)" = "1" ]; then
+      found=1; break
+    fi
+    sleep 2
+  done
+  [ "$found" = "1" ] || { ko "$t" "pgaudit extension did not replicate to $replica"; fail_dump "$t" "$replica"; teardown_scope "$scope"; return; }
+
+  ok "$t"
+  note "leader=$leader; preload set in DCS reached all three members; audit line logged; catalog replicated to $replica"
+  teardown_scope "$scope"
+}
+
 t_ha_per_cluster_path_marker() {
   local scope=t-pcpath-${PG_VERSION}
   reset_bucket
@@ -7201,6 +7274,7 @@ ALL_TESTS=(
   # ----- HA-specific, not reachable from ssl harness -----
   t_ha_replica_watcher_no_op
   t_ha_track_commit_timestamp_seeded
+  t_ha_pgaudit_preload_via_dcs
   t_ha_per_cluster_path_marker
   t_ha_recovery_source_conf_isolation
   # PR #78: replica re-seed from the S3 archive instead of the live leader
