@@ -754,6 +754,26 @@ This template supports PostgreSQL 14, 15, 16, 17, and 18. To upgrade:
 
 5. Delete old cluster after verification
 
+## Base distro pinning and collation (libc) changes
+
+The `postgres-patroni` image is built `FROM postgres:<minor>-<distro>` with the Debian release **frozen per major** (`ARG POSTGRES_BASE_DISTRO` in `postgres-patroni/Dockerfile`, mirrored by the `BASE_DISTRO` map in `.github/workflows/build-and-push.yml`). Today every supported major (14–18) and every published per-minor tag is on **trixie** (Debian 13, glibc 2.41); the build refuses to publish a tag whose image is not on the pinned release.
+
+Why it matters: glibc's collation order changes between Debian releases, and every btree index over a collatable column (`text`, `varchar`, …) is physically sorted in the order of the libc that built it. Move the libc under a volume and index lookups miss rows that are still in the heap — FK checks fail on existing rows and tables "lose" data (the 2026-08-29 `postgres-ssl:16` incident, where a same-tag digest bump silently went bookworm → trixie). Upstream's `postgres:16` and `postgres:16.15` tags float across Debian releases, and Railway's CVE lane redeploys these images in place, so a floating base is a live hazard rather than a cosmetic one.
+
+What the image does when the libc under a volume did change (a deliberate distro move, or a volume attached to a different image):
+
+- On the **leader only** — at boot (`patroni-runner`) and on promotion (`on-role-change`) — it detects the mismatch from the catalogs (`pg_database.datcollversion` vs `pg_database_collation_actual_version(oid)`, and `pg_collation.collversion` vs `pg_collation_actual_version(oid)` for versioned libc and ICU collations), **REINDEXes indexes that depend on a changed collation** (`REINDEX INDEX CONCURRENTLY`; plain `REINDEX` for exclusion constraints and catalog indexes; ordinary `C`/`POSIX`/uuid/numeric keys are untouched; expression and partial indexes are conservatively rebuilt when default ordering is suspect), and only then runs `ALTER COLLATION … REFRESH VERSION` / `ALTER DATABASE … REFRESH COLLATION VERSION`. A REINDEX failure leaves that database unrefreshed (Postgres keeps warning) and is retried on the next boot or promotion. Each index is logged as `collation-refresh: reindexed`.
+- Replicas never reindex: the rebuilt indexes reach them through WAL. During a rolling redeploy a replica already on the new libc reads mis-ordered indexes until the leader is redeployed and reindexes — roll the leader promptly after the replicas.
+- The gate re-checks `pg_is_in_recovery()`, Patroni's `/leader`, a pending `scheduled_switchover`, and maintenance-mode pause before every REINDEX; a node that loses the lock stops, and the promoted node redoes any database that was not yet refreshed.
+- Versioned ICU collations are repaired too. PG13/14 infer default libc drift from named stamps; newer majors also inspect the database stamp. Stale named stamps can reveal drift after an older image blindly refreshed the default stamp.
+- Standalone mode runs the same repair from a maintenance sidecar, with or without PITR. It waits for the final TCP server and uses `POSTGRES_USER`; Patroni checks apply only in HA mode.
+- `COLLATION_REINDEX_DISABLED=1` skips the whole procedure (the mismatch WARNING then stays visible). There is deliberately no "refresh without reindex" mode.
+- One repair runs at a time per node (a file lock shared by the boot pass, the promotion callback and the standalone sidecar), and an index some other backend is still building concurrently is never mistaken for an abandoned `_ccnew` leftover.
+
+Clusters whose catalogs were **already refreshed by an earlier image without a reindex** (the 2.36 → 2.41 move logged as `collation-refresh: NOTICE: changing version from 2.36 to 2.41` before this change) still carry the old libc's stamp on the predefined named collations (`en_US`, `en_US.utf8`), which the earlier image never refreshed. That stale stamp is what the repair keys on: on the first leader boot or promotion with this image it rebuilds every default-collation text index in those databases and then refreshes all the stamps. This is the correct outcome (those indexes are mis-ordered today), but it is a one-off REINDEX of every text index on such a cluster, fired by an ordinary redeploy — the HA fleet itself was never on Debian 12, so it applies to volumes brought in from `postgres-ssl` (bookworm) and similar conversions. Budget I/O for those before rolling this image there, or set `COLLATION_REINDEX_DISABLED=1` on that service until a maintenance window.
+
+Moving a major to a new Debian release is a reviewed change: update `POSTGRES_BASE_DISTRO` and the workflow's `BASE_DISTRO` entry together, expect every cluster of that major to run the leader-side REINDEX on its next redeploy (budget I/O and time for large databases), and never let it ride in a same-tag digest bump the CVE lane will fire unattended.
+
 ## Security
 
 - All passwords are auto-generated and encrypted at rest

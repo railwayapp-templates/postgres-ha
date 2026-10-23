@@ -205,6 +205,27 @@ jobs:
 
           SUPPORTED_MAJORS="14 15 16 17 18"
 
+          # Debian release each major is built FROM — frozen per major, and
+          # threaded into every build as POSTGRES_BASE_DISTRO so the
+          # Dockerfile's `FROM postgres:X.Y-<distro>` never follows upstream
+          # re-pointing `postgres:X.Y` to a newer Debian. A libc change under
+          # a volume silently invalidates every text index (the 2026-08-29
+          # postgres-ssl:16 incident — see the Dockerfile comment). Values
+          # MUST match what the published tags already run; verified
+          # 2026-09-20: :14 :15 :16 :17 :18 and every published per-minor
+          # tag are Debian 13 (trixie, glibc 2.41). Moving a major is a
+          # reviewed PR that changes the entry here AND the Dockerfile
+          # default, after budgeting for the leader-side REINDEX every
+          # cluster of that major will run on its next boot. Fails closed:
+          # a major without an entry is not built.
+          declare -A BASE_DISTRO=(
+            [14]=trixie
+            [15]=trixie
+            [16]=trixie
+            [17]=trixie
+            [18]=trixie
+          )
+
           # Newest upstream minor per supported major, via the Docker
           # Registry v2 API (registry-1.docker.io) — the Hub website API
           # hard-blocks shared GitHub runner IPs with persistent 403s.
@@ -262,6 +283,11 @@ jobs:
 
           INCLUDE="[]"
           for MAJOR in $SUPPORTED_MAJORS; do
+            DISTRO="${BASE_DISTRO[$MAJOR]:-}"
+            if [ -z "$DISTRO" ]; then
+              echo "::error::no base distro pinned for major ${MAJOR} — refusing to build it on a floating base"
+              exit 1
+            fi
             LATEST=$(printf '%s\n' "$UPSTREAM_MINORS" | grep -E "^${MAJOR}\.[0-9]+$" | sort -V | tail -1)
             if [ -z "$LATEST" ]; then
               echo "::error::no upstream minor resolved for major ${MAJOR} — refusing to shrink the build set"
@@ -270,8 +296,8 @@ jobs:
             MINORS=$( { printf '%s\n' "$PUBLISHED_MINORS" "$SSL_MINORS" | grep -E "^${MAJOR}\.[0-9]+$" || true; echo "$LATEST"; } | sort -uV)
             for MINOR in $MINORS; do
               IS_LATEST=$([ "$MINOR" = "$LATEST" ] && echo true || echo false)
-              INCLUDE=$(jq -c --arg major "$MAJOR" --arg minor "$MINOR" --argjson latest "$IS_LATEST" \
-                '. + [{major: $major, minor: $minor, latest: $latest}]' <<<"$INCLUDE")
+              INCLUDE=$(jq -c --arg major "$MAJOR" --arg minor "$MINOR" --arg distro "$DISTRO" --argjson latest "$IS_LATEST" \
+                '. + [{major: $major, minor: $minor, distro: $distro, latest: $latest}]' <<<"$INCLUDE")
             done
           done
 
@@ -283,7 +309,7 @@ jobs:
             | sed 's/^/::warning::published minor tag outside supported majors, NOT rebuilt: /' || true
 
           COUNT=$(jq 'length' <<<"$INCLUDE")
-          echo "building ${COUNT} minors: $(jq -r '[.[].minor] | join(", ")' <<<"$INCLUDE")"
+          echo "building ${COUNT} minors: $(jq -r '[.[] | "\(.minor)-\(.distro)"] | join(", ")' <<<"$INCLUDE")"
           echo "matrix=$(jq -c '{include: .}' <<<"$INCLUDE")" >> "$GITHUB_OUTPUT"
 
   # Build postgres-patroni for AMD64 (depends only on amd64 rust binaries).
@@ -337,11 +363,17 @@ jobs:
           IMG="${{ env.IMAGE_PREFIX }}/postgres-patroni"
           TAG="${{ matrix.minor }}${{ env.BETA_SUFFIX }}"
 
+          # The gate inspects the SAME distro-suffixed base the Dockerfile
+          # builds FROM: keying on the unsuffixed `postgres:X.Y` would make
+          # an upstream Debian re-point look like "something to pick up"
+          # while the build (correctly) stays on the pinned release.
+          BASE="postgres:${{ matrix.minor }}-${{ matrix.distro }}"
+
           GATE_OK=true
           CODE_KEY=$(git rev-parse HEAD:postgres-patroni HEAD:common HEAD:Cargo.toml HEAD:Cargo.lock | sha256sum | cut -c1-16) || GATE_OK=false
-          BASE_DIGEST=$(docker buildx imagetools inspect "postgres:${{ matrix.minor }}" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
-          docker pull -q "postgres:${{ matrix.minor }}" >/dev/null || GATE_OK=false
-          PKG_KEY=$(docker run --rm "postgres:${{ matrix.minor }}" bash -c "apt-get update -qq >/dev/null 2>&1; apt list --upgradable 2>/dev/null | sort" | sha256sum | cut -c1-16) || GATE_OK=false
+          BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
+          docker pull -q "$BASE" >/dev/null || GATE_OK=false
+          PKG_KEY=$(docker run --rm "$BASE" bash -c "apt-get update -qq >/dev/null 2>&1; apt list --upgradable 2>/dev/null | sort" | sha256sum | cut -c1-16) || GATE_OK=false
 
           if [ "$GATE_OK" != "true" ] || [ -z "$CODE_KEY" ] || [ -z "$BASE_DIGEST" ] || [ -z "$PKG_KEY" ]; then
             echo "::warning::content gate failed for ${TAG}; building unconditionally"
@@ -384,6 +416,7 @@ jobs:
           build-args: |
             POSTGRES_VERSION=${{ matrix.major }}
             POSTGRES_IMAGE_TAG=${{ matrix.minor }}
+            POSTGRES_BASE_DISTRO=${{ matrix.distro }}
             APT_REFRESH=${{ steps.gate.outputs.key }}
           labels: |
             railway.content-key=${{ steps.gate.outputs.key }}
@@ -414,6 +447,19 @@ jobs:
           fi
           if [ "$minor" != "${{ matrix.minor }}" ]; then
             echo "bundled minor $minor does not match matrix entry ${{ matrix.minor }}" >&2
+            exit 1
+          fi
+
+          # The base distro is part of the same contract: the libc under a
+          # pinned tag must not move (see the Dockerfile's
+          # POSTGRES_BASE_DISTRO comment). Refuse to mint the resolvable
+          # tags if the built image is not on the release the matrix pinned
+          # — whatever upstream did to its tag semantics.
+          codename=$(docker run --rm --entrypoint sh "$img" -c '. /etc/os-release && printf %s "$VERSION_CODENAME"')
+          glibc=$(docker run --rm --entrypoint sh "$img" -c 'ldd --version 2>/dev/null | head -1')
+          echo "base: debian ${codename} (${glibc})"
+          if [ "$codename" != "${{ matrix.distro }}" ]; then
+            echo "built image is on debian '${codename}', matrix pinned '${{ matrix.distro }}' — not publishing" >&2
             exit 1
           fi
 

@@ -99,7 +99,11 @@ async fn main() -> Result<()> {
     // PITR sidecar; see standalone_pitr and spawn_pitr_sidecar below.
     if env::args().nth(1).as_deref() == Some(standalone_pitr::SIDECAR_ARG) {
         let _guard = init_logging("standalone-pitr");
-        standalone_pitr::run_sidecar(pgdata()).await;
+        standalone_pitr::run_sidecar(
+            pgdata(),
+            env::args().nth(2).as_deref() != Some("--collation-only"),
+        )
+        .await;
         return Ok(());
     }
 
@@ -482,11 +486,9 @@ async fn main() -> Result<()> {
         // The PITR sidecar (stanza bootstrap + backup watcher) is a second
         // direct child. The loop below collects it like any orphan and
         // restarts it if it ever exits, so backups resume without a redeploy.
-        let mut sidecar = if pitr.run_sidecar {
-            spawn_pitr_sidecar(&telemetry)
-        } else {
-            None
-        };
+        // Collation repair also runs when PITR is disabled. The sidecar
+        // owns psql children, avoiding a race with this supervisor's waitpid.
+        let mut sidecar = spawn_pitr_sidecar(&telemetry, pitr.run_sidecar);
 
         let child_pid = Pid::from_raw(child.id() as i32);
         loop {
@@ -507,7 +509,7 @@ async fn main() -> Result<()> {
                         "standalone PITR sidecar exited; restarting it in 30s"
                     );
                     std::thread::sleep(PITR_SIDECAR_RESTART_DELAY);
-                    sidecar = spawn_pitr_sidecar(&telemetry);
+                    sidecar = spawn_pitr_sidecar(&telemetry, pitr.run_sidecar);
                 }
                 // An orphan reaped — the point of standing here.
                 Ok(_) => {}
@@ -530,7 +532,7 @@ const PITR_SIDECAR_RESTART_DELAY: Duration = Duration::from_secs(30);
 /// [`standalone_pitr::SIDECAR_ARG`]. A std (not tokio) child on purpose — the
 /// supervisor's `waitpid(-1)` loop owns its exit status. Failure to start is
 /// reported and leaves the server running without backups.
-fn spawn_pitr_sidecar(telemetry: &Telemetry) -> Option<Pid> {
+fn spawn_pitr_sidecar(telemetry: &Telemetry, archiving: bool) -> Option<Pid> {
     let exe = env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "/usr/local/bin/postgres-wrapper".to_string());
@@ -542,6 +544,9 @@ fn spawn_pitr_sidecar(telemetry: &Telemetry) -> Option<Pid> {
         Command::new(&exe)
     };
     cmd.arg(standalone_pitr::SIDECAR_ARG).stdin(Stdio::null());
+    if !archiving {
+        cmd.arg("--collation-only");
+    }
     match cmd.spawn() {
         Ok(child) => {
             info!(pid = child.id(), "standalone PITR sidecar started");

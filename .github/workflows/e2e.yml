@@ -40,7 +40,7 @@ jobs:
           tags: postgres-ha-pitr:${{ matrix.pg_version }}
           load: true
           cache-from: type=gha,scope=patroni-pg${{ matrix.pg_version }}
-          cache-to: type=gha,scope=patroni-pg${{ matrix.pg_version }},mode=max
+          cache-to: type=gha,scope=patroni-pg${{ matrix.pg_version }},mode=max,ignore-error=true
 
       - name: Build etcd image
         uses: docker/build-push-action@v5
@@ -51,7 +51,7 @@ jobs:
           tags: postgres-ha-etcd-test:latest
           load: true
           cache-from: type=gha,scope=etcd
-          cache-to: type=gha,scope=etcd,mode=max
+          cache-to: type=gha,scope=etcd,mode=max,ignore-error=true
 
       - name: Run e2e harness
         shell: bash
@@ -129,7 +129,7 @@ jobs:
           tags: postgres-ha-pitr:${{ matrix.pg_version }}
           load: true
           cache-from: type=gha,scope=patroni-pg${{ matrix.pg_version }}
-          cache-to: type=gha,scope=patroni-pg${{ matrix.pg_version }},mode=max
+          cache-to: type=gha,scope=patroni-pg${{ matrix.pg_version }},mode=max,ignore-error=true
 
       - name: Build postgres-patroni image (source major)
         uses: docker/build-push-action@v5
@@ -142,7 +142,7 @@ jobs:
           tags: postgres-ha-pitr:${{ matrix.from_version }}
           load: true
           cache-from: type=gha,scope=patroni-pg${{ matrix.from_version }}
-          cache-to: type=gha,scope=patroni-pg${{ matrix.from_version }},mode=max
+          cache-to: type=gha,scope=patroni-pg${{ matrix.from_version }},mode=max,ignore-error=true
 
       - name: Build postgres-patroni image (chain source major)
         uses: docker/build-push-action@v5
@@ -155,7 +155,7 @@ jobs:
           tags: postgres-ha-pitr:${{ matrix.chain_from_version }}
           load: true
           cache-from: type=gha,scope=patroni-pg${{ matrix.chain_from_version }}
-          cache-to: type=gha,scope=patroni-pg${{ matrix.chain_from_version }},mode=max
+          cache-to: type=gha,scope=patroni-pg${{ matrix.chain_from_version }},mode=max,ignore-error=true
 
       - name: Build etcd image
         uses: docker/build-push-action@v5
@@ -166,7 +166,7 @@ jobs:
           tags: postgres-ha-etcd-test:latest
           load: true
           cache-from: type=gha,scope=etcd
-          cache-to: type=gha,scope=etcd,mode=max
+          cache-to: type=gha,scope=etcd,mode=max,ignore-error=true
 
       - name: Run major-upgrade choreography tests
         shell: bash
