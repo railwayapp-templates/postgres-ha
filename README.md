@@ -98,8 +98,9 @@ Image-level tuning knobs:
 | `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `5120`, matching `archive-push-queue-max`). Outside the `PGBACKREST_*` namespace because pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
 | `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
 | `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
-| `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 2)`. Set `1` to reduce backup concurrency independently of archiving and restores. |
+| `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default `1`, independent of vCPU, to reduce contention with live queries on IOPS-limited volumes. Explicit overrides still win. |
 | `PGBACKREST_RESTORE_PROCESS_MAX` | parallel workers for `restore`. Default auto-sized as `clamp(cpus, 1, 32)`. |
+| `PGBACKREST_START_FAST` | native pgBackRest option. Default `n` in the image config: spread the backup-start checkpoint instead of forcing a fast one. Set `y` to opt into the previous behavior. Setting it either way also turns off the watcher's own decision below. |
 
 The four worker overrides are template settings, not native pgBackRest
 environment options. `patroni-runner` renders them into command-specific
@@ -107,6 +108,23 @@ config sections. The image's `pgbackrest` launcher removes these variables
 (and the legacy `PGBACKREST_DROP_THRESHOLD_MB` alias) only from pgBackRest's
 environment so unknown-option warnings cannot corrupt `info --output=json`.
 Native options such as `PGBACKREST_REPO1_PATH` remain available.
+
+Full and differential backups use one worker and `start-fast=n` by default.
+This reduces reader concurrency and checkpoint write bursts; it is not a hard
+IOPS cap, and backups can take longer to start and finish. WAL shipping,
+archive-get, restore worker counts, backup cadence and retention are
+unchanged. Redeploy to pick up the new defaults.
+
+Before each backup the watcher reads `checkpoint_timeout` and
+`checkpoint_completion_target` from the server. A backup opened without
+`start-fast` waits for a spread checkpoint, up to about twice
+`checkpoint_completion_target × checkpoint_timeout` when one is already
+running, with no byte progress for the stall watchdog to see and under
+pgBackRest's 30-minute `db-timeout`. When that worst case reaches the lower
+of the two, the watcher adds `--start-fast` (one immediate checkpoint) and
+logs why, instead of letting every backup time out. `PGBACKREST_START_FAST`
+(`y` or `n`) turns the heuristic off; pgBackRest reads that variable directly
+and it wins over the config file.
 
 When `WAL_ARCHIVE_BUCKET` is set, `patroni-runner` writes
 `archive_mode=on`, `archive_command='/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'`,
