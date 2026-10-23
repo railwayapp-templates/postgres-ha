@@ -67,6 +67,19 @@ ARG PATRONI_VERSION=4.1.3
 # prunes the whole minor from the pool, the daily rebuild fails loudly -
 # a human decides, never a nightly accident.
 ARG PGVECTOR_PKG_VERSION=0.8.*
+# pgaudit is deliberately NOT version-pinned (mirrors postgres-ssl). Upstream
+# keeps one release branch per Postgres major (1.5 for 13, 1.6 for 14, 1.7
+# for 15, 16.x for 16, 17.x for 17, ...) and pgdg's postgresql-<major>-pgaudit
+# package only ever carries that major's branch, so the package name already
+# fixes the line a tag can move along — there is no minor for the nightly
+# rebuild to drift across. Within a branch, patch releases ship empty catalog
+# upgrade scripts (1.7->1.7.1, 16.0->16.1 are both bare \echo guards), so a
+# refreshed .so under an older catalog is the same bugfix stream the pgvector
+# wildcard admits. The image preloads it next to pg_stat_statements (DCS seed
+# in patroni/yaml.rs, reconciled into DCS on every node boot for older
+# clusters; init-ssl.sh + postgres-wrapper in standalone mode): pgaudit
+# refuses to load any other way, and preloaded with pgaudit.log unset it is
+# inert, so CREATE EXTENSION pgaudit simply works (see README "Extensions").
 
 ARG POSTGRES_VERSION
 # CI passes its content key here (see the build workflow's content gate):
@@ -92,6 +105,7 @@ RUN echo "refresh key: ${APT_REFRESH}" \
     curl \
     pgbackrest \
     "postgresql-${POSTGRES_VERSION}-pgvector=${PGVECTOR_PKG_VERSION}" \
+    "postgresql-${POSTGRES_VERSION}-pgaudit" \
     && apt-mark unhold "postgresql-${POSTGRES_VERSION}" "postgresql-client-${POSTGRES_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 

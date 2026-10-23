@@ -11,7 +11,7 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 use postgres_patroni::pgbackrest::read_wal_level;
 use postgres_patroni::{
-    cert_expires_within, ensure_pg_stat_statements, is_patroni_enabled, is_valid_x509v3_cert,
+    cert_expires_within, ensure_image_preload_libraries, is_patroni_enabled, is_valid_x509v3_cert,
     major_upgrade, orphan_slots, pgdata, ssl_dir, standalone_pitr, sudo_command, volume_lock,
     volume_root, EXPECTED_VOLUME_MOUNT_PATH,
 };
@@ -363,9 +363,10 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Ensure pg_stat_statements is configured for existing databases
-        if let Err(e) = ensure_pg_stat_statements(&pgdata) {
-            warn!(error = %e, "Failed to configure pg_stat_statements");
+        // Ensure the image's preload libraries (pg_stat_statements, pgaudit)
+        // are configured on volumes initialized before they were
+        if let Err(e) = ensure_image_preload_libraries(&pgdata) {
+            warn!(error = %e, "Failed to configure the image preload libraries");
         }
 
         // If this was a replica (standby), promote it to primary for standalone mode.

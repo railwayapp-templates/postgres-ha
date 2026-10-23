@@ -12,6 +12,7 @@ This template deploys a production-ready, highly-available PostgreSQL cluster on
 - **Automatic recovery** - failed nodes rejoin as replicas
 - **Health monitoring** - Patroni REST API for cluster status
 - **Multi-version support** - PostgreSQL 14, 15, 16, 17, and 18
+- **pgvector and pgaudit** bundled (pgaudit opt-in, see [Extensions](#extensions))
 
 ## Architecture
 
@@ -466,6 +467,36 @@ Control-plane credentials (see [Control-plane authentication](#control-plane-aut
 | `PATRONI_RESTAPI_USERNAME` | Postgres nodes | Username for the above (default: the superuser name). |
 | `ETCD_ROOT_PASSWORD` | etcd nodes | etcd enables authentication with a `root` user holding this password. The template sets it to the cluster's superuser password. |
 | `PATRONI_ETCD3_USERNAME` / `PATRONI_ETCD3_PASSWORD` | Postgres nodes | Credential Patroni presents to etcd (default: `root` / the superuser password). |
+
+### Extensions
+
+Besides Postgres's contrib modules, the image ships pgvector and pgaudit
+(PGDG's `postgresql-<major>-pgvector` and `postgresql-<major>-pgaudit`), the
+same set as the standalone postgres-ssl image. Both are a `CREATE EXTENSION`
+away on the primary (`vector`, `pgaudit`), from psql or the dashboard's
+Extensions card.
+
+pgaudit refuses to load any way but `shared_preload_libraries`, so the image
+preloads it next to `pg_stat_statements`: the Patroni bootstrap seeds
+`shared_preload_libraries: pg_stat_statements,pgaudit` into DCS, and every
+node boot reconciles the two into DCS on clusters bootstrapped before (the
+same path that keeps the archive params and `failsafe_mode` current). The
+GUC is postmaster-scoped: the member whose boot wrote the DCS patch restarts
+its own Postgres in place to load it (a replica keeps streaming, a leader
+keeps its lock), and the members that were not restarted stay
+`pending_restart` until their next restart — a redeploy's rolling restart
+included. Preloaded with `pgaudit.log` unset it logs nothing and costs
+nothing; turning auditing on is
+
+```bash
+psql -c "CREATE EXTENSION pgaudit"            # on the primary; the catalog replicates
+patronictl -c /etc/patroni/patroni.yml edit-config --force -p "pgaudit.log=ddl, role"
+```
+
+`pgaudit.log` is reload-scoped, so Patroni applies it without a restart.
+Audit lines land in each member's server log. If you edit
+`shared_preload_libraries` yourself, keep both image libraries in the list;
+a member started without them is repaired on its next boot.
 
 ### Scaling HAProxy
 
