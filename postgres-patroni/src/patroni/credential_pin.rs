@@ -28,7 +28,12 @@
 //! The pin lives inside PGDATA on purpose: `pg_basebackup` and pgBackRest copy
 //! it into clones and backups, so a replica seeded from a pinned leader boots
 //! coherent with it (the same reason the forced-archive-GUCs sentinel lives
-//! there). Existing clusters that predate the pin adopt their current
+//! there). The volume keeps a copy of it, and of a staged rotation's journal,
+//! outside PGDATA ([`pin_copy_path`], [`journal_copy_path`]): a reinitialize
+//! empties PGDATA, and a member that boots mid-rotation on an empty PGDATA
+//! must still know what it was pinned to and what it is carrying out, or it
+//! presents the stale variables to etcd and is stopped. PGDATA's own files win
+//! whenever they exist; the copies are read only when it has none. Existing clusters that predate the pin adopt their current
 //! variables as the pin on the first boot of this image — at that point the
 //! variables are, by construction, the credentials the cluster runs with.
 //!
@@ -47,6 +52,25 @@ use super::config::Config;
 
 /// File inside PGDATA holding the pinned credentials.
 pub const CREDENTIAL_PIN_FILE: &str = ".railway_credentials";
+
+/// File inside PGDATA holding the request of a staged rotation, from its
+/// `prepare` step until `verify` removes it.
+pub const ROTATION_JOURNAL_FILE: &str = ".railway_rotation";
+
+/// The volume's copy of the pin, at the volume root, outside PGDATA. A
+/// reinitialize, and the runner's incomplete-clone wipe, empty PGDATA and with
+/// it the pin and the journal. A member that boots in that state in the middle
+/// of a rotation (PGDATA wiped, the clone not yet complete) knows neither the
+/// credentials it was pinned to nor the rotation it is carrying out, so it
+/// presents the stale variables to etcd, whose root password the rotation has
+/// already moved, and the credential pre-flight stops it; every later boot
+/// finds the same empty PGDATA and stops the same way, until the rotation
+/// fails. The copies survive the wipe. They are fallbacks: PGDATA's own files
+/// win whenever they exist (a completed clone brings the leader's). Distinct
+/// names, so a volume whose PGDATA is the volume root keeps the two apart.
+pub const CREDENTIAL_PIN_COPY_FILE: &str = ".railway_credentials.volume";
+/// The volume's copy of the rotation journal; see [`CREDENTIAL_PIN_COPY_FILE`].
+pub const ROTATION_JOURNAL_COPY_FILE: &str = ".railway_rotation.volume";
 
 /// Env knob: when "true", the variables win this boot and are re-pinned.
 pub const CREDENTIALS_FROM_ENV_VAR: &str = "PATRONI_CREDENTIALS_FROM_ENV";
@@ -93,12 +117,50 @@ pub fn pin_path(data_dir: &str) -> String {
     format!("{data_dir}/{CREDENTIAL_PIN_FILE}")
 }
 
+pub fn pin_copy_path(volume_root: &str) -> String {
+    format!("{volume_root}/{CREDENTIAL_PIN_COPY_FILE}")
+}
+
+pub fn journal_path(data_dir: &str) -> String {
+    format!("{data_dir}/{ROTATION_JOURNAL_FILE}")
+}
+
+pub fn journal_copy_path(volume_root: &str) -> String {
+    format!("{volume_root}/{ROTATION_JOURNAL_COPY_FILE}")
+}
+
+/// Which file a boot took its pin from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    /// PGDATA's own pin.
+    Pgdata,
+    /// PGDATA has no pin (wiped, or a clone still in progress): the volume's copy.
+    VolumeCopy,
+}
+
+/// The pin a boot reconciles against: PGDATA's own when it has one, else the
+/// volume's copy. None when neither exists (a fresh volume).
+pub fn pin_for_boot(data_dir: &str, volume_root: &str) -> Option<(PinnedCredentials, PinSource)> {
+    if let Some(pin) = read_credential_pin(data_dir) {
+        return Some((pin, PinSource::Pgdata));
+    }
+    read_credential_pin_copy(volume_root).map(|pin| (pin, PinSource::VolumeCopy))
+}
+
 /// The pinned credentials on this volume, or None on a fresh volume. An
 /// unreadable or unparseable pin is logged and treated as absent — the
 /// variables then apply, which is the pre-pin behaviour, never a crash.
 pub fn read_credential_pin(data_dir: &str) -> Option<PinnedCredentials> {
-    let path = pin_path(data_dir);
-    let content = match std::fs::read_to_string(&path) {
+    read_pin_file(&pin_path(data_dir))
+}
+
+/// The volume's copy of the pin (see [`CREDENTIAL_PIN_COPY_FILE`]), or None.
+pub fn read_credential_pin_copy(volume_root: &str) -> Option<PinnedCredentials> {
+    read_pin_file(&pin_copy_path(volume_root))
+}
+
+fn read_pin_file(path: &str) -> Option<PinnedCredentials> {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
@@ -117,9 +179,97 @@ pub fn read_credential_pin(data_dir: &str) -> Option<PinnedCredentials> {
 
 /// Persist the pin atomically (temp file + rename), mode 0600.
 pub fn write_credential_pin(data_dir: &str, creds: &PinnedCredentials) -> Result<()> {
-    let path = pin_path(data_dir);
-    let tmp = format!("{path}.tmp");
     let json = serde_json::to_string_pretty(creds).context("serialize credential pin")?;
+    write_private(&pin_path(data_dir), json.as_bytes())
+}
+
+/// Persist the volume's copy of the pin (see [`CREDENTIAL_PIN_COPY_FILE`]).
+pub fn write_credential_pin_copy(volume_root: &str, creds: &PinnedCredentials) -> Result<()> {
+    let json = serde_json::to_string_pretty(creds).context("serialize credential pin")?;
+    write_private(&pin_copy_path(volume_root), json.as_bytes())
+}
+
+/// Bring the volume's copy up to date with `pin` when it differs: the first
+/// boot of this image on an already pinned cluster, a replica whose pin came
+/// with its clone and that never rebooted since, or a copy write that failed.
+/// Best-effort, like every copy write.
+pub fn sync_credential_pin_copy(volume_root: &str, pin: &PinnedCredentials) {
+    if read_credential_pin_copy(volume_root).as_ref() == Some(pin) {
+        return;
+    }
+    if let Err(e) = write_credential_pin_copy(volume_root, pin) {
+        warn!(error = %e, volume_root, "could not write the volume's copy of the credential pin");
+    }
+}
+
+/// Pin `creds` in PGDATA and keep the volume's copy current. PGDATA's write is
+/// the result; a copy that cannot be written is logged, never fatal: the copy
+/// is a fallback for a boot on an empty PGDATA, not the pin itself.
+pub fn write_credential_pin_and_copy(
+    data_dir: &str,
+    volume_root: &str,
+    creds: &PinnedCredentials,
+) -> Result<()> {
+    write_credential_pin(data_dir, creds)?;
+    if let Err(e) = write_credential_pin_copy(volume_root, creds) {
+        warn!(error = %e, volume_root, "could not write the volume's copy of the credential pin");
+    }
+    Ok(())
+}
+
+/// Record a staged rotation's request in PGDATA and at the volume root. As
+/// with the pin, PGDATA's write is the result and the copy is best-effort.
+pub fn write_rotation_journal(data_dir: &str, volume_root: &str, body: &[u8]) -> Result<()> {
+    write_private(&journal_path(data_dir), body)?;
+    if let Err(e) = write_private(&journal_copy_path(volume_root), body) {
+        warn!(error = %e, volume_root, "could not write the volume's copy of the rotation journal");
+    }
+    Ok(())
+}
+
+/// The staged rotation this volume carries, if any: PGDATA's journal when it
+/// has one, else the volume's copy (the boot after a wipe, before the clone
+/// brings the leader's).
+pub fn read_rotation_journal(data_dir: &str, volume_root: &str) -> Option<Vec<u8>> {
+    match std::fs::read(journal_path(data_dir)) {
+        Ok(body) => return Some(body),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(error = %e, "rotation journal unreadable; trying the volume's copy"),
+    }
+    match std::fs::read(journal_copy_path(volume_root)) {
+        Ok(body) => {
+            info!("PGDATA carries no rotation journal; using the volume's copy");
+            Some(body)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(error = %e, "the volume's copy of the rotation journal is unreadable");
+            None
+        }
+    }
+}
+
+/// A rotation that has been verified (or restored) leaves no journal anywhere.
+pub fn clear_rotation_journal(data_dir: &str, volume_root: &str) -> Result<()> {
+    remove_if_present(&journal_path(data_dir))?;
+    if let Err(e) = remove_if_present(&journal_copy_path(volume_root)) {
+        warn!(error = %e, volume_root, "could not remove the volume's copy of the rotation journal");
+    }
+    Ok(())
+}
+
+fn remove_if_present(path: &str) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {path}")),
+    }
+}
+
+/// Write `body` to `path` atomically (temp file + rename), mode 0600, and
+/// fsync the directory so the rename is durable.
+fn write_private(path: &str, body: &[u8]) -> Result<()> {
+    let tmp = format!("{path}.tmp");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -127,12 +277,15 @@ pub fn write_credential_pin(data_dir: &str, creds: &PinnedCredentials) -> Result
         .mode(0o600)
         .open(&tmp)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(json.as_bytes())?;
+    file.write_all(body)?;
     file.sync_all()?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod {tmp}"))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp} -> {path}"))?;
-    std::fs::File::open(data_dir)?.sync_all()?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp} -> {path}"))?;
+    let dir = std::path::Path::new(path)
+        .parent()
+        .context("path without a parent")?;
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -152,6 +305,7 @@ pub fn credentials_from_env_requested() -> bool {
 /// [`credentials_from_env_requested`].
 pub fn apply_credential_pin(
     config: &mut Config,
+    volume_root: &str,
     has_cluster_data: bool,
     credentials_from_env: bool,
     telemetry: &Telemetry,
@@ -173,7 +327,7 @@ pub fn apply_credential_pin(
     let from_env = PinnedCredentials::from_config(config);
 
     if credentials_from_env {
-        match write_credential_pin(&config.data_dir, &from_env) {
+        match write_credential_pin_and_copy(&config.data_dir, volume_root, &from_env) {
             Ok(()) => warn!(
                 "{CREDENTIALS_FROM_ENV_VAR}=true: credentials taken from the variables and \
                  re-pinned — the roles must already carry these passwords (ALTER ROLE), or \
@@ -188,7 +342,7 @@ pub fn apply_credential_pin(
         // An existing cluster that predates the pin: its variables are, by
         // construction, the credentials it runs with (nothing else ever set
         // them) — adopt them.
-        match write_credential_pin(&config.data_dir, &from_env) {
+        match write_credential_pin_and_copy(&config.data_dir, volume_root, &from_env) {
             Ok(()) => info!(
                 path = pin_path(&config.data_dir),
                 "no credential pin on this volume — pinned the current variables"
@@ -201,6 +355,8 @@ pub fn apply_credential_pin(
         }
         return PinOutcome::Adopted;
     };
+
+    sync_credential_pin_copy(volume_root, &pinned);
 
     if pinned == from_env {
         return PinOutcome::Matches;
@@ -385,6 +541,94 @@ mod tests {
     }
 
     #[test]
+    fn the_volume_copy_is_read_only_when_pgdata_has_no_pin() {
+        let pgdata = tempdir().unwrap();
+        let volume = tempdir().unwrap();
+        let (data_dir, volume_root) = (
+            pgdata.path().to_str().unwrap(),
+            volume.path().to_str().unwrap(),
+        );
+        assert_eq!(pin_for_boot(data_dir, volume_root), None);
+        write_credential_pin_and_copy(data_dir, volume_root, &pin_of("one")).unwrap();
+        assert_eq!(
+            pin_for_boot(data_dir, volume_root),
+            Some((pin_of("one"), PinSource::Pgdata))
+        );
+        let mode = std::fs::metadata(pin_copy_path(volume_root))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // A clone brought a newer pin: PGDATA wins over a copy that fell behind.
+        write_credential_pin(data_dir, &pin_of("two")).unwrap();
+        assert_eq!(
+            pin_for_boot(data_dir, volume_root),
+            Some((pin_of("two"), PinSource::Pgdata))
+        );
+        // The reinitialize wiped PGDATA: the copy is what the boot has.
+        std::fs::remove_file(pin_path(data_dir)).unwrap();
+        assert_eq!(
+            pin_for_boot(data_dir, volume_root),
+            Some((pin_of("one"), PinSource::VolumeCopy))
+        );
+    }
+
+    #[test]
+    fn a_staged_rotation_journal_survives_a_pgdata_wipe() {
+        let pgdata = tempdir().unwrap();
+        let volume = tempdir().unwrap();
+        let (data_dir, volume_root) = (
+            pgdata.path().to_str().unwrap(),
+            volume.path().to_str().unwrap(),
+        );
+        assert_eq!(read_rotation_journal(data_dir, volume_root), None);
+        write_rotation_journal(data_dir, volume_root, b"{\"newPassword\":\"n\"}").unwrap();
+        assert_eq!(
+            read_rotation_journal(data_dir, volume_root).as_deref(),
+            Some(&b"{\"newPassword\":\"n\"}"[..])
+        );
+        for entry in std::fs::read_dir(data_dir).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        assert_eq!(
+            read_rotation_journal(data_dir, volume_root).as_deref(),
+            Some(&b"{\"newPassword\":\"n\"}"[..])
+        );
+        // verify ran: nothing is left anywhere, and clearing twice is fine.
+        clear_rotation_journal(data_dir, volume_root).unwrap();
+        clear_rotation_journal(data_dir, volume_root).unwrap();
+        assert_eq!(read_rotation_journal(data_dir, volume_root), None);
+        assert!(!std::path::Path::new(&journal_copy_path(volume_root)).exists());
+    }
+
+    #[test]
+    fn an_existing_pin_gets_its_volume_copy_on_the_next_boot() {
+        // A cluster pinned by an image without the copy: the first boot of this
+        // image writes it, so the next wipe already has it.
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let mut config = config_at(data_dir);
+        write_credential_pin(data_dir, &PinnedCredentials::from_config(&config)).unwrap();
+        assert_eq!(read_credential_pin_copy(data_dir), None);
+        assert_eq!(
+            apply_credential_pin(&mut config, data_dir, true, false, &telemetry()),
+            PinOutcome::Matches
+        );
+        assert_eq!(
+            read_credential_pin_copy(data_dir),
+            Some(PinnedCredentials::from_config(&config))
+        );
+    }
+
+    fn pin_of(password: &str) -> PinnedCredentials {
+        PinnedCredentials {
+            superuser_pass: password.into(),
+            repl_pass: password.into(),
+            app_pass: password.into(),
+        }
+    }
+
+    #[test]
     fn pin_is_absent_on_a_fresh_volume_or_when_unparseable() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap();
@@ -399,7 +643,7 @@ mod tests {
         let data_dir = dir.path().to_str().unwrap();
         let mut config = config_at(data_dir);
         assert_eq!(
-            apply_credential_pin(&mut config, false, false, &telemetry()),
+            apply_credential_pin(&mut config, data_dir, false, false, &telemetry()),
             PinOutcome::FreshVolume
         );
         assert_eq!(config.superuser_pass, "su-env");
@@ -424,7 +668,7 @@ mod tests {
         write_credential_pin(data_dir, &pinned).unwrap();
 
         let mut config = config_at(data_dir);
-        let outcome = apply_credential_pin(&mut config, false, false, &telemetry());
+        let outcome = apply_credential_pin(&mut config, data_dir, false, false, &telemetry());
         assert_eq!(
             outcome,
             PinOutcome::KeptPinned(vec![
@@ -452,7 +696,7 @@ mod tests {
         config.adopt_existing_data = true;
         assert_eq!(read_credential_pin(data_dir), None);
         assert_eq!(
-            apply_credential_pin(&mut config, true, false, &telemetry()),
+            apply_credential_pin(&mut config, data_dir, true, false, &telemetry()),
             PinOutcome::Adopted
         );
         let pinned = read_credential_pin(data_dir).expect("pin written on the adopting boot");
@@ -468,7 +712,7 @@ mod tests {
         let data_dir = dir.path().to_str().unwrap();
         let mut config = config_at(data_dir);
         assert_eq!(
-            apply_credential_pin(&mut config, true, false, &telemetry()),
+            apply_credential_pin(&mut config, data_dir, true, false, &telemetry()),
             PinOutcome::Adopted
         );
         assert_eq!(
@@ -477,7 +721,7 @@ mod tests {
         );
         // Second boot with the same variables is a no-op.
         assert_eq!(
-            apply_credential_pin(&mut config, true, false, &telemetry()),
+            apply_credential_pin(&mut config, data_dir, true, false, &telemetry()),
             PinOutcome::Matches
         );
     }
@@ -494,7 +738,7 @@ mod tests {
         write_credential_pin(data_dir, &pinned).unwrap();
 
         let mut config = config_at(data_dir);
-        let outcome = apply_credential_pin(&mut config, true, false, &telemetry());
+        let outcome = apply_credential_pin(&mut config, data_dir, true, false, &telemetry());
         assert_eq!(
             outcome,
             PinOutcome::KeptPinned(vec![
@@ -523,7 +767,7 @@ mod tests {
         )
         .unwrap();
         let mut config = config_at(data_dir);
-        let outcome = apply_credential_pin(&mut config, true, true, &telemetry());
+        let outcome = apply_credential_pin(&mut config, data_dir, true, true, &telemetry());
         assert_eq!(outcome, PinOutcome::RepinnedFromEnv);
         assert_eq!(config.superuser_pass, "su-env");
         assert_eq!(
