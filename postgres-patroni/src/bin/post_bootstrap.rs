@@ -10,7 +10,7 @@ use postgres_patroni::bootstrap::{
     dollar_quote_tag, quote_ident, quote_literal, read_credentials, run_psql, run_psql_in_db,
     run_psql_script, PATRONI_CONFIG,
 };
-use postgres_patroni::patroni::{write_credential_pin, PinnedCredentials};
+use postgres_patroni::patroni::{write_credential_pin_and_copy, PinnedCredentials};
 use postgres_patroni::{pgdata, volume_root};
 use std::env;
 use std::path::Path;
@@ -162,8 +162,9 @@ END
     } else {
         creds.data_dir.clone()
     };
-    match write_credential_pin(
+    match write_credential_pin_and_copy(
         &pin_dir,
+        &volume_root(),
         &PinnedCredentials {
             superuser_pass: creds.superuser_pass.clone(),
             repl_pass: creds.repl_pass.clone(),

@@ -26,8 +26,9 @@ pub async fn is_in_recovery(config: &HealthServerConfig) -> Result<bool> {
     // unreliable under 2s, too coarse for a sub-second budget.
     let stage_budget = Duration::from_millis(config.check_timeout_ms / 2);
 
-    let password = crate::patroni::read_credential_pin(&crate::paths::pgdata())
-        .map(|p| p.app_pass)
+    // The pin, or the volume's copy of it while PGDATA is being re-cloned.
+    let password = crate::patroni::pin_for_boot(&crate::paths::pgdata(), &crate::volume_root())
+        .map(|(p, _)| p.app_pass)
         .unwrap_or_else(|| config.pg_password.clone());
     let mut options = tokio_postgres::Config::new();
     options

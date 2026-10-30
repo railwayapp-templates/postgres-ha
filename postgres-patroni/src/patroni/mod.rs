@@ -25,8 +25,11 @@ pub use backup_watcher::{
 };
 pub use config::{Config, Credential, RestapiAddressSource};
 pub use credential_pin::{
-    apply_credential_pin, credential_drift, credentials_from_env_requested, read_credential_pin,
-    write_credential_pin, PinOutcome, PinnedCredentials, CREDENTIAL_PIN_FILE,
+    apply_credential_pin, clear_rotation_journal, credential_drift, credentials_from_env_requested,
+    pin_for_boot, read_credential_pin, read_credential_pin_copy, read_rotation_journal,
+    write_credential_pin, write_credential_pin_and_copy, write_credential_pin_copy,
+    write_rotation_journal, PinOutcome, PinSource, PinnedCredentials, CREDENTIAL_PIN_COPY_FILE,
+    CREDENTIAL_PIN_FILE, ROTATION_JOURNAL_COPY_FILE, ROTATION_JOURNAL_FILE,
 };
 pub use health::check_health;
 pub use monitoring::run_monitoring_loop;

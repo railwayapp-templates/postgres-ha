@@ -22,9 +22,11 @@ use postgres_patroni::patroni::rest_preflight::{
 };
 use postgres_patroni::patroni::{
     apply_credential_pin, credential_drift, credentials_from_env_requested,
-    generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
-    spawn_backup_watcher, spawn_self_heal_watcher, spawn_slot_recovery_watcher,
-    update_pg_hba_for_replication, Config, RestapiAddressSource,
+    generate_patroni_config, pin_for_boot, read_rotation_journal,
+    reconcile_pgbackrest_archive_config, run_monitoring_loop, spawn_backup_watcher,
+    spawn_self_heal_watcher, spawn_slot_recovery_watcher, update_pg_hba_for_replication,
+    write_credential_pin_and_copy, write_credential_pin_copy, Config, PinSource,
+    RestapiAddressSource,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::wal_archive::{
@@ -294,27 +296,51 @@ fn should_wipe_incomplete_clone(
         && wipe_has_safe_clone_source(pgdata_is_dedicated_subdir, leader, my_name)
 }
 
-/// A staged rotation survives a restart before the variable commit. Prove
-/// the candidate against the elected primary AND authenticated DCS before
-/// re-pinning; an edited variable alone cannot alter a dataset credential.
-async fn reconcile_rotation_at_boot(config: &mut Config) -> Result<()> {
-    let Some(pin) = postgres_patroni::patroni::read_credential_pin(&config.data_dir) else {
-        return Ok(());
-    };
-    let journal = format!("{}/.railway_rotation", config.data_dir);
-    let pending = std::fs::read(&journal)
-        .ok()
-        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
+/// The passwords a boot tries against etcd, in order: the staged rotation's
+/// target and origin (when a journal exists), then the variables, then the pin.
+fn rotation_boot_candidates(
+    pending: Option<&serde_json::Value>,
+    variables_superuser_pass: &str,
+    pinned_superuser_pass: &str,
+) -> Vec<String> {
     let mut candidates = Vec::new();
-    if let Some(request) = &pending {
+    if let Some(request) = pending {
         for key in ["newPassword", "currentPassword"] {
             if let Some(password) = request[key].as_str() {
                 candidates.push(password.to_string());
             }
         }
     }
-    candidates.push(config.superuser_pass.clone());
-    candidates.push(pin.superuser_pass.clone());
+    candidates.push(variables_superuser_pass.to_string());
+    candidates.push(pinned_superuser_pass.to_string());
+    candidates
+}
+
+/// A staged rotation survives a restart before the variable commit. Prove
+/// the candidate against the elected primary AND authenticated DCS before
+/// re-pinning; an edited variable alone cannot alter a dataset credential.
+///
+/// The pin and the journal are read from PGDATA, or from the volume's copies
+/// when PGDATA has none: a reinitialize mid-rotation empties PGDATA, and the
+/// boot that follows must still present the pending credential to etcd (whose
+/// root password the rotation already moved) instead of the stale variables,
+/// or the credential pre-flight stops it on every boot until the rotation
+/// fails. In that state nothing is written into PGDATA: the clone in progress
+/// needs it empty, and brings the leader's pin and journal with it.
+async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> Result<()> {
+    let Some((pin, source)) = pin_for_boot(&config.data_dir, volume_root) else {
+        return Ok(());
+    };
+    if source == PinSource::VolumeCopy {
+        info!("PGDATA carries no credential pin (wiped, or a clone in progress); reconciling against the volume's copy");
+    }
+    let pending = read_rotation_journal(&config.data_dir, volume_root)
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
+    let candidates = rotation_boot_candidates(
+        pending.as_ref(),
+        &config.superuser_pass,
+        &pin.superuser_pass,
+    );
     if pending.is_none() && config.superuser_pass == pin.superuser_pass {
         return Ok(());
     }
@@ -438,10 +464,13 @@ async fn reconcile_rotation_at_boot(config: &mut Config) -> Result<()> {
     if let Some(auth) = config.restapi_auth.as_mut() {
         auth.password = candidate;
     }
-    postgres_patroni::patroni::write_credential_pin(
-        &config.data_dir,
-        &postgres_patroni::patroni::PinnedCredentials::from_config(config),
-    )?;
+    let proven = postgres_patroni::patroni::PinnedCredentials::from_config(config);
+    match source {
+        PinSource::Pgdata => write_credential_pin_and_copy(&config.data_dir, volume_root, &proven)?,
+        // PGDATA is empty and about to be cloned over: the copy is enough for
+        // the next boot, and a file in PGDATA would get in the clone's way.
+        PinSource::VolumeCopy => write_credential_pin_copy(volume_root, &proven)?,
+    }
     Ok(())
 }
 
@@ -1496,7 +1525,7 @@ async fn async_main() -> Result<()> {
     let health_config = HealthServerConfig::from_env();
 
     let mut config = Config::from_env()?;
-    reconcile_rotation_at_boot(&mut config).await?;
+    reconcile_rotation_at_boot(&mut config, &volume_root).await?;
 
     info!(
         node = %config.name,
@@ -1628,6 +1657,7 @@ async fn async_main() -> Result<()> {
     let has_cluster_data = volume_carries_cluster(has_pg_control, has_marker, adopted_this_boot);
     let pin_outcome = apply_credential_pin(
         &mut config,
+        &volume_root,
         has_cluster_data,
         credentials_from_env_requested(),
         &telemetry,
@@ -1952,11 +1982,29 @@ mod tests {
         available_bytes, blank_credential_vars, build_pgbackrest_recovery_source_conf,
         build_pitr_managed_block, clear_clone_wipe_attempts, clone_wipe_ledger_path,
         configure_pitr_recovery, data_dir_nonempty, pgdata_is_dedicated_subdir,
-        read_clone_wipe_attempts, record_clone_wipe_attempt, should_wipe_incomplete_clone,
-        strip_pitr_managed_block, volume_carries_cluster, wipe_has_safe_clone_source,
-        wipe_pgdata_contents, Config, RecoverySourceConfParams, RestapiAddressSource,
-        MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
+        read_clone_wipe_attempts, record_clone_wipe_attempt, rotation_boot_candidates,
+        should_wipe_incomplete_clone, strip_pitr_managed_block, volume_carries_cluster,
+        wipe_has_safe_clone_source, wipe_pgdata_contents, Config, RecoverySourceConfParams,
+        RestapiAddressSource, MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
     };
+
+    #[test]
+    fn a_boot_mid_rotation_tries_the_pending_password_before_the_variables() {
+        // The member was reinitialized between the rotation's etcd step and
+        // its own member step: etcd already holds "new", the variables and
+        // the pin still say "old". The journal (from the volume's copy, PGDATA
+        // being empty) is what lets the boot present "new".
+        let journal = serde_json::json!({"newPassword": "new", "currentPassword": "old"});
+        assert_eq!(
+            rotation_boot_candidates(Some(&journal), "old", "old"),
+            vec!["new", "old", "old", "old"]
+        );
+        // No rotation staged: the variables, then whatever the pin says.
+        assert_eq!(
+            rotation_boot_candidates(None, "edited", "pinned"),
+            vec!["edited", "pinned"]
+        );
+    }
 
     #[test]
     fn a_volume_adopted_this_boot_counts_as_cluster_data_for_the_pin() {

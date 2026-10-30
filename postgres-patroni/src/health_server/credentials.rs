@@ -1,7 +1,13 @@
 //! Local half of an ordered cluster rotation. SQL is executed in this
 //! container; the control plane owns the etcd change and cluster ordering.
 use super::HealthServerConfig;
-use crate::patroni::{read_credential_pin, write_credential_pin, PinnedCredentials};
+#[cfg(test)]
+use crate::patroni::write_credential_pin;
+use crate::patroni::{
+    clear_rotation_journal, read_credential_pin, write_credential_pin_and_copy,
+    write_rotation_journal, PinnedCredentials,
+};
+use crate::volume_root;
 use anyhow::{Context, Result};
 use axum::{
     extract::State,
@@ -168,6 +174,7 @@ fn may_establish_pin(operation: &Operation) -> bool {
 /// run (Postgres down) leaves the node unavailable, never unauthorized.
 async fn resolve_pin<F, Fut>(
     data_dir: &str,
+    volume_root: &str,
     operation: &Operation,
     credential: Option<&[u8]>,
     verify: F,
@@ -195,7 +202,8 @@ where
         repl_pass: password.to_string(),
         app_pass: password.to_string(),
     };
-    write_credential_pin(data_dir, &pin).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    write_credential_pin_and_copy(data_dir, volume_root, &pin)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     info!(
         data_dir,
         operation = ?operation,
@@ -300,9 +308,13 @@ pub async fn rotate(
     let supplied = supplied_credential(&headers);
     let resolved = tokio::time::timeout(
         Duration::from_secs(10),
-        resolve_pin(dir, &request.operation, supplied.as_deref(), |password| {
-            roles_carry(&config, &yaml, password)
-        }),
+        resolve_pin(
+            dir,
+            &volume_root(),
+            &request.operation,
+            supplied.as_deref(),
+            |password| roles_carry(&config, &yaml, password),
+        ),
     )
     .await;
     let pin = match resolved {
@@ -436,11 +448,10 @@ async fn apply(
         }
         Operation::Prepare => {
             // Persist intent before any database or DCS mutation. Recovery can
-            // finish adoption even while the control-plane worker is down.
-            atomic_write(
-                &format!("{data_dir}/.railway_rotation"),
-                &serde_json::to_vec(&request)?,
-            )?;
+            // finish adoption even while the control-plane worker is down, and
+            // the volume's copy outlives a wipe of PGDATA (a reinitialize
+            // mid-rotation), so the boot after it still knows the rotation.
+            write_rotation_journal(&data_dir, &volume_root(), &serde_json::to_vec(&request)?)?;
         }
         Operation::Database => {
             let mut client = match connect(config, &user, &request.new_password).await {
@@ -579,8 +590,9 @@ async fn apply(
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            write_credential_pin(
+            write_credential_pin_and_copy(
                 &data_dir,
+                &volume_root(),
                 &PinnedCredentials {
                     superuser_pass: request.new_password.clone(),
                     repl_pass: request.new_password.clone(),
@@ -612,11 +624,7 @@ async fn apply(
                     "previous password still accepted"
                 );
             }
-            match std::fs::remove_file(format!("{data_dir}/.railway_rotation")) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
+            clear_rotation_journal(&data_dir, &volume_root())?;
         }
     }
     // During DATABASE the YAML/pin still holds the old value, but SQL already
@@ -790,9 +798,13 @@ mod tests {
         let dir = temp.path().to_str().unwrap();
         write_credential_pin(dir, &pin_of("pinned")).unwrap();
         let credential = basic("railway", "wrong");
-        let pin = resolve_pin(dir, &Operation::Preflight, Some(&credential), |_| async {
-            panic!("verifier must not run when a pin exists")
-        })
+        let pin = resolve_pin(
+            dir,
+            dir,
+            &Operation::Preflight,
+            Some(&credential),
+            |_| async { panic!("verifier must not run when a pin exists") },
+        )
         .await
         .unwrap();
         assert_eq!(pin, pin_of("pinned"));
@@ -844,6 +856,7 @@ mod tests {
         let credential = basic("railway", "carried");
         let pin = resolve_pin(
             dir,
+            dir,
             &Operation::Preflight,
             Some(&credential),
             |password| async move {
@@ -864,7 +877,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_str().unwrap();
         let credential = basic("railway", "carried");
-        let pin = resolve_pin(dir, &Operation::Verify, Some(&credential), |_| async {
+        let pin = resolve_pin(dir, dir, &Operation::Verify, Some(&credential), |_| async {
             Ok(true)
         })
         .await
@@ -879,7 +892,7 @@ mod tests {
         let dir = temp.path().to_str().unwrap();
         let credential = basic("railway", "carried");
         for operation in [Operation::Prepare, Operation::Database, Operation::Member] {
-            let outcome = resolve_pin(dir, &operation, Some(&credential), |_| async {
+            let outcome = resolve_pin(dir, dir, &operation, Some(&credential), |_| async {
                 panic!("verifier must not run for {operation:?}")
             })
             .await;
@@ -897,21 +910,28 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_str().unwrap();
         let credential = basic("railway", "edited-variable");
-        let outcome = resolve_pin(dir, &Operation::Preflight, Some(&credential), |_| async {
-            Ok(false)
-        })
+        let outcome = resolve_pin(
+            dir,
+            dir,
+            &Operation::Preflight,
+            Some(&credential),
+            |_| async { Ok(false) },
+        )
         .await;
         assert_eq!(outcome, Err(StatusCode::UNAUTHORIZED));
         assert_eq!(read_credential_pin(dir), None);
 
         // No credential, or one for another user: nothing to verify.
         assert_eq!(
-            resolve_pin(dir, &Operation::Preflight, None, |_| async { Ok(true) }).await,
+            resolve_pin(dir, dir, &Operation::Preflight, None, |_| async {
+                Ok(true)
+            })
+            .await,
             Err(StatusCode::UNAUTHORIZED)
         );
         let other = basic("someone", "carried");
         assert_eq!(
-            resolve_pin(dir, &Operation::Preflight, Some(&other), |_| async {
+            resolve_pin(dir, dir, &Operation::Preflight, Some(&other), |_| async {
                 Ok(true)
             })
             .await,
@@ -925,7 +945,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_str().unwrap();
         let credential = basic("railway", "carried");
-        let outcome = resolve_pin(dir, &Operation::Verify, Some(&credential), |_| async {
+        let outcome = resolve_pin(dir, dir, &Operation::Verify, Some(&credential), |_| async {
             anyhow::bail!("connection refused")
         })
         .await;
