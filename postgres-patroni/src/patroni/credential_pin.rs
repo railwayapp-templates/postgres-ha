@@ -189,6 +189,19 @@ pub fn write_credential_pin_copy(volume_root: &str, creds: &PinnedCredentials) -
     write_private(&pin_copy_path(volume_root), json.as_bytes())
 }
 
+/// Bring the volume's copy up to date with `pin` when it differs: the first
+/// boot of this image on an already pinned cluster, a replica whose pin came
+/// with its clone and that never rebooted since, or a copy write that failed.
+/// Best-effort, like every copy write.
+pub fn sync_credential_pin_copy(volume_root: &str, pin: &PinnedCredentials) {
+    if read_credential_pin_copy(volume_root).as_ref() == Some(pin) {
+        return;
+    }
+    if let Err(e) = write_credential_pin_copy(volume_root, pin) {
+        warn!(error = %e, volume_root, "could not write the volume's copy of the credential pin");
+    }
+}
+
 /// Pin `creds` in PGDATA and keep the volume's copy current. PGDATA's write is
 /// the result; a copy that cannot be written is logged, never fatal: the copy
 /// is a fallback for a boot on an empty PGDATA, not the pin itself.
@@ -343,13 +356,7 @@ pub fn apply_credential_pin(
         return PinOutcome::Adopted;
     };
 
-    if read_credential_pin_copy(volume_root).as_ref() != Some(&pinned) {
-        // The first boot of this image on an existing cluster, or a copy that
-        // fell behind: the volume's copy follows the pin.
-        if let Err(e) = write_credential_pin_copy(volume_root, &pinned) {
-            warn!(error = %e, volume_root, "could not write the volume's copy of the credential pin");
-        }
-    }
+    sync_credential_pin_copy(volume_root, &pinned);
 
     if pinned == from_env {
         return PinOutcome::Matches;

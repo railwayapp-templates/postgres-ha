@@ -4,8 +4,8 @@ use super::HealthServerConfig;
 #[cfg(test)]
 use crate::patroni::write_credential_pin;
 use crate::patroni::{
-    clear_rotation_journal, read_credential_pin, write_credential_pin_and_copy,
-    write_rotation_journal, PinnedCredentials,
+    clear_rotation_journal, read_credential_pin, sync_credential_pin_copy,
+    write_credential_pin_and_copy, write_rotation_journal, PinnedCredentials,
 };
 use crate::volume_root;
 use anyhow::{Context, Result};
@@ -184,6 +184,11 @@ where
     Fut: std::future::Future<Output = Result<bool>>,
 {
     if let Some(pin) = read_credential_pin(data_dir) {
+        // A replica's pin arrives with its clone, and the volume's copy only
+        // on its next boot; a rotation must not stage a journal on a member
+        // whose copy is missing, or the boot after a wipe mid-rotation has
+        // the journal and no pin to reconcile it against.
+        sync_credential_pin_copy(volume_root, &pin);
         return Ok(pin);
     }
     if !may_establish_pin(operation) {
@@ -870,6 +875,35 @@ mod tests {
         // for every later request and boot.
         assert_eq!(pin, pin_of("carried"));
         assert_eq!(read_credential_pin(dir), Some(pin_of("carried")));
+    }
+
+    #[tokio::test]
+    async fn a_rotation_request_leaves_the_volume_copy_current_before_staging_anything() {
+        // The pin came with the clone; this member never rebooted since, so
+        // the volume has no copy of it yet.
+        let pgdata = tempfile::tempdir().unwrap();
+        let volume = tempfile::tempdir().unwrap();
+        let (dir, root) = (
+            pgdata.path().to_str().unwrap(),
+            volume.path().to_str().unwrap(),
+        );
+        write_credential_pin(dir, &pin_of("cloned")).unwrap();
+        assert_eq!(crate::patroni::read_credential_pin_copy(root), None);
+        let credential = basic("railway", "cloned");
+        let pin = resolve_pin(
+            dir,
+            root,
+            &Operation::Prepare,
+            Some(&credential),
+            |_| async { panic!("verifier must not run when a pin exists") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(pin, pin_of("cloned"));
+        assert_eq!(
+            crate::patroni::read_credential_pin_copy(root),
+            Some(pin_of("cloned"))
+        );
     }
 
     #[tokio::test]
