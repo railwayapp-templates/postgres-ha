@@ -17,7 +17,11 @@ use axum::{
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{io::Write, os::unix::fs::OpenOptionsExt, time::Duration};
+use std::{
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    time::{Duration, Instant},
+};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
@@ -629,6 +633,21 @@ async fn apply(
                     "previous password still accepted"
                 );
             }
+            // A replica that carries the password but is not streaming from
+            // the leader, on the leader's timeline, has not finished the
+            // rotation: its walreceiver is still presenting the previous
+            // credential, or it lost the leader at the restart that applied
+            // the new one. Left alone it falls further behind until the
+            // self-heal reinitializes it, long after the rotation reported
+            // DONE. Say so now, within the request's budget: the coordinator
+            // re-applies the member step and verifies again.
+            if client
+                .query_one("SELECT pg_is_in_recovery()", &[])
+                .await?
+                .get::<_, bool>(0)
+            {
+                wait_for_streaming(&http, &patroni, STREAMING_BUDGET).await?;
+            }
             clear_rotation_journal(&data_dir, &volume_root())?;
         }
     }
@@ -646,6 +665,63 @@ async fn apply(
         .await?
         .get::<_, bool>(0);
     Ok(json!({"version": 1, "leader": leader, "capabilities": ["catalog_verifier"]}))
+}
+
+/// How long `verify` waits for a replica to stream from the leader on the
+/// leader's timeline. Well inside the request's 35 s budget: a replica whose
+/// member step just reloaded its credentials reconnects within seconds, and
+/// one that does not is reported, not waited for.
+const STREAMING_BUDGET: Duration = Duration::from_secs(20);
+
+/// What Patroni says about this replica's replication: `/patroni` must report
+/// `replication_state: streaming` and the replica's timeline must be the
+/// leader's (`/cluster`). A cluster that names no leader timeline cannot be
+/// held against the replica; the streaming state alone decides then.
+fn streaming_from_leader(local: &Value, cluster: &Value) -> std::result::Result<(), String> {
+    match local["replication_state"].as_str() {
+        Some("streaming") => {}
+        Some(state) => return Err(format!("replica not streaming ({state})")),
+        None => return Err("replica not streaming (no replication state)".to_string()),
+    }
+    let leader_timeline = cluster["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|member| member["role"] == "leader")
+        .and_then(|member| member["timeline"].as_i64());
+    match (local["timeline"].as_i64(), leader_timeline) {
+        (Some(local), Some(leader)) if local != leader => Err(format!(
+            "replica on timeline {local}, leader on timeline {leader}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Wait for [`streaming_from_leader`] to hold, polling Patroni once a second
+/// until `budget` runs out; the last reason is the error.
+async fn wait_for_streaming(http: &reqwest::Client, patroni: &str, budget: Duration) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    loop {
+        // /patroni answers 503 on a replica with the same body; read it either way.
+        let local: Value = http
+            .get(format!("{patroni}/patroni"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let cluster: Value = http
+            .get(format!("{patroni}/cluster"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        match streaming_from_leader(&local, &cluster) {
+            Ok(()) => return Ok(()),
+            Err(reason) if Instant::now() >= deadline => anyhow::bail!("{reason}"),
+            Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+        }
+    }
 }
 
 /// The pending credential is private on-disk intent, never progress or logs.
@@ -767,6 +843,38 @@ mod tests {
             repl_pass: password.into(),
             app_pass: password.into(),
         }
+    }
+
+    #[test]
+    fn verify_holds_a_replica_to_streaming_on_the_leaders_timeline() {
+        let cluster = json!({"members": [
+            {"name": "pg-1", "role": "leader", "state": "running", "timeline": 2},
+            {"name": "pg-2", "role": "replica", "state": "running", "timeline": 2},
+        ]});
+        let streaming = json!({"role": "replica", "replication_state": "streaming", "timeline": 2});
+        assert_eq!(streaming_from_leader(&streaming, &cluster), Ok(()));
+        // The precursor of the mid-rotation reinitialize: every member on the
+        // new password, two replicas sitting a timeline behind, not streaming.
+        let behind =
+            json!({"role": "replica", "replication_state": "in archive recovery", "timeline": 1});
+        assert_eq!(
+            streaming_from_leader(&behind, &cluster),
+            Err("replica not streaming (in archive recovery)".to_string())
+        );
+        let stuck = json!({"role": "replica", "replication_state": "streaming", "timeline": 1});
+        assert_eq!(
+            streaming_from_leader(&stuck, &cluster),
+            Err("replica on timeline 1, leader on timeline 2".to_string())
+        );
+        let silent = json!({"role": "replica", "timeline": 2});
+        assert_eq!(
+            streaming_from_leader(&silent, &cluster),
+            Err("replica not streaming (no replication state)".to_string())
+        );
+        // No leader in the cluster view (an election in flight): the
+        // streaming state is all that can be held against the replica.
+        let leaderless = json!({"members": [{"name": "pg-2", "role": "replica", "timeline": 1}]});
+        assert_eq!(streaming_from_leader(&streaming, &leaderless), Ok(()));
     }
     fn basic(user: &str, password: &str) -> Vec<u8> {
         format!("{user}:{password}").into_bytes()
