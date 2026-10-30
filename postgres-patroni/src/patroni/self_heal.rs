@@ -133,6 +133,14 @@ const DEFAULT_POLL_SECONDS: u64 = 10;
 /// persists. Long enough not to spam a legitimate upgrade window, short
 /// enough that a stale marker (self-heal silently disabled) keeps waving.
 const STANDDOWN_REEMIT_SECS: i64 = 6 * 3600;
+// How long a staged password rotation holds this watcher off. A rotation
+// takes minutes; its journal (`<pgdata>/.railway_rotation`, written by the
+// rotation's `prepare` step, removed by its `verify`) outlives it only when
+// the rotation failed with this member unreachable, and self-heal must not
+// stay off for that: past the cap the journal no longer counts.
+const ROTATION_STANDDOWN_MAX_SECS: i64 = 3600;
+// Re-emit the rotation stand-down line at this cadence while it holds.
+const ROTATION_STANDDOWN_REEMIT_SECS: i64 = 60;
 const DEFAULT_CRASH_LOOP_THRESHOLD: u32 = 3;
 const DEFAULT_RECENT_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_ACTION_BACKOFF_SECONDS: u64 = 600;
@@ -771,6 +779,31 @@ pub async fn force_reinitialize(client: &reqwest::Client) -> Result<()> {
     issue_reinitialize(client).await
 }
 
+/// Seconds since the staged password rotation on this member was journaled
+/// (`<pgdata>/.railway_rotation`), or None when no rotation is staged. The
+/// journal is written by the rotation's `prepare` step and removed by its
+/// `verify`, so its age is the age of the rotation.
+pub fn staged_rotation_age_secs(data_dir: &str, now: i64) -> Option<i64> {
+    let modified = fs::metadata(format!("{data_dir}/.railway_rotation"))
+        .ok()?
+        .modified()
+        .ok()?;
+    let modified = modified.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some((now - modified).max(0))
+}
+
+/// Whether a staged rotation holds the watcher off: a journal younger than
+/// `cap_secs`. Between the rotation's database step (the leader's roles move
+/// to the new password) and this member's own step (its pgpass and config
+/// follow), the replica's streaming is expected to drop and its timeline to
+/// fall behind: every signal this watcher reads as a stall. A reinitialize
+/// then wipes the journal that lets the member finish the rotation, and the
+/// clone that follows must authenticate with credentials the rotation is
+/// still moving. The window belongs to the coordinator; the watcher waits.
+pub fn rotation_stands_down(journal_age_secs: Option<i64>, cap_secs: i64) -> bool {
+    journal_age_secs.is_some_and(|age| age < cap_secs)
+}
+
 /// Per-hour reinitialize cap, env-overridable, shared by both self-heal paths.
 pub fn reinit_attempt_cap() -> u32 {
     env_u32(
@@ -1266,6 +1299,9 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
     // — a single event at the start is too easy to lose). Cleared once the
     // marker is gone, so a later window emits afresh.
     let mut upgrade_standdown_last_emit: Option<i64> = None;
+    // Same latch for the password-rotation stand-down (see
+    // `rotation_stands_down`): one line a minute while a rotation is staged.
+    let mut rotation_standdown_last_emit: Option<i64> = None;
 
     loop {
         if let Err(e) = iteration(
@@ -1279,6 +1315,7 @@ async fn run(volume_root: String, telemetry: Telemetry, cfg: WatcherConfig) -> R
             &mut divergence_window,
             &mut start_failed_since,
             &mut upgrade_standdown_last_emit,
+            &mut rotation_standdown_last_emit,
             &telemetry,
         )
         .await
@@ -1300,6 +1337,7 @@ async fn iteration(
     divergence_window: &mut Option<DivergenceWindow>,
     start_failed_since: &mut Option<i64>,
     upgrade_standdown_last_emit: &mut Option<i64>,
+    rotation_standdown_last_emit: &mut Option<i64>,
     telemetry: &Telemetry,
 ) -> Result<()> {
     let now = now_epoch();
@@ -1348,6 +1386,32 @@ async fn iteration(
         return Ok(());
     }
     *upgrade_standdown_last_emit = None;
+
+    // A staged password rotation owns this member's lag for its window; see
+    // `rotation_stands_down`. The transient dwell state is cleared for the
+    // same reason as during an upgrade: a replica that spent the rotation
+    // behind must re-earn its dwell from zero once the journal is gone.
+    let rotation_age = staged_rotation_age_secs(&crate::paths::pgdata(), now);
+    if rotation_stands_down(rotation_age, ROTATION_STANDDOWN_MAX_SECS) {
+        *divergence_window = None;
+        *start_failed_since = None;
+        if rotation_standdown_last_emit
+            .is_none_or(|last| now - last >= ROTATION_STANDDOWN_REEMIT_SECS)
+        {
+            info!(
+                journal_age_secs = ?rotation_age,
+                "self-heal: standing down while a password rotation is staged on this member"
+            );
+            *rotation_standdown_last_emit = Some(now);
+        }
+        return Ok(());
+    }
+    if rotation_standdown_last_emit.take().is_some() {
+        info!(
+            journal_age_secs = ?rotation_age,
+            "self-heal: the staged password rotation is over (or past the stand-down cap); resuming"
+        );
+    }
 
     // 1. Local Patroni status: role, state, postmaster_start_time.
     let local = match fetch_local_patroni(client).await {
@@ -2069,6 +2133,47 @@ fn recent_action_count(state_path: &str, now: i64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_staged_rotation_holds_the_watcher_off_until_its_journal_ages_out() {
+        // No journal: nothing staged, the watcher runs.
+        assert!(!rotation_stands_down(None, ROTATION_STANDDOWN_MAX_SECS));
+        // Written just now, or minutes ago: the coordinator's window.
+        assert!(rotation_stands_down(Some(0), ROTATION_STANDDOWN_MAX_SECS));
+        assert!(rotation_stands_down(
+            Some(15 * 60),
+            ROTATION_STANDDOWN_MAX_SECS
+        ));
+        // A journal a failed rotation left behind: self-heal resumes.
+        assert!(!rotation_stands_down(
+            Some(ROTATION_STANDDOWN_MAX_SECS),
+            ROTATION_STANDDOWN_MAX_SECS
+        ));
+        assert!(!rotation_stands_down(
+            Some(3 * 3600),
+            ROTATION_STANDDOWN_MAX_SECS
+        ));
+    }
+
+    #[test]
+    fn the_journals_age_is_read_from_pgdata() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        assert_eq!(staged_rotation_age_secs(data_dir, 10_000), None);
+        std::fs::write(format!("{data_dir}/.railway_rotation"), b"{}").unwrap();
+        let written = std::fs::metadata(format!("{data_dir}/.railway_rotation"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(staged_rotation_age_secs(data_dir, written + 90), Some(90));
+        // A clock that ran backwards never reads as a negative age.
+        assert_eq!(staged_rotation_age_secs(data_dir, written - 5), Some(0));
+        std::fs::remove_file(format!("{data_dir}/.railway_rotation")).unwrap();
+        assert_eq!(staged_rotation_age_secs(data_dir, written + 90), None);
+    }
 
     fn base() -> SelfHealInputs {
         SelfHealInputs {
