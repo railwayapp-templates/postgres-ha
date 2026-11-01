@@ -4,8 +4,9 @@ use super::HealthServerConfig;
 #[cfg(test)]
 use crate::patroni::write_credential_pin;
 use crate::patroni::{
-    clear_rotation_journal, read_credential_pin, sync_credential_pin_copy,
-    write_credential_pin_and_copy, write_rotation_journal, PinnedCredentials,
+    clear_rotation_journal, pin_for_boot, read_credential_pin, read_credential_pin_copy,
+    sync_credential_pin_copy, write_credential_pin_and_copy, write_rotation_journal,
+    PinnedCredentials,
 };
 use crate::volume_root;
 use anyhow::{Context, Result};
@@ -163,9 +164,37 @@ fn may_establish_pin(operation: &Operation) -> bool {
     matches!(operation, Operation::Preflight | Operation::Verify)
 }
 
+/// Whether `supplied` is `railway:<password>` for this `password`, in
+/// constant time.
+fn carries(supplied: Option<&[u8]>, password: &str) -> bool {
+    let expected = format!("{ROTATION_USER}:{password}");
+    supplied.is_some_and(|s| bool::from(s.ct_eq(expected.as_bytes())))
+}
+
 /// The pin a rotation request authenticates against.
 ///
-/// A volume without a pin used to refuse every rotation with 503. That left
+/// PGDATA's pin, normally. The volume's copy of it (see
+/// [`crate::patroni::CREDENTIAL_PIN_COPY_FILE`]) is consulted in two cases:
+///
+/// - PGDATA has no pin and the request carries the copy's password: PGDATA
+///   was wiped (a reinitialize in progress) and the copy is what this member
+///   was pinned to. The request authenticates against it; nothing is written
+///   into PGDATA, which the clone needs empty. The operation then fails on
+///   the database being down, which the control plane retries, instead of
+///   "credential pin unavailable", which it reads as a member whose image
+///   never pinned and redeploys mid-clone.
+/// - PGDATA has a pin, the copy differs, and the request carries the copy's
+///   password rather than PGDATA's: a re-seed from the archive restored the
+///   pin of the last backup, from before a rotation this member already
+///   went through (the copy is written at every pin change, the backup is
+///   not). Once the roles are proven to carry the copy's password, PGDATA is
+///   re-pinned to it and the request proceeds; a preflight would otherwise
+///   answer 401, which the control plane reports as the variable no longer
+///   matching the cluster. Roles that carry neither, or a verifier that
+///   cannot run, leave PGDATA's pin in force: the request is then refused as
+///   today, never left without a pin.
+///
+/// A volume without any pin used to refuse every rotation with 503. That left
 /// the clusters that never got one stranded: replicas cloned from a leader
 /// that booted unpinned (the adoption gap fixed in the runner) carry neither
 /// pin nor bootstrap marker, so no later boot adopts one — only a re-clone
@@ -176,6 +205,9 @@ fn may_establish_pin(operation: &Operation) -> bool {
 /// post_bootstrap would have written. A credential the roles do not carry is
 /// unauthorized, the same answer a pinned node gives; a verifier that cannot
 /// run (Postgres down) leaves the node unavailable, never unauthorized.
+///
+/// Reads only, apart from the re-pin above: the volume's copy is brought up
+/// to date by [`admit`], after the request has authenticated.
 async fn resolve_pin<F, Fut>(
     data_dir: &str,
     volume_root: &str,
@@ -187,13 +219,40 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<bool>>,
 {
+    let copy = read_credential_pin_copy(volume_root);
     if let Some(pin) = read_credential_pin(data_dir) {
-        // A replica's pin arrives with its clone, and the volume's copy only
-        // on its next boot; a rotation must not stage a journal on a member
-        // whose copy is missing, or the boot after a wipe mid-rotation has
-        // the journal and no pin to reconcile it against.
-        sync_credential_pin_copy(volume_root, &pin);
-        return Ok(pin);
+        let Some(copy) = copy.filter(|copy| *copy != pin) else {
+            return Ok(pin);
+        };
+        if carries(credential, &pin.superuser_pass) || !carries(credential, &copy.superuser_pass) {
+            return Ok(pin);
+        }
+        return match verify(copy.superuser_pass.clone()).await {
+            Ok(true) => {
+                write_credential_pin_and_copy(data_dir, volume_root, &copy)
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                info!(
+                    data_dir,
+                    operation = ?operation,
+                    "PGDATA's credential pin is behind the volume's copy (re-seeded from a backup \
+                     older than a rotation this member went through); re-pinned to the copy, \
+                     which the roles were verified to carry"
+                );
+                Ok(copy)
+            }
+            Ok(false) | Err(_) => Ok(pin),
+        };
+    }
+    if let Some(copy) = copy {
+        if carries(credential, &copy.superuser_pass) {
+            info!(
+                data_dir,
+                operation = ?operation,
+                "PGDATA carries no credential pin (wiped, or a clone in progress); the request \
+                 authenticates against the volume's copy"
+            );
+            return Ok(copy);
+        }
     }
     if !may_establish_pin(operation) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -341,11 +400,22 @@ pub async fn rotate(
             )
         }
     };
-    let expected = format!("{ROTATION_USER}:{}", pin.superuser_pass);
-    if !supplied.is_some_and(|s| bool::from(s.as_slice().ct_eq(expected.as_bytes()))) {
+    if admit(supplied.as_deref(), &pin, &volume_root()).is_err() {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"unauthorized"})),
+        );
+    }
+    if needs_pgdata_pin(&request.operation) && read_credential_pin(dir).is_none() {
+        warn!(
+            operation = ?request.operation,
+            "credential operation refused: PGDATA carries no pin (wiped, or a clone in progress)"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"error":"credential rotation could not be verified: PGDATA is being re-cloned"}),
+            ),
         );
     }
     if request.new_password.is_empty()
@@ -382,6 +452,36 @@ pub async fn rotate(
             )
         }
     }
+}
+
+/// Whether an operation writes into PGDATA before it touches the database.
+/// `prepare` records the journal first and connects after; on a PGDATA that
+/// was wiped for a clone in progress (the request then authenticated against
+/// the volume's copy) that file would make the directory non-empty and
+/// `pg_basebackup` refuse it. Every other operation connects first, and the
+/// database being down refuses it before it writes anything. Refused as
+/// "could not be verified", which the control plane retries, like a member
+/// that is down.
+fn needs_pgdata_pin(operation: &Operation) -> bool {
+    matches!(operation, Operation::Prepare)
+}
+
+/// Authenticate the request against `pin` and, once it has, bring the volume's
+/// copy of the pin up to date. A replica's pin arrives with its clone, and the
+/// volume's copy only on its next boot; a rotation must not stage a journal
+/// on a member whose copy is missing, or the boot after a wipe mid-rotation
+/// has the journal and no pin to reconcile it against. After authentication
+/// only: a request that cannot present the pin writes nothing.
+fn admit(
+    supplied: Option<&[u8]>,
+    pin: &PinnedCredentials,
+    volume_root: &str,
+) -> Result<(), StatusCode> {
+    if !carries(supplied, &pin.superuser_pass) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    sync_credential_pin_copy(volume_root, pin);
+    Ok(())
 }
 
 /// One short line naming why an operation was refused, so the control plane
@@ -620,7 +720,9 @@ async fn apply(
                 .await?,
                 "role password differs"
             );
-            let pin = read_credential_pin(&data_dir).context("pin missing")?;
+            // PGDATA's pin, or the volume's copy while PGDATA is being
+            // re-cloned (the request authenticated against that same copy).
+            let (pin, _) = pin_for_boot(&data_dir, &volume_root()).context("pin missing")?;
             anyhow::ensure!(
                 pin.superuser_pass == request.new_password
                     && pin.repl_pass == request.new_password
@@ -986,7 +1088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rotation_request_leaves_the_volume_copy_current_before_staging_anything() {
+    async fn a_rotation_request_leaves_the_volume_copy_current_once_it_has_authenticated() {
         // The pin came with the clone; this member never rebooted since, so
         // the volume has no copy of it yet.
         let pgdata = tempfile::tempdir().unwrap();
@@ -1008,10 +1110,148 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pin, pin_of("cloned"));
+        // Resolving writes nothing: an unauthenticated request must not
+        // make this member touch its volume.
+        assert_eq!(crate::patroni::read_credential_pin_copy(root), None);
+        let wrong = basic("railway", "wrong");
+        assert_eq!(
+            admit(Some(&wrong), &pin, root),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(crate::patroni::read_credential_pin_copy(root), None);
+        assert_eq!(admit(Some(&credential), &pin, root), Ok(()));
         assert_eq!(
             crate::patroni::read_credential_pin_copy(root),
             Some(pin_of("cloned"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_wiped_pgdata_authenticates_against_the_volume_copy_without_writing_into_it() {
+        // A reinitialize mid-rotation: PGDATA is empty, the clone is in
+        // progress, Postgres is down. The copy is what this member was
+        // pinned to; the request that carries it proceeds (and then fails on
+        // the database, which the control plane retries) instead of
+        // "credential pin unavailable", which the control plane reads as a
+        // member that never pinned and redeploys mid-clone.
+        let pgdata = tempfile::tempdir().unwrap();
+        let volume = tempfile::tempdir().unwrap();
+        let (dir, root) = (
+            pgdata.path().to_str().unwrap(),
+            volume.path().to_str().unwrap(),
+        );
+        crate::patroni::write_credential_pin_copy(root, &pin_of("pinned")).unwrap();
+        let credential = basic("railway", "pinned");
+        for operation in [
+            Operation::Preflight,
+            Operation::Prepare,
+            Operation::Database,
+            Operation::Member,
+            Operation::Verify,
+        ] {
+            let pin = resolve_pin(dir, root, &operation, Some(&credential), |_| async {
+                anyhow::bail!("connection refused")
+            })
+            .await
+            .unwrap();
+            assert_eq!(pin, pin_of("pinned"));
+        }
+        assert_eq!(read_credential_pin(dir), None);
+        assert!(std::fs::read_dir(dir).unwrap().next().is_none());
+        // Of the five, only prepare writes into PGDATA before it connects:
+        // that one is refused while PGDATA has no pin, the others reach the
+        // database and are refused by its absence.
+        assert!(needs_pgdata_pin(&Operation::Prepare));
+        for operation in [
+            Operation::Preflight,
+            Operation::Database,
+            Operation::Member,
+            Operation::Verify,
+        ] {
+            assert!(!needs_pgdata_pin(&operation), "{operation:?}");
+        }
+        // A request that carries something else is what it was before the
+        // copy existed: a preflight verifies it (here: the database is down,
+        // so the node is unavailable), a mutating step is refused.
+        let other = basic("railway", "other");
+        assert_eq!(
+            resolve_pin(dir, root, &Operation::Preflight, Some(&other), |_| async {
+                anyhow::bail!("connection refused")
+            })
+            .await,
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            resolve_pin(dir, root, &Operation::Member, Some(&other), |_| async {
+                panic!("verifier must not run for a mutating step")
+            })
+            .await,
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pin_restored_from_an_old_backup_is_repinned_to_the_copy_the_roles_carry() {
+        // The member was re-seeded from the archive after a rotation: the
+        // backup's PGDATA carries the pin from before it, the volume's copy
+        // the one the rotation moved to. The control plane presents the
+        // current password (the copy's).
+        let pgdata = tempfile::tempdir().unwrap();
+        let volume = tempfile::tempdir().unwrap();
+        let (dir, root) = (
+            pgdata.path().to_str().unwrap(),
+            volume.path().to_str().unwrap(),
+        );
+        write_credential_pin(dir, &pin_of("backup")).unwrap();
+        crate::patroni::write_credential_pin_copy(root, &pin_of("current")).unwrap();
+        let current = basic("railway", "current");
+        // The roles carry the copy's password: PGDATA is re-pinned to it.
+        let verified = std::cell::Cell::new(None);
+        let pin = resolve_pin(
+            dir,
+            root,
+            &Operation::Preflight,
+            Some(&current),
+            |password| {
+                verified.set(Some(password));
+                async { Ok(true) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified.take().as_deref(), Some("current"));
+        assert_eq!(pin, pin_of("current"));
+        assert_eq!(read_credential_pin(dir), Some(pin_of("current")));
+        assert_eq!(
+            crate::patroni::read_credential_pin_copy(root),
+            Some(pin_of("current"))
+        );
+
+        // Roles that do not carry the copy's password, or a verifier that
+        // cannot run: PGDATA's pin stands, and the request is refused by it
+        // (401, as before the copy existed), never left without a pin.
+        write_credential_pin(dir, &pin_of("backup")).unwrap();
+        for outcome in [Ok(false), Err(anyhow::anyhow!("connection refused"))] {
+            let pin = resolve_pin(dir, root, &Operation::Member, Some(&current), |_| async {
+                outcome
+            })
+            .await
+            .unwrap();
+            assert_eq!(pin, pin_of("backup"));
+            assert_eq!(
+                admit(Some(&current), &pin, root),
+                Err(StatusCode::UNAUTHORIZED)
+            );
+            assert_eq!(read_credential_pin(dir), Some(pin_of("backup")));
+        }
+        // A request carrying PGDATA's own password never consults the copy.
+        let backup = basic("railway", "backup");
+        let pin = resolve_pin(dir, root, &Operation::Preflight, Some(&backup), |_| async {
+            panic!("verifier must not run when the request carries PGDATA's pin")
+        })
+        .await
+        .unwrap();
+        assert_eq!(pin, pin_of("backup"));
     }
 
     #[tokio::test]

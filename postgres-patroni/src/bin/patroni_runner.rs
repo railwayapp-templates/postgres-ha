@@ -22,11 +22,11 @@ use postgres_patroni::patroni::rest_preflight::{
 };
 use postgres_patroni::patroni::{
     apply_credential_pin, credential_drift, credentials_from_env_requested,
-    generate_patroni_config, pin_for_boot, read_rotation_journal,
-    reconcile_pgbackrest_archive_config, run_monitoring_loop, spawn_backup_watcher,
-    spawn_self_heal_watcher, spawn_slot_recovery_watcher, update_pg_hba_for_replication,
-    write_credential_pin_and_copy, write_credential_pin_copy, Config, PinSource,
-    RestapiAddressSource,
+    discard_stale_rotation_journal_copy, generate_patroni_config, pin_for_boot,
+    read_rotation_journal_copy, reconcile_pgbackrest_archive_config, run_monitoring_loop,
+    spawn_backup_watcher, spawn_self_heal_watcher, spawn_slot_recovery_watcher,
+    update_pg_hba_for_replication, write_credential_pin_and_copy, write_credential_pin_copy,
+    Config, PinSource, RestapiAddressSource,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::wal_archive::{
@@ -296,51 +296,77 @@ fn should_wipe_incomplete_clone(
         && wipe_has_safe_clone_source(pgdata_is_dedicated_subdir, leader, my_name)
 }
 
-/// The passwords a boot tries against etcd, in order: the staged rotation's
-/// target and origin (when a journal exists), then the variables, then the pin.
+/// The passwords a boot tries against etcd, in order: each staged rotation's
+/// target and origin (PGDATA's journal first, then the volume's copy, when
+/// they exist and differ), then the variables, then the pin. Every password
+/// once: the same one proves nothing twice and each probe costs a round trip.
 fn rotation_boot_candidates(
-    pending: Option<&serde_json::Value>,
+    journals: &[&serde_json::Value],
     variables_superuser_pass: &str,
     pinned_superuser_pass: &str,
 ) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Some(request) = pending {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |password: &str| {
+        if !candidates.iter().any(|c| c == password) {
+            candidates.push(password.to_string());
+        }
+    };
+    for request in journals {
         for key in ["newPassword", "currentPassword"] {
             if let Some(password) = request[key].as_str() {
-                candidates.push(password.to_string());
+                push(password);
             }
         }
     }
-    candidates.push(variables_superuser_pass.to_string());
-    candidates.push(pinned_superuser_pass.to_string());
+    push(variables_superuser_pass);
+    push(pinned_superuser_pass);
     candidates
+}
+
+/// A journal body as a rotation request, when it parses as one.
+fn parse_journal(body: Option<Vec<u8>>) -> Option<serde_json::Value> {
+    body.and_then(|body| serde_json::from_slice(&body).ok())
 }
 
 /// A staged rotation survives a restart before the variable commit. Prove
 /// the candidate against the elected primary AND authenticated DCS before
 /// re-pinning; an edited variable alone cannot alter a dataset credential.
 ///
-/// The pin and the journal are read from PGDATA, or from the volume's copies
-/// when PGDATA has none: a reinitialize mid-rotation empties PGDATA, and the
-/// boot that follows must still present the pending credential to etcd (whose
-/// root password the rotation already moved) instead of the stale variables,
-/// or the credential pre-flight stops it on every boot until the rotation
-/// fails. In that state nothing is written into PGDATA: the clone in progress
-/// needs it empty, and brings the leader's pin and journal with it.
+/// The pin is read from PGDATA, or from the volume's copy when PGDATA has
+/// none: a reinitialize mid-rotation empties PGDATA, and the boot that
+/// follows must still present the pending credential to etcd (whose root
+/// password the rotation already moved) instead of the stale variables, or
+/// the credential pre-flight stops it on every boot until the rotation fails.
+/// In that state nothing is written into PGDATA: the clone in progress needs
+/// it empty. The candidates come from BOTH journals when both exist: a clone
+/// off the leader brings the leader's current journal, but a re-seed from the
+/// archive brings the last backup's, which may record an older rotation while
+/// the volume's copy records the one in flight; neither alone is reliably
+/// the fresher. A copy left behind by a rotation that already finished on
+/// this member is discarded first, so it stops costing every boot a probe.
 async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> Result<()> {
     let Some((pin, source)) = pin_for_boot(&config.data_dir, volume_root) else {
         return Ok(());
     };
     if source == PinSource::VolumeCopy {
         info!("PGDATA carries no credential pin (wiped, or a clone in progress); reconciling against the volume's copy");
+    } else {
+        discard_stale_rotation_journal_copy(&config.data_dir, volume_root, &pin);
     }
-    let pending = read_rotation_journal(&config.data_dir, volume_root)
-        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
-    let candidates = rotation_boot_candidates(
-        pending.as_ref(),
-        &config.superuser_pass,
-        &pin.superuser_pass,
+    let pending_in_pgdata = parse_journal(
+        std::fs::read(postgres_patroni::patroni::journal_path(&config.data_dir)).ok(),
     );
+    let pending_in_copy = parse_journal(read_rotation_journal_copy(volume_root));
+    if pending_in_pgdata.is_none() && pending_in_copy.is_some() {
+        info!("PGDATA carries no rotation journal; using the volume's copy");
+    }
+    let journals: Vec<&serde_json::Value> = pending_in_pgdata
+        .iter()
+        .chain(pending_in_copy.iter())
+        .collect();
+    let candidates =
+        rotation_boot_candidates(&journals, &config.superuser_pass, &pin.superuser_pass);
+    let pending = pending_in_pgdata.as_ref().or(pending_in_copy.as_ref());
     if pending.is_none() && config.superuser_pass == pin.superuser_pass {
         return Ok(());
     }
@@ -469,7 +495,13 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
         PinSource::Pgdata => write_credential_pin_and_copy(&config.data_dir, volume_root, &proven)?,
         // PGDATA is empty and about to be cloned over: the copy is enough for
         // the next boot, and a file in PGDATA would get in the clone's way.
-        PinSource::VolumeCopy => write_credential_pin_copy(volume_root, &proven)?,
+        // Like every write of the copy, best-effort: this boot runs on the
+        // proven credentials either way, and the clone brings a pin.
+        PinSource::VolumeCopy => {
+            if let Err(e) = write_credential_pin_copy(volume_root, &proven) {
+                warn!(error = %e, volume_root, "could not write the volume's copy of the credential pin");
+            }
+        }
     }
     Ok(())
 }
@@ -1996,13 +2028,22 @@ mod tests {
         // being empty) is what lets the boot present "new".
         let journal = serde_json::json!({"newPassword": "new", "currentPassword": "old"});
         assert_eq!(
-            rotation_boot_candidates(Some(&journal), "old", "old"),
-            vec!["new", "old", "old", "old"]
+            rotation_boot_candidates(&[&journal], "old", "old"),
+            vec!["new", "old"]
         );
         // No rotation staged: the variables, then whatever the pin says.
         assert_eq!(
-            rotation_boot_candidates(None, "edited", "pinned"),
+            rotation_boot_candidates(&[], "edited", "pinned"),
             vec!["edited", "pinned"]
+        );
+        // PGDATA re-seeded from a backup taken during an older rotation
+        // carries that rotation's journal; the volume's copy records the one
+        // in flight. PGDATA's candidates first, then the copy's, then the
+        // rest, each once: the pending "new" is still presented.
+        let stale = serde_json::json!({"newPassword": "old", "currentPassword": "older"});
+        assert_eq!(
+            rotation_boot_candidates(&[&stale, &journal], "old", "older"),
+            vec!["old", "older", "new"]
         );
     }
 

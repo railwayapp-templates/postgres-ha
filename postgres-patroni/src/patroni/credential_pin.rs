@@ -32,10 +32,18 @@
 //! outside PGDATA ([`pin_copy_path`], [`journal_copy_path`]): a reinitialize
 //! empties PGDATA, and a member that boots mid-rotation on an empty PGDATA
 //! must still know what it was pinned to and what it is carrying out, or it
-//! presents the stale variables to etcd and is stopped. PGDATA's own files win
-//! whenever they exist; the copies are read only when it has none. Existing clusters that predate the pin adopt their current
-//! variables as the pin on the first boot of this image — at that point the
-//! variables are, by construction, the credentials the cluster runs with.
+//! presents the stale variables to etcd and is stopped. PGDATA's own pin wins
+//! whenever it exists; the copy is read when PGDATA has none. Neither file is
+//! always the fresher one: a clone off the leader (`basebackup`) brings the
+//! leader's current pin and journal, but a re-seed from the archive
+//! (`pgbackrest`, the first replica method on clusters with WAL archiving)
+//! brings the ones in the last backup, as old as that backup. So a rotation
+//! request that carries the copy's password instead of PGDATA's is proven
+//! against the roles and re-pins (health server), and a boot takes the
+//! candidates of both journals (runner). Existing clusters that predate the
+//! pin adopt their current variables as the pin on the first boot of this
+//! image — at that point the variables are, by construction, the credentials
+//! the cluster runs with.
 //!
 //! Break-glass: `PATRONI_CREDENTIALS_FROM_ENV=true` makes the variables win
 //! for that boot and re-pins them — for an operator who has ALREADY rotated
@@ -66,8 +74,12 @@ pub const ROTATION_JOURNAL_FILE: &str = ".railway_rotation";
 /// already moved, and the credential pre-flight stops it; every later boot
 /// finds the same empty PGDATA and stops the same way, until the rotation
 /// fails. The copies survive the wipe. They are fallbacks: PGDATA's own files
-/// win whenever they exist (a completed clone brings the leader's). Distinct
-/// names, so a volume whose PGDATA is the volume root keeps the two apart.
+/// win whenever they exist (a clone off the leader brings the leader's; a
+/// re-seed from the archive brings the last backup's, see the module doc).
+/// Distinct names, so a volume whose PGDATA is the volume root (the legacy
+/// layout) keeps the two apart; there the copies live inside PGDATA and a
+/// reinitialize removes them with everything else, so that layout boots
+/// after a wipe as it did before the copies existed.
 pub const CREDENTIAL_PIN_COPY_FILE: &str = ".railway_credentials.volume";
 /// The volume's copy of the rotation journal; see [`CREDENTIAL_PIN_COPY_FILE`].
 pub const ROTATION_JOURNAL_COPY_FILE: &str = ".railway_rotation.volume";
@@ -249,6 +261,60 @@ pub fn read_rotation_journal(data_dir: &str, volume_root: &str) -> Option<Vec<u8
     }
 }
 
+/// The volume's copy of the staged rotation's request, if any.
+pub fn read_rotation_journal_copy(volume_root: &str) -> Option<Vec<u8>> {
+    match std::fs::read(journal_copy_path(volume_root)) {
+        Ok(body) => Some(body),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(error = %e, "the volume's copy of the rotation journal is unreadable");
+            None
+        }
+    }
+}
+
+/// The `newPassword` of a journal body, when it parses as a rotation request.
+fn journal_target(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body).ok()?["newPassword"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Drop the volume's copy of the journal once it is behind PGDATA: PGDATA
+/// carries a pin (it is complete, not a clone in progress) and no journal,
+/// and the copy's rotation already moved this member's pin to its target
+/// (`verify` cleared PGDATA's journal but not the copy, or a clone brought a
+/// pin that is already the copy's target without the journal). Left in
+/// place, every later boot would present a finished rotation's candidates to
+/// etcd before the pin. A copy whose target is NOT the pin is kept: PGDATA
+/// may have come from a backup older than the rotation in flight, and the
+/// copy is then the only record of it. Returns whether the copy was removed.
+pub fn discard_stale_rotation_journal_copy(
+    data_dir: &str,
+    volume_root: &str,
+    pin: &PinnedCredentials,
+) -> bool {
+    if std::path::Path::new(&journal_path(data_dir)).exists() {
+        return false;
+    }
+    let Some(copy) = read_rotation_journal_copy(volume_root) else {
+        return false;
+    };
+    if journal_target(&copy).as_deref() != Some(pin.superuser_pass.as_str()) {
+        return false;
+    }
+    match remove_if_present(&journal_copy_path(volume_root)) {
+        Ok(()) => {
+            info!("the volume's copy of the rotation journal is behind PGDATA's pin (rotation finished); removed it");
+            true
+        }
+        Err(e) => {
+            warn!(error = %e, volume_root, "could not remove the stale copy of the rotation journal");
+            false
+        }
+    }
+}
+
 /// A rotation that has been verified (or restored) leaves no journal anywhere.
 pub fn clear_rotation_journal(data_dir: &str, volume_root: &str) -> Result<()> {
     remove_if_present(&journal_path(data_dir))?;
@@ -275,7 +341,8 @@ fn write_private(path: &str, body: &[u8]) -> Result<()> {
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&tmp)?;
+        .open(&tmp)
+        .with_context(|| format!("open {tmp}"))?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.write_all(body)?;
     file.sync_all()?;
@@ -559,7 +626,10 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        // A clone brought a newer pin: PGDATA wins over a copy that fell behind.
+        // A clone brought another pin: PGDATA's wins, whichever is fresher
+        // (a basebackup brings the leader's current one, a pgbackrest
+        // re-seed the last backup's; the health server and the runner prove
+        // the copy's password against the roles before trusting it).
         write_credential_pin(data_dir, &pin_of("two")).unwrap();
         assert_eq!(
             pin_for_boot(data_dir, volume_root),
@@ -599,6 +669,70 @@ mod tests {
         clear_rotation_journal(data_dir, volume_root).unwrap();
         assert_eq!(read_rotation_journal(data_dir, volume_root), None);
         assert!(!std::path::Path::new(&journal_copy_path(volume_root)).exists());
+    }
+
+    #[test]
+    fn a_journal_copy_behind_pgdatas_pin_is_discarded_and_one_ahead_of_it_is_kept() {
+        let pgdata = tempdir().unwrap();
+        let volume = tempdir().unwrap();
+        let (data_dir, volume_root) = (
+            pgdata.path().to_str().unwrap(),
+            volume.path().to_str().unwrap(),
+        );
+        let journal = br#"{"newPassword":"new","currentPassword":"old"}"#;
+        // Nothing staged: nothing to discard.
+        assert!(!discard_stale_rotation_journal_copy(
+            data_dir,
+            volume_root,
+            &pin_of("new")
+        ));
+        // Both journals present (mid-rotation): PGDATA's is authoritative,
+        // the copy stays whatever the pin says.
+        write_rotation_journal(data_dir, volume_root, journal).unwrap();
+        assert!(!discard_stale_rotation_journal_copy(
+            data_dir,
+            volume_root,
+            &pin_of("new")
+        ));
+        assert_eq!(
+            read_rotation_journal_copy(volume_root).as_deref(),
+            Some(&journal[..])
+        );
+        // PGDATA's journal is gone and the pin already carries the target:
+        // the rotation finished on this member; the copy is behind.
+        std::fs::remove_file(journal_path(data_dir)).unwrap();
+        assert!(!discard_stale_rotation_journal_copy(
+            data_dir,
+            volume_root,
+            &pin_of("old")
+        ));
+        assert!(discard_stale_rotation_journal_copy(
+            data_dir,
+            volume_root,
+            &pin_of("new")
+        ));
+        assert_eq!(read_rotation_journal_copy(volume_root), None);
+        // PGDATA restored from a backup older than the rotation (pin "old",
+        // no journal) while the copy records the rotation in flight: kept,
+        // it is the only record of the pending password on this volume.
+        write_rotation_journal(data_dir, volume_root, journal).unwrap();
+        std::fs::remove_file(journal_path(data_dir)).unwrap();
+        assert!(!discard_stale_rotation_journal_copy(
+            data_dir,
+            volume_root,
+            &pin_of("old")
+        ));
+        assert_eq!(
+            read_rotation_journal_copy(volume_root).as_deref(),
+            Some(&journal[..])
+        );
+        // A copy that does not parse is left alone (and ignored by its readers).
+        write_private(&journal_copy_path(volume_root), b"not json").unwrap();
+        assert!(!discard_stale_rotation_journal_copy(
+            data_dir,
+            volume_root,
+            &pin_of("new")
+        ));
     }
 
     #[test]
