@@ -143,6 +143,35 @@ pub fn sync_credential_pin_copy(data_dir: &str, volume_root: &str, pin: &PinnedC
     }
 }
 
+/// Which file a boot took its pin from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    /// PGDATA's own pin.
+    Pgdata,
+    /// PGDATA has no pin (wiped, or a clone still in progress): the volume's copy.
+    VolumeCopy,
+}
+
+/// The pin a boot reconciles against: PGDATA's own when it has one, else the
+/// volume's copy. None when neither exists (a fresh volume).
+pub fn pin_for_boot(data_dir: &str, volume_root: &str) -> Option<(PinnedCredentials, PinSource)> {
+    if let Some(pin) = read_credential_pin(data_dir) {
+        return Some((pin, PinSource::Pgdata));
+    }
+    if !keeps_copies(data_dir, volume_root) {
+        return None;
+    }
+    read_credential_pin_copy(volume_root).map(|pin| (pin, PinSource::VolumeCopy))
+}
+
+/// The volume's copy of a staged rotation's journal, or None.
+pub fn read_rotation_journal_copy(data_dir: &str, volume_root: &str) -> Option<Vec<u8>> {
+    if !keeps_copies(data_dir, volume_root) {
+        return None;
+    }
+    std::fs::read(journal_copy_path(volume_root)).ok()
+}
+
 /// Write the volume's copy of a staged rotation's journal. Best-effort.
 pub fn write_rotation_journal_copy(data_dir: &str, volume_root: &str, body: &[u8]) {
     if !keeps_copies(data_dir, volume_root) {
@@ -502,6 +531,44 @@ mod tests {
         remove_rotation_journal_copy(root);
         remove_rotation_journal_copy(root);
         assert!(!std::path::Path::new(&journal_copy_path(root)).exists());
+    }
+
+    #[test]
+    fn a_boot_on_a_wiped_pgdata_takes_the_volume_copy() {
+        let volume = tempdir().unwrap();
+        let root = volume.path().to_str().unwrap();
+        let pgdata = format!("{root}/pgdata");
+        std::fs::create_dir(&pgdata).unwrap();
+        assert_eq!(pin_for_boot(&pgdata, root), None);
+
+        write_credential_pin(&pgdata, &pin_of("one")).unwrap();
+        sync_credential_pin_copy(&pgdata, root, &pin_of("one"));
+        write_rotation_journal_copy(&pgdata, root, b"{}");
+        assert_eq!(
+            pin_for_boot(&pgdata, root),
+            Some((pin_of("one"), PinSource::Pgdata))
+        );
+        // A clone brought a newer pin: PGDATA wins over the copy.
+        write_credential_pin(&pgdata, &pin_of("two")).unwrap();
+        assert_eq!(
+            pin_for_boot(&pgdata, root),
+            Some((pin_of("two"), PinSource::Pgdata))
+        );
+        // The reinitialize emptied PGDATA: the copies are what the boot has.
+        for entry in std::fs::read_dir(&pgdata).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        assert_eq!(
+            pin_for_boot(&pgdata, root),
+            Some((pin_of("one"), PinSource::VolumeCopy))
+        );
+        assert_eq!(
+            read_rotation_journal_copy(&pgdata, root).as_deref(),
+            Some(&b"{}"[..])
+        );
+        // The legacy layout has no copies to fall back on.
+        assert_eq!(pin_for_boot(root, root).map(|(_, s)| s), None);
+        assert_eq!(read_rotation_journal_copy(root, root), None);
     }
 
     #[test]
