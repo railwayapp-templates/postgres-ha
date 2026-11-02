@@ -301,6 +301,19 @@ pub async fn rotate(
         }
     };
     let dir = yaml["postgresql"]["data_dir"].as_str().unwrap_or("");
+    if recloning(dir) {
+        // A reinitialize emptied PGDATA and the clone is not complete: the pin
+        // is gone with everything else, and "credential pin unavailable"
+        // would read as an image that never pinned, which the control plane
+        // answers by redeploying the member in the middle of its clone. This
+        // member is down; say so, and the control plane retries.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"error":"credential rotation could not be verified: PGDATA is being re-cloned"}),
+            ),
+        );
+    }
     let supplied = supplied_credential(&headers);
     let resolved = tokio::time::timeout(
         Duration::from_secs(10),
@@ -365,6 +378,16 @@ pub async fn rotate(
             )
         }
     }
+}
+
+/// Whether PGDATA holds no complete cluster: `global/pg_control` is written
+/// last by `pg_basebackup` and is absent from an emptied directory, so its
+/// absence is a clone in progress (or a member that cannot start at all),
+/// never a running member whose image predates the pin.
+fn recloning(data_dir: &str) -> bool {
+    !std::path::Path::new(data_dir)
+        .join("global/pg_control")
+        .exists()
 }
 
 /// One short line naming why an operation was refused, so the control plane
@@ -824,6 +847,20 @@ mod tests {
             assert!(!roles_match(&client, &["postgres"], previous).await.unwrap());
         }
     }
+    #[test]
+    fn a_pgdata_without_pg_control_is_a_clone_in_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        assert!(recloning(dir));
+        // A pin alone (copied early by the clone) is not a complete cluster.
+        write_credential_pin(dir, &pin_of("pinned")).unwrap();
+        assert!(recloning(dir));
+        std::fs::create_dir(temp.path().join("global")).unwrap();
+        std::fs::write(temp.path().join("global/pg_control"), b"").unwrap();
+        assert!(!recloning(dir));
+        assert!(recloning(""));
+    }
+
     fn pin_of(password: &str) -> PinnedCredentials {
         PinnedCredentials {
             superuser_pass: password.into(),
