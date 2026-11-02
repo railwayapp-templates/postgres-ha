@@ -1,7 +1,11 @@
 //! Local half of an ordered cluster rotation. SQL is executed in this
 //! container; the control plane owns the etcd change and cluster ordering.
 use super::HealthServerConfig;
-use crate::patroni::{read_credential_pin, write_credential_pin, PinnedCredentials};
+use crate::patroni::{
+    read_credential_pin, remove_rotation_journal_copy, sync_credential_pin_copy,
+    write_credential_pin, write_rotation_journal_copy, PinnedCredentials,
+};
+use crate::volume_root;
 use anyhow::{Context, Result};
 use axum::{
     extract::State,
@@ -331,6 +335,9 @@ pub async fn rotate(
             Json(json!({"error":"unauthorized"})),
         );
     }
+    // A replica's pin arrives with its clone and was never copied to the
+    // volume; no rotation may stage a journal on a member without the copy.
+    sync_credential_pin_copy(dir, &volume_root(), &pin);
     if request.new_password.is_empty()
         || request.new_password.len() > 1024
         || request.new_password.contains(['\0', '\n', '\r'])
@@ -441,10 +448,9 @@ async fn apply(
         Operation::Prepare => {
             // Persist intent before any database or DCS mutation. Recovery can
             // finish adoption even while the control-plane worker is down.
-            atomic_write(
-                &format!("{data_dir}/.railway_rotation"),
-                &serde_json::to_vec(&request)?,
-            )?;
+            let journal = serde_json::to_vec(&request)?;
+            atomic_write(&format!("{data_dir}/.railway_rotation"), &journal)?;
+            write_rotation_journal_copy(&data_dir, &volume_root(), &journal);
         }
         Operation::Database => {
             let mut client = match connect(config, &user, &request.new_password).await {
@@ -583,14 +589,13 @@ async fn apply(
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            write_credential_pin(
-                &data_dir,
-                &PinnedCredentials {
-                    superuser_pass: request.new_password.clone(),
-                    repl_pass: request.new_password.clone(),
-                    app_pass: request.new_password.clone(),
-                },
-            )?;
+            let pin = PinnedCredentials {
+                superuser_pass: request.new_password.clone(),
+                repl_pass: request.new_password.clone(),
+                app_pass: request.new_password.clone(),
+            };
+            write_credential_pin(&data_dir, &pin)?;
+            sync_credential_pin_copy(&data_dir, &volume_root(), &pin);
         }
         Operation::Verify => {
             let client = connect(config, &user, &request.new_password).await?;
@@ -636,6 +641,7 @@ async fn apply(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
+            remove_rotation_journal_copy(&volume_root());
         }
     }
     // During DATABASE the YAML/pin still holds the old value, but SQL already

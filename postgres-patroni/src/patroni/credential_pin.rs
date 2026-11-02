@@ -48,6 +48,20 @@ use super::config::Config;
 /// File inside PGDATA holding the pinned credentials.
 pub const CREDENTIAL_PIN_FILE: &str = ".railway_credentials";
 
+/// The volume's copy of the pin, at the volume root, outside PGDATA. A
+/// reinitialize (and the runner's incomplete-clone wipe) empties PGDATA, and
+/// with it the pin and a staged rotation's journal; the copies survive it, so
+/// a member that boots on an empty PGDATA still knows what it was pinned to.
+/// Written wherever PGDATA's pin and journal are written, best-effort: the
+/// copy is a fallback, never the pin. On the legacy layout (PGDATA is the
+/// volume root) the copies would live inside PGDATA and go with it, so none
+/// are kept there.
+pub const CREDENTIAL_PIN_COPY_FILE: &str = ".railway_credentials.volume";
+/// The volume's copy of a staged rotation's journal (`$PGDATA/.railway_rotation`,
+/// written by the rotation's `prepare` step, removed by its `verify`); see
+/// [`CREDENTIAL_PIN_COPY_FILE`].
+pub const ROTATION_JOURNAL_COPY_FILE: &str = ".railway_rotation.volume";
+
 /// Env knob: when "true", the variables win this boot and are re-pinned.
 pub const CREDENTIALS_FROM_ENV_VAR: &str = "PATRONI_CREDENTIALS_FROM_ENV";
 
@@ -93,6 +107,63 @@ pub fn pin_path(data_dir: &str) -> String {
     format!("{data_dir}/{CREDENTIAL_PIN_FILE}")
 }
 
+pub fn pin_copy_path(volume_root: &str) -> String {
+    format!("{volume_root}/{CREDENTIAL_PIN_COPY_FILE}")
+}
+
+pub fn journal_copy_path(volume_root: &str) -> String {
+    format!("{volume_root}/{ROTATION_JOURNAL_COPY_FILE}")
+}
+
+/// Whether this volume keeps copies: only when PGDATA is a subdirectory of the
+/// volume root, so a wipe of PGDATA leaves them in place.
+fn keeps_copies(data_dir: &str, volume_root: &str) -> bool {
+    data_dir.trim_end_matches('/') != volume_root.trim_end_matches('/')
+}
+
+/// The volume's copy of the pin, or None.
+pub fn read_credential_pin_copy(volume_root: &str) -> Option<PinnedCredentials> {
+    let content = std::fs::read_to_string(pin_copy_path(volume_root)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Make the volume's copy of the pin equal to `pin`, when it is not already.
+/// Best-effort: a failure is logged and the next call tries again.
+pub fn sync_credential_pin_copy(data_dir: &str, volume_root: &str, pin: &PinnedCredentials) {
+    if !keeps_copies(data_dir, volume_root)
+        || read_credential_pin_copy(volume_root).as_ref() == Some(pin)
+    {
+        return;
+    }
+    let written = serde_json::to_string_pretty(pin)
+        .context("serialize credential pin")
+        .and_then(|json| write_private(&pin_copy_path(volume_root), json.as_bytes()));
+    if let Err(e) = written {
+        warn!(error = %e, volume_root, "could not write the volume's copy of the credential pin");
+    }
+}
+
+/// Write the volume's copy of a staged rotation's journal. Best-effort.
+pub fn write_rotation_journal_copy(data_dir: &str, volume_root: &str, body: &[u8]) {
+    if !keeps_copies(data_dir, volume_root) {
+        return;
+    }
+    if let Err(e) = write_private(&journal_copy_path(volume_root), body) {
+        warn!(error = %e, volume_root, "could not write the volume's copy of the rotation journal");
+    }
+}
+
+/// Remove the volume's copy of a rotation's journal. Best-effort.
+pub fn remove_rotation_journal_copy(volume_root: &str) {
+    match std::fs::remove_file(journal_copy_path(volume_root)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(error = %e, volume_root, "could not remove the volume's copy of the rotation journal")
+        }
+    }
+}
+
 /// The pinned credentials on this volume, or None on a fresh volume. An
 /// unreadable or unparseable pin is logged and treated as absent — the
 /// variables then apply, which is the pre-pin behaviour, never a crash.
@@ -117,9 +188,14 @@ pub fn read_credential_pin(data_dir: &str) -> Option<PinnedCredentials> {
 
 /// Persist the pin atomically (temp file + rename), mode 0600.
 pub fn write_credential_pin(data_dir: &str, creds: &PinnedCredentials) -> Result<()> {
-    let path = pin_path(data_dir);
-    let tmp = format!("{path}.tmp");
     let json = serde_json::to_string_pretty(creds).context("serialize credential pin")?;
+    write_private(&pin_path(data_dir), json.as_bytes())
+}
+
+/// Write `body` to `path` atomically (temp file + rename), mode 0600, and
+/// fsync the directory so the rename is durable.
+fn write_private(path: &str, body: &[u8]) -> Result<()> {
+    let tmp = format!("{path}.tmp");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -127,12 +203,15 @@ pub fn write_credential_pin(data_dir: &str, creds: &PinnedCredentials) -> Result
         .mode(0o600)
         .open(&tmp)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(json.as_bytes())?;
+    file.write_all(body)?;
     file.sync_all()?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod {tmp}"))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp} -> {path}"))?;
-    std::fs::File::open(data_dir)?.sync_all()?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp} -> {path}"))?;
+    let dir = std::path::Path::new(path)
+        .parent()
+        .context("path without a parent")?;
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -382,6 +461,59 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    fn pin_of(password: &str) -> PinnedCredentials {
+        PinnedCredentials {
+            superuser_pass: password.into(),
+            repl_pass: password.into(),
+            app_pass: password.into(),
+        }
+    }
+
+    #[test]
+    fn the_volume_copies_follow_the_pin_and_the_journal_outside_pgdata() {
+        let volume = tempdir().unwrap();
+        let root = volume.path().to_str().unwrap();
+        let pgdata = format!("{root}/pgdata");
+        std::fs::create_dir(&pgdata).unwrap();
+
+        assert_eq!(read_credential_pin_copy(root), None);
+        sync_credential_pin_copy(&pgdata, root, &pin_of("one"));
+        assert_eq!(read_credential_pin_copy(root), Some(pin_of("one")));
+        let mode = std::fs::metadata(pin_copy_path(root))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        sync_credential_pin_copy(&pgdata, root, &pin_of("two"));
+        assert_eq!(read_credential_pin_copy(root), Some(pin_of("two")));
+
+        write_rotation_journal_copy(&pgdata, root, b"{\"newPassword\":\"n\"}");
+        assert_eq!(
+            std::fs::read(journal_copy_path(root)).unwrap(),
+            b"{\"newPassword\":\"n\"}"
+        );
+        // A wipe of PGDATA leaves both copies in place.
+        std::fs::remove_dir_all(&pgdata).unwrap();
+        assert_eq!(read_credential_pin_copy(root), Some(pin_of("two")));
+        assert!(std::path::Path::new(&journal_copy_path(root)).exists());
+        // verify removes the journal's copy; removing twice is fine.
+        remove_rotation_journal_copy(root);
+        remove_rotation_journal_copy(root);
+        assert!(!std::path::Path::new(&journal_copy_path(root)).exists());
+    }
+
+    #[test]
+    fn the_legacy_layout_keeps_no_copies() {
+        // PGDATA is the volume root: a wipe removes the copies with it, so
+        // writing them would only put files into the directory a clone needs empty.
+        let volume = tempdir().unwrap();
+        let root = volume.path().to_str().unwrap();
+        sync_credential_pin_copy(root, root, &pin_of("one"));
+        write_rotation_journal_copy(root, root, b"{}");
+        assert!(!std::path::Path::new(&pin_copy_path(root)).exists());
+        assert!(!std::path::Path::new(&journal_copy_path(root)).exists());
     }
 
     #[test]

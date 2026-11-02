@@ -1633,6 +1633,11 @@ async fn async_main() -> Result<()> {
         &telemetry,
     );
     info!(outcome = ?pin_outcome, "credential pin reconciled");
+    // Whatever this boot pinned (adopted, re-pinned, kept), the volume's copy
+    // follows it, so a later wipe of PGDATA still leaves it behind.
+    if let Some(pin) = postgres_patroni::patroni::read_credential_pin(&config.data_dir) {
+        postgres_patroni::patroni::sync_credential_pin_copy(&config.data_dir, &volume_root, &pin);
+    }
 
     // Recover the debris of an interrupted clone. A non-empty data directory
     // with NO pg_control is what a pg_basebackup killed mid-stream leaves
