@@ -25,12 +25,19 @@
 //! it: Patroni never bootstraps it, so `post_bootstrap` never pins it, and the
 //! runner adopts the variables as its pin on that same boot instead.
 //!
-//! The pin lives inside PGDATA on purpose: `pg_basebackup` and pgBackRest copy
-//! it into clones and backups, so a replica seeded from a pinned leader boots
-//! coherent with it (the same reason the forced-archive-GUCs sentinel lives
-//! there). Existing clusters that predate the pin adopt their current
-//! variables as the pin on the first boot of this image — at that point the
-//! variables are, by construction, the credentials the cluster runs with.
+//! The pin lives inside PGDATA on purpose: `pg_basebackup` copies it into
+//! clones, so a replica seeded from a pinned leader boots coherent with it
+//! (the same reason the forced-archive-GUCs sentinel lives there). pgBackRest
+//! backups do not carry it, nor the rotation journal: both are excluded from
+//! the backup set (see `wal_archive::build_pgbackrest_conf`), so no backup
+//! holds the cluster's passwords in plaintext and a re-seed from the archive
+//! cannot bring back a pin from before a rotation. A replica re-seeded that
+//! way gets its pin from the volume's copy instead (the replica restore
+//! wrapper materializes [`CREDENTIAL_PIN_COPY_FILE`] into PGDATA after a
+//! successful restore). Existing clusters that predate the pin adopt their
+//! current variables as the pin on the first boot of this image — at that
+//! point the variables are, by construction, the credentials the cluster runs
+//! with.
 //!
 //! Break-glass: `PATRONI_CREDENTIALS_FROM_ENV=true` makes the variables win
 //! for that boot and re-pins them — for an operator who has ALREADY rotated
@@ -47,6 +54,10 @@ use super::config::Config;
 
 /// File inside PGDATA holding the pinned credentials.
 pub const CREDENTIAL_PIN_FILE: &str = ".railway_credentials";
+
+/// File inside PGDATA holding a staged rotation's journal, written by the
+/// rotation's `prepare` step and removed by its `verify`.
+pub const ROTATION_JOURNAL_FILE: &str = ".railway_rotation";
 
 /// The volume's copy of the pin, at the volume root, outside PGDATA. A
 /// reinitialize (and the runner's incomplete-clone wipe) empties PGDATA, and

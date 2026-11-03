@@ -30,6 +30,7 @@ pub use credential_pin::{
     remove_rotation_journal_copy, sync_credential_pin_copy, write_credential_pin,
     write_rotation_journal_copy, PinOutcome, PinSource, PinnedCredentials,
     CREDENTIAL_PIN_COPY_FILE, CREDENTIAL_PIN_FILE, ROTATION_JOURNAL_COPY_FILE,
+    ROTATION_JOURNAL_FILE,
 };
 pub use health::check_health;
 pub use monitoring::run_monitoring_loop;

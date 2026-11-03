@@ -39,6 +39,20 @@
 # later path migration may have staled; restore_command (the archive-get
 # wrapper) reads the marker on every call.
 #
+# On success the credential pin ($PGDATA/.railway_credentials) and, when one is
+# staged, the rotation journal ($PGDATA/.railway_rotation) are materialized
+# from the volume's copies (<volume root>/.railway_credentials.volume and
+# .railway_rotation.volume, kept outside PGDATA by the runner and the rotation
+# endpoint). Backups exclude both files, and a `--delta` restore removes
+# excluded files it finds in the target directory, so a restore alone leaves
+# the replica without a pin; an older backup taken before the exclusion
+# restores the leader's pin as of backup time, stale once a rotation has
+# happened since. The member's own copy is at least as fresh as its last
+# rotation, so it wins either way. This reproduces what pg_basebackup brings
+# from the leader. Without copies (the legacy layout, where PGDATA is the
+# volume root and keeps none) nothing is written: the runner's boot
+# reconciliation and the rotation endpoint establish the pin as they do today.
+#
 # Non-zero exit → Patroni tries the next create_replica_method. A fresh
 # stanza with no backups fails here before writing anything; Patroni wipes
 # the data dir before running basebackup (no keep_data on that method).
@@ -52,6 +66,26 @@ repo_path_is_usable() {
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
 MARKER="$PGDATA/.pgbackrest_repo_path"
+# Same derivation as the runner's volume_root(): the platform's mount path,
+# else the image default.
+VOLUME_ROOT="${RAILWAY_VOLUME_MOUNT_PATH:-/var/lib/postgresql/data}"
+
+# Copy <volume root>/<name>.volume over $PGDATA/<name>, mode 0600, via tmp +
+# rename so a concurrent reader never sees a partial pin. No copy → nothing
+# written (and a pin the restore brought is left in place). A failure is
+# reported but never fails the restore: the pin is a fallback the boot
+# reconciliation and the rotation endpoint can re-establish.
+materialize_volume_copy() {
+  local name="$1" copy="$VOLUME_ROOT/$1.volume" target="$PGDATA/$1" tmp
+  [ -f "$copy" ] || return 0
+  tmp="$target.tmp.$$"
+  if { cp "$copy" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$target"; } 2>/dev/null; then
+    echo "pgbackrest-replica-restore: $name materialized from the volume's copy" >&2
+  else
+    rm -f "$tmp" 2>/dev/null
+    echo "pgbackrest-replica-restore: could not materialize $name from the volume's copy" >&2
+  fi
+}
 
 if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
   echo "pgbackrest-replica-restore: WAL_ARCHIVE_BUCKET unset; deferring to next create_replica_method" >&2
@@ -85,6 +119,14 @@ if [ "$rc" -eq 0 ] && [ -n "${PGBACKREST_REPO1_PATH:-}" ]; then
   MARKER_TMP="$MARKER.tmp.$$"
   { printf '%s\n' "$PGBACKREST_REPO1_PATH" >"$MARKER_TMP" && chmod 640 "$MARKER_TMP" && mv "$MARKER_TMP" "$MARKER"; } 2>/dev/null \
     || rm -f "$MARKER_TMP" 2>/dev/null || true
+fi
+
+# On the legacy layout PGDATA is the volume root: no copies are kept there,
+# and "<PGDATA>/.railway_credentials.volume" would be a file inside the data
+# directory, never the volume's copy.
+if [ "$rc" -eq 0 ] && [ "${PGDATA%/}" != "${VOLUME_ROOT%/}" ]; then
+  materialize_volume_copy .railway_credentials
+  materialize_volume_copy .railway_rotation
 fi
 
 exit "$rc"
