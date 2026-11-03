@@ -251,6 +251,83 @@ t_replica_restore_marker_written_atomically_no_tmp_leftover() {
   teardown
 }
 
+pin_mode() { python3 -c "import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])" "$1"; }
+
+t_replica_restore_materializes_pin_and_journal_from_volume_copies() {
+  # The volume root is $TMPROOT (PGDATA is its pgdata/ subdirectory, the
+  # dedicated layout). The copies hold the member's current credentials; a
+  # stale pin in PGDATA stands for what an older backup, taken before the
+  # pin was excluded from the backup set, restores. The copies must win.
+  setup
+  printf '{"superuser_pass":"stale"}' > "$TMPROOT/pgdata/.railway_credentials"
+  printf '{"superuser_pass":"current"}' > "$TMPROOT/.railway_credentials.volume"
+  printf '{"newPassword":"next"}' > "$TMPROOT/.railway_rotation.volume"
+  dcs_json_for "/some-path"
+  echo "/some-path" > "$TMPROOT/control/success_path"
+  WAL_ARCHIVE_BUCKET=bucket RAILWAY_VOLUME_MOUNT_PATH="$TMPROOT" run "$RESTORE_WRAPPER"
+  local rc; rc=$(exit_code)
+  if [ "$rc" != "0" ]; then ko "$FUNCNAME" "expected exit 0, got $rc: $(cat "$TMPROOT/control/output")"; teardown; return; fi
+  assert_eq "$(cat "$TMPROOT/pgdata/.railway_credentials")" '{"superuser_pass":"current"}' "the volume's copy of the pin must replace the restored one" || { ko "$FUNCNAME" "pin content"; teardown; return; }
+  assert_eq "$(cat "$TMPROOT/pgdata/.railway_rotation")" '{"newPassword":"next"}' "the volume's copy of the journal must be materialized" || { ko "$FUNCNAME" "journal content"; teardown; return; }
+  assert_eq "$(pin_mode "$TMPROOT/pgdata/.railway_credentials")" "600" "pin must be 0600" || { ko "$FUNCNAME" "pin mode"; teardown; return; }
+  assert_eq "$(pin_mode "$TMPROOT/pgdata/.railway_rotation")" "600" "journal must be 0600" || { ko "$FUNCNAME" "journal mode"; teardown; return; }
+  if find "$TMPROOT/pgdata" -maxdepth 1 -name '.railway_*.tmp.*' | grep -q .; then
+    ko "$FUNCNAME" "tmp file leaked (tmp+rename must clean up)"; teardown; return
+  fi
+  # The copies themselves are untouched: they are the member's, not the clone's.
+  assert_eq "$(cat "$TMPROOT/.railway_credentials.volume")" '{"superuser_pass":"current"}' "the copy must stay" || { ko "$FUNCNAME" "copy changed"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_replica_restore_without_volume_copies_writes_no_pin() {
+  # A member that never kept copies (first boot on this image, or a brand
+  # new volume): what the restore brought, if anything, is left alone, and
+  # nothing is invented.
+  setup
+  dcs_json_for "/some-path"
+  echo "/some-path" > "$TMPROOT/control/success_path"
+  WAL_ARCHIVE_BUCKET=bucket RAILWAY_VOLUME_MOUNT_PATH="$TMPROOT" run "$RESTORE_WRAPPER"
+  if [ "$(exit_code)" != "0" ]; then ko "$FUNCNAME" "expected exit 0: $(cat "$TMPROOT/control/output")"; teardown; return; fi
+  if [ -e "$TMPROOT/pgdata/.railway_credentials" ] || [ -e "$TMPROOT/pgdata/.railway_rotation" ]; then
+    ko "$FUNCNAME" "no copy on the volume must mean no pin or journal written"; teardown; return
+  fi
+  printf '{"superuser_pass":"restored"}' > "$TMPROOT/pgdata/.railway_credentials"
+  WAL_ARCHIVE_BUCKET=bucket RAILWAY_VOLUME_MOUNT_PATH="$TMPROOT" run "$RESTORE_WRAPPER"
+  assert_eq "$(cat "$TMPROOT/pgdata/.railway_credentials")" '{"superuser_pass":"restored"}' "a restored pin must stay when there is no copy" || { ko "$FUNCNAME" "restored pin changed"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_replica_restore_failure_does_not_materialize_the_pin() {
+  # Patroni falls through to basebackup (which wipes PGDATA first) after a
+  # failed restore; writing a pin into the failed partial would only put a
+  # file where the next method needs nothing.
+  setup
+  printf '{"superuser_pass":"current"}' > "$TMPROOT/.railway_credentials.volume"
+  dcs_json_for "/some-path"
+  echo "2" > "$TMPROOT/control/fail_code"
+  WAL_ARCHIVE_BUCKET=bucket RAILWAY_VOLUME_MOUNT_PATH="$TMPROOT" run "$RESTORE_WRAPPER"
+  assert_eq "$(exit_code)" "2" "exit code must still be pgbackrest's" || { ko "$FUNCNAME" "rc"; teardown; return; }
+  if [ -e "$TMPROOT/pgdata/.railway_credentials" ]; then ko "$FUNCNAME" "a failed restore must not materialize the pin"; teardown; return; fi
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_replica_restore_legacy_layout_never_materializes() {
+  # PGDATA is the volume root: the runner keeps no copies there, so a file
+  # named like one is just a file inside the data directory.
+  setup
+  printf '{"superuser_pass":"not-a-copy"}' > "$TMPROOT/pgdata/.railway_credentials.volume"
+  dcs_json_for "/some-path"
+  echo "/some-path" > "$TMPROOT/control/success_path"
+  WAL_ARCHIVE_BUCKET=bucket RAILWAY_VOLUME_MOUNT_PATH="$TMPROOT/pgdata" run "$RESTORE_WRAPPER"
+  if [ "$(exit_code)" != "0" ]; then ko "$FUNCNAME" "expected exit 0: $(cat "$TMPROOT/control/output")"; teardown; return; fi
+  if [ -e "$TMPROOT/pgdata/.railway_credentials" ]; then ko "$FUNCNAME" "the legacy layout must never materialize a pin"; teardown; return; fi
+  ok "$FUNCNAME"
+  teardown
+}
+
 # =============================================================================
 # pgbackrest-archive-get-wrapper.sh (restore_command)
 # =============================================================================
@@ -543,6 +620,10 @@ ALL_TESTS=(
   t_replica_restore_failure_never_writes_marker
   t_replica_restore_creates_missing_pgdata_dir
   t_replica_restore_marker_written_atomically_no_tmp_leftover
+  t_replica_restore_materializes_pin_and_journal_from_volume_copies
+  t_replica_restore_without_volume_copies_writes_no_pin
+  t_replica_restore_failure_does_not_materialize_the_pin
+  t_replica_restore_legacy_layout_never_materializes
   t_archive_get_bucket_unset_noop
   t_archive_get_usage_error_on_missing_args
   t_archive_get_marker_hit_never_queries_dcs

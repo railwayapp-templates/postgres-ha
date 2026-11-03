@@ -7,6 +7,7 @@
 //! `/etc/pgbackrest/pgbackrest.conf`, and bootstrap the stanza once the
 //! local Postgres is up and primary. None of it depends on Patroni.
 
+use crate::patroni::{CREDENTIAL_PIN_FILE, ROTATION_JOURNAL_FILE};
 use crate::pgbackrest::derive_pgbackrest_repo_path;
 use anyhow::{Context, Result};
 use std::env;
@@ -418,6 +419,16 @@ struct PgbackrestConfParams<'a> {
 /// like `archive-push`) is unit-testable without writing to the real
 /// `/etc/pgbackrest` path.
 fn build_pgbackrest_conf(params: &PgbackrestConfParams) -> String {
+    // The credential pin and a staged rotation's journal live inside PGDATA
+    // (see patroni::credential_pin), so without these excludes every full
+    // and differential backup would carry the cluster's passwords in
+    // plaintext, and a pgBackRest re-seed would put a replica's pin back to
+    // the leader's at backup time: stale once a rotation has happened since,
+    // and the member then refuses the cluster's current password. Exclusions
+    // are matched by exact name relative to pg1-path. A `--delta` restore
+    // removes excluded files it finds in the target directory, so the
+    // replica restore wrapper re-materializes the pin from the volume's copy
+    // after a successful restore.
     let PgbackrestConfParams {
         data_dir,
         queue_max_mib,
@@ -452,6 +463,8 @@ fn build_pgbackrest_conf(params: &PgbackrestConfParams) -> String {
          \n\
          [global:backup]\n\
          process-max={backup_max}\n\
+         exclude={CREDENTIAL_PIN_FILE}\n\
+         exclude={ROTATION_JOURNAL_FILE}\n\
          \n\
          [global:restore]\n\
          process-max={restore_max}\n\
@@ -754,6 +767,41 @@ mod tests {
         assert!(conf.contains("[global:restore]\nprocess-max=32\n"));
         assert!(conf.contains("repo1-retention-full=4\n"));
         assert!(conf.contains("repo1-retention-diff=14\n"));
+    }
+
+    #[test]
+    fn backups_exclude_the_credential_pin_and_the_rotation_journal() {
+        // Both live inside PGDATA (pg1-path), so without the excludes every
+        // backup carries the cluster's passwords in plaintext and a re-seed
+        // puts a pre-rotation pin back on the replica. The excludes belong to
+        // the backup section only: the restore wrapper re-materializes the
+        // pin itself, and the repo-path marker stays in the backup set (the
+        // archive-get wrapper reads it on every call).
+        let conf = build_pgbackrest_conf(&PgbackrestConfParams {
+            data_dir: "/pgdata",
+            queue_max_mib: 5120,
+            push_max: 8,
+            get_max: 4,
+            backup_max: 2,
+            restore_max: 32,
+            retention_full: 4,
+            retention_diff: 14,
+        });
+        let backup_section = conf
+            .split("[global:backup]\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("a [global:backup] section");
+        assert!(
+            backup_section.contains("exclude=.railway_credentials\n"),
+            "{conf}"
+        );
+        assert!(
+            backup_section.contains("exclude=.railway_rotation\n"),
+            "{conf}"
+        );
+        assert!(!backup_section.contains("exclude=.pgbackrest_repo_path"));
+        assert_eq!(conf.matches("exclude=").count(), 2, "{conf}");
     }
     #[test]
     fn is_uuid_shape_accepts_canonical() {
