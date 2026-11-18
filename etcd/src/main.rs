@@ -417,7 +417,14 @@ async fn main() -> Result<()> {
         // directly, which ensures we crash and recover on fatal errors (promotion
         // exhaustion, health check errors). On restart, clean_stale_data() will
         // clear incomplete bootstrap data.
-        let monitor_config = Config::from_env()?;
+        let mut monitor_config = Config::from_env()?;
+        if is_leader && params.joined_as_learner {
+            // The bootstrap leader rejoined the cluster its siblings kept. Its
+            // own ETCD_INITIAL_CLUSTER may name it alone, and etcd serves
+            // member list and promote on voting members only: the monitor
+            // reaches them through the membership the join returned.
+            monitor_config.initial_cluster = params.initial_cluster.clone();
+        }
         let monitor_telemetry = telemetry.clone();
         let joined_as_learner = params.joined_as_learner;
         let member_id = params.member_id.clone();
