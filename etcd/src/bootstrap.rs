@@ -6,9 +6,11 @@ use crate::cluster::{
     add_as_learner, add_self_to_cluster, check_cluster_health, clear_directory, find_self,
     get_member_list, get_voting_member_endpoint, has_local_data, is_name_collision,
     member_sharing_my_name, promote_self, refuse_name_collision, remove_stale_self,
-    shared_name_message, PromoteOutcome, SelfIdentity,
+    shared_name_message, MemberInfo, PromoteOutcome, SelfIdentity,
 };
-use crate::config::{get_leader_endpoint, parse_initial_cluster, peer_to_client_url, Config};
+use crate::config::{
+    get_leader_endpoint, parse_initial_cluster, peer_to_client_url, sibling_peers, Config,
+};
 use anyhow::{anyhow, Result};
 use common::{etcd_http_health, etcd_http_user_add, etcdctl, Telemetry, TelemetryEvent};
 use std::io::ErrorKind;
@@ -59,6 +61,65 @@ pub async fn check_existing_cluster(
     }
 
     Ok(None)
+}
+
+/// Whether `members`, the list a sibling returned, is a cluster that sibling
+/// votes in. The sibling was reached at a name derived from this node's own,
+/// so its own voting entry at that peer URL is what ties the cluster to this
+/// node's service family.
+pub(crate) fn sibling_votes_in(members: &[MemberInfo], name: &str, peer_url: &str) -> bool {
+    find_self(members, &SelfIdentity::new(name, peer_url, None))
+        .is_some_and(|(member, _)| !member.is_learner)
+}
+
+/// Client endpoint of the cluster this bootstrap leader's siblings already
+/// run, if any: first through the peers `ETCD_INITIAL_CLUSTER` declares, then
+/// through the siblings its own peer URL implies (see [`sibling_peers`]). A
+/// derived sibling counts when it is healthy, which takes a quorum, and votes
+/// in the cluster it lists. The siblings are probed concurrently, so a first
+/// deploy whose siblings do not answer spends one probe timeout here.
+async fn find_existing_cluster(config: &Config) -> Result<Option<String>> {
+    if let Some(endpoint) =
+        check_existing_cluster(&config.initial_cluster, &config.etcd_name).await?
+    {
+        return Ok(Some(endpoint));
+    }
+
+    let declared = parse_initial_cluster(&config.initial_cluster)?;
+    let probes: Vec<_> = sibling_peers(&config.initial_advertise_peer_urls)
+        .into_iter()
+        .filter(|(name, _)| !declared.contains_key(name))
+        .map(|(name, peer_url)| {
+            tokio::spawn(async move {
+                let endpoint = peer_to_client_url(&peer_url);
+                if !etcd_http_health(&endpoint).await.unwrap_or(false) {
+                    return None;
+                }
+                match get_member_list(&endpoint).await {
+                    Ok(members) if sibling_votes_in(&members, &name, &peer_url) => {
+                        info!(peer = %name, endpoint = %endpoint, "Found healthy cluster on a sibling");
+                        Some(endpoint)
+                    }
+                    Ok(_) => {
+                        warn!(peer = %name, endpoint = %endpoint, "Healthy etcd at a sibling name lists no voting member at that name; leaving it alone");
+                        None
+                    }
+                    Err(e) => {
+                        warn!(peer = %name, error = %e, "Healthy sibling did not list its members");
+                        None
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let mut found = None;
+    for probe in probes {
+        if let Ok(Some(endpoint)) = probe.await {
+            found.get_or_insert(endpoint);
+        }
+    }
+    Ok(found)
 }
 
 /// Wait for leader or any healthy peer
@@ -413,8 +474,7 @@ pub async fn bootstrap_as_leader(
     // and `state=new` would mint a second cluster id. Probe a few more
     // times when the declared topology has peers; first-time deploys still
     // bootstrap as new once the probes miss.
-    let mut existing_endpoint =
-        check_existing_cluster(&config.initial_cluster, &config.etcd_name).await?;
+    let mut existing_endpoint = find_existing_cluster(config).await?;
     if existing_endpoint.is_none() && cluster.len() > 1 {
         const EXTRA_PROBES: u32 = 5;
         for i in 1..=EXTRA_PROBES {
@@ -424,8 +484,7 @@ pub async fn bootstrap_as_leader(
                 "no healthy peer yet; not bootstrapping a new cluster"
             );
             sleep(config.peer_check_interval).await;
-            existing_endpoint =
-                check_existing_cluster(&config.initial_cluster, &config.etcd_name).await?;
+            existing_endpoint = find_existing_cluster(config).await?;
             if existing_endpoint.is_some() {
                 break;
             }
@@ -771,6 +830,60 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(present);
+    }
+
+    fn member(id: &str, name: &str, peer_url: &str, is_learner: bool) -> MemberInfo {
+        MemberInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            peer_url: peer_url.to_string(),
+            is_learner,
+        }
+    }
+
+    #[test]
+    fn a_wiped_leader_recognises_the_cluster_its_siblings_kept() {
+        // etcd-1 lost its volume; etcd-2 and etcd-3 still hold the cluster
+        // and still list the entry etcd-1 left behind.
+        let members = [
+            member("a1", "etcd-1", "http://etcd-1.railway.internal:2380", false),
+            member("b2", "etcd-2", "http://etcd-2.railway.internal:2380", false),
+            member("c3", "etcd-3", "http://etcd-3.railway.internal:2380", false),
+        ];
+        for (name, peer_url) in sibling_peers("http://etcd-1.railway.internal:2380")
+            .into_iter()
+            .take(2)
+        {
+            assert!(sibling_votes_in(&members, &name, &peer_url));
+        }
+    }
+
+    #[test]
+    fn a_sibling_still_a_learner_is_not_an_established_cluster() {
+        let members = [
+            member("a1", "etcd-1", "http://etcd-1.railway.internal:2380", false),
+            member("b2", "etcd-2", "http://etcd-2.railway.internal:2380", true),
+        ];
+        assert!(!sibling_votes_in(
+            &members,
+            "etcd-2",
+            "http://etcd-2.railway.internal:2380"
+        ));
+    }
+
+    #[test]
+    fn an_etcd_that_lists_no_member_at_the_sibling_name_is_left_alone() {
+        // Something healthy answers at the derived name, with members of
+        // another service family.
+        let members = [
+            member("d4", "kv-a", "http://kv-a.railway.internal:2380", false),
+            member("e5", "etcd-2", "http://kv-b.railway.internal:2380", false),
+        ];
+        assert!(!sibling_votes_in(
+            &members,
+            "etcd-2",
+            "http://etcd-2.railway.internal:2380"
+        ));
     }
 
     #[test]
