@@ -7296,6 +7296,466 @@ t_standalone_invalid_repo_marker_is_rederived() {
   ok "$t"
 }
 
+# ============================================================================
+# Fresh-cluster start ordering
+#
+# A new deploy starts its six data-plane services in whatever order the
+# platform schedules them. These tests create every member with the
+# PRODUCTION TEMPLATE's variables (backboard scripts/seed-postgres-templates.ts)
+# instead of setup_etcd_cluster / setup_patroni_cluster, which differ from the
+# template on exactly the start-order-relevant ones:
+#   * etcd-N: the template's ETCD_INITIAL_CLUSTER names ONLY etcd-1 (followers
+#     find it and join as learners), sets ETCD_ROOT_PASSWORD and
+#     ETCD_DATA_DIR, and leaves ETCD_INITIAL_CLUSTER_STATE unset; the harness
+#     lists all three members, sets state=new and no root password.
+#   * Postgres-2/3 carry PATRONI_WAIT_FOR_LEADER=true and Postgres-1 carries
+#     PATRONI_ADOPT_EXISTING_DATA=true; the harness sets neither.
+#   * PATRONI_RESTAPI_PASSWORD is set, the replication user is the superuser
+#     (postgres), PATRONI_TTL/LOOP_WAIT are 45/10, PG* point at the node, and
+#     the restart policy is ALWAYS; the harness uses a separate `replicator`
+#     user, no REST password and no restart policy.
+# Containers are created up front and only STARTED in the order under test.
+# ============================================================================
+
+SO_PASSWORD="test"
+
+# so_create_etcd <scope> <idx> — create (not start) <scope>-etcd-<idx> on a
+# fresh volume with the template's etcd variables.
+so_create_etcd() {
+  local scope="$1" i="$2"
+  local n="${scope}-etcd-${i}" n1="${scope}-etcd-1"
+  docker rm -f "$n" >/dev/null 2>&1 || true
+  new_volume "${n}-vol"
+  docker create --name "$n" --label "$HA_LABEL" --network "$NET" --restart always \
+    -e "ETCD_NAME=$n" \
+    -e "ETCD_DATA_DIR=/var/lib/etcd" \
+    -e "ETCD_INITIAL_CLUSTER=${n1}=http://${n1}:2380" \
+    -e "ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380" \
+    -e "ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379" \
+    -e "ETCD_ADVERTISE_CLIENT_URLS=http://${n}:2379" \
+    -e "ETCD_INITIAL_CLUSTER_TOKEN=${scope}" \
+    -e "ETCD_ROOT_PASSWORD=${SO_PASSWORD}" \
+    -e "ETCD_INITIAL_ADVERTISE_PEER_URLS=http://${n}:2380" \
+    -v "${n}-vol:/var/lib/etcd" \
+    "$ETCD_IMAGE" >/dev/null
+}
+
+# so_create_pg <scope> <idx> — create (not start) <scope>-pg-<idx> on a fresh
+# volume with the template's Postgres-<idx> variables.
+so_create_pg() {
+  local scope="$1" i="$2"
+  local n="${scope}-pg-${i}"
+  local hosts="${scope}-etcd-1:2379,${scope}-etcd-2:2379,${scope}-etcd-3:2379"
+  local role_env=(-e "PATRONI_ADOPT_EXISTING_DATA=true")
+  [ "$i" = 1 ] || role_env=(-e "PATRONI_WAIT_FOR_LEADER=true")
+  docker rm -f "$n" >/dev/null 2>&1 || true
+  new_volume "${n}-vol"
+  docker create --name "$n" --label "$HA_LABEL" --network "$NET" --restart always \
+    --hostname "$n" \
+    -e "PATRONI_ENABLED=true" \
+    -e "PATRONI_NAME=${n}" \
+    -e "PATRONI_SCOPE=${scope}" \
+    -e "RAILWAY_PRIVATE_DOMAIN=${n}" \
+    -e "PATRONI_ETCD3_HOSTS=${hosts}" \
+    -e "PATRONI_TTL=45" \
+    -e "PATRONI_LOOP_WAIT=10" \
+    -e "PATRONI_API_PORT=8008" \
+    -e "POSTGRES_USER=postgres" \
+    -e "POSTGRES_PASSWORD=${SO_PASSWORD}" \
+    -e "POSTGRES_DB=railway" \
+    -e "PGDATA=/var/lib/postgresql/data/pgdata" \
+    -e "PGHOST=${n}" \
+    -e "PGPORT=5432" \
+    -e "PGUSER=postgres" \
+    -e "PGPASSWORD=${SO_PASSWORD}" \
+    -e "PGDATABASE=railway" \
+    -e "PATRONI_SUPERUSER_USERNAME=postgres" \
+    -e "PATRONI_SUPERUSER_PASSWORD=${SO_PASSWORD}" \
+    -e "PATRONI_RESTAPI_PASSWORD=${SO_PASSWORD}" \
+    -e "PATRONI_REPLICATION_USERNAME=postgres" \
+    -e "PATRONI_REPLICATION_PASSWORD=${SO_PASSWORD}" \
+    -e "SSL_CERT_DAYS=820" \
+    -e "WATCHDOG_CURL_TIMEOUT=5" \
+    -e "WATCHDOG_CURL_CONNECT_TIMEOUT=5" \
+    -e "RAILWAY_DEPLOYMENT_DRAINING_SECONDS=60" \
+    "${role_env[@]}" \
+    -v "${n}-vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+}
+
+so_create_cluster() {
+  local scope="$1" i
+  for i in 1 2 3; do so_create_etcd "$scope" "$i"; done
+  for i in 1 2 3; do so_create_pg "$scope" "$i"; done
+}
+
+so_all_members() {
+  local scope="$1"
+  echo "${scope}-etcd-1 ${scope}-etcd-2 ${scope}-etcd-3 ${scope}-pg-1 ${scope}-pg-2 ${scope}-pg-3"
+}
+
+# so_start_parallel <container>... — issue every `docker start` at once.
+so_start_parallel() {
+  local c pids=()
+  for c in "$@"; do
+    docker start "$c" >/dev/null &
+    pids+=("$!")
+  done
+  for c in "${pids[@]}"; do wait "$c"; done
+}
+
+# etcdctl as root once the entrypoint has enabled authentication, bare before.
+so_etcdctl() {
+  local c="$1"; shift
+  docker exec "$c" etcdctl --user="root:${SO_PASSWORD}" "$@" 2>/dev/null \
+    || docker exec "$c" etcdctl "$@" 2>/dev/null
+}
+
+# Every key under the Patroni scope, as `key<TAB>value` (values trimmed), read
+# through the first etcd member that answers.
+so_dcs_snapshot() {
+  local scope="$1" e out
+  for e in "${scope}-etcd-1" "${scope}-etcd-2" "${scope}-etcd-3"; do
+    out=$(so_etcdctl "$e" get --prefix "/service/${scope}/" --command-timeout=5s) || continue
+    if [ -z "$out" ]; then
+      echo "    [via $e] (no keys under /service/${scope}/)"
+    else
+      paste - - <<<"$out" | cut -c1-160 | sed "s/^/    [via $e] /"
+    fi
+    return 0
+  done
+  echo "    (no etcd member answered)"
+}
+
+# Raft cluster id as each etcd member itself reports it.
+so_etcd_cluster_id() {
+  so_etcdctl "$1" endpoint status --write-out=json --command-timeout=5s \
+    | grep -oE '"cluster_id":[0-9]+' | head -1 | cut -d: -f2
+}
+
+# so_log_lines <container> <ERE> [max] — the matching log lines, ANSI-stripped.
+so_log_lines() {
+  { docker logs "$1" 2>&1 | _strip_ansi | grep -E -- "$2" | tail -n "${3:-8}" \
+      | cut -c1-260 | sed "s/^/    [$1] /"; } || true
+}
+
+so_failure_evidence() {
+  local scope="$1" n
+  echo "  --- DCS keys under /service/${scope}/ ---"
+  so_dcs_snapshot "$scope"
+  echo "  --- members ---"
+  for n in $(so_all_members "$scope"); do
+    docker inspect -f "    $n status={{.State.Status}} restarts={{.RestartCount}} exit={{.State.ExitCode}}" "$n" 2>/dev/null \
+      || echo "    $n (gone)"
+  done
+  echo "  --- decisive log lines ---"
+  for n in "${scope}-pg-1" "${scope}-pg-2" "${scope}-pg-3"; do
+    so_log_lines "$n" 'waiting for leader to bootstrap|system ID is invalid|not safe to wipe|Timeout waiting for cluster|bootstrap a new cluster|initialize lock|bootstrap from leader|No PostgreSQL data found|pg_control|stale data|FATAL|panicked|Error' 10
+  done
+  for n in "${scope}-etcd-1" "${scope}-etcd-2" "${scope}-etcd-3"; do
+    so_log_lines "$n" 'Bootstrapping single-node|RECOVERY MODE|Joining as learner|no healthy peer yet|mismatch|authentication enabled|Bootstrap marked complete' 6
+  done
+}
+
+# Patroni logs this when it runs initdb; initdb's own banner follows it.
+so_ran_initdb() {
+  logs_match "$1" "trying to bootstrap a new cluster|The files belonging to this database system"
+}
+
+so_sysid() {
+  psql_leader "$1" -At -c "SELECT system_identifier FROM pg_control_system()" 2>/dev/null
+}
+
+# Members whose postmaster is a primary right now (pg_is_in_recovery = f).
+so_primaries() {
+  local scope="$1" n out=()
+  for n in "${scope}-pg-1" "${scope}-pg-2" "${scope}-pg-3"; do
+    if [ "$(psql_leader "$n" -At -c 'SELECT pg_is_in_recovery()' 2>/dev/null)" = "f" ]; then
+      out+=("$n")
+    fi
+  done
+  echo "${out[*]:-}"
+}
+
+# so_wait_canary <container> <table> <value> <timeout>
+so_wait_canary() {
+  local n="$1" table="$2" want="$3" timeout_secs="$4"
+  local deadline=$(($(date +%s) + timeout_secs))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$(psql_leader "$n" -At -c "SELECT v FROM ${table}" 2>/dev/null)" = "$want" ]; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# The fresh-cluster contract shared by every start order: a leader inside
+# <timeout>, and it is postgres-1; both others stream from it; postgres-1 ran
+# initdb and the others never did; one system identifier across the three;
+# a write on the leader reaches both replicas. ko's on the first breach.
+so_assert_formed_by_pg1() {
+  local t="$1" scope="$2" timeout_secs="$3"
+  local n1="${scope}-pg-1" n2="${scope}-pg-2" n3="${scope}-pg-3" n
+  local leader
+  leader=$(wait_for_leader "$scope" "$timeout_secs") || {
+    ko "$t" "no Patroni leader within ${timeout_secs}s"
+    so_failure_evidence "$scope"
+    fail_dump "$t" "$n1" "$n2" "$n3"
+    return 1
+  }
+  if [ "$leader" != "$n1" ]; then
+    ko "$t" "leader is $leader, not $n1 (the only member allowed to bootstrap)"
+    so_failure_evidence "$scope"
+    return 1
+  fi
+  if ! wait_for_replication "$scope" 2 "$timeout_secs"; then
+    ko "$t" "replicas did not both stream from $n1 within ${timeout_secs}s"
+    so_failure_evidence "$scope"
+    fail_dump "$t" "$n2" "$n3"
+    return 1
+  fi
+  if ! so_ran_initdb "$n1"; then
+    ko "$t" "$n1 leads but its log shows no initdb"
+    fail_dump "$t" "$n1"
+    return 1
+  fi
+  for n in "$n2" "$n3"; do
+    if so_ran_initdb "$n"; then
+      ko "$t" "$n ran initdb (a replica must only ever clone)"
+      so_log_lines "$n" "bootstrap a new cluster|The files belonging" 4
+      return 1
+    fi
+  done
+  local s1 s2 s3
+  wait_for_pg_accepting "$n2" 60 >/dev/null; wait_for_pg_accepting "$n3" 60 >/dev/null
+  s1=$(so_sysid "$n1"); s2=$(so_sysid "$n2"); s3=$(so_sysid "$n3")
+  if [ -z "$s1" ] || [ "$s1" != "$s2" ] || [ "$s1" != "$s3" ]; then
+    ko "$t" "system identifiers differ: $n1=$s1 $n2=$s2 $n3=$s3"
+    return 1
+  fi
+  if ! psql_leader "$n1" -c "CREATE TABLE so_canary(v text); INSERT INTO so_canary VALUES ('replicated')" >/dev/null 2>&1; then
+    ko "$t" "write on the leader $n1 failed"
+    fail_dump "$t" "$n1"
+    return 1
+  fi
+  for n in "$n2" "$n3"; do
+    if ! so_wait_canary "$n" so_canary replicated 60; then
+      ko "$t" "the leader's write never reached $n"
+      fail_dump "$t" "$n"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# The template's replicas must actually sit on the PATRONI_WAIT_FOR_LEADER
+# gate, or a start-order test is not exercising the production boot path.
+so_assert_replicas_gated() {
+  local t="$1" scope="$2" n
+  for n in "${scope}-pg-2" "${scope}-pg-3"; do
+    if ! logs_contain "$n" "Waiting for cluster to be initialized by primary"; then
+      ko "$t" "$n never waited on PATRONI_WAIT_FOR_LEADER (template env not applied?)"
+      fail_dump "$t" "$n"
+      return 1
+    fi
+  done
+}
+
+# Postgres-1 and etcd-1 come up LAST, 20 s after everything else, on empty
+# volumes: the replicas and etcd-2/3 must sit and wait for them rather than
+# bootstrap anything themselves.
+t_ha_start_order_pg1_starts_last() {
+  local t="${FUNCNAME[0]}" scope="t-so-last-${PG_VERSION}"
+  so_create_cluster "$scope"
+  so_start_parallel "${scope}-etcd-2" "${scope}-etcd-3" "${scope}-pg-2" "${scope}-pg-3"
+  log "etcd-2/3 and pg-2/3 started; etcd-1 and pg-1 follow in 20 s"
+  sleep 20
+  so_start_parallel "${scope}-etcd-1" "${scope}-pg-1"
+  local start; start=$(date +%s)
+  so_assert_formed_by_pg1 "$t" "$scope" 300 || { teardown_scope "$scope"; return; }
+  so_assert_replicas_gated "$t" "$scope" || { teardown_scope "$scope"; return; }
+  ok "$t"
+  note "formed in $(( $(date +%s) - start ))s after pg-1 started; ${scope}-pg-1 initdb'd and leads, both replicas cloned and stream"
+  teardown_scope "$scope"
+}
+
+# All six members started at once on empty volumes (a fresh template deploy).
+t_ha_start_order_all_at_once() {
+  local t="${FUNCNAME[0]}" scope="t-so-once-${PG_VERSION}"
+  so_create_cluster "$scope"
+  local start; start=$(date +%s)
+  # shellcheck disable=SC2046 # one word per container name
+  so_start_parallel $(so_all_members "$scope")
+  so_assert_formed_by_pg1 "$t" "$scope" 300 || { teardown_scope "$scope"; return; }
+  so_assert_replicas_gated "$t" "$scope" || { teardown_scope "$scope"; return; }
+  ok "$t"
+  note "formed in $(( $(date +%s) - start ))s; ${scope}-pg-1 initdb'd and leads, both replicas cloned and stream"
+  teardown_scope "$scope"
+}
+
+# Postgres-1 dies (SIGKILL: OOM, host loss, a redeploy's hard stop) while its
+# very first initdb is running, and the platform restarts it on the same
+# volume. Patroni claimed /service/<scope>/initialize before running initdb
+# and only a FAILED bootstrap (not a killed one) removes it again. The correct
+# outcome is the one a fresh deploy promises: within five minutes of the
+# restart there is a leader and both replicas stream from it.
+t_ha_start_order_leader_killed_mid_initdb() {
+  local t="${FUNCNAME[0]}" scope="t-so-initdb-${PG_VERSION}"
+  local n1="${scope}-pg-1" n2="${scope}-pg-2" n3="${scope}-pg-3"
+  so_create_cluster "$scope"
+  # shellcheck disable=SC2046 # one word per container name
+  so_start_parallel $(so_all_members "$scope")
+
+  # Catch pg-1's initdb process in the act and SIGKILL the container.
+  local deadline=$(($(date +%s) + 240)) caught=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec "$n1" sh -c 'grep -qx initdb /proc/[0-9]*/comm 2>/dev/null'; then
+      docker kill "$n1" >/dev/null
+      caught=1
+      break
+    fi
+  done
+  if [ "$caught" != 1 ]; then
+    ko "$t" "never saw initdb running on $n1 (harness could not interrupt it)"
+    so_failure_evidence "$scope"
+    teardown_scope "$scope"; return
+  fi
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$(docker inspect -f '{{.State.Running}}' "$n1")" = "false" ] && break
+    sleep 0.5
+  done
+
+  # Record what the kill left behind: the volume, and the DCS keys.
+  local vol_state
+  vol_state=$(docker run --rm -v "${n1}-vol:/v" alpine sh -c '
+    echo "pgdata_entries=$(ls -A /v/pgdata 2>/dev/null | wc -l | tr -d " ")"
+    [ -f /v/pgdata/global/pg_control ] && echo pg_control=yes || echo pg_control=no
+    [ -f /v/.patroni_bootstrap_complete ] && echo bootstrap_marker=yes || echo bootstrap_marker=no' \
+    | tr '\n' ' ')
+  log "killed $n1 mid-initdb; volume: $vol_state"
+  log "DCS right after the kill:"
+  so_dcs_snapshot "$scope"
+  local had_leader_key=0
+  if [ -n "$(so_etcdctl "${scope}-etcd-1" get "/service/${scope}/leader" --print-value-only)" ]; then
+    had_leader_key=1
+  fi
+  if [ "$had_leader_key" = 1 ]; then
+    ko "$t" "a leader key already existed at the kill: initdb was not interrupted before the bootstrap finished"
+    so_failure_evidence "$scope"
+    teardown_scope "$scope"; return
+  fi
+
+  # The platform restarts the member on the same volume.
+  [ "$(docker inspect -f '{{.State.Running}}' "$n1")" = "true" ] || docker start "$n1" >/dev/null
+  local restarted; restarted=$(date +%s)
+
+  local leader
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no Patroni leader within 300s of restarting $n1 after it was killed mid-initdb"
+    so_failure_evidence "$scope"
+    teardown_scope "$scope"; return
+  }
+  local left=$(( 300 - ($(date +%s) - restarted) ))
+  [ "$left" -lt 30 ] && left=30
+  if ! wait_for_replication "$scope" 2 "$left"; then
+    ko "$t" "leader $leader elected but both replicas were not streaming within 300s of the restart"
+    so_failure_evidence "$scope"
+    teardown_scope "$scope"; return
+  fi
+  ok "$t"
+  note "kill left: $vol_state; leader=$leader $(( $(date +%s) - restarted ))s after the restart; restarts pg-2=$(docker inspect -f '{{.RestartCount}}' "$n2") pg-3=$(docker inspect -f '{{.RestartCount}}' "$n3")"
+  teardown_scope "$scope"
+}
+
+# etcd-1 loses its volume (deleted/recreated, restored to empty) on a running
+# cluster and restarts. With stop_peers=1, etcd-2 and etcd-3 are down while it
+# does and come back afterwards; with stop_peers=0 they stay up throughout.
+# Correct outcome either way: the three members share ONE raft cluster id
+# again, Patroni never runs two primaries, and the leader keeps the data.
+so_etcd1_wiped_case() {
+  local t="$1" scope="$2" stop_peers="$3"
+  local e1="${scope}-etcd-1" e2="${scope}-etcd-2" e3="${scope}-etcd-3"
+  so_create_cluster "$scope"
+  # shellcheck disable=SC2046 # one word per container name
+  so_start_parallel $(so_all_members "$scope")
+  so_assert_formed_by_pg1 "$t" "$scope" 300 || { teardown_scope "$scope"; return; }
+  local cid_before; cid_before=$(so_etcd_cluster_id "$e1")
+  local sysid_before; sysid_before=$(so_sysid "${scope}-pg-1")
+  log "cluster formed; etcd cluster_id=$cid_before"
+
+  if [ "$stop_peers" = 1 ]; then
+    docker stop -t 15 "$e2" "$e3" >/dev/null
+    log "stopped $e2 and $e3"
+  fi
+  docker stop -t 15 "$e1" >/dev/null
+  docker run --rm -v "${e1}-vol:/v" alpine sh -c 'rm -rf /v/* /v/.[!.]* /v/..?* 2>/dev/null; ls -A /v | wc -l' \
+    | grep -qx 0 || { ko "$t" "could not wipe ${e1}-vol"; teardown_scope "$scope"; return; }
+  docker start "$e1" >/dev/null
+  log "wiped and restarted $e1"
+  wait_for_docker_healthy "$e1" 120 >/dev/null || note "$e1 not healthy within 120s"
+  if [ "$stop_peers" = 1 ]; then
+    sleep 10
+    so_start_parallel "$e2" "$e3"
+    log "restarted $e2 and $e3"
+  fi
+
+  # Settle for up to 180 s, sampling for two simultaneous primaries all along.
+  local deadline=$(($(date +%s) + 180)) max_primaries=0 two_primaries="" converged=0
+  local c1 c2 c3 prims nprims
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    prims=$(so_primaries "$scope")
+    nprims=$(wc -w <<<"$prims" | tr -d ' ')
+    [ "$nprims" -gt "$max_primaries" ] && max_primaries=$nprims
+    [ "$nprims" -gt 1 ] && two_primaries="$prims"
+    c1=$(so_etcd_cluster_id "$e1"); c2=$(so_etcd_cluster_id "$e2"); c3=$(so_etcd_cluster_id "$e3")
+    if [ -n "$c1" ] && [ "$c1" = "$c2" ] && [ "$c1" = "$c3" ] && [ "$nprims" = 1 ] \
+       && wait_for_replication "$scope" 2 3 2>/dev/null; then
+      converged=1
+      break
+    fi
+    sleep 3
+  done
+  log "cluster ids after: $e1=${c1:-?} $e2=${c2:-?} $e3=${c3:-?} (before: $cid_before)"
+  local e
+  for e in "$e1" "$e2" "$e3"; do
+    echo "    leader key as $e serves it (serializable): $(so_etcdctl "$e" get "/service/${scope}/leader" --print-value-only --consistency=s --command-timeout=5s || echo '?')"
+  done
+  if [ -n "$two_primaries" ]; then
+    ko "$t" "two primaries at once after the etcd-1 wipe: $two_primaries"
+    so_failure_evidence "$scope"
+    teardown_scope "$scope"; return
+  fi
+  if [ "$converged" != 1 ]; then
+    ko "$t" "no convergence within 180s: etcd cluster ids $e1=${c1:-?} $e2=${c2:-?} $e3=${c3:-?}, primaries='${prims}'"
+    so_failure_evidence "$scope"
+    teardown_scope "$scope"; return
+  fi
+  local leader="$prims"
+  if [ "$(so_sysid "$leader")" != "$sysid_before" ] \
+     || [ "$(psql_leader "$leader" -At -c 'SELECT v FROM so_canary' 2>/dev/null)" != "replicated" ]; then
+    ko "$t" "leader $leader lost the data written before the wipe"
+    teardown_scope "$scope"; return
+  fi
+  ok "$t"
+  note "one etcd cluster id ($c1, before $cid_before); single primary $leader with the data; max primaries seen=$max_primaries"
+  teardown_scope "$scope"
+}
+
+# Suspicion B as briefed: etcd-1 is wiped while BOTH other etcd members are
+# down, so its recovery probes find no peer. Needs the volume loss and a
+# two-member outage at once — rare (the template staggers etcd auto-updates
+# precisely so the three never restart together).
+t_ha_start_order_etcd1_wiped_peers_down() {
+  so_etcd1_wiped_case "${FUNCNAME[0]}" "t-so-e1dn-${PG_VERSION}" 1
+}
+
+# The single-fault variant: only etcd-1's volume is lost; etcd-2/3 stay up.
+t_ha_start_order_etcd1_wiped_peers_up() {
+  so_etcd1_wiped_case "${FUNCNAME[0]}" "t-so-e1up-${PG_VERSION}" 0
+}
+
 ALL_TESTS=(
   t_ha_half_stanza_preserves_path_across_failover
   t_standalone_half_stanza_takes_new_full
@@ -7399,6 +7859,16 @@ ALL_TESTS=(
   t_ha_password_edit_stops_member_with_guidance
   t_ha_password_edit_stops_member_rest_only
   t_ha_scale_up_joins_authenticated_cluster
+  # fresh-cluster start ordering, with the production template's variables
+  # (etcd-1-only ETCD_INITIAL_CLUSTER, PATRONI_WAIT_FOR_LEADER on 2/3): any
+  # start order forms one cluster led by postgres-1, which alone runs initdb
+  t_ha_start_order_pg1_starts_last
+  t_ha_start_order_all_at_once
+  # postgres-1 SIGKILLed during its first initdb, then restarted on the volume
+  t_ha_start_order_leader_killed_mid_initdb
+  # etcd-1's volume wiped on a running cluster (peers down / peers up)
+  t_ha_start_order_etcd1_wiped_peers_down
+  t_ha_start_order_etcd1_wiped_peers_up
 )
 
 usage() {
