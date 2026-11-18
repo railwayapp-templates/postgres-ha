@@ -11,9 +11,9 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 use postgres_patroni::pgbackrest::read_wal_level;
 use postgres_patroni::{
-    cert_expires_within, ensure_image_preload_libraries, is_patroni_enabled, is_valid_x509v3_cert,
-    major_upgrade, orphan_slots, pgdata, ssl_dir, standalone_pitr, sudo_command, volume_lock,
-    volume_root, EXPECTED_VOLUME_MOUNT_PATH,
+    cert_expires_within, ensure_image_preload_libraries, initdb_started_marker, is_patroni_enabled,
+    is_valid_x509v3_cert, major_upgrade, orphan_slots, pgdata, ssl_dir, standalone_pitr,
+    sudo_command, volume_lock, volume_root, EXPECTED_VOLUME_MOUNT_PATH,
 };
 use std::env;
 use std::io::Write;
@@ -280,6 +280,22 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
+
+        // Standalone Postgres owns PGDATA from here on. A record of an HA
+        // bootstrap's initdb describes a directory patroni-runner would
+        // discard, so it ends here: whatever this mode puts in PGDATA is data.
+        if let Err(e) = std::fs::remove_file(initdb_started_marker(&volume_root())) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                let reason = format!("Failed to remove the initdb-started record: {e}");
+                error!("{reason}");
+                telemetry.send(TelemetryEvent::ComponentError {
+                    component: "postgres-wrapper".to_string(),
+                    error: reason,
+                    context: "standalone boot".to_string(),
+                });
+                std::process::exit(1);
+            }
+        }
 
         // A staged point-in-time recovery must finish under the mode that
         // staged it. Fail-stop BEFORE any conf handling below so a

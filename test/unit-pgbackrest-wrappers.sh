@@ -610,7 +610,87 @@ t_invalid_marker_and_dcs_never_override_valid_env() {
   ok "$FUNCNAME"
 }
 
+# =============================================================================
+# initdb-first-bootstrap.sh (installed as patroni-initdb)
+# =============================================================================
+
+INITDB_LAUNCHER="${REPO_ROOT}/postgres-patroni/initdb-first-bootstrap.sh"
+
+# Fake initdb: logs whether the initdb-started record was already on the volume
+# when it ran, and its arguments, then exits with control/initdb_exit (default 0).
+setup_fake_initdb() {
+  mkdir -p "$TMPROOT/volume/pgdata"
+  cat > "$TMPROOT/bin/initdb" <<'EOF'
+#!/usr/bin/env bash
+CONTROL="$FAKE_CONTROL_DIR"
+if [ -f "$FAKE_VOLUME_ROOT/.patroni_initdb_started" ]; then
+  echo "record=yes" >> "$CONTROL/initdb_calls.log"
+else
+  echo "record=no" >> "$CONTROL/initdb_calls.log"
+fi
+printf '%s\n' "$@" > "$CONTROL/initdb_args"
+exit "$(cat "$CONTROL/initdb_exit" 2>/dev/null || echo 0)"
+EOF
+  chmod +x "$TMPROOT/bin/initdb"
+}
+
+# run_initdb_launcher <volume root> <initdb args...>
+run_initdb_launcher() {
+  local volume_root="$1"; shift
+  PATH="$TMPROOT/bin:$PATH" \
+  FAKE_CONTROL_DIR="$TMPROOT/control" \
+  FAKE_VOLUME_ROOT="$TMPROOT/volume" \
+  RAILWAY_VOLUME_MOUNT_PATH="$volume_root" \
+  sh "$INITDB_LAUNCHER" "$@" > "$TMPROOT/control/output" 2>&1
+  echo "$?" > "$TMPROOT/control/exit_code"
+}
+
+t_initdb_launcher_records_the_start_before_initdb_runs() {
+  local t="${FUNCNAME[0]}"
+  setup; setup_fake_initdb
+  echo 7 > "$TMPROOT/control/initdb_exit"
+  run_initdb_launcher "$TMPROOT/volume" --encoding=UTF8 --data-checksums "$TMPROOT/volume/pgdata"
+  if assert_eq "$(cat "$TMPROOT/control/initdb_calls.log" 2>/dev/null)" "record=yes" "the record must exist when initdb starts" \
+    && assert_eq "$(tr '\n' ' ' < "$TMPROOT/control/initdb_args")" "--encoding=UTF8 --data-checksums $TMPROOT/volume/pgdata " "initdb receives the launcher's arguments unchanged" \
+    && assert_eq "$(exit_code)" "7" "initdb's exit status is the launcher's" \
+    && assert_eq "$(find "$TMPROOT/volume/pgdata" -mindepth 1 | wc -l | tr -d ' ')" "0" "the record lives outside PGDATA"; then
+    ok "$t"
+  else
+    ko "$t" "see above"
+  fi
+  teardown
+}
+
+t_initdb_launcher_pgdata_at_the_volume_root_gets_no_record() {
+  local t="${FUNCNAME[0]}"
+  setup; setup_fake_initdb
+  run_initdb_launcher "$TMPROOT/volume" --encoding=UTF8 "$TMPROOT/volume/"
+  if assert_eq "$(cat "$TMPROOT/control/initdb_calls.log" 2>/dev/null)" "record=no" "PGDATA at the volume root must stay empty for initdb" \
+    && assert_eq "$(exit_code)" "0" "initdb still runs"; then
+    ok "$t"
+  else
+    ko "$t" "see above"
+  fi
+  teardown
+}
+
+t_initdb_launcher_without_a_record_never_runs_initdb() {
+  local t="${FUNCNAME[0]}"
+  setup; setup_fake_initdb
+  run_initdb_launcher "$TMPROOT/no-such-volume" --encoding=UTF8 "$TMPROOT/volume/pgdata"
+  if assert_eq "$([ -f "$TMPROOT/control/initdb_calls.log" ] && echo ran || echo not-run)" "not-run" "initdb must not start when its start cannot be recorded" \
+    && [ "$(exit_code)" != "0" ]; then
+    ok "$t"
+  else
+    ko "$t" "exit=$(exit_code)"
+  fi
+  teardown
+}
+
 ALL_TESTS=(
+  t_initdb_launcher_records_the_start_before_initdb_runs
+  t_initdb_launcher_pgdata_at_the_volume_root_gets_no_record
+  t_initdb_launcher_without_a_record_never_runs_initdb
   t_invalid_marker_and_dcs_never_override_valid_env
   t_replica_restore_bucket_unset_noop
   t_replica_restore_dcs_path_wins_over_marker_and_env

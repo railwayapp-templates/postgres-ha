@@ -23,3 +23,12 @@ pub fn ssl_dir() -> String {
 pub fn pgdata() -> String {
     env::var("PGDATA").unwrap_or_else(|_| format!("{}/pgdata", volume_root()))
 }
+
+/// Path of the record `patroni-initdb` writes at the volume root right before
+/// the initdb of a first bootstrap starts writing PGDATA. `post-bootstrap`
+/// removes it when the bootstrap completes, so one found at boot without the
+/// bootstrap-complete marker means PGDATA holds what an interrupted first
+/// bootstrap left behind.
+pub fn initdb_started_marker(volume_root: &str) -> String {
+    format!("{}/.patroni_initdb_started", volume_root)
+}

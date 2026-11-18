@@ -11,7 +11,7 @@ use postgres_patroni::bootstrap::{
     run_psql_script, PATRONI_CONFIG,
 };
 use postgres_patroni::patroni::{write_credential_pin, PinnedCredentials};
-use postgres_patroni::{pgdata, volume_root};
+use postgres_patroni::{initdb_started_marker, pgdata, volume_root};
 use std::env;
 use std::path::Path;
 use std::time::Instant;
@@ -246,6 +246,12 @@ END
     // Mark bootstrap complete
     let marker_path = format!("{}/.patroni_bootstrap_complete", volume_root());
     std::fs::write(&marker_path, "").context("Failed to write bootstrap marker")?;
+    // The bootstrap that patroni-initdb announced is complete.
+    if let Err(e) = std::fs::remove_file(initdb_started_marker(&volume_root())) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(error = %e, "Failed to remove the initdb-started record; the next boot removes it");
+        }
+    }
 
     let duration_ms = start.elapsed().as_millis() as u64;
     telemetry.send(TelemetryEvent::BootstrapCompleted {

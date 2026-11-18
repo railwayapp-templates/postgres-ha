@@ -19,7 +19,7 @@ pub mod volume_lock;
 pub mod wal_archive;
 
 // Re-export path utilities
-pub use paths::{pgdata, ssl_dir, volume_root, EXPECTED_VOLUME_MOUNT_PATH};
+pub use paths::{initdb_started_marker, pgdata, ssl_dir, volume_root, EXPECTED_VOLUME_MOUNT_PATH};
 
 // Re-export SSL utilities
 pub use ssl::{cert_expires_within, is_valid_x509v3_cert};

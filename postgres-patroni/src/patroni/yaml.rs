@@ -225,6 +225,8 @@ postgresql:
     max-rate: {basebackup_max_rate}
     checkpoint: fast
   pgpass: /tmp/pgpass
+  bin_name:
+    initdb: /usr/local/bin/patroni-initdb
   callbacks:
     on_role_change: /usr/local/bin/on-role-change
   authentication:
@@ -570,6 +572,16 @@ mod tests {
         cfg.basebackup_max_rate = "64M".into();
         let yaml = generate_patroni_config(&cfg, "replica");
         assert!(yaml.contains("  basebackup:\n    max-rate: 64M\n    checkpoint: fast\n"));
+    }
+
+    #[test]
+    fn patroni_runs_initdb_through_the_launcher_that_records_it() {
+        let yaml = generate_patroni_config(&test_config(None), "replica");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            doc["postgresql"]["bin_name"]["initdb"].as_str(),
+            Some("/usr/local/bin/patroni-initdb")
+        );
     }
 
     #[test]
