@@ -21,6 +21,20 @@ pub trait ConfigExt {
         env::var(name).unwrap_or_else(|_| default.to_string())
     }
 
+    /// Get an environment variable with a default value, treating an empty or
+    /// whitespace-only value as unset.
+    ///
+    /// For names such as a role name, where an empty string has no meaning and
+    /// would otherwise reach the server as an empty user.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let user = String::env_non_empty_or("PGUSER", "postgres");
+    /// ```
+    fn env_non_empty_or(name: &str, default: &str) -> String {
+        non_empty_or(env::var(name).ok(), default)
+    }
+
     /// Get a required environment variable, returning an error if not set.
     ///
     /// # Example
@@ -58,6 +72,13 @@ pub trait ConfigExt {
 
 // Blanket implementation for all types
 impl<T> ConfigExt for T {}
+
+/// `value` unless it is missing, empty, or whitespace-only; else `default`.
+pub fn non_empty_or(value: Option<String>, default: &str) -> String {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
 
 /// Railway-specific environment helpers.
 ///
@@ -99,5 +120,44 @@ impl RailwayEnv {
     pub fn graphql_endpoint() -> String {
         env::var("RAILWAY_GRAPHQL_ENDPOINT")
             .unwrap_or_else(|_| "https://backboard.railway.app/graphql/internal".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_empty_or_treats_empty_as_unset() {
+        assert_eq!(non_empty_or(Some(String::new()), "postgres"), "postgres");
+    }
+
+    #[test]
+    fn non_empty_or_treats_whitespace_as_unset() {
+        assert_eq!(
+            non_empty_or(Some("  \t".to_string()), "postgres"),
+            "postgres"
+        );
+    }
+
+    #[test]
+    fn non_empty_or_keeps_a_set_value() {
+        assert_eq!(non_empty_or(Some("app".to_string()), "postgres"), "app");
+    }
+
+    #[test]
+    fn non_empty_or_uses_default_when_missing() {
+        assert_eq!(non_empty_or(None, "postgres"), "postgres");
+    }
+
+    #[test]
+    fn env_non_empty_or_reads_an_empty_variable_as_unset() {
+        // A name no other test reads, so no lock is needed.
+        let name = "COMMON_CONFIG_TEST_ENV_NON_EMPTY_OR";
+        env::set_var(name, "");
+        assert_eq!(String::env_non_empty_or(name, "postgres"), "postgres");
+        env::set_var(name, "app");
+        assert_eq!(String::env_non_empty_or(name, "postgres"), "app");
+        env::remove_var(name);
     }
 }
