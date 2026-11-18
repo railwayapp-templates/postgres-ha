@@ -559,6 +559,171 @@ fn wipe_pgdata_contents(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// What a boot finds about the record `patroni-initdb` writes at the volume
+/// root when the initdb of a first bootstrap starts (see
+/// `postgres_patroni::initdb_started_marker`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitdbRecord {
+    /// No initdb is on record: PGDATA is whatever the rest of the boot finds.
+    Absent,
+    /// The record has nothing left to describe: the bootstrap it announced
+    /// completed, or PGDATA is empty. The boot removes it.
+    Spent,
+    /// initdb started on this volume and the bootstrap never completed: PGDATA
+    /// holds only what that initdb and its unfinished bootstrap wrote. The boot
+    /// discards it so Patroni bootstraps again.
+    InterruptedBootstrap,
+    /// The record stands but the discard's preconditions do not hold; the boot
+    /// leaves the record and PGDATA as they are.
+    Unresolved,
+}
+
+/// Pure classification of the initdb-started record (unit-tested). PGDATA is
+/// discarded only for `InterruptedBootstrap`, which takes all of: the record
+/// is present (initdb ran here on an empty PGDATA), the bootstrap-complete
+/// marker is absent (that bootstrap never finished), PGDATA is non-empty and a
+/// dedicated subdirectory of the volume, and no major upgrade is in flight.
+fn classify_initdb_record(
+    initdb_started: bool,
+    bootstrap_complete: bool,
+    data_dir_nonempty: bool,
+    pgdata_is_dedicated_subdir: bool,
+    upgrade_in_flight: bool,
+) -> InitdbRecord {
+    if !initdb_started {
+        InitdbRecord::Absent
+    } else if bootstrap_complete || !data_dir_nonempty {
+        InitdbRecord::Spent
+    } else if pgdata_is_dedicated_subdir && !upgrade_in_flight {
+        InitdbRecord::InterruptedBootstrap
+    } else {
+        InitdbRecord::Unresolved
+    }
+}
+
+/// Reads the volume and classifies its initdb-started record.
+fn initdb_record_on_volume(data_dir: &str, volume_root: &str) -> InitdbRecord {
+    classify_initdb_record(
+        Path::new(&postgres_patroni::initdb_started_marker(volume_root)).exists(),
+        Path::new(&format!("{}/.patroni_bootstrap_complete", volume_root)).exists(),
+        data_dir_nonempty(data_dir),
+        pgdata_is_dedicated_subdir(data_dir, volume_root),
+        major_upgrade::upgrade_in_flight(volume_root),
+    )
+}
+
+/// Removes the initdb-started record. A record that stays behind would
+/// describe whatever PGDATA holds next, so a failed removal is an error.
+fn remove_initdb_started_record(volume_root: &str) -> Result<()> {
+    let path = postgres_patroni::initdb_started_marker(volume_root);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {path}")),
+    }
+}
+
+/// etcd transaction that deletes `/service/{scope}/initialize` only while its
+/// value is empty. Patroni creates the key empty when it starts a bootstrap
+/// and writes the system identifier into it once the bootstrap succeeds, so
+/// the comparison matches a bootstrap in progress and leaves the key of a
+/// formed cluster alone.
+fn release_in_progress_initialize_txn(scope: &str) -> serde_json::Value {
+    let key = BASE64.encode(format!("/service/{}/initialize", scope).as_bytes());
+    serde_json::json!({
+        "compare": [{"key": key, "target": "VALUE", "value": ""}],
+        "success": [{"request_delete_range": {"key": key}}],
+    })
+}
+
+#[derive(Deserialize)]
+struct EtcdTxnResponse {
+    #[serde(default)]
+    succeeded: bool,
+}
+
+/// Releases the in-progress `/initialize` claim of the bootstrap this member
+/// was running when it died. Patroni only bootstraps a new cluster when the
+/// key is absent, so while it stays, this member (and every other one) waits
+/// for a leader that is not coming. `Ok(true)` when the key was deleted,
+/// `Ok(false)` when etcd answered that there is no empty-valued key; an error
+/// when no etcd host answered.
+async fn release_in_progress_initialize(config: &Config) -> Result<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("Failed to create HTTP client")?;
+    let body = release_in_progress_initialize_txn(&config.scope);
+    for host in config.etcd_hosts.split(',') {
+        let url = format!("http://{}/v3/kv/txn", host.trim());
+        let mut req = client.post(&url).json(&body);
+        if let Some(token) = etcd_gateway_token(&client, host, config.etcd_auth.as_ref()).await {
+            req = req.header(reqwest::header::AUTHORIZATION, token);
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(txn) = resp.json::<EtcdTxnResponse>().await {
+                    return Ok(txn.succeeded);
+                }
+            }
+            Ok(resp) => {
+                warn!(host = %host, status = %resp.status(), "etcd returned non-success status");
+            }
+            Err(e) => warn!(host = %host, error = %e, "Failed to connect to etcd"),
+        }
+    }
+    anyhow::bail!(
+        "no etcd host answered the request to release the in-progress /service/{}/initialize",
+        config.scope
+    )
+}
+
+/// Resolves the initdb-started record before anything else reads PGDATA.
+///
+/// For an interrupted first bootstrap the order is: release the dead
+/// bootstrap's `/initialize` claim, empty PGDATA, remove the record. Each step
+/// is repeatable and the record goes last, so a boot that dies or fails part
+/// way through is picked up by the next one.
+async fn resolve_initdb_record(
+    config: &Config,
+    volume_root: &str,
+    telemetry: &Telemetry,
+) -> Result<()> {
+    match initdb_record_on_volume(&config.data_dir, volume_root) {
+        InitdbRecord::Absent => Ok(()),
+        InitdbRecord::Spent => remove_initdb_started_record(volume_root),
+        InitdbRecord::Unresolved => {
+            warn!(
+                data_dir = %config.data_dir,
+                volume_root = %volume_root,
+                "An initdb started on this volume and its bootstrap never completed, but PGDATA is the volume root or a major upgrade is in flight; leaving the data directory as it is"
+            );
+            Ok(())
+        }
+        InitdbRecord::InterruptedBootstrap => {
+            warn!(
+                data_dir = %config.data_dir,
+                "The first bootstrap of this member was interrupted (initdb started, bootstrap never completed); discarding what it left so Patroni bootstraps again"
+            );
+            let released = release_in_progress_initialize(config).await.context(
+                "Failed to release the interrupted bootstrap's /initialize claim; the data directory is untouched and the next boot retries",
+            )?;
+            wipe_pgdata_contents(&config.data_dir)
+                .context("Failed to discard the interrupted bootstrap's data directory")?;
+            remove_initdb_started_record(volume_root)?;
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "patroni-runner".to_string(),
+                error: format!(
+                    "{} was stopped during its first bootstrap (initdb started, bootstrap never completed); discarded the partial data directory (in-progress /initialize released: {released}) and bootstrapping again",
+                    config.name
+                ),
+                context: "interrupted first bootstrap".to_string(),
+            });
+            Ok(())
+        }
+    }
+}
+
 /// A failed marker removal is more than a stale file: the self-heal watcher
 /// treats any non-completed marker as an upgrade in flight and stands down
 /// for as long as it exists, so a removal that fails in handle_reseed_marker
@@ -1637,6 +1802,13 @@ async fn async_main() -> Result<()> {
     // just sheds the marker.
     handle_reseed_marker(&config, &volume_root, image_major.as_deref(), &telemetry).await?;
 
+    // A member killed during its first bootstrap restarts on a PGDATA that
+    // initdb left half-written (pg_control present, catalogs missing). Resolve
+    // that here, ahead of the adoption branch and the pg_control checks below,
+    // so they see the directory an interrupted bootstrap leaves once discarded:
+    // an empty one.
+    resolve_initdb_record(&config, &volume_root, &telemetry).await?;
+
     // Unconditional, every boot, every node — not gated behind
     // `adopt_existing_data`. pg_hba.conf lives on the volume and nothing else
     // ever revisits it after it is first written; whichever member is
@@ -2002,13 +2174,160 @@ async fn async_main() -> Result<()> {
 mod tests {
     use super::{
         available_bytes, blank_credential_vars, build_pgbackrest_recovery_source_conf,
-        build_pitr_managed_block, clear_clone_wipe_attempts, clone_wipe_ledger_path,
-        configure_pitr_recovery, data_dir_nonempty, persist_proven_pin, pgdata_is_dedicated_subdir,
-        read_clone_wipe_attempts, record_clone_wipe_attempt, rotation_boot_candidates,
-        should_wipe_incomplete_clone, strip_pitr_managed_block, volume_carries_cluster,
-        wipe_has_safe_clone_source, wipe_pgdata_contents, Config, RecoverySourceConfParams,
-        RestapiAddressSource, MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
+        build_pitr_managed_block, classify_initdb_record, clear_clone_wipe_attempts,
+        clone_wipe_ledger_path, configure_pitr_recovery, data_dir_nonempty,
+        initdb_record_on_volume, persist_proven_pin, pgdata_is_dedicated_subdir,
+        read_clone_wipe_attempts, record_clone_wipe_attempt, release_in_progress_initialize_txn,
+        remove_initdb_started_record, rotation_boot_candidates, should_wipe_incomplete_clone,
+        strip_pitr_managed_block, volume_carries_cluster, wipe_has_safe_clone_source,
+        wipe_pgdata_contents, Config, InitdbRecord, RecoverySourceConfParams, RestapiAddressSource,
+        MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
     };
+
+    /// A volume in the standard layout: `<root>/pgdata` holding `entries`.
+    fn volume_with_pgdata(entries: &[&str]) -> (tempfile::TempDir, String, String) {
+        let volume = tempfile::tempdir().unwrap();
+        let root = volume.path().to_str().unwrap().to_string();
+        let pgdata = format!("{root}/pgdata");
+        std::fs::create_dir_all(format!("{pgdata}/global")).unwrap();
+        for entry in entries {
+            std::fs::write(format!("{pgdata}/{entry}"), "x").unwrap();
+        }
+        (volume, root, pgdata)
+    }
+
+    #[test]
+    fn a_pgdata_left_by_an_initdb_whose_bootstrap_never_completed_is_discarded() {
+        // What a SIGKILL mid-initdb leaves: pg_control written, catalogs
+        // missing, the initdb-started record, no bootstrap-complete marker.
+        let (_volume, root, pgdata) = volume_with_pgdata(&["PG_VERSION", "global/pg_control"]);
+        std::fs::write(postgres_patroni::initdb_started_marker(&root), "").unwrap();
+        assert_eq!(
+            initdb_record_on_volume(&pgdata, &root),
+            InitdbRecord::InterruptedBootstrap
+        );
+
+        // Killed before initdb reached pg_control: same verdict.
+        std::fs::remove_file(format!("{pgdata}/global/pg_control")).unwrap();
+        assert_eq!(
+            initdb_record_on_volume(&pgdata, &root),
+            InitdbRecord::InterruptedBootstrap
+        );
+
+        // The discard leaves an empty PGDATA and no record, which is the
+        // volume Patroni bootstraps from scratch.
+        wipe_pgdata_contents(&pgdata).unwrap();
+        assert_eq!(initdb_record_on_volume(&pgdata, &root), InitdbRecord::Spent);
+        remove_initdb_started_record(&root).unwrap();
+        assert_eq!(
+            initdb_record_on_volume(&pgdata, &root),
+            InitdbRecord::Absent
+        );
+        assert!(!data_dir_nonempty(&pgdata));
+    }
+
+    #[test]
+    fn a_pgdata_with_no_initdb_on_record_is_never_an_interrupted_bootstrap() {
+        // A replica's clone, an adopted standalone volume and a restored
+        // directory all look like this: pg_control, no bootstrap-complete
+        // marker, and no initdb ever started by Patroni on this volume.
+        let (_volume, root, pgdata) = volume_with_pgdata(&["PG_VERSION", "global/pg_control"]);
+        assert_eq!(
+            initdb_record_on_volume(&pgdata, &root),
+            InitdbRecord::Absent
+        );
+
+        // Every combination of the other inputs keeps that verdict.
+        for bits in 0..16u8 {
+            assert_eq!(
+                classify_initdb_record(
+                    false,
+                    bits & 1 != 0,
+                    bits & 2 != 0,
+                    bits & 4 != 0,
+                    bits & 8 != 0
+                ),
+                InitdbRecord::Absent,
+                "bits={bits:04b}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_completed_bootstrap_is_never_an_interrupted_one() {
+        // Killed between post-bootstrap writing its marker and removing the
+        // record: both files exist and the data is a bootstrapped cluster.
+        let (_volume, root, pgdata) = volume_with_pgdata(&["PG_VERSION", "global/pg_control"]);
+        std::fs::write(postgres_patroni::initdb_started_marker(&root), "").unwrap();
+        std::fs::write(format!("{root}/.patroni_bootstrap_complete"), "").unwrap();
+        assert_eq!(initdb_record_on_volume(&pgdata, &root), InitdbRecord::Spent);
+
+        for bits in 0..8u8 {
+            assert_eq!(
+                classify_initdb_record(true, true, bits & 1 != 0, bits & 2 != 0, bits & 4 != 0),
+                InitdbRecord::Spent,
+                "bits={bits:03b}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_discard_needs_a_dedicated_pgdata_and_no_upgrade_in_flight() {
+        assert_eq!(
+            classify_initdb_record(true, false, true, true, false),
+            InitdbRecord::InterruptedBootstrap
+        );
+        // PGDATA at the volume root shares the directory with the certs and
+        // the markers.
+        assert_eq!(
+            classify_initdb_record(true, false, true, false, false),
+            InitdbRecord::Unresolved
+        );
+        assert_eq!(
+            classify_initdb_record(true, false, true, true, true),
+            InitdbRecord::Unresolved
+        );
+        // An empty PGDATA has nothing to discard; the record is spent.
+        assert_eq!(
+            classify_initdb_record(true, false, false, true, false),
+            InitdbRecord::Spent
+        );
+    }
+
+    #[test]
+    fn removing_an_absent_initdb_record_succeeds() {
+        let volume = tempfile::tempdir().unwrap();
+        remove_initdb_started_record(volume.path().to_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_initialize_release_only_matches_an_empty_value() {
+        use base64::Engine as _;
+        let txn = release_in_progress_initialize_txn("my-scope");
+        let key = base64::engine::general_purpose::STANDARD.encode("/service/my-scope/initialize");
+        assert_eq!(
+            txn,
+            serde_json::json!({
+                "compare": [{"key": key, "target": "VALUE", "value": ""}],
+                "success": [{"request_delete_range": {"key": key}}],
+            })
+        );
+        // The delete addresses the one key: no range_end, no failure branch.
+        assert!(txn["success"][0]["request_delete_range"]
+            .get("range_end")
+            .is_none());
+        assert!(txn.get("failure").is_none());
+    }
+
+    #[test]
+    fn the_initdb_launcher_writes_the_record_the_runner_reads() {
+        let launcher = include_str!("../../initdb-first-bootstrap.sh");
+        let marker = postgres_patroni::initdb_started_marker("${volume_root}");
+        assert!(
+            launcher.contains(&format!("marker=\"{marker}\"")),
+            "initdb-first-bootstrap.sh must write {marker}"
+        );
+    }
 
     #[test]
     fn a_boot_mid_rotation_presents_the_pending_password_first_and_each_once() {

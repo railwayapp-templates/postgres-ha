@@ -133,6 +133,7 @@ COPY --chmod=755 postgres-patroni/pgbackrest-env-wrapper.sh /usr/local/bin/pgbac
 COPY --chmod=755 postgres-patroni/pgbackrest-archive-push-wrapper.sh /usr/local/bin/pgbackrest-archive-push-wrapper.sh
 COPY --chmod=755 postgres-patroni/pgbackrest-archive-get-wrapper.sh /usr/local/bin/pgbackrest-archive-get-wrapper.sh
 COPY --chmod=755 postgres-patroni/pgbackrest-replica-restore-wrapper.sh /usr/local/bin/pgbackrest-replica-restore-wrapper.sh
+COPY --chmod=755 postgres-patroni/initdb-first-bootstrap.sh /usr/local/bin/patroni-initdb
 COPY --from=rust-binaries --chmod=755 /postgres-wrapper /usr/local/bin/postgres-wrapper
 COPY --from=rust-binaries --chmod=755 /post-bootstrap /usr/local/bin/post-bootstrap
 COPY --from=rust-binaries --chmod=755 /patroni-runner /usr/local/bin/patroni-runner
