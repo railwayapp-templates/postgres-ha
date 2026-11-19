@@ -37,11 +37,57 @@ impl HealthServerConfig {
         Self {
             port: u16::env_parse("HEALTH_SERVER_PORT", 8009),
             pg_port: u16::env_parse("PGPORT", 5432),
-            pg_user: String::env_parse("PGUSER", "postgres".to_string()),
+            // An empty PGUSER would reach Postgres as an empty user name and
+            // fail every check, so it reads as unset.
+            pg_user: String::env_non_empty_or("PGUSER", "postgres"),
             pg_password: String::env_parse("PGPASSWORD", String::new()),
             pg_database: String::env_parse("PGDATABASE", "postgres".to_string()),
             patroni_port: u16::env_parse("PATRONI_PORT", 8008),
             check_timeout_ms: u64::env_parse("HEALTH_CHECK_TIMEOUT_MS", 2000),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes the tests below, which all set `PGUSER` in the process.
+    static PGUSER_LOCK: Mutex<()> = Mutex::new(());
+
+    fn pg_user_with(value: Option<&str>) -> String {
+        let _env = PGUSER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("PGUSER").ok();
+        match value {
+            Some(v) => std::env::set_var("PGUSER", v),
+            None => std::env::remove_var("PGUSER"),
+        }
+        let user = HealthServerConfig::from_env().pg_user;
+        match previous {
+            Some(v) => std::env::set_var("PGUSER", v),
+            None => std::env::remove_var("PGUSER"),
+        }
+        user
+    }
+
+    #[test]
+    fn empty_pguser_connects_as_the_default_user() {
+        assert_eq!(pg_user_with(Some("")), "postgres");
+    }
+
+    #[test]
+    fn whitespace_pguser_connects_as_the_default_user() {
+        assert_eq!(pg_user_with(Some(" ")), "postgres");
+    }
+
+    #[test]
+    fn set_pguser_is_kept() {
+        assert_eq!(pg_user_with(Some("app")), "app");
+    }
+
+    #[test]
+    fn unset_pguser_connects_as_the_default_user() {
+        assert_eq!(pg_user_with(None), "postgres");
     }
 }
