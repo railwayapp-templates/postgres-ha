@@ -29,8 +29,8 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use bootstrap::{
-    bootstrap_as_follower, bootstrap_as_leader, bootstrap_marker_present, check_existing_cluster,
-    clean_stale_data, defrag_loop, local_liveness_watchdog, monitor_and_mark_bootstrap,
+    bootstrap_as_follower, bootstrap_as_leader, bootstrap_marker_present, clean_stale_data,
+    defrag_loop, find_existing_cluster, local_liveness_watchdog, monitor_and_mark_bootstrap,
 };
 use cluster::{clear_directory, has_local_data, is_name_collision, start_etcd};
 use config::{get_bootstrap_leader, Config};
@@ -57,6 +57,19 @@ fn is_raft_corruption_line(line: &str) -> bool {
 fn is_removed_member_line(line: &str) -> bool {
     line.contains("the member has been permanently removed from the cluster")
         || line.contains("data-dir used by this member must be removed")
+}
+
+/// etcd panics while applying its log when a peer it has no record of talks to
+/// it under its own cluster id ("failed to update; member unknown"). A
+/// bootstrap leader gets here after losing its volume while its siblings were
+/// down: it bootstrapped a single-member cluster, which carries the same
+/// cluster and member ids as the original, and the returning siblings then
+/// address it as the member they knew. The panic repeats on every start of the
+/// same data dir; the recovery is the same wipe and re-join as a fresh learner.
+/// Measured 2026-11-19 in `t_ha_start_order_etcd1_wiped_peers_down`: 36 starts,
+/// 36 panics, exit 2 each time.
+fn is_unknown_member_line(line: &str) -> bool {
+    line.contains("failed to update; member unknown")
 }
 
 /// etcd's gRPC gateway (`ETCD_ENABLE_GRPC_GATEWAY=true`, the HTTP/JSON API
@@ -370,9 +383,11 @@ async fn main() -> Result<()> {
         // reader must keep draining or etcd would block on a full stderr pipe.
         let corruption_detected = Arc::new(AtomicBool::new(false));
         let removed_member_detected = Arc::new(AtomicBool::new(false));
+        let unknown_member_detected = Arc::new(AtomicBool::new(false));
         let stderr_reader = child.stderr.take().map(|stderr| {
             let corrupt_flag = Arc::clone(&corruption_detected);
             let removed_flag = Arc::clone(&removed_member_detected);
+            let unknown_flag = Arc::clone(&unknown_member_detected);
             tokio::spawn(async move {
                 let mut stderr_out = tokio::io::stderr();
                 let mut lines = BufReader::new(stderr).lines();
@@ -383,6 +398,9 @@ async fn main() -> Result<()> {
                     }
                     if is_removed_member_line(&line) {
                         removed_flag.store(true, Ordering::Relaxed);
+                    }
+                    if is_unknown_member_line(&line) {
+                        unknown_flag.store(true, Ordering::Relaxed);
                     }
                     if let Some(key) = gateway_noise_key(&line) {
                         match gateway_noise.admit(key, std::time::Instant::now()) {
@@ -495,6 +513,7 @@ async fn main() -> Result<()> {
         }
         let was_corrupt = corruption_detected.load(Ordering::Relaxed);
         let was_removed_member = removed_member_detected.load(Ordering::Relaxed);
+        let was_unknown_member = unknown_member_detected.load(Ordering::Relaxed);
 
         if let Some(sig) = stop_signal {
             // A requested stop ends supervision with etcd's own status — never
@@ -535,7 +554,7 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-        } else if marker_exists && (was_corrupt || was_removed_member) {
+        } else if marker_exists && (was_corrupt || was_removed_member || was_unknown_member) {
             // A fully-bootstrapped member whose data dir is unrecoverable — raft
             // WAL corrupt, or the member identity in the dir was removed from the
             // cluster — fails identically on every start, so retrying the same
@@ -547,10 +566,12 @@ async fn main() -> Result<()> {
             // recovery path (remove stale member → re-add as learner → re-sync).
             let reason = if was_corrupt {
                 "raft log corrupted/truncated; quorum intact on peers"
+            } else if was_unknown_member {
+                "local data dir holds a cluster its peers are not members of; quorum intact on peers"
             } else {
                 "member removed from cluster; local data dir orphaned; quorum intact on peers"
             };
-            match check_existing_cluster(&config.initial_cluster, &config.etcd_name).await {
+            match find_existing_cluster(&config).await {
                 Ok(Some(_)) => {
                     warn!(reason, "etcd data dir unrecoverable with a healthy peer cluster - wiping data dir to re-clone as a fresh member");
                     // Clear data FIRST; remove marker only on success. If clear fails,
@@ -606,7 +627,8 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         exit_code_for, exit_is_clean, gateway_noise_key, is_healthcheck_invocation,
-        is_raft_corruption_line, is_removed_member_line, LineThrottle, Throttle,
+        is_raft_corruption_line, is_removed_member_line, is_unknown_member_line, LineThrottle,
+        Throttle,
     };
     use std::time::{Duration, Instant};
 
@@ -768,6 +790,22 @@ mod tests {
         ));
         assert!(!is_removed_member_line(
             "removing member 83132ee335828269 from cluster"
+        ));
+    }
+
+    #[test]
+    fn matches_the_unknown_member_panic() {
+        assert!(is_unknown_member_line(
+            r#"{"level":"panic","ts":"2026-11-19T04:55:52.351882Z","caller":"membership/cluster.go:503","msg":"failed to update; member unknown","cluster-id":"702dc19dfaa5a3a6","local-member-id":"cf1d3e91c2a2cd26","unknown-remote-peer-id":"e942d1ad9b554187"}"#
+        ));
+        assert!(is_unknown_member_line(
+            "panic: failed to update; member unknown [recovered]"
+        ));
+        assert!(!is_unknown_member_line(
+            r#"{"level":"warn","msg":"request sent was ignored by remote peer due to cluster ID mismatch"}"#
+        ));
+        assert!(!is_unknown_member_line(
+            "panic: tocommit(7) is out of range [lastIndex(3)]. Was the raft log corrupted, truncated, or lost?"
         ));
     }
 

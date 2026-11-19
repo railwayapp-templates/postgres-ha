@@ -78,7 +78,7 @@ pub(crate) fn sibling_votes_in(members: &[MemberInfo], name: &str, peer_url: &st
 /// derived sibling counts when it is healthy, which takes a quorum, and votes
 /// in the cluster it lists. The siblings are probed concurrently, so a first
 /// deploy whose siblings do not answer spends one probe timeout here.
-async fn find_existing_cluster(config: &Config) -> Result<Option<String>> {
+pub async fn find_existing_cluster(config: &Config) -> Result<Option<String>> {
     if let Some(endpoint) =
         check_existing_cluster(&config.initial_cluster, &config.etcd_name).await?
     {
