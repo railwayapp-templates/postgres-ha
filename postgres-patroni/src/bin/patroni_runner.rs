@@ -315,9 +315,27 @@ fn rotation_boot_candidates(
     candidates
 }
 
-/// A staged rotation survives a restart before the variable commit. Prove
-/// the candidate against the elected primary AND authenticated DCS before
-/// re-pinning; an edited variable alone cannot alter a dataset credential.
+/// The passwords a boot holds against the leader's roles. With a rotation
+/// staged, any of the boot's candidates may be the one the roles carry.
+/// Without one, a single password is in question: the one etcd accepted, or,
+/// where etcd does not authenticate, the variables'.
+fn role_password_candidates(
+    candidates: &[String],
+    rotation_staged: bool,
+    dcs_accepted: Option<&str>,
+    variables_superuser_pass: &str,
+) -> Vec<String> {
+    if rotation_staged {
+        return candidates.to_vec();
+    }
+    vec![dcs_accepted.unwrap_or(variables_superuser_pass).to_string()]
+}
+
+/// A staged rotation survives a restart before the variable commit, and a
+/// member that was not running while the cluster rotated comes back with the
+/// variable already moved. Prove the candidate against the elected primary,
+/// and against the DCS where it authenticates, before re-pinning; an edited
+/// variable alone cannot alter a dataset credential.
 ///
 /// A reinitialize mid-rotation empties PGDATA, pin and journal included. The
 /// boot that follows reads the volume's copies instead, so it presents the
@@ -348,29 +366,44 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
     if pending.is_none() && config.superuser_pass == pin.superuser_pass {
         return Ok(());
     }
-    let mut accepted = None;
+    // etcd vouches for a password only where it authenticates. On a cluster
+    // created before the etcd root password it accepts anyone: the DCS is
+    // read without a credential and the leader's roles alone decide.
+    let mut credential = None;
+    let mut dcs_open = false;
     for password in &candidates {
-        let credential = postgres_patroni::patroni::Credential {
+        let candidate = postgres_patroni::patroni::Credential {
             username: "root".into(),
             password: password.clone(),
         };
-        if probe_etcd_credential(&config.etcd_hosts, &credential, Duration::from_secs(2)).await
-            == EtcdAuthProbe::Accepted
-        {
-            accepted = Some(credential);
-            break;
+        match probe_etcd_credential(&config.etcd_hosts, &candidate, Duration::from_secs(2)).await {
+            EtcdAuthProbe::Accepted => {
+                credential = Some(candidate);
+                break;
+            }
+            EtcdAuthProbe::NotEnabled => {
+                dcs_open = true;
+                break;
+            }
+            EtcdAuthProbe::Rejected | EtcdAuthProbe::Inconclusive => {}
         }
     }
-    let Some(credential) = accepted else {
+    if credential.is_none() && !dcs_open {
         return Ok(());
-    };
+    }
+    let role_candidates = role_password_candidates(
+        &candidates,
+        pending.is_some(),
+        credential.as_ref().map(|c| c.password.as_str()),
+        &config.superuser_pass,
+    );
     // A staged restart may fall between the SQL and DCS commits. Each plane
     // uses a proven credential until the coordinator completes that boundary.
     if pending.is_some() {
         config.superuser_pass = pin.superuser_pass.clone();
         config.repl_pass = pin.repl_pass.clone();
         config.app_pass = pin.app_pass.clone();
-        if let Some(auth) = config.etcd_auth.as_mut() {
+        if let (Some(auth), Some(credential)) = (config.etcd_auth.as_mut(), credential.as_ref()) {
             auth.password = credential.password.clone();
         }
         if let Some(auth) = config.restapi_auth.as_mut() {
@@ -384,14 +417,14 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
         for host in config.etcd_hosts.split(',') {
             let attempt = async {
                 let leader_key = BASE64.encode(format!("/service/{}/leader", config.scope));
-                let response = etcd_range(&client, host, &leader_key, Some(&credential)).await?;
+                let response = etcd_range(&client, host, &leader_key, credential.as_ref()).await?;
                 let value: serde_json::Value = response.error_for_status()?.json().await?;
                 let leader = String::from_utf8(
                     BASE64.decode(value["kvs"][0]["value"].as_str().context("leader absent")?)?,
                 )?;
                 let member_key =
                     BASE64.encode(format!("/service/{}/members/{}", config.scope, leader));
-                let response = etcd_range(&client, host, &member_key, Some(&credential)).await?;
+                let response = etcd_range(&client, host, &member_key, credential.as_ref()).await?;
                 let value: serde_json::Value = response.error_for_status()?.json().await?;
                 let member: serde_json::Value = serde_json::from_slice(
                     &BASE64.decode(value["kvs"][0]["value"].as_str().context("member absent")?)?,
@@ -401,10 +434,7 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
                         .as_str()
                         .context("primary endpoint absent")?,
                 )?;
-                for candidate in &candidates {
-                    if pending.is_none() && *candidate != credential.password {
-                        continue;
-                    }
+                for candidate in &role_candidates {
                     let roles = async {
                         let (sql, connection) = tokio_postgres::Config::new()
                             .host(url.host_str().context("missing host")?)
@@ -462,7 +492,7 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
     config.superuser_pass = candidate.clone();
     config.repl_pass = candidate.clone();
     config.app_pass = candidate.clone();
-    if let Some(auth) = config.etcd_auth.as_mut() {
+    if let (Some(auth), Some(credential)) = (config.etcd_auth.as_mut(), credential) {
         auth.password = credential.password;
     }
     if let Some(auth) = config.restapi_auth.as_mut() {
@@ -2178,10 +2208,11 @@ mod tests {
         clone_wipe_ledger_path, configure_pitr_recovery, data_dir_nonempty,
         initdb_record_on_volume, persist_proven_pin, pgdata_is_dedicated_subdir,
         read_clone_wipe_attempts, record_clone_wipe_attempt, release_in_progress_initialize_txn,
-        remove_initdb_started_record, rotation_boot_candidates, should_wipe_incomplete_clone,
-        strip_pitr_managed_block, volume_carries_cluster, wipe_has_safe_clone_source,
-        wipe_pgdata_contents, Config, InitdbRecord, RecoverySourceConfParams, RestapiAddressSource,
-        MAX_CLONE_WIPE_ATTEMPTS, PITR_MANAGED_MARKER,
+        remove_initdb_started_record, role_password_candidates, rotation_boot_candidates,
+        should_wipe_incomplete_clone, strip_pitr_managed_block, volume_carries_cluster,
+        wipe_has_safe_clone_source, wipe_pgdata_contents, Config, InitdbRecord,
+        RecoverySourceConfParams, RestapiAddressSource, MAX_CLONE_WIPE_ATTEMPTS,
+        PITR_MANAGED_MARKER,
     };
 
     /// A volume in the standard layout: `<root>/pgdata` holding `entries`.
@@ -2350,6 +2381,33 @@ mod tests {
             rotation_boot_candidates(&[], "edited", "pinned"),
             vec!["edited", "pinned"]
         );
+    }
+
+    #[test]
+    fn the_leader_is_asked_about_one_password_unless_a_rotation_is_staged() {
+        let candidates = vec!["variable".to_string(), "pinned".to_string()];
+        // A member that was away while the cluster rotated, on a cluster whose
+        // etcd authenticates: etcd already accepted the variables' password.
+        assert_eq!(
+            role_password_candidates(&candidates, false, Some("variable"), "variable"),
+            vec!["variable"]
+        );
+        // The same member where etcd accepts anyone: nothing vouched for the
+        // variables' password yet, so the leader is asked about it. Never
+        // about the pin: a leader that carries the pin says the variable was
+        // edited, and that boot keeps reporting the drift.
+        assert_eq!(
+            role_password_candidates(&candidates, false, None, "variable"),
+            vec!["variable"]
+        );
+        // etcd accepted the pin, not the edited variable.
+        assert_eq!(
+            role_password_candidates(&candidates, false, Some("pinned"), "variable"),
+            vec!["pinned"]
+        );
+        // A staged rotation may have stopped on either side of the role change.
+        let staged = vec!["new".to_string(), "old".to_string()];
+        assert_eq!(role_password_candidates(&staged, true, None, "old"), staged);
     }
 
     #[test]
