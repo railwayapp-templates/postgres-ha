@@ -748,6 +748,15 @@ pub(super) fn pending_password(data_dir: &str) -> Option<String> {
     Some(request.new_password)
 }
 
+/// Whether the DCS is on the staged password. Patroni renders `etcd3.password`
+/// whenever the superuser has one, also on a cluster whose etcd was created
+/// before the root password and accepts anyone: there etcd has no password to
+/// move, so there is nothing left to wait for.
+fn dcs_committed(probe: crate::patroni::etcd_preflight::EtcdAuthProbe) -> bool {
+    use crate::patroni::etcd_preflight::EtcdAuthProbe;
+    matches!(probe, EtcdAuthProbe::Accepted | EtcdAuthProbe::NotEnabled)
+}
+
 /// Failsafe preserves leadership while etcd sessions are invalidated. Finish
 /// the local reload after observing BOTH committed roles and DCS credentials;
 /// never infer a credential change merely from an edited environment variable.
@@ -785,13 +794,14 @@ pub(super) async fn reconcile(config: HealthServerConfig) {
                     password: request.new_password.clone(),
                 };
                 anyhow::ensure!(
-                    crate::patroni::etcd_preflight::probe_etcd_credential(
-                        hosts,
-                        &credential,
-                        Duration::from_secs(2)
-                    )
-                    .await
-                        == crate::patroni::etcd_preflight::EtcdAuthProbe::Accepted,
+                    dcs_committed(
+                        crate::patroni::etcd_preflight::probe_etcd_credential(
+                            hosts,
+                            &credential,
+                            Duration::from_secs(2)
+                        )
+                        .await
+                    ),
                     "DCS not committed"
                 );
             }
@@ -865,6 +875,16 @@ mod tests {
         std::fs::write(temp.path().join("global/pg_control"), b"").unwrap();
         assert!(!recloning(dir));
         assert!(recloning(""));
+    }
+
+    #[test]
+    fn a_staged_rotation_does_not_wait_for_an_etcd_that_has_no_password() {
+        use crate::patroni::etcd_preflight::EtcdAuthProbe;
+        assert!(dcs_committed(EtcdAuthProbe::Accepted));
+        assert!(dcs_committed(EtcdAuthProbe::NotEnabled));
+        // etcd still holds the previous password, or did not answer.
+        assert!(!dcs_committed(EtcdAuthProbe::Rejected));
+        assert!(!dcs_committed(EtcdAuthProbe::Inconclusive));
     }
 
     fn pin_of(password: &str) -> PinnedCredentials {

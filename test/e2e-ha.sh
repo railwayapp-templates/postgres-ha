@@ -6738,6 +6738,248 @@ t_ha_scale_up_joins_authenticated_cluster() {
   teardown_scope "$scope"
 }
 
+# ----- a member that was away while the cluster rotated its password ---------
+#
+# The control plane rotates credentials on the members that are running:
+# `POST /credentials/rotate` on each, in order. A member whose container was
+# not running then (stopped, crashed, removed) takes part in no step. Its
+# volume still pins the previous password, and it comes back with the password
+# variable already carrying the new one. It has to end up streaming from the
+# leader on the new password without anyone redeploying it a second time.
+
+# rotate_call <container> <operation> <new> <current> <request password>
+# One rotation step on one member; echoes the HTTP status.
+rotate_call() {
+  local c="$1" op="$2" new="$3" current="$4" auth="$5"
+  docker exec "$c" curl -s -o /dev/null -w '%{http_code}' --max-time 60 \
+    -u "railway:${auth}" -H 'Content-Type: application/json' \
+    -d "{\"operation\":\"${op}\",\"newPassword\":\"${new}\",\"currentPassword\":\"${current}\"}" \
+    http://localhost:8009/credentials/rotate 2>/dev/null
+}
+
+# rotate_step <operation> <new> <current> <member>...
+# One step on every listed member, presenting the previous password and then
+# the new one (a member's pin moves at its own `member` step). Each member is
+# asked for two minutes: it answers 503 while a role change replays or
+# Patroni reloads. Echoes the refusal and returns 1 when a member never agrees.
+rotate_step() {
+  local op="$1" new="$2" current="$3"; shift 3
+  local m code auth deadline
+  for m in "$@"; do
+    deadline=$(($(date +%s) + 120)); code=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      for auth in "$current" "$new"; do
+        code=$(rotate_call "$m" "$op" "$new" "$current" "$auth")
+        [ "$code" = "200" ] && break 2
+      done
+      sleep 3
+    done
+    if [ "$code" != "200" ]; then
+      echo "$op on $m answered $code"
+      return 1
+    fi
+  done
+}
+
+# rotate_cluster_password <etcd container, or ""> <leader> <current> <new> <member>...
+# The control plane's order: preflight and prepare on every member, the role
+# change on the leader, etcd's root password when etcd authenticates, then
+# the member step and the verification on every member.
+rotate_cluster_password() {
+  local etcd="$1" leader="$2" current="$3" new="$4"; shift 4
+  rotate_step preflight "$current" "$current" "$@" || return 1
+  rotate_step prepare "$new" "$current" "$@" || return 1
+  rotate_step database "$new" "$current" "$leader" || return 1
+  if [ -n "$etcd" ]; then
+    if ! printf '%s\n' "$new" | docker exec -i "$etcd" etcdctl "--user=root:${current}" \
+      user passwd root --interactive=false >/dev/null 2>&1; then
+      echo "etcd refused the root password change"
+      return 1
+    fi
+  fi
+  rotate_step member "$new" "$current" "$@" || return 1
+  rotate_step verify "$new" "$current" "$@" || return 1
+}
+
+# peer_login_ok <target> <probe container> <password>
+# A password-authenticated login to <target> from another container. Loopback
+# is `trust` (see t_ha_password_variable_edit_does_not_rotate), so only a
+# connection from a peer exercises the role's password.
+peer_login_ok() {
+  docker exec "$2" psql \
+    "host=$1 port=5432 user=postgres password=$3 dbname=postgres connect_timeout=5" \
+    -tAc "SELECT 1" 2>/dev/null | grep -qx 1
+}
+
+# run_returning_member_case <test> <scope> <etcd auth: on|off> <REST: enforced|sent> <boot: cluster-up|dcs-down>
+#
+#   etcd auth  on:  etcd checks the root password (ETCD_ROOT_PASSWORD), and
+#                   the rotation moves it. off: clusters created before the
+#                   etcd root password, whose etcd accepts anyone.
+#   REST       enforced: PATRONI_RESTAPI_PASSWORD is set, as on the template.
+#                   sent: it is not, as on clusters from before that variable.
+#   boot       cluster-up: the leader answers when the member comes back.
+#                   dcs-down: etcd is unreachable when it boots, and returns
+#                   a while later.
+run_returning_member_case() {
+  local t="$1" scope="$2" etcd_auth="$3" rest="$4" boot="$5"
+  local old=test new=rotated-while-away
+  local pin=/var/lib/postgresql/data/pgdata/.railway_credentials
+  local e1="${scope}-etcd-1" e2="${scope}-etcd-2" e3="${scope}-etcd-3"
+  local n1="${scope}-pg-1" n2="${scope}-pg-2" n3="${scope}-pg-3" n
+
+  local etcd_hosts etcd_node=""
+  if [ "$etcd_auth" = "on" ]; then
+    etcd_hosts=$(setup_etcd_cluster "$scope" -e "ETCD_ROOT_PASSWORD=${old}")
+    etcd_node="$e1"
+  else
+    etcd_hosts=$(setup_etcd_cluster "$scope")
+  fi
+
+  # One password behind every credential from the first boot, as the template
+  # renders it: the rotation refuses a cluster whose credentials are not
+  # coupled, and the pin records whatever the bootstrap ran with.
+  local before=(-e "PATRONI_REPLICATION_PASSWORD=${old}")
+  local after=(-e "POSTGRES_PASSWORD=${new}" -e "PATRONI_SUPERUSER_PASSWORD=${new}"
+               -e "PATRONI_REPLICATION_PASSWORD=${new}")
+  if [ "$rest" = "enforced" ]; then
+    before+=(-e "PATRONI_RESTAPI_PASSWORD=${old}")
+    after+=(-e "PATRONI_RESTAPI_PASSWORD=${new}")
+  fi
+  for n in "$n1" "$n2" "$n3"; do
+    docker rm -f "$n" >/dev/null 2>&1 || true
+    new_volume "${n}-vol"
+  done
+  for n in "$n1" "$n2" "$n3"; do
+    run_patroni_node "$scope" "$etcd_hosts" "$n" "${before[@]}"
+  done
+
+  local leader
+  leader=$(wait_for_leader "$scope" 300) || {
+    ko "$t" "no leader elected"
+    fail_dump "$t" "$n1" "$n2" "$n3" "$e1"
+    teardown_scope "$scope"; return
+  }
+  if ! wait_for_replication "$scope" 2 300; then
+    ko "$t" "replicas did not stream before the rotation"
+    fail_dump "$t" "$leader" "$e1"
+    teardown_scope "$scope"; return
+  fi
+
+  # The member that is away is a replica. To Patroni the cluster's original
+  # service is one more member, so this is also that service being stopped.
+  local away="" stay=""
+  for n in "$n1" "$n2" "$n3"; do
+    [ "$n" = "$leader" ] && continue
+    if [ -z "$away" ]; then away="$n"; else stay="$n"; fi
+  done
+
+  log "removing $away's container (its volume stays); rotating on $leader and $stay"
+  docker rm -f "$away" >/dev/null 2>&1 || true
+  local refusal
+  if ! refusal=$(rotate_cluster_password "$etcd_node" "$leader" "$old" "$new" "$leader" "$stay"); then
+    ko "$t" "the rotation on the running members did not complete: $refusal"
+    fail_dump "$t" "$leader" "$stay"
+    teardown_scope "$scope"; return
+  fi
+  if ! peer_login_ok "$leader" "$stay" "$new" || peer_login_ok "$leader" "$stay" "$old"; then
+    ko "$t" "after the rotation $leader does not accept exactly the new password"
+    fail_dump "$t" "$leader"
+    teardown_scope "$scope"; return
+  fi
+
+  if [ "$boot" = "dcs-down" ]; then
+    log "stopping etcd; starting $away with the new password variable"
+    docker stop "$e1" "$e2" "$e3" >/dev/null 2>&1 || true
+    run_patroni_node "$scope" "$etcd_hosts" "$away" "${after[@]}"
+    # Long enough for the boot to ask the cluster and get no answer.
+    sleep 60
+    if [ "$(docker inspect -f '{{.State.Running}}' "$away" 2>/dev/null)" != "true" ]; then
+      ko "$t" "$away exited while the DCS was unreachable (exit $(docker inspect -f '{{.State.ExitCode}}' "$away" 2>/dev/null)); it has to wait for the cluster's answer"
+      fail_dump "$t" "$away"
+      teardown_scope "$scope"; return
+    fi
+    log "starting etcd again"
+    docker start "$e1" "$e2" "$e3" >/dev/null 2>&1 || true
+  else
+    log "starting $away with the new password variable"
+    run_patroni_node "$scope" "$etcd_hosts" "$away" "${after[@]}"
+  fi
+
+  # It joins on its own: no second redeploy, no restart.
+  local deadline=$(($(date +%s) + 360)) streaming=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$away" 2>/dev/null)" != "true" ]; then
+      break
+    fi
+    if docker exec "$away" curl -s http://localhost:8008/patroni 2>/dev/null \
+        | grep -qE '"replication_state":[[:space:]]*"streaming"' \
+      && docker exec "$away" grep -q "$new" "$pin" 2>/dev/null; then
+      streaming=1; break
+    fi
+    sleep 3
+  done
+  if [ "$(docker inspect -f '{{.State.Running}}' "$away" 2>/dev/null)" != "true" ]; then
+    ko "$t" "$away stopped (exit $(docker inspect -f '{{.State.ExitCode}}' "$away" 2>/dev/null)) instead of adopting the password the cluster rotated to"
+    fail_dump "$t" "$away"
+    teardown_scope "$scope"; return
+  fi
+  if [ "$streaming" != "1" ]; then
+    ko "$t" "$away never streamed from the leader on the new password (pin: $(docker exec "$away" grep -c "$new" "$pin" 2>/dev/null || echo unreadable) match)"
+    fail_dump "$t" "$away" "$leader"
+    teardown_scope "$scope"; return
+  fi
+  if [ "$(docker inspect -f '{{.RestartCount}}' "$away" 2>/dev/null)" != "0" ]; then
+    ko "$t" "$away needed a restart to adopt the password"
+    fail_dump "$t" "$away"
+    teardown_scope "$scope"; return
+  fi
+  if ! wait_for_replication "$scope" 2 180; then
+    ko "$t" "the leader does not see two streaming replicas after $away came back"
+    fail_dump "$t" "$leader" "$away"
+    teardown_scope "$scope"; return
+  fi
+  # The role transaction replays on the member once it streams.
+  local replayed=0
+  deadline=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if peer_login_ok "$away" "$stay" "$new" && ! peer_login_ok "$away" "$stay" "$old"; then
+      replayed=1; break
+    fi
+    sleep 3
+  done
+  if [ "$replayed" != "1" ]; then
+    ko "$t" "$away does not accept exactly the new password after rejoining"
+    fail_dump "$t" "$away"
+    teardown_scope "$scope"; return
+  fi
+  # A rotation that includes it again goes through: its credentials are coupled.
+  local code
+  code=$(rotate_call "$away" preflight "$new" "$new" "$new")
+  if [ "$code" != "200" ]; then
+    ko "$t" "$away answers $code to a rotation preflight after rejoining (want 200)"
+    fail_dump "$t" "$away"
+    teardown_scope "$scope"; return
+  fi
+
+  ok "$t"
+  note "leader=$leader; $away was away for the rotation and rejoined streaming on the new password (etcd auth $etcd_auth, REST $rest, boot $boot)"
+  teardown_scope "$scope"
+}
+
+# The template's shape: etcd checks the password, the REST API enforces it.
+t_ha_returning_member_adopts_rotated_password() {
+  run_returning_member_case t_ha_returning_member_adopts_rotated_password \
+    "t-away-${PG_VERSION}" on enforced cluster-up
+}
+
+# A cluster created before the etcd root password: etcd accepts anyone, so
+# nothing there can vouch for the variable. The leader's roles still can.
+t_ha_returning_member_adopts_rotated_password_without_etcd_auth() {
+  run_returning_member_case t_ha_returning_member_adopts_rotated_password_without_etcd_auth \
+    "t-away-open-${PG_VERSION}" off enforced cluster-up
+}
+
 # Seed $vol with a vanilla PostgreSQL data dir carrying the replication-slot
 # population a reverted HA root inherits: two Patroni member slots (physical,
 # reserved — what the leader holds for `postgres-2`/`postgres-3`), one physical
@@ -7859,6 +8101,9 @@ ALL_TESTS=(
   t_ha_password_edit_stops_member_with_guidance
   t_ha_password_edit_stops_member_rest_only
   t_ha_scale_up_joins_authenticated_cluster
+  # a member away during a password rotation comes back on the new password
+  t_ha_returning_member_adopts_rotated_password
+  t_ha_returning_member_adopts_rotated_password_without_etcd_auth
   # fresh-cluster start ordering, with the production template's variables
   # (etcd-1-only ETCD_INITIAL_CLUSTER, PATRONI_WAIT_FOR_LEADER on 2/3): any
   # start order forms one cluster led by postgres-1, which alone runs initdb
