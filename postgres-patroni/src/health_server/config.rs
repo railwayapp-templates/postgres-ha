@@ -2,6 +2,22 @@
 
 use common::ConfigExt;
 
+/// A password variable this boot did not adopt: it differs from the pinned
+/// password, and the cluster had not vouched for it when the member started.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UnadoptedVariable {
+    /// The superuser password as the variables say it.
+    pub password: String,
+    /// The pinned password this boot kept instead.
+    pub pinned: String,
+}
+
+impl std::fmt::Debug for UnadoptedVariable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UnadoptedVariable(..)")
+    }
+}
+
 /// Configuration for the health server
 #[derive(Debug, Clone)]
 pub struct HealthServerConfig {
@@ -25,6 +41,10 @@ pub struct HealthServerConfig {
     /// stages (pg connect, then the Patroni fallback) so one can't starve the
     /// other of its turn.
     pub check_timeout_ms: u64,
+    /// Set by the runner when this boot kept the pinned credentials against
+    /// a password variable that differs from them (see
+    /// `credentials::adopt_rotated_variable`).
+    pub unadopted_variable: Option<UnadoptedVariable>,
 }
 
 impl HealthServerConfig {
@@ -42,6 +62,7 @@ impl HealthServerConfig {
             pg_database: String::env_parse("PGDATABASE", "postgres".to_string()),
             patroni_port: u16::env_parse("PATRONI_PORT", 8008),
             check_timeout_ms: u64::env_parse("HEALTH_CHECK_TIMEOUT_MS", 2000),
+            unadopted_variable: None,
         }
     }
 }

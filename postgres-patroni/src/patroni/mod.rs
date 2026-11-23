@@ -7,8 +7,10 @@
 //! - Process monitoring
 
 mod backup_watcher;
+pub mod cluster_proof;
 mod config;
 mod credential_pin;
+pub mod etcd_kv;
 pub mod etcd_preflight;
 mod exit_history;
 mod health;
