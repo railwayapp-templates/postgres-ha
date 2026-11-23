@@ -192,6 +192,14 @@ struct WatcherConfig {
     /// against only matters once a full already exists; until then, retrying
     /// promptly (once the hiccup clears) is the safer trade.
     initial_full_retry_backoff: u64,
+    /// Longest the watcher goes without running `pgbackrest stanza-create` —
+    /// see `stanza_create_step`. stanza-create holds the stanza's archive
+    /// lock while it runs, and archive-push cannot start its async worker
+    /// without that lock, so it runs every iteration only while
+    /// `pgbackrest info` reports a stanza that is not whole. Otherwise (the
+    /// stanza reads whole, or the bucket gave no answer) it runs once this
+    /// interval has passed since the last run. 0 runs it every iteration.
+    stanza_create_interval: u64,
     /// Minimum age of a half-created-stanza sighting before the watcher acts
     /// on it (see `half_created_stanza_step`). Defaults to `poll_interval`,
     /// so the two sightings are always at least one normal poll apart, even
@@ -273,6 +281,7 @@ impl WatcherConfig {
                 "WAL_BACKUP_INITIAL_FULL_RETRY_BACKOFF_SECONDS",
                 30,
             ),
+            stanza_create_interval: env_u64("WAL_BACKUP_STANZA_CREATE_INTERVAL_SECONDS", 3600),
             half_stanza_confirm: env_u64("WAL_BACKUP_HALF_STANZA_CONFIRM_SECONDS", poll_interval),
             stall: StallConfig::from_env(),
         }
@@ -483,10 +492,11 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &Coor
         }
     };
 
-    // Idempotent stanza health — every iteration. A no-op (2 S3 reads) when
-    // the stanza is healthy; repairs a missing or corrupt backup.info on the
-    // spot. Running every iteration means a broken stanza is fixed on the next
-    // poll rather than waiting up to catalog_verify_interval (default 3600 s).
+    // Stanza health — every iteration. `pgbackrest info` (no lock) says
+    // whether the stanza is whole; stanza-create runs on the spot when it is
+    // not, so a broken stanza is fixed on the next poll rather than waiting up
+    // to catalog_verify_interval, and once per stanza_create_interval
+    // otherwise.
     stanza_create_step(data_dir, config, client, &stats).await;
 
     adopt_backup_history_from_catalog(data_dir).await;
@@ -1134,15 +1144,144 @@ async fn log_catalog_probe_error() {
     }
 }
 
-/// Runs `pgbackrest stanza-create` every watcher iteration.
+/// State field holding the epoch of the watcher's last stanza-create run,
+/// whatever its outcome. Empty/absent = never.
+const LAST_STANZA_CREATE_FIELD: &str = "last_stanza_create_at";
+
+/// What `pgbackrest info` says about the stanza on repo1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StanzaProbe {
+    /// `backup.info` and `archive.info` both loaded: status 0 ("ok") or 2
+    /// ("no valid backups").
+    Whole,
+    /// They did not: status 1 ("missing stanza path"), 3 ("missing stanza
+    /// data"), 99 (an error reading the repo or an info file), or any other
+    /// code.
+    NotWhole,
+    /// No answer: killed by the timeout, a non-zero exit, or output with no
+    /// status code for the stanza.
+    NoAnswer,
+}
+
+/// Repo1's status code for stanza `main` in `pgbackrest info --output=json`
+/// (src/command/info/info.c). `None` when the output is not JSON, has no
+/// stanza `main`, or carries no numeric status code for it.
+fn parse_stanza_status_code(info_json: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(info_json).ok()?;
+    v.as_array()?
+        .iter()
+        .find(|stanza| stanza.get("name").and_then(|n| n.as_str()) == Some("main"))?
+        .get("status")?
+        .get("code")?
+        .as_u64()
+}
+
+fn classify_stanza_status(info_json: Option<&str>) -> StanzaProbe {
+    match info_json.and_then(parse_stanza_status_code) {
+        Some(0 | 2) => StanzaProbe::Whole,
+        Some(_) => StanzaProbe::NotWhole,
+        None => StanzaProbe::NoAnswer,
+    }
+}
+
+/// Asks `pgbackrest info`, which takes no lock, what stanza-create would
+/// find. Bounded at 30 s; an expired probe is killed and reaped.
+async fn probe_stanza_status() -> StanzaProbe {
+    let mut command = Command::new("pgbackrest");
+    command
+        .args(["--stanza=main", "--repo=1", "info", "--output=json"])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT");
+    let info_json = bounded_info_output(&mut command, Duration::from_secs(30)).await;
+    classify_stanza_status(info_json.as_deref())
+}
+
+/// Whether the interval has passed since the last stanza-create run. No run
+/// on record, an unreadable stamp or one from the future all count as due.
+fn stanza_create_due(last_run: Option<i64>, now: i64, interval: u64) -> bool {
+    match last_run.filter(|t| *t > 0 && *t <= now) {
+        Some(last) => now - last >= interval as i64,
+        None => true,
+    }
+}
+
+/// Outcome of the stanza-create gate for one iteration.
+#[derive(Debug, PartialEq, Eq)]
+enum StanzaCreateGate {
+    /// Run stanza-create now; the run has been stamped.
+    Run,
+    /// `pgbackrest info` reports a whole stanza and the interval has not
+    /// passed. `sighting_ended` says whether a half-created sighting was on
+    /// record and has been ended.
+    Whole { sighting_ended: bool },
+    /// `pgbackrest info` gave no answer and the interval has not passed.
+    NoAnswer { last_run_age: i64 },
+}
+
+/// Decides whether stanza-create runs this iteration and records the run.
+/// `probe` (`pgbackrest info`) is consulted only when the interval has not
+/// passed since the last run:
+///   - not whole → run now, and on every iteration until the stanza is whole;
+///   - whole → no run; a half-created sighting in progress ends here, the
+///     same as on a successful stanza-create. Otherwise a transient sighting
+///     would stay on record until the next periodic run and let a later
+///     sighting skip its confirmation window;
+///   - no answer → no run: stanza-create would spend its timeout holding the
+///     locks. Once the interval has passed it runs anyway, answer or not, so
+///     a bucket that fails only `info` cannot keep it from running for longer
+///     than that.
 ///
-/// `stanza-create` is idempotent: when the stanza already exists and
-/// `backup.info` is valid it does a couple of S3 reads and exits 0 (silent
-/// from the caller's perspective). It only writes when `backup.info` is missing
-/// or corrupt — exactly the rc=2 deadlock scenario. Running every iteration
-/// decouples stanza repair from the catalog-verify interval so a broken stanza
-/// is fixed on the next poll (~60 s) rather than waiting up to
-/// `catalog_verify_interval` (default 3600 s). Logs only on failure.
+/// The stamp is written before the run, whatever its outcome, so a run that
+/// fails with no answer from `info` is retried an interval later, not on the
+/// next poll.
+async fn stanza_create_gate<P, Fut>(
+    state_path: &str,
+    now: i64,
+    interval: u64,
+    probe: P,
+) -> StanzaCreateGate
+where
+    P: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = StanzaProbe>,
+{
+    let last_run =
+        read_state_field(state_path, LAST_STANZA_CREATE_FIELD).and_then(|s| s.parse::<i64>().ok());
+    if !stanza_create_due(last_run, now, interval) {
+        match probe().await {
+            StanzaProbe::NotWhole => {}
+            StanzaProbe::Whole => {
+                return StanzaCreateGate::Whole {
+                    sighting_ended: clear_half_stanza_sighting(state_path),
+                };
+            }
+            StanzaProbe::NoAnswer => {
+                return StanzaCreateGate::NoAnswer {
+                    last_run_age: now - last_run.unwrap_or(now),
+                };
+            }
+        }
+    }
+    let _ = write_state_field(state_path, LAST_STANZA_CREATE_FIELD, &now.to_string());
+    StanzaCreateGate::Run
+}
+
+/// Runs `pgbackrest stanza-create` when the stanza needs it, and once every
+/// `stanza_create_interval` regardless.
+///
+/// `stanza-create` is idempotent: on a whole stanza it does a few S3 reads
+/// and exits 0. It holds the stanza's archive and backup locks for as long as
+/// it runs (`lock-type: all` in pgBackRest's command definition), and
+/// archive-push starts its async worker only once it gets the archive lock
+/// (src/command/archive/push/push.c). While stanza-create waits on a slow
+/// bucket, the segment Postgres is handing off waits with it and fails with
+/// [082] at archive-timeout.
+///
+/// `pgbackrest info` takes no lock and reports what stanza-create would find
+/// (`probe_stanza_status`), so it decides — see `stanza_create_gate`. A
+/// broken stanza is still fixed on the next poll (~60 s) rather than waiting
+/// up to `catalog_verify_interval`; on a whole one the repair left for the
+/// periodic run is a missing `.info` / `.info.copy` twin, which `info` cannot
+/// see because it reads either file. Logs only on failure.
 ///
 /// A failure is also checked for a half-created stanza
 /// (`half_created_stanza_kind`), the one stanza-create failure that retrying
@@ -1154,6 +1293,30 @@ async fn stanza_create_step(
     stats: &ArchiverStats,
 ) {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
+    match stanza_create_gate(
+        &state_path,
+        now_epoch(),
+        config.stanza_create_interval,
+        probe_stanza_status,
+    )
+    .await
+    {
+        StanzaCreateGate::Run => {}
+        StanzaCreateGate::Whole { sighting_ended } => {
+            if sighting_ended {
+                info!("pgbackrest-watcher: half-created stanza: pgbackrest info reports a whole stanza; the earlier sighting was transient");
+            }
+            return;
+        }
+        StanzaCreateGate::NoAnswer { last_run_age } => {
+            debug!(
+                last_run_age,
+                interval = config.stanza_create_interval,
+                "pgbackrest-watcher: stanza-create: waiting — pgbackrest info gave no answer; runs regardless once the interval has passed"
+            );
+            return;
+        }
+    }
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         Command::new("pgbackrest")
@@ -1410,9 +1573,9 @@ fn clear_half_stanza_sighting(state_path: &str) -> bool {
 /// - `Inconclusive` → info errored (S3 hiccup, auth, or a rejected
 ///   backup.info). Don't clear `last_full_at` — that would burn a full on
 ///   every transient info error, which are common. Log the otherwise-swallowed
-///   stderr. `stanza_create_step` already ran this iteration and will repair a
-///   missing/half-written `backup.info`; the *next* verify will then see
-///   `NoFull` and the clear path takes over.
+///   stderr. Repairing a missing/half-written `backup.info` is
+///   `stanza_create_step`'s job, earlier in the same iteration; once it has,
+///   the *next* verify will see `NoFull` and the clear path takes over.
 ///
 /// `last_catalog_verify_at` is stamped on every outcome (including Inconclusive)
 /// so the probe runs at most once per interval, not every poll.
@@ -1459,7 +1622,7 @@ async fn catalog_verify_step(data_dir: &str, config: &WatcherConfig) {
             let _ = write_state_field(&state_path, "last_full_at", "");
         }
         CatalogBackupState::Inconclusive => {
-            info!("pgbackrest-watcher: catalog check inconclusive (pgbackrest info errored); logging probe error (stanza-create ran this iteration)");
+            info!("pgbackrest-watcher: catalog check inconclusive (pgbackrest info errored); logging probe error");
             log_catalog_probe_error().await;
         }
     }
@@ -4058,6 +4221,321 @@ P00   INFO: stanza-create command end: aborted with exception [055]\n";
         assert_eq!(
             read_state_field(&path, "wal_regression_orig_path").as_deref(),
             Some("/pgbackrest/cluster-1")
+        );
+    }
+}
+
+#[cfg(test)]
+mod stanza_create_tests {
+    use super::{
+        classify_stanza_status, observe_half_stanza, parse_stanza_status_code, read_state_field,
+        stanza_create_due, stanza_create_gate, write_state_field, HalfStanzaDecision,
+        StanzaCreateGate, StanzaProbe, HALF_STANZA_FIRST_SEEN_FIELD, LAST_STANZA_CREATE_FIELD,
+    };
+    use std::cell::Cell;
+
+    const HOUR: u64 = 3600;
+    const POLL: i64 = 60;
+    const T0: i64 = 1_700_000_000;
+
+    fn temp_state_path() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").to_string_lossy().into_owned();
+        (dir, path)
+    }
+
+    fn info_with_status(code: &str) -> String {
+        format!(
+            r#"[{{"archive":[],"backup":[],"name":"main","status":{{"code":{code},"lock":{{"backup":{{"held":false}}}},"message":"m"}}}}]"#
+        )
+    }
+
+    /// One watcher poll against a `pgbackrest info` that answers `probe`.
+    /// Returns the gate's outcome and whether `info` was consulted.
+    async fn poll_at(
+        state_path: &str,
+        now: i64,
+        interval: u64,
+        probe: StanzaProbe,
+    ) -> (StanzaCreateGate, bool) {
+        let asked = Cell::new(false);
+        let gate = stanza_create_gate(state_path, now, interval, || {
+            asked.set(true);
+            async move { probe }
+        })
+        .await;
+        (gate, asked.get())
+    }
+
+    /// Polls every minute over `[from, until)` and counts stanza-create runs.
+    async fn runs_between(
+        state_path: &str,
+        from: i64,
+        until: i64,
+        interval: u64,
+        probe: StanzaProbe,
+    ) -> usize {
+        let mut runs = 0;
+        let mut now = from;
+        while now < until {
+            if poll_at(state_path, now, interval, probe).await.0 == StanzaCreateGate::Run {
+                runs += 1;
+            }
+            now += POLL;
+        }
+        runs
+    }
+
+    fn last_run(state_path: &str) -> Option<String> {
+        read_state_field(state_path, LAST_STANZA_CREATE_FIELD)
+    }
+
+    #[test]
+    fn status_code_is_read_from_stanza_main() {
+        assert_eq!(parse_stanza_status_code(&info_with_status("0")), Some(0));
+        assert_eq!(parse_stanza_status_code(&info_with_status("99")), Some(99));
+        // A real `info` answer for a stanza that does not exist on the repo.
+        let missing = r#"[{"archive":[],"backup":[],"cipher":"none","db":[],"name":"main","repo":[{"cipher":"none","key":1,"status":{"code":1,"message":"missing stanza path"}}],"status":{"code":1,"lock":{"backup":{"held":false}},"message":"missing stanza path"}}]"#;
+        assert_eq!(parse_stanza_status_code(missing), Some(1));
+        // Another stanza's status is not this stanza's.
+        let other = r#"[{"name":"other","status":{"code":0}},{"name":"main","status":{"code":3}}]"#;
+        assert_eq!(parse_stanza_status_code(other), Some(3));
+    }
+
+    #[test]
+    fn status_code_is_absent_when_info_does_not_carry_one() {
+        for output in [
+            "",
+            "not json",
+            "[]",
+            "{}",
+            r#"[{"name":"other","status":{"code":0}}]"#,
+            r#"[{"name":"main"}]"#,
+            r#"[{"name":"main","status":{"message":"ok"}}]"#,
+            r#"[{"name":"main","status":{"code":"0"}}]"#,
+            r#"[{"name":"main","status":{"code":-1}}]"#,
+            r#"[{"name":"main","status":{"code":null}}]"#,
+        ] {
+            assert_eq!(parse_stanza_status_code(output), None, "{output}");
+        }
+    }
+
+    #[test]
+    fn stanza_is_whole_on_status_0_and_2_only() {
+        for (code, want) in [
+            ("0", StanzaProbe::Whole),
+            ("2", StanzaProbe::Whole),
+            ("1", StanzaProbe::NotWhole),
+            ("3", StanzaProbe::NotWhole),
+            ("99", StanzaProbe::NotWhole),
+            ("4", StanzaProbe::NotWhole),
+        ] {
+            assert_eq!(
+                classify_stanza_status(Some(&info_with_status(code))),
+                want,
+                "status {code}"
+            );
+        }
+        // Killed by its timeout or a non-zero exit: no output at all.
+        assert_eq!(classify_stanza_status(None), StanzaProbe::NoAnswer);
+        assert_eq!(classify_stanza_status(Some("")), StanzaProbe::NoAnswer);
+        assert_eq!(
+            classify_stanza_status(Some("P00  ERROR: [056]: unable to find primary")),
+            StanzaProbe::NoAnswer
+        );
+        assert_eq!(classify_stanza_status(Some("[]")), StanzaProbe::NoAnswer);
+    }
+
+    #[test]
+    fn due_when_never_run_unreadable_or_past_the_interval() {
+        assert!(stanza_create_due(None, T0, HOUR));
+        assert!(stanza_create_due(Some(0), T0, HOUR));
+        assert!(stanza_create_due(Some(-5), T0, HOUR));
+        // A stamp from the future (clock stepped back, corrupt state).
+        assert!(stanza_create_due(Some(T0 + 1), T0, HOUR));
+        assert!(!stanza_create_due(Some(T0), T0, HOUR));
+        assert!(!stanza_create_due(Some(T0 - 3599), T0, HOUR));
+        assert!(stanza_create_due(Some(T0 - 3600), T0, HOUR));
+        // Interval 0: every iteration.
+        assert!(stanza_create_due(Some(T0), T0, 0));
+    }
+
+    #[tokio::test]
+    async fn first_iteration_runs_without_asking_info() {
+        let (_dir, state_path) = temp_state_path();
+        let (gate, asked) = poll_at(&state_path, T0, HOUR, StanzaProbe::NoAnswer).await;
+        assert_eq!(gate, StanzaCreateGate::Run);
+        assert!(!asked, "info must not be consulted when a run is due");
+        assert_eq!(last_run(&state_path), Some(T0.to_string()));
+    }
+
+    #[tokio::test]
+    async fn whole_stanza_runs_once_per_hour_not_every_poll() {
+        let (_dir, state_path) = temp_state_path();
+        // 120 polls over two hours: the first one, and one an hour later.
+        let runs = runs_between(
+            &state_path,
+            T0,
+            T0 + 2 * HOUR as i64,
+            HOUR,
+            StanzaProbe::Whole,
+        )
+        .await;
+        assert_eq!(runs, 2);
+        assert_eq!(last_run(&state_path), Some((T0 + 3600).to_string()));
+        // Between runs the answer is "whole", after asking info.
+        let (gate, asked) = poll_at(&state_path, T0 + 3660, HOUR, StanzaProbe::Whole).await;
+        assert_eq!(
+            gate,
+            StanzaCreateGate::Whole {
+                sighting_ended: false
+            }
+        );
+        assert!(asked);
+    }
+
+    #[tokio::test]
+    async fn stanza_that_is_not_whole_runs_on_every_poll_until_repaired() {
+        let (_dir, state_path) = temp_state_path();
+        let runs = runs_between(&state_path, T0, T0 + 600, HOUR, StanzaProbe::NotWhole).await;
+        assert_eq!(runs, 10);
+        assert_eq!(last_run(&state_path), Some((T0 + 540).to_string()));
+        // Repaired: back to the hourly run, counted from the last run.
+        let runs = runs_between(&state_path, T0 + 600, T0 + 4200, HOUR, StanzaProbe::Whole).await;
+        assert_eq!(runs, 1);
+        assert_eq!(last_run(&state_path), Some((T0 + 4140).to_string()));
+    }
+
+    #[tokio::test]
+    async fn no_answer_from_info_holds_stanza_create_back() {
+        let (_dir, state_path) = temp_state_path();
+        write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, &T0.to_string()).unwrap();
+        let (gate, asked) = poll_at(&state_path, T0 + 600, HOUR, StanzaProbe::NoAnswer).await;
+        assert_eq!(gate, StanzaCreateGate::NoAnswer { last_run_age: 600 });
+        assert!(asked);
+        assert_eq!(last_run(&state_path), Some(T0.to_string()));
+    }
+
+    #[tokio::test]
+    async fn two_hours_without_an_answer_still_run_once_per_hour() {
+        let (_dir, state_path) = temp_state_path();
+        write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, &T0.to_string()).unwrap();
+        // Polls at T0+60 .. T0+7200: runs at T0+3600 and T0+7200, and the
+        // poll right after each run does not repeat it.
+        let runs = runs_between(
+            &state_path,
+            T0 + POLL,
+            T0 + 2 * HOUR as i64 + POLL,
+            HOUR,
+            StanzaProbe::NoAnswer,
+        )
+        .await;
+        assert_eq!(runs, 2);
+        assert_eq!(last_run(&state_path), Some((T0 + 7200).to_string()));
+    }
+
+    #[tokio::test]
+    async fn answer_after_a_blackout_with_the_stanza_not_whole_runs_at_once() {
+        let (_dir, state_path) = temp_state_path();
+        write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, &T0.to_string()).unwrap();
+        assert_eq!(
+            runs_between(
+                &state_path,
+                T0 + POLL,
+                T0 + 600,
+                HOUR,
+                StanzaProbe::NoAnswer
+            )
+            .await,
+            0
+        );
+        let (gate, _) = poll_at(&state_path, T0 + 600, HOUR, StanzaProbe::NotWhole).await;
+        assert_eq!(gate, StanzaCreateGate::Run);
+        assert_eq!(last_run(&state_path), Some((T0 + 600).to_string()));
+    }
+
+    #[tokio::test]
+    async fn interval_zero_runs_on_every_poll_without_asking_info() {
+        let (_dir, state_path) = temp_state_path();
+        for i in 0..5 {
+            let (gate, asked) = poll_at(&state_path, T0 + i * POLL, 0, StanzaProbe::Whole).await;
+            assert_eq!(gate, StanzaCreateGate::Run);
+            assert!(!asked);
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_or_future_stamp_counts_as_due() {
+        for stamp in ["garbage", "0", "", &(T0 + 86_400).to_string()] {
+            let (_dir, state_path) = temp_state_path();
+            write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, stamp).unwrap();
+            let (gate, asked) = poll_at(&state_path, T0, HOUR, StanzaProbe::Whole).await;
+            assert_eq!(gate, StanzaCreateGate::Run, "stamp {stamp:?}");
+            assert!(!asked, "stamp {stamp:?}");
+            assert_eq!(last_run(&state_path), Some(T0.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn half_created_stanza_reaches_its_confirmation_gate_on_every_poll() {
+        // `info` reports a half-created stanza as not whole, so stanza-create
+        // keeps running — and failing with the error the confirmation gate
+        // reads — on consecutive polls, not once an hour.
+        let (_dir, state_path) = temp_state_path();
+        write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, &T0.to_string()).unwrap();
+        let (gate, _) = poll_at(&state_path, T0 + 60, HOUR, StanzaProbe::NotWhole).await;
+        assert_eq!(gate, StanzaCreateGate::Run);
+        assert_eq!(
+            observe_half_stanza(&state_path, T0 + 60, 60),
+            HalfStanzaDecision::RecordFirstSighting
+        );
+        let (gate, _) = poll_at(&state_path, T0 + 120, HOUR, StanzaProbe::NotWhole).await;
+        assert_eq!(gate, StanzaCreateGate::Run);
+        assert_eq!(
+            observe_half_stanza(&state_path, T0 + 120, 60),
+            HalfStanzaDecision::Migrate { age: 60 }
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_stanza_reported_by_info_ends_a_half_created_sighting() {
+        let (_dir, state_path) = temp_state_path();
+        write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, &T0.to_string()).unwrap();
+        assert_eq!(
+            observe_half_stanza(&state_path, T0, 60),
+            HalfStanzaDecision::RecordFirstSighting
+        );
+        let (gate, _) = poll_at(&state_path, T0 + 60, HOUR, StanzaProbe::Whole).await;
+        assert_eq!(
+            gate,
+            StanzaCreateGate::Whole {
+                sighting_ended: true
+            }
+        );
+        assert_eq!(
+            read_state_field(&state_path, HALF_STANZA_FIRST_SEEN_FIELD),
+            None
+        );
+        // A later sighting starts its confirmation window from scratch.
+        assert_eq!(
+            observe_half_stanza(&state_path, T0 + 600, 60),
+            HalfStanzaDecision::RecordFirstSighting
+        );
+    }
+
+    #[tokio::test]
+    async fn half_created_sighting_is_kept_while_info_gives_no_answer() {
+        let (_dir, state_path) = temp_state_path();
+        write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, &T0.to_string()).unwrap();
+        assert_eq!(
+            observe_half_stanza(&state_path, T0, 60),
+            HalfStanzaDecision::RecordFirstSighting
+        );
+        let (gate, _) = poll_at(&state_path, T0 + 60, HOUR, StanzaProbe::NoAnswer).await;
+        assert_eq!(gate, StanzaCreateGate::NoAnswer { last_run_age: 60 });
+        assert_eq!(
+            read_state_field(&state_path, HALF_STANZA_FIRST_SEEN_FIELD),
+            Some(T0.to_string())
         );
     }
 }
