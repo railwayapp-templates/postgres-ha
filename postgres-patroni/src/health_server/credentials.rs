@@ -417,10 +417,10 @@ fn refusal_reason(error: &anyhow::Error, secrets: &[String]) -> String {
 }
 
 /// Move this member's own credentials to `new_password`: patroni.yml, the
-/// passfile, Patroni's running configuration, then the pin. The roles are not
-/// touched here; the caller has established that the cluster's roles carry
-/// the password. `current_password` is one Patroni's REST API may still
-/// enforce. Safe to repeat after an interruption at any point.
+/// passfile, Patroni's running configuration, then the pin. The caller has
+/// established that the cluster's roles carry the password.
+/// `current_password` is one Patroni's REST API may still enforce. Safe to
+/// repeat after an interruption at any point.
 async fn set_member_credentials(
     config: &HealthServerConfig,
     mut yaml: serde_yaml::Value,
@@ -870,8 +870,8 @@ enum Adoption {
 ///
 /// So the question is asked again here, for as long as that boot's pin stands
 /// and this member is a replica that does not stream, and the answer is acted
-/// on the moment it comes: no restart, no second redeploy. The roles are never
-/// changed from here; only this member's own copies of the credential are.
+/// on the moment it comes, without a restart or a second redeploy. Only this
+/// member's own copies of the credential change.
 pub(super) async fn adopt_rotated_variable(config: HealthServerConfig) {
     let Some(unadopted) = config.unadopted_variable.clone() else {
         return;
