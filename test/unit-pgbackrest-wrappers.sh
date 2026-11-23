@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # test/unit-pgbackrest-wrappers.sh — fast, docker-free unit tests for
-# postgres-patroni/pgbackrest-replica-restore-wrapper.sh and
-# pgbackrest-archive-get-wrapper.sh (PR #78).
+# postgres-patroni/pgbackrest-replica-restore-wrapper.sh,
+# pgbackrest-archive-get-wrapper.sh (PR #78) and
+# pgbackrest-archive-push-wrapper.sh.
 #
 # These two scripts carry the trickiest logic in the PR — per-cluster
 # repo1-path resolution at call time, with a DCS/marker/env priority order
@@ -22,6 +23,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RESTORE_WRAPPER="${REPO_ROOT}/postgres-patroni/pgbackrest-replica-restore-wrapper.sh"
 ARCHIVE_GET_WRAPPER="${REPO_ROOT}/postgres-patroni/pgbackrest-archive-get-wrapper.sh"
+ARCHIVE_PUSH_WRAPPER="${REPO_ROOT}/postgres-patroni/pgbackrest-archive-push-wrapper.sh"
 
 PASS=0
 FAIL=0
@@ -50,11 +52,13 @@ setup() {
   # Fake pgbackrest: succeeds iff $PGBACKREST_REPO1_PATH equals the content of
   # control/success_path (if that file exists); otherwise exits with
   # control/fail_code (default 1). Always logs "call: <repo1-path or <unset>>"
-  # so tests can assert call count + which path each call used.
+  # so tests can assert call count + which path each call used. Prints
+  # control/console (if that file exists) first, as pgBackRest's console log.
   cat > "$TMPROOT/bin/pgbackrest" <<'EOF'
 #!/usr/bin/env bash
 CONTROL="$FAKE_CONTROL_DIR"
 echo "call: ${PGBACKREST_REPO1_PATH:-<unset>}" >> "$CONTROL/pgbackrest_calls.log"
+[ -f "$CONTROL/console" ] && cat "$CONTROL/console"
 if [ -f "$CONTROL/success_path" ]; then
   want="$(cat "$CONTROL/success_path")"
   if [ "${PGBACKREST_REPO1_PATH:-}" = "$want" ]; then
@@ -687,7 +691,124 @@ t_initdb_launcher_without_a_record_never_runs_initdb() {
   teardown
 }
 
+# =============================================================================
+# pgbackrest-archive-push-wrapper.sh (archive_command)
+# =============================================================================
+#
+# Every way a segment can leave the PITR chain must leave
+# $PGDATA/.pgbackrest_gap_pending: it is the backup watcher's only durable
+# record that WAL is missing from the bucket. A push that fails and is handed
+# back to Postgres for a retry loses nothing and must leave no marker.
+
+ARCHIVE_PUSH_SEGMENT="pg_wal/000000010000000000000005"
+gap_marker() { [ -e "$TMPROOT/pgdata/.pgbackrest_gap_pending" ] && echo yes || echo no; }
+
+# The wrapper's free-space backstop reads `df -Pk "$PGDATA"`; answer for a
+# volume with $1 KiB free out of $2 so the result does not depend on the disk
+# the test happens to run on.
+fake_df() {
+  cat > "$TMPROOT/bin/df" <<EOF
+#!/usr/bin/env bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/fake $2 $(( $2 - $1 )) $1 1% /"
+EOF
+  chmod +x "$TMPROOT/bin/df"
+}
+
+# Extra arguments are VAR=value settings for the wrapper's environment.
+run_archive_push() {
+  env WAL_ARCHIVE_BUCKET=bucket PGBACKREST_REPO1_PATH=/repo "$@" \
+    PATH="$TMPROOT/bin:$PATH" \
+    FAKE_CONTROL_DIR="$TMPROOT/control" \
+    PGDATA="$TMPROOT/pgdata" \
+    bash "$ARCHIVE_PUSH_WRAPPER" "$ARCHIVE_PUSH_SEGMENT" > "$TMPROOT/control/output" 2>&1
+  echo "$?" > "$TMPROOT/control/exit_code"
+}
+
+t_archive_push_pushed_segment_leaves_no_gap_marker() {
+  setup
+  echo "/repo" > "$TMPROOT/control/success_path"
+  echo "P00   INFO: pushed WAL file '000000010000000000000005' to the archive asynchronously" > "$TMPROOT/control/console"
+  run_archive_push
+  assert_eq "$(exit_code)" "0" "a pushed segment reports success" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
+  assert_eq "$(gap_marker)" "no" "a pushed segment is not a gap" || { ko "$FUNCNAME" "gap marker mismatch"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_push_queue_max_drop_leaves_gap_marker() {
+  setup
+  echo "/repo" > "$TMPROOT/control/success_path"
+  echo "P00   WARN: dropped WAL file '000000010000000000000005' because archive queue exceeded 5GB" > "$TMPROOT/control/console"
+  run_archive_push
+  assert_eq "$(exit_code)" "0" "pgBackRest reports a queue-max drop as success, and so does the wrapper" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
+  assert_eq "$(gap_marker)" "yes" "a segment dropped by archive-push-queue-max is a gap" || { ko "$FUNCNAME" "gap marker mismatch"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_push_timeout_with_room_to_spare_is_retried_without_gap_marker() {
+  setup
+  fake_df 900000000 1000000000
+  echo "82" > "$TMPROOT/control/fail_code"
+  echo "P00  ERROR: [082]: unable to push WAL file '000000010000000000000005' to the archive asynchronously after 60 second(s)" > "$TMPROOT/control/console"
+  mkdir -p "$TMPROOT/pgdata/pg_wal"
+  run_archive_push WAL_DROP_THRESHOLD_MB=5120
+  assert_eq "$(exit_code)" "82" "the failure goes back to Postgres, which keeps the segment and retries" || { ko "$FUNCNAME" "exit code mismatch: $(cat "$TMPROOT/control/output")"; teardown; return; }
+  assert_eq "$(gap_marker)" "no" "a push Postgres will retry is not a gap" || { ko "$FUNCNAME" "gap marker mismatch"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_push_revoked_credentials_drop_leaves_gap_marker() {
+  setup
+  fake_df 900000000 1000000000
+  echo "29" > "$TMPROOT/control/fail_code"
+  echo "P00  ERROR: [029]: unable to write to the archive: InvalidAccessKeyId" > "$TMPROOT/control/console"
+  run_archive_push
+  assert_eq "$(exit_code)" "0" "revoked credentials drop the segment" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
+  assert_eq "$(gap_marker)" "yes" "a dropped segment is a gap" || { ko "$FUNCNAME" "gap marker mismatch"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_push_almost_full_volume_drop_leaves_gap_marker() {
+  setup
+  fake_df 1000 1000000000
+  echo "82" > "$TMPROOT/control/fail_code"
+  run_archive_push
+  assert_eq "$(exit_code)" "0" "a failing push on an almost-full volume drops the segment" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
+  assert_eq "$(gap_marker)" "yes" "a dropped segment is a gap" || { ko "$FUNCNAME" "gap marker mismatch"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
+t_archive_push_drop_threshold_leaves_gap_marker() {
+  setup
+  fake_df 900000000 1000000000
+  echo "82" > "$TMPROOT/control/fail_code"
+  # The wrapper sizes pg_wal and the spool with GNU `du -sb`; answer it the
+  # same way on any platform. Threshold 0 MiB: any failing push is over budget.
+  cat > "$TMPROOT/bin/du" <<'EOF'
+#!/usr/bin/env bash
+echo "1048576 ${*: -1}"
+EOF
+  chmod +x "$TMPROOT/bin/du"
+  mkdir -p "$TMPROOT/pgdata/pg_wal"
+  run_archive_push WAL_DROP_THRESHOLD_MB=0
+  assert_eq "$(exit_code)" "0" "a failing push over the WAL budget drops the segment" || { ko "$FUNCNAME" "exit code mismatch"; teardown; return; }
+  assert_eq "$(gap_marker)" "yes" "a dropped segment is a gap" || { ko "$FUNCNAME" "gap marker mismatch"; teardown; return; }
+  ok "$FUNCNAME"
+  teardown
+}
+
 ALL_TESTS=(
+  t_archive_push_pushed_segment_leaves_no_gap_marker
+  t_archive_push_queue_max_drop_leaves_gap_marker
+  t_archive_push_timeout_with_room_to_spare_is_retried_without_gap_marker
+  t_archive_push_revoked_credentials_drop_leaves_gap_marker
+  t_archive_push_almost_full_volume_drop_leaves_gap_marker
+  t_archive_push_drop_threshold_leaves_gap_marker
   t_initdb_launcher_records_the_start_before_initdb_runs
   t_initdb_launcher_pgdata_at_the_volume_root_gets_no_record
   t_initdb_launcher_without_a_record_never_runs_initdb
