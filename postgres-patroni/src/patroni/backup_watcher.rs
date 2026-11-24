@@ -19,11 +19,17 @@
 //!      diverging from the S3 catalog, regardless of cause. Entry conditions
 //!      (any of):
 //!        - pgbackrest-archive-push-wrapper.sh dropped a segment and touched
-//!          `.pgbackrest_gap_pending` (bucket gone, hard archive-push failure)
+//!          `.pgbackrest_gap_pending` (bucket gone, hard archive-push
+//!          failure), or saw pgBackRest drop its queue
+//!          (archive-push-queue-max)
 //!        - LSN-lag probe found `pg_stat_archiver.last_archived_wal` more
 //!          than `WAL_LAG_GAP_THRESHOLD_SEGMENTS` ahead of the catalog max
 //!          (async worker silently wedged — queue-max-trip or hung
 //!          connection)
+//!      A failing archive_command alone (`pg_stat_archiver.failed_count`
+//!      growing) loses no WAL — Postgres keeps the segment and retries it —
+//!      and is followed by `decide_archive_failure` until Postgres archives
+//!      again; it never ends in a backup.
 //!      Recovery flow once in the state:
 //!        - Wait `GAP_RECOVERY_BACKOFF_SECONDS` (default 10 min) for natural
 //!          async recovery. Most short Tigris/S3 hiccups self-heal here.
@@ -35,7 +41,10 @@
 //!          S3 successfully) → take a diff backup to re-anchor
 //!          `latestRestorableAt`, then clear the gap marker.
 //!      Diff (not full) is enough because the customer-visible state is
-//!      "latestRestorableAt is fresh", which a diff produces in seconds.
+//!      "latestRestorableAt is fresh". A diff reads everything changed since
+//!      the last full, so on a large database it runs for minutes and
+//!      competes with live queries for volume I/O — which is why it is kept
+//!      for WAL that is actually missing.
 //!      Historical missing segments stay missing in the old chain;
 //!      retention eventually rolls them off.
 //!   3. Periodic full every `WAL_BACKUP_FULL_INTERVAL_HOURS` (default
@@ -56,7 +65,9 @@
 //! accepting WAL (foreground returns 0) while the S3 catalog stays
 //! frozen. archive-push-queue-max eventually drops segments and ALSO
 //! returns 0 to Postgres — so failed_count never increments and the
-//! archive-push wrapper never sees a non-zero exit.
+//! archive-push wrapper never sees a non-zero exit; it touches the gap
+//! marker when pgBackRest's output reports the drop. The probe below covers
+//! a worker that is wedged without dropping anything.
 //!
 //! Detection: every iteration, compare pg_stat_archiver.last_archived_wal
 //! against the catalog max from `pgbackrest info --output=json` (parsed
@@ -2059,14 +2070,27 @@ struct GapRecoveryInputs {
     catalog_max: String,
     handoff_wal: String,
     failed_count: i64,
+    /// `pg_stat_archiver.last_archived_time` / `last_failed_time` as epochs
+    /// (`0` = never) and `last_failed_wal` (`""` = never). Postgres keeps all
+    /// three until it restarts, so `last_failed_wal` describes a failure that
+    /// is still going on only while `last_failed_epoch > last_archived_epoch`.
+    last_archived_epoch: i64,
+    last_failed_epoch: i64,
+    last_failed_wal: String,
+    /// Catalog max on `last_failed_wal`'s timeline; `""` when the catalog has
+    /// none there or it was not probed. Read only by `archive_failure_over`.
+    failed_wal_catalog_max: String,
     marker_present: bool,
     /// `0` when no recovery cycle is in flight (or wrapper-touched marker
-    /// the watcher hasn't seen yet).
+    /// the watcher hasn't seen yet) and no archive_command failure is being
+    /// followed. Otherwise when the gap-recovery cycle started, or when
+    /// `decide_archive_failure` first saw the failure it is following.
     detected_at: i64,
     /// `""` when not yet back-filled.
     catalog_at_detection: String,
     /// `0` when never force-recovered this cycle.
     last_force_recovery_at: i64,
+    /// pkill cycles this gap-recovery cycle or this archive_command failure.
     force_attempts: u64,
     last_full_failed: i64,
     threshold_segments: u64,
@@ -2106,8 +2130,26 @@ enum GapRecoveryAction {
     /// Backoff has elapsed since the last action. pkill the async
     /// daemon, bump attempts, stamp `last_force_recovery_at = now`.
     KickAsyncDaemon { attempt: u64 },
-    /// In recovery; nothing to do this iteration.
+    /// In recovery, or following an archive_command failure; nothing to do
+    /// this iteration.
     Wait,
+    /// `failed_count` is past its anchor with no gap marker and lag below the
+    /// threshold: an archive_command failure that has lost no WAL, seen for
+    /// the first time. Stamp `last_lag_detected_at = now` so the kick backoff
+    /// has a start; no marker.
+    FollowArchiveFailure,
+    /// The followed failure has outlasted the backoff. Same pkill, attempt
+    /// bump and `last_force_recovery_at` stamp as `KickAsyncDaemon`, without
+    /// the gap marker.
+    KickForArchiveFailure { attempt: u64 },
+    /// The failure is over (`archive_failure_over`): fold the failures into
+    /// the `failed_count` anchor and zero the clock. No backup.
+    ArchiveFailureOver,
+    /// `failed_count` is back at its anchor while the clock of a followed
+    /// failure is still set — a Postgres restart zeroed `pg_stat_archiver`
+    /// before the failure ever read as over. Zero the clock so the next
+    /// failure starts a fresh backoff window.
+    ResetArchiveFailureClock,
 }
 
 /// Pure state-machine decision. No I/O, no async. Driven by a
@@ -2117,15 +2159,24 @@ enum GapRecoveryAction {
 /// `GapRecoveryAction` and is unit-tested below.
 fn decide_gap_recovery(inp: &GapRecoveryInputs) -> GapRecoveryAction {
     if !inp.marker_present {
-        // Not in recovery. Two independent entry conditions:
-        //   - LSN lag ≥ threshold (async wedge / queue-max-trip)
-        //   - failed_count > anchor (foreground hard failure)
-        let lag_trigger = inp.lag >= inp.threshold_segments;
-        let failed_trigger = inp.failed_count > inp.last_full_failed;
-        if lag_trigger || failed_trigger {
+        // Not in recovery. Two signals, with different meanings:
+        //   - LSN lag ≥ threshold (async wedge / queue-max-trip — Postgres
+        //     keeps handing off, async doesn't drain to S3): WAL may already
+        //     be missing from the repo, so enter recovery, which ends in a
+        //     diff.
+        //   - failed_count > anchor (archive_command returned non-zero):
+        //     Postgres still holds the segment and retries it, so nothing is
+        //     missing. `decide_archive_failure` follows it without a backup.
+        if inp.lag >= inp.threshold_segments {
             return GapRecoveryAction::Detect {
                 catalog_at_detection: inp.catalog_max.clone(),
             };
+        }
+        if inp.failed_count > inp.last_full_failed {
+            return decide_archive_failure(inp);
+        }
+        if inp.detected_at != 0 {
+            return GapRecoveryAction::ResetArchiveFailureClock;
         }
         return GapRecoveryAction::NoOp;
     }
@@ -2166,6 +2217,145 @@ fn decide_gap_recovery(inp: &GapRecoveryInputs) -> GapRecoveryAction {
     }
 
     GapRecoveryAction::Wait
+}
+
+/// Whether the archive_command failure `pg_stat_archiver` last recorded is
+/// over: Postgres has archived again since, and — for a WAL segment — the
+/// repo is known to be past it.
+///
+/// Postgres retries a failed file until archive_command accepts it, and its
+/// archiver always takes the oldest file waiting (pgarch_readyXlog), so an
+/// archive after the last failure means the failed file is no longer waiting.
+/// That alone is the whole answer for a timeline history or backup-label
+/// file, which has no place in the catalog's segment range. For a segment
+/// the repo has to agree, one of two ways:
+///   - the catalog max on the segment's timeline has reached it;
+///   - the file Postgres archived last is a segment on a later timeline. The
+///     archiver orders segments by name, so every segment of an earlier
+///     timeline goes first, and `pgbackrest info` reports one max per stanza,
+///     on the newest timeline — after a failover the catalog has nothing left
+///     to say about the timeline the failure happened on.
+fn archive_failure_over(inp: &GapRecoveryInputs) -> bool {
+    if inp.last_archived_epoch <= inp.last_failed_epoch {
+        return false;
+    }
+    let Some(failed_n) = segment_to_number(&inp.last_failed_wal, inp.segments_per_log_file) else {
+        return true;
+    };
+    let timeline = |wal: &str| u32::from_str_radix(&wal[..8], 16).ok();
+    if let Some(handoff) = archived_wal_segment(&inp.handoff_wal) {
+        if matches!(
+            (timeline(handoff), timeline(&inp.last_failed_wal)),
+            (Some(h), Some(f)) if h > f
+        ) {
+            return true;
+        }
+    }
+    segment_to_number(&inp.failed_wal_catalog_max, inp.segments_per_log_file)
+        .is_some_and(|catalog_n| catalog_n >= failed_n)
+}
+
+/// Follows an archive_command failure that has lost no WAL: `failed_count` is
+/// past its anchor, the gap marker is absent and the catalog keeps up with
+/// the handoff. Postgres holds the segment in pg_wal and retries it, so the
+/// WAL chain in the repo stays whole and there is nothing for a backup to
+/// seal. A single archive-push that outlives pgBackRest's archive-timeout and
+/// lands on the retry is the common case; a diff for it reads everything
+/// changed since the last full off the data volume for no gain in
+/// restorability.
+///
+/// WAL goes missing only when a segment is dropped, and every drop goes
+/// through the archive-push wrapper, which touches the gap marker for its own
+/// drops and for pgBackRest's queue-max drop alike. The marker — or lag
+/// reaching the threshold — moves this failure into gap recovery on the next
+/// iteration, and that ends in a diff.
+///
+/// While the failure lasts, the async daemon gets the same kick every
+/// `backoff_seconds` that gap recovery gives it. Once `archive_failure_over`
+/// holds, the failures fold into the anchor.
+fn decide_archive_failure(inp: &GapRecoveryInputs) -> GapRecoveryAction {
+    if archive_failure_over(inp) {
+        return GapRecoveryAction::ArchiveFailureOver;
+    }
+    if inp.detected_at == 0 {
+        return GapRecoveryAction::FollowArchiveFailure;
+    }
+    let last_action_at = inp.detected_at.max(inp.last_force_recovery_at);
+    if inp.now.saturating_sub(last_action_at) >= inp.backoff_seconds as i64 {
+        return GapRecoveryAction::KickForArchiveFailure {
+            attempt: inp.force_attempts + 1,
+        };
+    }
+    GapRecoveryAction::Wait
+}
+
+/// State-file side of the four archive_command-failure actions, with their
+/// log lines; `false` for every other action. None of them touches the gap
+/// marker. The pkill of `KickForArchiveFailure` is the caller's.
+fn apply_archive_failure_action(
+    state_path: &str,
+    action: &GapRecoveryAction,
+    inp: &GapRecoveryInputs,
+) -> bool {
+    let failed_wal = if inp.last_failed_wal.is_empty() {
+        "a WAL file"
+    } else {
+        inp.last_failed_wal.as_str()
+    };
+    let write_clock = |since: i64, last_force: i64, attempts: u64| {
+        let _ = write_state_field(state_path, "last_lag_detected_at", &since.to_string());
+        let _ = write_state_field(
+            state_path,
+            "last_force_recovery_at",
+            &last_force.to_string(),
+        );
+        let _ = write_state_field(state_path, "force_attempts", &attempts.to_string());
+    };
+    match action {
+        GapRecoveryAction::FollowArchiveFailure => {
+            write_clock(inp.now, 0, 0);
+            info!(
+                failed_wal = %failed_wal,
+                failed_count = inp.failed_count,
+                last_full_failed = inp.last_full_failed,
+                handoff = %inp.handoff_wal,
+                catalog_max = %inp.catalog_max,
+                backoff_seconds = inp.backoff_seconds,
+                "pgbackrest-watcher: archive-failure: archive_command failed; Postgres keeps the file and retries — first pkill after backoff if it has not archived by then"
+            );
+        }
+        GapRecoveryAction::KickForArchiveFailure { attempt } => {
+            write_clock(inp.detected_at, inp.now, *attempt);
+            info!(
+                failed_wal = %failed_wal,
+                handoff = %inp.handoff_wal,
+                catalog_max = %inp.catalog_max,
+                attempt,
+                stuck_min = (inp.now - inp.detected_at) / 60,
+                "pgbackrest-watcher: archive-failure: still failing, pkill async daemon"
+            );
+        }
+        GapRecoveryAction::ArchiveFailureOver => {
+            let _ = write_state_field(
+                state_path,
+                "last_full_failed_count",
+                &inp.failed_count.to_string(),
+            );
+            write_clock(0, 0, 0);
+            info!(
+                failed_wal = %failed_wal,
+                failed_count = inp.failed_count,
+                last_full_failed = inp.last_full_failed,
+                handoff = %inp.handoff_wal,
+                catalog_max = %inp.catalog_max,
+                force_attempts = inp.force_attempts,
+                "pgbackrest-watcher: archive-failure: over — Postgres archived the failed file on retry; no WAL was lost, no backup needed"
+            );
+        }
+        GapRecoveryAction::ResetArchiveFailureClock => write_clock(0, 0, 0),
+        _ => return false,
+    }
+    true
 }
 
 async fn gap_recovery_step(
@@ -2261,13 +2451,40 @@ async fn gap_recovery_step(
         return;
     }
 
+    let marker_present = Path::new(&gap_marker).exists();
+    let last_full_failed = read_state_field(&state_path, "last_full_failed_count")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    // The one extra reading `archive_failure_over` needs: where the catalog
+    // stands on the failed segment's timeline. Free when that is the timeline
+    // the lag probe just read; otherwise one more `pgbackrest info`, and only
+    // while a failure is being followed that Postgres has archived past.
+    let mut failed_wal_catalog_max = String::new();
+    if !marker_present
+        && stats.failed_count > last_full_failed
+        && stats.last_archived_epoch > stats.last_failed_epoch
+        && segment_to_number(&stats.last_failed_wal, stats.segments_per_log_file).is_some()
+    {
+        match repo_max_for_wal(&stats.last_failed_wal, &catalog_max).await {
+            Ok(max) => failed_wal_catalog_max = max.unwrap_or_default(),
+            Err(e) => {
+                warn!(error = %e, "pgbackrest-watcher: archive-failure: catalog probe for the failed segment's timeline failed")
+            }
+        }
+    }
+
     let inp = GapRecoveryInputs {
         now,
         lag: probe.lag,
         catalog_max,
         handoff_wal: stats.last_archived_wal.clone(),
         failed_count: stats.failed_count,
-        marker_present: Path::new(&gap_marker).exists(),
+        last_archived_epoch: stats.last_archived_epoch,
+        last_failed_epoch: stats.last_failed_epoch,
+        last_failed_wal: stats.last_failed_wal.clone(),
+        failed_wal_catalog_max,
+        marker_present,
         detected_at: read_state_field(&state_path, "last_lag_detected_at")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0),
@@ -2279,15 +2496,20 @@ async fn gap_recovery_step(
         force_attempts: read_state_field(&state_path, "force_attempts")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0),
-        last_full_failed: read_state_field(&state_path, "last_full_failed_count")
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0),
+        last_full_failed,
         threshold_segments: config.lag_threshold_segments,
         backoff_seconds: config.gap_recovery_backoff,
         segments_per_log_file: stats.segments_per_log_file,
     };
 
-    match decide_gap_recovery(&inp) {
+    let action = decide_gap_recovery(&inp);
+    if apply_archive_failure_action(&state_path, &action, &inp) {
+        if matches!(action, GapRecoveryAction::KickForArchiveFailure { .. }) {
+            kick_async_daemon().await;
+        }
+        return;
+    }
+    match action {
         GapRecoveryAction::NoOp => {}
 
         GapRecoveryAction::Detect {
@@ -2372,6 +2594,12 @@ async fn gap_recovery_step(
             // state; printing the same "still waiting" message every
             // minute for 10 minutes per backoff cycle is just spam.
         }
+
+        // Dispatched by apply_archive_failure_action above.
+        GapRecoveryAction::FollowArchiveFailure
+        | GapRecoveryAction::KickForArchiveFailure { .. }
+        | GapRecoveryAction::ArchiveFailureOver
+        | GapRecoveryAction::ResetArchiveFailureClock => {}
     }
 }
 
@@ -2923,10 +3151,11 @@ fn now_epoch() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        archived_wal_segment, decide_adopt_backup_history, decide_gap_recovery, full_retry_ready,
-        parse_catalog_max, parse_has_full, parse_latest_backup_stops, probe_async_duplicate_error,
-        segment_to_number, wal_has_async_archive_duplicate_error, AdoptDecision, GapRecoveryAction,
-        GapRecoveryInputs,
+        apply_archive_failure_action, archived_wal_segment, decide_adopt_backup_history,
+        decide_gap_recovery, full_retry_ready, parse_catalog_max, parse_has_full,
+        parse_latest_backup_stops, probe_async_duplicate_error, segment_to_number,
+        wal_has_async_archive_duplicate_error, AdoptDecision, GapRecoveryAction, GapRecoveryInputs,
+        GAP_MARKER_FILENAME,
     };
     use super::{
         converge_repo_path_with_patroni_dcs, patch_patroni_dcs_repo_path, patroni_dcs_repo_path,
@@ -3001,6 +3230,10 @@ mod tests {
             catalog_max: String::new(),
             handoff_wal: String::new(),
             failed_count: 0,
+            last_archived_epoch: 0,
+            last_failed_epoch: 0,
+            last_failed_wal: String::new(),
+            failed_wal_catalog_max: String::new(),
             marker_present: false,
             detected_at: 0,
             catalog_at_detection: String::new(),
@@ -3625,22 +3858,501 @@ mod tests {
         );
     }
 
-    #[test]
-    fn not_in_recovery_failed_count_grew_triggers_detect_without_lag() {
-        // Foreground hard-failure path: archive_command returns non-zero,
-        // postgres's last_archived_wal never advances, so lag stays at 0
-        // even though failed_count climbs.
-        let inp = GapRecoveryInputs {
-            lag: 0,
-            failed_count: 13,
+    // ---- archive_command failure that loses no WAL -----------------------
+    //
+    // `failed_count` past its anchor, no gap marker, lag below the threshold.
+    // Segment names: SEG_1F..SEG_22 are consecutive segments on timeline 1.
+
+    const SEG_1F: &str = "00000001000000000000001F";
+    const SEG_20: &str = "000000010000000000000020";
+    const SEG_21: &str = "000000010000000000000021";
+    const SEG_22: &str = "000000010000000000000022";
+
+    /// One archive-push for SEG_20 has just failed: Postgres last archived
+    /// SEG_1F at t=9_900, the failure is at t=9_950, the watcher polls at
+    /// t=10_000 and the catalog stands at SEG_1F.
+    fn failing_inputs() -> GapRecoveryInputs {
+        GapRecoveryInputs {
+            failed_count: 1,
             last_full_failed: 0,
+            last_archived_epoch: 9_900,
+            last_failed_epoch: 9_950,
+            last_failed_wal: SEG_20.into(),
+            handoff_wal: SEG_1F.into(),
+            catalog_max: SEG_1F.into(),
+            failed_wal_catalog_max: SEG_1F.into(),
+            ..base_inputs()
+        }
+    }
+
+    #[test]
+    fn failed_count_growth_alone_is_followed_not_gap_recovery() {
+        assert_eq!(
+            decide_gap_recovery(&failing_inputs()),
+            GapRecoveryAction::FollowArchiveFailure
+        );
+        // Whatever the size of the jump, and with no archive ever recorded.
+        let inp = GapRecoveryInputs {
+            failed_count: 13,
             ..base_inputs()
         };
         assert_eq!(
             decide_gap_recovery(&inp),
+            GapRecoveryAction::FollowArchiveFailure
+        );
+    }
+
+    #[test]
+    fn archive_failure_is_over_once_postgres_archived_and_catalog_reached_the_segment() {
+        // The retry landed: Postgres archived SEG_20 after the failure and
+        // the catalog has it.
+        let inp = GapRecoveryInputs {
+            detected_at: 10_000,
+            now: 10_060,
+            last_archived_epoch: 9_955,
+            handoff_wal: SEG_20.into(),
+            catalog_max: SEG_20.into(),
+            failed_wal_catalog_max: SEG_20.into(),
+            ..failing_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::ArchiveFailureOver
+        );
+        // Same when the catalog is already past the failed segment.
+        let inp = GapRecoveryInputs {
+            handoff_wal: SEG_22.into(),
+            catalog_max: SEG_22.into(),
+            failed_wal_catalog_max: SEG_22.into(),
+            ..inp
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::ArchiveFailureOver
+        );
+    }
+
+    #[test]
+    fn archive_failure_already_over_at_first_sight_is_never_followed() {
+        // The failure and its successful retry both fell between two polls.
+        let inp = GapRecoveryInputs {
+            detected_at: 0,
+            last_archived_epoch: 9_955,
+            handoff_wal: SEG_20.into(),
+            catalog_max: SEG_20.into(),
+            failed_wal_catalog_max: SEG_20.into(),
+            ..failing_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::ArchiveFailureOver
+        );
+    }
+
+    #[test]
+    fn archive_failure_is_not_over_while_the_catalog_is_short_of_the_segment() {
+        // Postgres reports an archive after the failure (the foreground
+        // returned 0) but the repo does not have the segment yet.
+        let inp = GapRecoveryInputs {
+            detected_at: 10_000,
+            now: 10_060,
+            last_archived_epoch: 9_955,
+            handoff_wal: SEG_20.into(),
+            ..failing_inputs()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+        // No catalog reading for the segment's timeline is not proof either.
+        let inp = GapRecoveryInputs {
+            catalog_max: String::new(),
+            failed_wal_catalog_max: String::new(),
+            ..inp
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+    }
+
+    #[test]
+    fn archive_failure_is_not_over_while_postgres_has_not_archived_since() {
+        // Catalog at or past the failed segment name, but nothing archived
+        // after the failure: the failure is still the latest word.
+        let inp = GapRecoveryInputs {
+            detected_at: 10_000,
+            now: 10_060,
+            catalog_max: SEG_21.into(),
+            failed_wal_catalog_max: SEG_21.into(),
+            ..failing_inputs()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+        // Same second counts as not after.
+        let inp = GapRecoveryInputs {
+            last_archived_epoch: 9_950,
+            ..inp
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+    }
+
+    #[test]
+    fn archive_failure_for_a_non_segment_file_is_over_on_postgres_order_alone() {
+        // A timeline history file has no place in the catalog's segment
+        // range; Postgres archiving after the failure is the whole answer.
+        let inp = GapRecoveryInputs {
+            detected_at: 10_000,
+            now: 10_060,
+            last_failed_wal: "00000002.history".into(),
+            last_archived_epoch: 9_955,
+            failed_wal_catalog_max: String::new(),
+            ..failing_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::ArchiveFailureOver
+        );
+        // Still failing: followed like any other file.
+        let inp = GapRecoveryInputs {
+            last_archived_epoch: 9_900,
+            ..inp
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+    }
+
+    #[test]
+    fn archive_failure_on_an_earlier_timeline_is_over_once_a_later_timeline_archives() {
+        // After a failover the catalog max is on the new timeline and says
+        // nothing about timeline 1. Postgres archives segments in name order,
+        // so a timeline-2 segment archived after the failure means SEG_20 of
+        // timeline 1 was no longer waiting.
+        let inp = GapRecoveryInputs {
+            detected_at: 10_000,
+            now: 10_060,
+            last_archived_epoch: 9_955,
+            handoff_wal: "000000020000000000000021".into(),
+            catalog_max: "000000020000000000000021".into(),
+            failed_wal_catalog_max: String::new(),
+            ..failing_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::ArchiveFailureOver
+        );
+        // A backup label on the later timeline names a segment there too.
+        let inp = GapRecoveryInputs {
+            handoff_wal: "000000020000000000000021.00000028.backup".into(),
+            ..inp
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::ArchiveFailureOver
+        );
+        // A history file archived last proves nothing about segments: it
+        // jumps the archiver's queue.
+        let inp = GapRecoveryInputs {
+            handoff_wal: "00000002.history".into(),
+            ..inp
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+        // Nor does an archive that predates the failure.
+        let inp = GapRecoveryInputs {
+            handoff_wal: "000000020000000000000021".into(),
+            last_archived_epoch: 9_900,
+            ..inp
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+    }
+
+    #[test]
+    fn persistent_archive_failure_kicks_at_each_backoff_and_never_takes_a_backup() {
+        let followed = GapRecoveryInputs {
+            detected_at: 10_000,
+            ..failing_inputs()
+        };
+        // Inside the first backoff window.
+        let inp = GapRecoveryInputs {
+            now: 10_599,
+            ..followed.clone()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+        // At the window: first kick.
+        let inp = GapRecoveryInputs {
+            now: 10_600,
+            ..followed.clone()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::KickForArchiveFailure { attempt: 1 }
+        );
+        // The next window counts from the kick.
+        let kicked = GapRecoveryInputs {
+            last_force_recovery_at: 10_600,
+            force_attempts: 1,
+            ..followed
+        };
+        let inp = GapRecoveryInputs {
+            now: 11_199,
+            ..kicked.clone()
+        };
+        assert_eq!(decide_gap_recovery(&inp), GapRecoveryAction::Wait);
+        let inp = GapRecoveryInputs {
+            now: 11_200,
+            ..kicked
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::KickForArchiveFailure { attempt: 2 }
+        );
+    }
+
+    #[test]
+    fn lag_at_threshold_enters_gap_recovery_even_while_a_failure_is_followed() {
+        let inp = GapRecoveryInputs {
+            detected_at: 10_000,
+            now: 10_060,
+            lag: 32,
+            ..failing_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
             GapRecoveryAction::Detect {
-                catalog_at_detection: String::new(),
+                catalog_at_detection: SEG_1F.into(),
             }
+        );
+    }
+
+    #[test]
+    fn dropped_segment_moves_a_followed_failure_into_gap_recovery_and_ends_in_a_diff() {
+        // The wrapper dropped a segment while the failure was being followed:
+        // the marker is there, the clock and kick count carry over.
+        let dropped = GapRecoveryInputs {
+            marker_present: true,
+            detected_at: 10_000,
+            last_force_recovery_at: 10_600,
+            force_attempts: 1,
+            now: 10_660,
+            ..failing_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&dropped),
+            GapRecoveryAction::BackFillCatalogAtDetection {
+                value: SEG_1F.into(),
+            }
+        );
+        // The bucket receives WAL again: diff, even though by now Postgres
+        // has archived past the failed segment.
+        let inp = GapRecoveryInputs {
+            catalog_at_detection: SEG_1F.into(),
+            last_archived_epoch: 10_700,
+            handoff_wal: SEG_22.into(),
+            catalog_max: SEG_22.into(),
+            failed_wal_catalog_max: SEG_22.into(),
+            now: 10_720,
+            ..dropped
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::TakeRecoveryDiff
+        );
+    }
+
+    #[test]
+    fn clock_left_by_a_failure_that_a_restart_erased_is_reset() {
+        // pg_stat_archiver was zeroed by a Postgres restart: failed_count is
+        // back under the anchor while the clock is still set.
+        let inp = GapRecoveryInputs {
+            failed_count: 0,
+            last_full_failed: 0,
+            detected_at: 10_000,
+            last_force_recovery_at: 10_600,
+            force_attempts: 1,
+            now: 10_660,
+            ..base_inputs()
+        };
+        assert_eq!(
+            decide_gap_recovery(&inp),
+            GapRecoveryAction::ResetArchiveFailureClock
+        );
+    }
+
+    /// Feeds each poll's decision through the state-file writer and returns
+    /// what the next poll would read back, the way `gap_recovery_step` does.
+    fn poll(
+        state_path: &str,
+        data_dir: &std::path::Path,
+        observed: GapRecoveryInputs,
+    ) -> GapRecoveryAction {
+        let field = |name: &str| {
+            read_state_field(state_path, name)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        let inp = GapRecoveryInputs {
+            marker_present: data_dir.join(GAP_MARKER_FILENAME).exists(),
+            detected_at: field("last_lag_detected_at"),
+            last_force_recovery_at: field("last_force_recovery_at"),
+            force_attempts: field("force_attempts") as u64,
+            last_full_failed: field("last_full_failed_count"),
+            ..observed
+        };
+        let action = decide_gap_recovery(&inp);
+        apply_archive_failure_action(state_path, &action, &inp);
+        action
+    }
+
+    #[test]
+    fn single_archive_push_timeout_ends_without_marker_or_backup() {
+        let (dir, state_path) = temp_state_path();
+        fs::write(&state_path, "last_full_at=5000\nlast_full_failed_count=4\n").unwrap();
+
+        // Poll 1: one failure past the anchor of 4, retry not landed yet.
+        let first = poll(
+            &state_path,
+            dir.path(),
+            GapRecoveryInputs {
+                failed_count: 5,
+                ..failing_inputs()
+            },
+        );
+        assert_eq!(first, GapRecoveryAction::FollowArchiveFailure);
+        assert_eq!(
+            read_state_field(&state_path, "last_lag_detected_at").as_deref(),
+            Some("10000")
+        );
+        assert_eq!(
+            read_state_field(&state_path, "last_full_failed_count").as_deref(),
+            Some("4")
+        );
+
+        // Poll 2, a minute later: Postgres archived the segment on retry and
+        // the catalog has it.
+        let second = poll(
+            &state_path,
+            dir.path(),
+            GapRecoveryInputs {
+                now: 10_060,
+                failed_count: 5,
+                last_archived_epoch: 9_955,
+                handoff_wal: SEG_20.into(),
+                catalog_max: SEG_20.into(),
+                failed_wal_catalog_max: SEG_20.into(),
+                ..failing_inputs()
+            },
+        );
+        assert_eq!(second, GapRecoveryAction::ArchiveFailureOver);
+        assert_eq!(
+            read_state_field(&state_path, "last_full_failed_count").as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            read_state_field(&state_path, "last_lag_detected_at").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            read_state_field(&state_path, "force_attempts").as_deref(),
+            Some("0")
+        );
+
+        // Poll 3: nothing left to follow.
+        let third = poll(
+            &state_path,
+            dir.path(),
+            GapRecoveryInputs {
+                now: 10_120,
+                failed_count: 5,
+                last_archived_epoch: 10_100,
+                handoff_wal: SEG_21.into(),
+                catalog_max: SEG_21.into(),
+                failed_wal_catalog_max: SEG_21.into(),
+                ..failing_inputs()
+            },
+        );
+        assert_eq!(third, GapRecoveryAction::NoOp);
+
+        assert!(!dir.path().join(GAP_MARKER_FILENAME).exists());
+        assert_eq!(
+            read_state_field(&state_path, "last_full_at").as_deref(),
+            Some("5000")
+        );
+        assert_eq!(read_state_field(&state_path, "last_diff_at"), None);
+    }
+
+    #[test]
+    fn persistent_failure_records_each_kick_then_hands_over_to_gap_recovery_on_a_drop() {
+        let (dir, state_path) = temp_state_path();
+        fs::write(&state_path, "last_full_at=5000\n").unwrap();
+        let at = |now: i64| GapRecoveryInputs {
+            now,
+            ..failing_inputs()
+        };
+
+        assert_eq!(
+            poll(&state_path, dir.path(), at(10_000)),
+            GapRecoveryAction::FollowArchiveFailure
+        );
+        assert_eq!(
+            poll(&state_path, dir.path(), at(10_300)),
+            GapRecoveryAction::Wait
+        );
+        assert_eq!(
+            poll(&state_path, dir.path(), at(10_600)),
+            GapRecoveryAction::KickForArchiveFailure { attempt: 1 }
+        );
+        assert_eq!(
+            poll(&state_path, dir.path(), at(10_660)),
+            GapRecoveryAction::Wait
+        );
+        assert_eq!(
+            poll(&state_path, dir.path(), at(11_200)),
+            GapRecoveryAction::KickForArchiveFailure { attempt: 2 }
+        );
+        assert_eq!(
+            read_state_field(&state_path, "last_lag_detected_at").as_deref(),
+            Some("10000")
+        );
+        assert_eq!(
+            read_state_field(&state_path, "last_force_recovery_at").as_deref(),
+            Some("11200")
+        );
+        assert_eq!(
+            read_state_field(&state_path, "force_attempts").as_deref(),
+            Some("2")
+        );
+        assert!(!dir.path().join(GAP_MARKER_FILENAME).exists());
+
+        // The wrapper drops a segment: gap recovery owns the next poll, with
+        // the clock and kick count the failure left.
+        fs::write(dir.path().join(GAP_MARKER_FILENAME), "").unwrap();
+        assert_eq!(
+            poll(&state_path, dir.path(), at(11_260)),
+            GapRecoveryAction::BackFillCatalogAtDetection {
+                value: SEG_1F.into(),
+            }
+        );
+        assert_eq!(
+            read_state_field(&state_path, "force_attempts").as_deref(),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn apply_archive_failure_action_leaves_gap_recovery_actions_alone() {
+        let (_dir, state_path) = temp_state_path();
+        fs::write(&state_path, "last_full_failed_count=4\n").unwrap();
+        for action in [
+            GapRecoveryAction::NoOp,
+            GapRecoveryAction::Wait,
+            GapRecoveryAction::TakeRecoveryDiff,
+            GapRecoveryAction::BackFillDetectedAt,
+            GapRecoveryAction::KickAsyncDaemon { attempt: 1 },
+            GapRecoveryAction::Detect {
+                catalog_at_detection: SEG_1F.into(),
+            },
+        ] {
+            assert!(!apply_archive_failure_action(
+                &state_path,
+                &action,
+                &failing_inputs()
+            ));
+        }
+        assert_eq!(
+            fs::read_to_string(&state_path).unwrap(),
+            "last_full_failed_count=4\n"
         );
     }
 
