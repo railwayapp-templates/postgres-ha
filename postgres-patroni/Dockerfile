@@ -94,9 +94,24 @@ ARG APT_REFRESH=none
 # minor, so an unheld `apt-get upgrade` silently turns a pinned :16.12 image
 # into one that bundles 16.14, poisoning the tag's contract. Everything else
 # (glibc, openssl, libpq, ...) upgrades freely.
+# newest_installable: when PGDG rebuilds an extension against a new Postgres
+# minor, the rebuilt package depends on that minor and the previous build
+# stays in the pool. Each extension is installed at the newest build whose
+# dependencies the held minor satisfies: the latest one on the major's newest
+# minor, the build made for it on a pinned older minor.
 RUN echo "refresh key: ${APT_REFRESH}" \
     && apt-mark hold "postgresql-${POSTGRES_VERSION}" "postgresql-client-${POSTGRES_VERSION}" \
     && apt-get update && apt-get upgrade -y \
+    && newest_installable() { \
+         for v in $(apt-cache madison "$1" | awk -F'|' '{gsub(/ /, "", $2); if (!seen[$2]++) print $2}'); do \
+           case "$v" in $2) ;; *) continue ;; esac; \
+           if apt-get install -s --no-install-recommends "$1=$v" >/dev/null 2>&1; then echo "$1=$v"; return 0; fi; \
+         done; \
+         echo "no build of $1 matching '$2' installs against the held Postgres minor" >&2; return 1; \
+       } \
+    && PGVECTOR_PKG=$(newest_installable "postgresql-${POSTGRES_VERSION}-pgvector" "${PGVECTOR_PKG_VERSION}") \
+    && PGAUDIT_PKG=$(newest_installable "postgresql-${POSTGRES_VERSION}-pgaudit" "*") \
+    && echo "extensions: ${PGVECTOR_PKG} ${PGAUDIT_PKG}" \
     && apt-get install -y --no-install-recommends \
     openssl \
     sudo \
@@ -104,8 +119,8 @@ RUN echo "refresh key: ${APT_REFRESH}" \
     python3-pip \
     curl \
     pgbackrest \
-    "postgresql-${POSTGRES_VERSION}-pgvector=${PGVECTOR_PKG_VERSION}" \
-    "postgresql-${POSTGRES_VERSION}-pgaudit" \
+    "${PGVECTOR_PKG}" \
+    "${PGAUDIT_PKG}" \
     && apt-mark unhold "postgresql-${POSTGRES_VERSION}" "postgresql-client-${POSTGRES_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
