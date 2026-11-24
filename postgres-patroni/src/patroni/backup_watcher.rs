@@ -198,7 +198,8 @@ struct WatcherConfig {
     /// without that lock, so it runs every iteration only while
     /// `pgbackrest info` reports a stanza that is not whole. Otherwise (the
     /// stanza reads whole, or the bucket gave no answer) it runs once this
-    /// interval has passed since the last run. 0 runs it every iteration.
+    /// interval has passed since the last run (default 10 minutes). 0 runs it
+    /// every iteration.
     stanza_create_interval: u64,
     /// Minimum age of a half-created-stanza sighting before the watcher acts
     /// on it (see `half_created_stanza_step`). Defaults to `poll_interval`,
@@ -281,7 +282,10 @@ impl WatcherConfig {
                 "WAL_BACKUP_INITIAL_FULL_RETRY_BACKOFF_SECONDS",
                 30,
             ),
-            stanza_create_interval: env_u64("WAL_BACKUP_STANZA_CREATE_INTERVAL_SECONDS", 3600),
+            stanza_create_interval: env_u64(
+                "WAL_BACKUP_STANZA_CREATE_INTERVAL_SECONDS",
+                STANZA_CREATE_INTERVAL_DEFAULT,
+            ),
             half_stanza_confirm: env_u64("WAL_BACKUP_HALF_STANZA_CONFIRM_SECONDS", poll_interval),
             stall: StallConfig::from_env(),
         }
@@ -1264,6 +1268,9 @@ where
     let _ = write_state_field(state_path, LAST_STANZA_CREATE_FIELD, &now.to_string());
     StanzaCreateGate::Run
 }
+
+/// Default `stanza_create_interval`: 10 minutes.
+const STANZA_CREATE_INTERVAL_DEFAULT: u64 = 600;
 
 /// Runs `pgbackrest stanza-create` when the stanza needs it, and once every
 /// `stanza_create_interval` regardless.
@@ -4231,10 +4238,11 @@ mod stanza_create_tests {
         classify_stanza_status, observe_half_stanza, parse_stanza_status_code, read_state_field,
         stanza_create_due, stanza_create_gate, write_state_field, HalfStanzaDecision,
         StanzaCreateGate, StanzaProbe, HALF_STANZA_FIRST_SEEN_FIELD, LAST_STANZA_CREATE_FIELD,
+        STANZA_CREATE_INTERVAL_DEFAULT,
     };
     use std::cell::Cell;
 
-    const HOUR: u64 = 3600;
+    const INTERVAL: u64 = STANZA_CREATE_INTERVAL_DEFAULT;
     const POLL: i64 = 60;
     const T0: i64 = 1_700_000_000;
 
@@ -4348,14 +4356,14 @@ mod stanza_create_tests {
 
     #[test]
     fn due_when_never_run_unreadable_or_past_the_interval() {
-        assert!(stanza_create_due(None, T0, HOUR));
-        assert!(stanza_create_due(Some(0), T0, HOUR));
-        assert!(stanza_create_due(Some(-5), T0, HOUR));
+        assert!(stanza_create_due(None, T0, INTERVAL));
+        assert!(stanza_create_due(Some(0), T0, INTERVAL));
+        assert!(stanza_create_due(Some(-5), T0, INTERVAL));
         // A stamp from the future (clock stepped back, corrupt state).
-        assert!(stanza_create_due(Some(T0 + 1), T0, HOUR));
-        assert!(!stanza_create_due(Some(T0), T0, HOUR));
-        assert!(!stanza_create_due(Some(T0 - 3599), T0, HOUR));
-        assert!(stanza_create_due(Some(T0 - 3600), T0, HOUR));
+        assert!(stanza_create_due(Some(T0 + 1), T0, INTERVAL));
+        assert!(!stanza_create_due(Some(T0), T0, INTERVAL));
+        assert!(!stanza_create_due(Some(T0 - 599), T0, INTERVAL));
+        assert!(stanza_create_due(Some(T0 - 600), T0, INTERVAL));
         // Interval 0: every iteration.
         assert!(stanza_create_due(Some(T0), T0, 0));
     }
@@ -4363,28 +4371,28 @@ mod stanza_create_tests {
     #[tokio::test]
     async fn first_iteration_runs_without_asking_info() {
         let (_dir, state_path) = temp_state_path();
-        let (gate, asked) = poll_at(&state_path, T0, HOUR, StanzaProbe::NoAnswer).await;
+        let (gate, asked) = poll_at(&state_path, T0, INTERVAL, StanzaProbe::NoAnswer).await;
         assert_eq!(gate, StanzaCreateGate::Run);
         assert!(!asked, "info must not be consulted when a run is due");
         assert_eq!(last_run(&state_path), Some(T0.to_string()));
     }
 
     #[tokio::test]
-    async fn whole_stanza_runs_once_per_hour_not_every_poll() {
+    async fn whole_stanza_runs_once_per_interval_not_every_poll() {
         let (_dir, state_path) = temp_state_path();
-        // 120 polls over two hours: the first one, and one an hour later.
+        // 20 polls over twenty minutes: the first one, and one ten minutes later.
         let runs = runs_between(
             &state_path,
             T0,
-            T0 + 2 * HOUR as i64,
-            HOUR,
+            T0 + 2 * INTERVAL as i64,
+            INTERVAL,
             StanzaProbe::Whole,
         )
         .await;
         assert_eq!(runs, 2);
-        assert_eq!(last_run(&state_path), Some((T0 + 3600).to_string()));
+        assert_eq!(last_run(&state_path), Some((T0 + 600).to_string()));
         // Between runs the answer is "whole", after asking info.
-        let (gate, asked) = poll_at(&state_path, T0 + 3660, HOUR, StanzaProbe::Whole).await;
+        let (gate, asked) = poll_at(&state_path, T0 + 660, INTERVAL, StanzaProbe::Whole).await;
         assert_eq!(
             gate,
             StanzaCreateGate::Whole {
@@ -4397,41 +4405,48 @@ mod stanza_create_tests {
     #[tokio::test]
     async fn stanza_that_is_not_whole_runs_on_every_poll_until_repaired() {
         let (_dir, state_path) = temp_state_path();
-        let runs = runs_between(&state_path, T0, T0 + 600, HOUR, StanzaProbe::NotWhole).await;
+        let runs = runs_between(&state_path, T0, T0 + 600, INTERVAL, StanzaProbe::NotWhole).await;
         assert_eq!(runs, 10);
         assert_eq!(last_run(&state_path), Some((T0 + 540).to_string()));
-        // Repaired: back to the hourly run, counted from the last run.
-        let runs = runs_between(&state_path, T0 + 600, T0 + 4200, HOUR, StanzaProbe::Whole).await;
+        // Repaired: back to one run per interval, counted from the last run.
+        let runs = runs_between(
+            &state_path,
+            T0 + 600,
+            T0 + 1200,
+            INTERVAL,
+            StanzaProbe::Whole,
+        )
+        .await;
         assert_eq!(runs, 1);
-        assert_eq!(last_run(&state_path), Some((T0 + 4140).to_string()));
+        assert_eq!(last_run(&state_path), Some((T0 + 1140).to_string()));
     }
 
     #[tokio::test]
     async fn no_answer_from_info_holds_stanza_create_back() {
         let (_dir, state_path) = temp_state_path();
         write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, &T0.to_string()).unwrap();
-        let (gate, asked) = poll_at(&state_path, T0 + 600, HOUR, StanzaProbe::NoAnswer).await;
-        assert_eq!(gate, StanzaCreateGate::NoAnswer { last_run_age: 600 });
+        let (gate, asked) = poll_at(&state_path, T0 + 300, INTERVAL, StanzaProbe::NoAnswer).await;
+        assert_eq!(gate, StanzaCreateGate::NoAnswer { last_run_age: 300 });
         assert!(asked);
         assert_eq!(last_run(&state_path), Some(T0.to_string()));
     }
 
     #[tokio::test]
-    async fn two_hours_without_an_answer_still_run_once_per_hour() {
+    async fn two_intervals_without_an_answer_still_run_once_per_interval() {
         let (_dir, state_path) = temp_state_path();
         write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, &T0.to_string()).unwrap();
-        // Polls at T0+60 .. T0+7200: runs at T0+3600 and T0+7200, and the
+        // Polls at T0+60 .. T0+1200: runs at T0+600 and T0+1200, and the
         // poll right after each run does not repeat it.
         let runs = runs_between(
             &state_path,
             T0 + POLL,
-            T0 + 2 * HOUR as i64 + POLL,
-            HOUR,
+            T0 + 2 * INTERVAL as i64 + POLL,
+            INTERVAL,
             StanzaProbe::NoAnswer,
         )
         .await;
         assert_eq!(runs, 2);
-        assert_eq!(last_run(&state_path), Some((T0 + 7200).to_string()));
+        assert_eq!(last_run(&state_path), Some((T0 + 1200).to_string()));
     }
 
     #[tokio::test]
@@ -4442,16 +4457,16 @@ mod stanza_create_tests {
             runs_between(
                 &state_path,
                 T0 + POLL,
-                T0 + 600,
-                HOUR,
+                T0 + 300,
+                INTERVAL,
                 StanzaProbe::NoAnswer
             )
             .await,
             0
         );
-        let (gate, _) = poll_at(&state_path, T0 + 600, HOUR, StanzaProbe::NotWhole).await;
+        let (gate, _) = poll_at(&state_path, T0 + 300, INTERVAL, StanzaProbe::NotWhole).await;
         assert_eq!(gate, StanzaCreateGate::Run);
-        assert_eq!(last_run(&state_path), Some((T0 + 600).to_string()));
+        assert_eq!(last_run(&state_path), Some((T0 + 300).to_string()));
     }
 
     #[tokio::test]
@@ -4469,7 +4484,7 @@ mod stanza_create_tests {
         for stamp in ["garbage", "0", "", &(T0 + 86_400).to_string()] {
             let (_dir, state_path) = temp_state_path();
             write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, stamp).unwrap();
-            let (gate, asked) = poll_at(&state_path, T0, HOUR, StanzaProbe::Whole).await;
+            let (gate, asked) = poll_at(&state_path, T0, INTERVAL, StanzaProbe::Whole).await;
             assert_eq!(gate, StanzaCreateGate::Run, "stamp {stamp:?}");
             assert!(!asked, "stamp {stamp:?}");
             assert_eq!(last_run(&state_path), Some(T0.to_string()));
@@ -4480,16 +4495,16 @@ mod stanza_create_tests {
     async fn half_created_stanza_reaches_its_confirmation_gate_on_every_poll() {
         // `info` reports a half-created stanza as not whole, so stanza-create
         // keeps running — and failing with the error the confirmation gate
-        // reads — on consecutive polls, not once an hour.
+        // reads — on consecutive polls, not once per interval.
         let (_dir, state_path) = temp_state_path();
         write_state_field(&state_path, LAST_STANZA_CREATE_FIELD, &T0.to_string()).unwrap();
-        let (gate, _) = poll_at(&state_path, T0 + 60, HOUR, StanzaProbe::NotWhole).await;
+        let (gate, _) = poll_at(&state_path, T0 + 60, INTERVAL, StanzaProbe::NotWhole).await;
         assert_eq!(gate, StanzaCreateGate::Run);
         assert_eq!(
             observe_half_stanza(&state_path, T0 + 60, 60),
             HalfStanzaDecision::RecordFirstSighting
         );
-        let (gate, _) = poll_at(&state_path, T0 + 120, HOUR, StanzaProbe::NotWhole).await;
+        let (gate, _) = poll_at(&state_path, T0 + 120, INTERVAL, StanzaProbe::NotWhole).await;
         assert_eq!(gate, StanzaCreateGate::Run);
         assert_eq!(
             observe_half_stanza(&state_path, T0 + 120, 60),
@@ -4505,7 +4520,7 @@ mod stanza_create_tests {
             observe_half_stanza(&state_path, T0, 60),
             HalfStanzaDecision::RecordFirstSighting
         );
-        let (gate, _) = poll_at(&state_path, T0 + 60, HOUR, StanzaProbe::Whole).await;
+        let (gate, _) = poll_at(&state_path, T0 + 60, INTERVAL, StanzaProbe::Whole).await;
         assert_eq!(
             gate,
             StanzaCreateGate::Whole {
@@ -4531,7 +4546,7 @@ mod stanza_create_tests {
             observe_half_stanza(&state_path, T0, 60),
             HalfStanzaDecision::RecordFirstSighting
         );
-        let (gate, _) = poll_at(&state_path, T0 + 60, HOUR, StanzaProbe::NoAnswer).await;
+        let (gate, _) = poll_at(&state_path, T0 + 60, INTERVAL, StanzaProbe::NoAnswer).await;
         assert_eq!(gate, StanzaCreateGate::NoAnswer { last_run_age: 60 });
         assert_eq!(
             read_state_field(&state_path, HALF_STANZA_FIRST_SEEN_FIELD),
