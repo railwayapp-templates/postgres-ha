@@ -284,11 +284,14 @@ fn role_password_candidates(
 /// (which the etcd pre-flight would refuse on every boot until the rotation
 /// failed). Nothing is written into an empty PGDATA: the clone needs it empty
 /// and brings the leader's pin.
-async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> Result<()> {
+async fn reconcile_rotation_at_boot(
+    config: &mut Config,
+    volume_root: &str,
+) -> Result<VariableVerdict> {
     let Some((pin, source)) =
         postgres_patroni::patroni::pin_for_boot(&config.data_dir, volume_root)
     else {
-        return Ok(());
+        return Ok(VariableVerdict::Settled);
     };
     if source == PinSource::VolumeCopy {
         info!("PGDATA carries no credential pin (wiped, or a clone in progress); reconciling against the volume's copy");
@@ -305,13 +308,14 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
         rotation_boot_candidates(&journals, &config.superuser_pass, &pin.superuser_pass);
     let pending = journals.first();
     if pending.is_none() && config.superuser_pass == pin.superuser_pass {
-        return Ok(());
+        return Ok(VariableVerdict::Settled);
     }
     // etcd vouches for a password only where it authenticates. On a cluster
     // created before the etcd root password it accepts anyone: the DCS is
     // read without a credential and the leader's roles alone decide.
     let mut credential = None;
     let mut dcs_open = false;
+    let mut variable_refused = false;
     for password in &candidates {
         let candidate = postgres_patroni::patroni::Credential {
             username: "root".into(),
@@ -326,17 +330,25 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
                 dcs_open = true;
                 break;
             }
-            EtcdAuthProbe::Rejected | EtcdAuthProbe::Inconclusive => {}
+            EtcdAuthProbe::Rejected => {
+                variable_refused |= *password == config.superuser_pass;
+            }
+            EtcdAuthProbe::Inconclusive => {}
         }
     }
     if credential.is_none() && !dcs_open {
-        return Ok(());
+        return Ok(verdict_without_proof(
+            pending.is_some(),
+            variable_refused,
+            true,
+        ));
     }
+    let variables_superuser_pass = config.superuser_pass.clone();
     let role_candidates = role_password_candidates(
         &candidates,
         pending.is_some(),
         credential.as_ref().map(|c| c.password.as_str()),
-        &config.superuser_pass,
+        &variables_superuser_pass,
     );
     // A staged restart may fall between the SQL and DCS commits. Each plane
     // uses a proven credential until the coordinator completes that boundary.
@@ -367,7 +379,11 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
         .await
     };
     let Ok(LeaderAnswer::Carries(candidate)) = answer else {
-        return Ok(());
+        return Ok(verdict_without_proof(
+            pending.is_some(),
+            matches!(answer, Ok(LeaderAnswer::CarriesNone)),
+            role_candidates.contains(&variables_superuser_pass),
+        ));
     };
     config.superuser_pass = candidate.clone();
     config.repl_pass = candidate.clone();
@@ -383,8 +399,51 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
         volume_root,
         source,
         &postgres_patroni::patroni::PinnedCredentials::from_config(config),
-    )
+    )?;
+    Ok(VariableVerdict::Settled)
 }
+
+/// Whether the cluster has had its say about the variables' password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VariableVerdict {
+    /// Nothing is in question, or the cluster answered: the password was
+    /// adopted, or it is not the one the cluster runs with.
+    Settled,
+    /// The variables differ from the pin and nothing answered: etcd is
+    /// unreachable, it names no leader, or the leader cannot be reached.
+    Unanswered,
+}
+
+/// The verdict of a boot that proved nothing. `variable_refused`: etcd or the
+/// leader said the variables' password is not the cluster's.
+/// `variable_in_question`: it was, or would have been, the password asked
+/// about. A staged rotation is the coordinator's to finish.
+fn verdict_without_proof(
+    rotation_staged: bool,
+    variable_refused: bool,
+    variable_in_question: bool,
+) -> VariableVerdict {
+    if !rotation_staged && !variable_refused && variable_in_question {
+        VariableVerdict::Unanswered
+    } else {
+        VariableVerdict::Settled
+    }
+}
+
+/// Whether the REST pre-flight stops this member (see
+/// `patroni::rest_preflight`). `config` is pre-pin, so its superuser password
+/// is the variable's value.
+fn rest_preflight_stops(config: &Config, drift: &[&str]) -> bool {
+    let restapi_password = config
+        .restapi_auth
+        .as_ref()
+        .filter(|_| config.restapi_auth_enforced)
+        .map(|cred| cred.password.as_str());
+    rest_credential_diverges(drift, restapi_password, &config.superuser_pass)
+}
+
+/// How often a boot that is waiting for the cluster's answer asks again.
+const CLUSTER_ANSWER_POLL: Duration = Duration::from_secs(5);
 
 /// Pin what the boot proved. Into PGDATA only when it carries a pin: an empty
 /// PGDATA is about to be cloned over and must stay empty, so there only the
@@ -1618,7 +1677,7 @@ async fn async_main() -> Result<()> {
     let mut health_config = HealthServerConfig::from_env();
 
     let mut config = Config::from_env()?;
-    reconcile_rotation_at_boot(&mut config, &volume_root).await?;
+    let mut variable_verdict = reconcile_rotation_at_boot(&mut config, &volume_root).await?;
 
     info!(
         node = %config.name,
@@ -1648,7 +1707,47 @@ async fn async_main() -> Result<()> {
     // reseed wipe removes along with the rest of pgdata); the pin itself is
     // applied further down, once the post-reseed state of the data directory
     // is known, and reports the same list.
-    let credential_drift = credential_drift(&config, credentials_from_env_requested());
+    let mut credential_drift = credential_drift(&config, credentials_from_env_requested());
+
+    // The REST pre-flight below stops a member whose password variable was
+    // edited. A member that was not running while the cluster rotated its
+    // password looks the same from here until the cluster says which it is,
+    // and stopping it for good because etcd or the leader was unreachable at
+    // that moment would leave it out until someone redeploys it again. So a
+    // boot the cluster has not answered waits for the answer: it adopts the
+    // variable once the leader vouches for it, and stops with the guidance
+    // once the leader says otherwise.
+    if variable_verdict == VariableVerdict::Unanswered
+        && rest_preflight_stops(&config, &credential_drift)
+    {
+        let waiting = format!(
+            "the password variables differ from the credentials pinned on this volume ({}) and \
+             the cluster has not said which it runs with (etcd unreachable, or no leader to \
+             ask); waiting for its answer before starting Patroni",
+            drifted_summary(&credential_drift)
+        );
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "patroni-runner".to_string(),
+            error: waiting.clone(),
+            context: "credential pre-flight".to_string(),
+        });
+        let mut asked = 0u32;
+        while variable_verdict == VariableVerdict::Unanswered
+            && rest_preflight_stops(&config, &credential_drift)
+        {
+            if asked % 12 == 0 {
+                warn!("{waiting}");
+            }
+            asked += 1;
+            tokio::time::sleep(CLUSTER_ANSWER_POLL).await;
+            variable_verdict = reconcile_rotation_at_boot(&mut config, &volume_root).await?;
+            credential_drift = postgres_patroni::patroni::credential_drift(
+                &config,
+                credentials_from_env_requested(),
+            );
+        }
+        info!("the cluster answered; continuing the boot");
+    }
 
     // etcd's root password is fixed when the etcd entrypoint first enables
     // authentication; the credential this member presents is re-derived from
@@ -1687,12 +1786,7 @@ async fn async_main() -> Result<()> {
     // from the pin's drift list and the variables alone (see
     // patroni::rest_preflight). `config` is pre-pin here, so its superuser
     // password is the variable's value.
-    let restapi_password = config
-        .restapi_auth
-        .as_ref()
-        .filter(|_| config.restapi_auth_enforced)
-        .map(|cred| cred.password.as_str());
-    if rest_credential_diverges(&credential_drift, restapi_password, &config.superuser_pass) {
+    if rest_preflight_stops(&config, &credential_drift) {
         let message = divergence_message(&credential_drift);
         error!("{message}");
         telemetry.send(TelemetryEvent::ComponentError {
@@ -2286,9 +2380,8 @@ mod tests {
             vec!["variable"]
         );
         // The same member where etcd accepts anyone: nothing vouched for the
-        // variables' password yet, so the leader is asked about it. Never
-        // about the pin: a leader that carries the pin says the variable was
-        // edited, and that boot keeps reporting the drift.
+        // variables' password yet, so the leader is asked about it. A leader
+        // that carries the pin leaves the boot on the drift it reports today.
         assert_eq!(
             role_password_candidates(&candidates, false, None, "variable"),
             vec!["variable"]
@@ -2301,6 +2394,33 @@ mod tests {
         // A staged rotation may have stopped on either side of the role change.
         let staged = vec!["new".to_string(), "old".to_string()];
         assert_eq!(role_password_candidates(&staged, true, None, "old"), staged);
+    }
+
+    #[test]
+    fn a_boot_waits_only_for_an_answer_the_cluster_has_not_given() {
+        use super::{verdict_without_proof, VariableVerdict};
+        // etcd unreachable, or no leader to ask about the variables' password.
+        assert_eq!(
+            verdict_without_proof(false, false, true),
+            VariableVerdict::Unanswered
+        );
+        // etcd refused it, or the leader's roles do not carry it: an edit.
+        assert_eq!(
+            verdict_without_proof(false, true, true),
+            VariableVerdict::Settled
+        );
+        // etcd accepted the pin instead, so the leader was asked about the
+        // pin; its silence says nothing new about the variable.
+        assert_eq!(
+            verdict_without_proof(false, false, false),
+            VariableVerdict::Settled
+        );
+        // A staged rotation boots on what it can prove and is finished by
+        // the coordinator.
+        assert_eq!(
+            verdict_without_proof(true, false, true),
+            VariableVerdict::Settled
+        );
     }
 
     #[test]
