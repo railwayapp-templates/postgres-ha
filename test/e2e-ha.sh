@@ -1293,15 +1293,10 @@ t_watcher_gap_recovery_full() {
   # gap-recovery diff) rather than the generic "gap-recovery state cleared"
   # message: that message is shared with the unrelated full-backup path
   # (clear_gap_recovery_state's "cleared by full backup" reason), which
-  # reliably fires moments earlier in this same test — the leader's very
-  # first archive-push always fails before stanza-create exists, tripping
-  # decide_gap_recovery's failed_trigger before the initial full has even
-  # landed; decide_action's NEEDS_INITIAL_BACKUP check (which runs before
-  # the gap-marker gate) then takes that full regardless, incidentally
-  # clearing the marker gap-recovery had just written. Matching the bare
-  # substring made this loop's first iteration false-hit on that stale,
-  # pre-existing log line instead of waiting for the diff this test
-  # actually injects the marker to provoke — see
+  # fires whenever a full lands while the marker is present —
+  # decide_action's NEEDS_INITIAL_BACKUP check runs before the gap-marker
+  # gate. Matching the bare substring would false-hit on that line instead
+  # of waiting for the diff this test injects the marker to provoke — see
   # 'no gap-recovery diff' failures for the symptom.
   # grep -c (not -q) keeps the pipe SIGPIPE-free under `set -o pipefail`:
   # -q exits on first match, and once the container's log outgrows the
@@ -5306,7 +5301,7 @@ t_ha_invalid_bucket_validator() {
 #                                     ssl and HA images (markers + recovery
 #                                     conf). Covered by ssl harness.
 # t_pitr_target_before_retention_window_refuses,
-# t_watcher_gap_recovery_failed_count_path,
+# t_watcher_archive_failure_without_wal_loss_takes_no_backup,
 # t_watcher_reconciles_state_against_bucket_on_boot — defense-in-depth tests
 #                                     against the watcher; behavior is identical
 #                                     to ssl. Covered there.
