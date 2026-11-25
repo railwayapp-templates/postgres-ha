@@ -105,6 +105,16 @@ pgb_out=$(pgbackrest --stanza=main archive-push "$WAL_FILE" 2>&1)
 PGB_RC=$?
 [ -n "$pgb_out" ] && printf '%s\n' "$pgb_out" >&2
 if [ "$PGB_RC" -eq 0 ]; then
+  # pgBackRest's own archive-push-queue-max drop also returns 0: it discards
+  # the queued segments, reports each as archived, and says so only in a
+  # warning ("dropped WAL file '<segment>' because archive queue exceeded
+  # <size>"). The WAL is gone from the PITR chain exactly as in the drops
+  # below, so leave the same signal for the backup watcher.
+  case "$pgb_out" in
+    *"dropped WAL file"*"archive queue exceeded"*)
+      touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
+      ;;
+  esac
   exit 0
 fi
 
@@ -172,10 +182,9 @@ if [ "$TOTAL_BYTES" -ge "$PGWAL_THRESHOLD_BYTES" ]; then
   PGWAL_MB=$(( PGWAL_BYTES / 1024 / 1024 ))
   SPOOL_MB=$(( SPOOL_BYTES / 1024 / 1024 ))
   echo "pgbackrest-wrapper: pg_wal+spool at ${PGWAL_MB}+${SPOOL_MB} MiB (threshold ${PGWAL_THRESHOLD_MB} MiB combined) and archive-push failing; dropping ${WAL_FILE} to keep Postgres up" >&2
-  # Mark the gap so the backup watcher takes a fresh full once archiving
-  # recovers. Without this, gap detection collapses to single-signal
-  # (failed_count growth from foreground archive_command failures), but the
-  # wrapper-drop path returns 0 to Postgres so failed_count never grows.
+  # Mark the gap so the backup watcher takes a differential once the bucket
+  # receives WAL again. This drop returns 0 to Postgres, so the marker is the
+  # only record that a segment left the PITR chain.
   touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
   exit 0
 fi

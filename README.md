@@ -215,14 +215,17 @@ one of these conditions holds:
    in `pg_backup_start`/`pg_backup_stop` and waits for the closing WAL
    to archive before declaring success, so a broken `archive_command`
    fails the backup loudly instead of producing an unrestorable base.
-2. **Gap recovery** — either the archive-push wrapper dropped a segment
-   (touches `$PGDATA/.pgbackrest_gap_pending`) or
-   `pg_stat_archiver.failed_count` grew since the last full. Once
-   archive failures have been quiescent for
-   `WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS` (default 300s), runs a fresh
-   full so the PITR window resumes from the new base. The dropped
-   segment itself remains unrestorable; everything from the new base
-   forward is.
+2. **Gap recovery** — WAL is missing from the bucket: either a segment
+   was dropped (by the archive-push wrapper or by pgBackRest's
+   `archive-push-queue-max`; both touch
+   `$PGDATA/.pgbackrest_gap_pending`) or the bucket has fallen
+   `WAL_LAG_GAP_THRESHOLD_SEGMENTS` behind what Postgres handed off. Once
+   the bucket receives WAL again, runs a differential so the PITR window
+   resumes from a new restore point. The dropped segment itself remains
+   unrestorable; everything from the new backup forward is. An
+   `archive_command` failure that Postgres retries successfully
+   (`pg_stat_archiver.failed_count` grows, nothing is dropped) loses no
+   WAL and triggers no backup.
 3. **Periodic** — `WAL_BACKUP_FULL_INTERVAL_HOURS` (default 168 h /
    weekly) for fulls, `WAL_BACKUP_DIFF_INTERVAL_HOURS` (default 24 h)
    for differentials. Set either to `0` to disable that schedule.
@@ -239,11 +242,16 @@ bucket-side `pgbackrest --stanza=main info --output=json` is the
 canonical source of truth; the local file is a cache that survives
 restarts.
 
-**Known gap**: pgBackRest's `archive-push-queue-max` trip drops segments
-without going through the archive-push wrapper *and* without
-incrementing `failed_count`, so neither gap signal fires. Until log
-parsing or LSN-lag detection lands, queue-max-trip gaps are sealed by
-the next periodic full rather than promptly.
+**Queue-max-trip detection**: pgBackRest's `archive-push-queue-max` trip
+drops segments and reports them to Postgres as archived. The archive-push
+wrapper sees the drop in pgBackRest's output and touches the gap marker.
+The backup watcher also checks independently, which covers an async
+worker that is wedged without dropping anything: every poll
+(`WAL_BACKUP_POLL_INTERVAL_SECONDS`, default 60s) it compares
+`pg_stat_archiver.last_archived_wal` against the repo's archived
+high-water mark (`pgbackrest info --output=json`); once the lag reaches
+`WAL_LAG_GAP_THRESHOLD_SEGMENTS` (default 32 ≈ 512 MiB) it enters gap
+recovery the same way a wrapper drop does.
 
 ### Per-cluster archive paths
 
