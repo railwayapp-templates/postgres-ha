@@ -6975,6 +6975,13 @@ t_ha_returning_member_adopts_rotated_password_without_etcd_auth() {
     "t-away-open-${PG_VERSION}" off enforced cluster-up
 }
 
+# The cluster does not answer when the member boots: it starts on the pinned
+# credentials and adopts the variable once the leader vouches for it.
+t_ha_returning_member_adopts_rotated_password_after_dcs_outage() {
+  run_returning_member_case t_ha_returning_member_adopts_rotated_password_after_dcs_outage \
+    "t-away-dcs-${PG_VERSION}" off sent dcs-down
+}
+
 # Seed $vol with a vanilla PostgreSQL data dir carrying the replication-slot
 # population a reverted HA root inherits: two Patroni member slots (physical,
 # reserved — what the leader holds for `postgres-2`/`postgres-3`), one physical
@@ -8099,6 +8106,7 @@ ALL_TESTS=(
   # a member away during a password rotation comes back on the new password
   t_ha_returning_member_adopts_rotated_password
   t_ha_returning_member_adopts_rotated_password_without_etcd_auth
+  t_ha_returning_member_adopts_rotated_password_after_dcs_outage
   # fresh-cluster start ordering, with the production template's variables
   # (etcd-1-only ETCD_INITIAL_CLUSTER, PATRONI_WAIT_FOR_LEADER on 2/3): any
   # start order forms one cluster led by postgres-1, which alone runs initdb

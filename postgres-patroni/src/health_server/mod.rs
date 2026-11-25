@@ -8,7 +8,7 @@ mod credentials;
 mod postgres;
 mod routes;
 
-pub use config::HealthServerConfig;
+pub use config::{HealthServerConfig, UnadoptedVariable};
 
 use anyhow::{Context, Result};
 use common::{Telemetry, TelemetryEvent};
@@ -58,6 +58,7 @@ const RESPAWN_DELAY: Duration = Duration::from_secs(5);
 /// so a crash loop pages once, not once per respawn.
 pub fn spawn(config: HealthServerConfig, telemetry: Telemetry) {
     tokio::spawn(credentials::reconcile(config.clone()));
+    tokio::spawn(credentials::adopt_rotated_variable(config.clone()));
     tokio::spawn(async move {
         let mut alerted_for_current_incident = false;
 

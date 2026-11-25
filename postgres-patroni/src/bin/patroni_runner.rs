@@ -11,8 +11,10 @@ use nix::sys::stat::{umask, Mode};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{ForkResult, Pid};
 use postgres_patroni::bootstrap::{reconcile_pg_stat_statements, refresh_collation_versions};
-use postgres_patroni::health_server::{self, HealthServerConfig};
+use postgres_patroni::health_server::{self, HealthServerConfig, UnadoptedVariable};
 use postgres_patroni::major_upgrade;
+use postgres_patroni::patroni::cluster_proof::{ask_leader, Cluster, LeaderAnswer};
+use postgres_patroni::patroni::etcd_kv::{etcd_gateway_token, etcd_range};
 use postgres_patroni::patroni::etcd_preflight::{
     etcd_password_source_variable, probe_etcd_credential, rejection_message, EtcdAuthProbe,
     REJECTION_PREFIX,
@@ -24,7 +26,7 @@ use postgres_patroni::patroni::{
     apply_credential_pin, credential_drift, credentials_from_env_requested,
     generate_patroni_config, reconcile_pgbackrest_archive_config, run_monitoring_loop,
     spawn_backup_watcher, spawn_self_heal_watcher, spawn_slot_recovery_watcher,
-    update_pg_hba_for_replication, Config, PinSource, RestapiAddressSource,
+    update_pg_hba_for_replication, Config, PinOutcome, PinSource, RestapiAddressSource,
 };
 use postgres_patroni::pgbackrest::{derive_pgbackrest_repo_path, read_wal_level};
 use postgres_patroni::wal_archive::{
@@ -32,7 +34,7 @@ use postgres_patroni::wal_archive::{
     spawn_bootstrap_stanza_create, translate_wal_env_to_pgbackrest, validate_wal_archive_bucket,
 };
 use postgres_patroni::{volume_root, Telemetry, TelemetryEvent};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -43,72 +45,11 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-/// Request body for etcd v3 range API
-#[derive(Serialize)]
-struct EtcdRangeRequest {
-    key: String,
-}
-
 /// Response from etcd v3 range API
 #[derive(Deserialize)]
 struct EtcdRangeResponse {
     #[serde(default)]
     kvs: Option<Vec<serde_json::Value>>,
-}
-
-#[derive(Serialize)]
-struct EtcdAuthRequest<'a> {
-    name: &'a str,
-    password: &'a str,
-}
-
-#[derive(Deserialize)]
-struct EtcdAuthResponse {
-    #[serde(default)]
-    token: Option<String>,
-}
-
-/// Token for etcd's HTTP gateway, or `None` when the cluster has not enabled
-/// authentication (the request is then accepted without one). Any other
-/// failure also yields `None`; the following request surfaces the real error.
-async fn etcd_gateway_token(
-    client: &reqwest::Client,
-    host: &str,
-    cred: Option<&postgres_patroni::patroni::Credential>,
-) -> Option<String> {
-    let cred = cred?;
-    let url = format!("http://{}/v3/auth/authenticate", host.trim());
-    let resp = client
-        .post(&url)
-        .json(&EtcdAuthRequest {
-            name: &cred.username,
-            password: &cred.password,
-        })
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    resp.json::<EtcdAuthResponse>().await.ok()?.token
-}
-
-/// `POST /v3/kv/range` for one key on one etcd host, authenticating first when
-/// a credential is configured.
-async fn etcd_range(
-    client: &reqwest::Client,
-    host: &str,
-    key_base64: &str,
-    cred: Option<&postgres_patroni::patroni::Credential>,
-) -> reqwest::Result<reqwest::Response> {
-    let url = format!("http://{}/v3/kv/range", host.trim());
-    let mut req = client.post(&url).json(&EtcdRangeRequest {
-        key: key_base64.to_string(),
-    });
-    if let Some(token) = etcd_gateway_token(client, host, cred).await {
-        req = req.header(reqwest::header::AUTHORIZATION, token);
-    }
-    req.send().await
 }
 
 /// Wait for the Patroni cluster to exist in etcd before starting.
@@ -410,83 +351,22 @@ async fn reconcile_rotation_at_boot(config: &mut Config, volume_root: &str) -> R
             auth.password = pin.superuser_pass.clone();
         }
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()?;
-    let proof = async {
-        for host in config.etcd_hosts.split(',') {
-            let attempt = async {
-                let leader_key = BASE64.encode(format!("/service/{}/leader", config.scope));
-                let response = etcd_range(&client, host, &leader_key, credential.as_ref()).await?;
-                let value: serde_json::Value = response.error_for_status()?.json().await?;
-                let leader = String::from_utf8(
-                    BASE64.decode(value["kvs"][0]["value"].as_str().context("leader absent")?)?,
-                )?;
-                let member_key =
-                    BASE64.encode(format!("/service/{}/members/{}", config.scope, leader));
-                let response = etcd_range(&client, host, &member_key, credential.as_ref()).await?;
-                let value: serde_json::Value = response.error_for_status()?.json().await?;
-                let member: serde_json::Value = serde_json::from_slice(
-                    &BASE64.decode(value["kvs"][0]["value"].as_str().context("member absent")?)?,
-                )?;
-                let url = reqwest::Url::parse(
-                    member["conn_url"]
-                        .as_str()
-                        .context("primary endpoint absent")?,
-                )?;
-                for candidate in &role_candidates {
-                    let roles = async {
-                        let (sql, connection) = tokio_postgres::Config::new()
-                            .host(url.host_str().context("missing host")?)
-                            .port(url.port().unwrap_or(5432))
-                            .user(&config.superuser)
-                            .password(candidate)
-                            .dbname("postgres")
-                            .connect_timeout(Duration::from_secs(3))
-                            .connect(tokio_postgres::NoTls)
-                            .await?;
-                        tokio::spawn(async move {
-                            let _ = connection.await;
-                        });
-                        anyhow::ensure!(
-                            !sql.query_one("SELECT pg_is_in_recovery()", &[])
-                                .await?
-                                .get::<_, bool>(0),
-                            "leader changed"
-                        );
-                        for user in [&config.superuser, &config.repl_user, &config.app_user] {
-                            let row = sql
-                                .query_one(
-                                    "SELECT rolpassword FROM pg_authid WHERE rolname = $1",
-                                    &[user],
-                                )
-                                .await?;
-                            let verifier: Option<String> = row.get(0);
-                            anyhow::ensure!(
-                                verifier.is_some_and(|value| {
-                                    postgres_patroni::patroni::scram::verify(
-                                        &value, user, candidate,
-                                    ) == postgres_patroni::patroni::scram::VerifierCheck::Matches
-                                }),
-                                "role password differs"
-                            );
-                        }
-                        Ok::<(), anyhow::Error>(())
-                    };
-                    if roles.await.is_ok() {
-                        return Ok::<String, anyhow::Error>(candidate.clone());
-                    }
-                }
-                anyhow::bail!("no database credential proved")
-            };
-            if let Ok(candidate) = attempt.await {
-                return Ok::<String, anyhow::Error>(candidate);
-            }
-        }
-        anyhow::bail!("primary unavailable")
-    };
     // Never log database connection errors: some drivers include credentials.
-    let Ok(Ok(candidate)) = tokio::time::timeout(Duration::from_secs(20), proof).await else {
+    let answer = {
+        let cluster = Cluster {
+            etcd_hosts: &config.etcd_hosts,
+            scope: &config.scope,
+            superuser: &config.superuser,
+            replication_user: &config.repl_user,
+            app_user: &config.app_user,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            ask_leader(&cluster, credential.as_ref(), &role_candidates),
+        )
+        .await
+    };
+    let Ok(LeaderAnswer::Carries(candidate)) = answer else {
         return Ok(());
     };
     config.superuser_pass = candidate.clone();
@@ -1735,7 +1615,7 @@ async fn async_main() -> Result<()> {
     translate_wal_env_to_pgbackrest();
 
     // Capture health server config BEFORE clearing PG* env vars
-    let health_config = HealthServerConfig::from_env();
+    let mut health_config = HealthServerConfig::from_env();
 
     let mut config = Config::from_env()?;
     reconcile_rotation_at_boot(&mut config, &volume_root).await?;
@@ -1875,6 +1755,7 @@ async fn async_main() -> Result<()> {
     // patroni::credential_pin). Must run before generate_patroni_config and
     // before anything else reads config.*_pass.
     let has_cluster_data = volume_carries_cluster(has_pg_control, has_marker, adopted_this_boot);
+    let variables_superuser_pass = config.superuser_pass.clone();
     let pin_outcome = apply_credential_pin(
         &mut config,
         has_cluster_data,
@@ -1882,6 +1763,18 @@ async fn async_main() -> Result<()> {
         &telemetry,
     );
     info!(outcome = ?pin_outcome, "credential pin reconciled");
+    // This boot kept the pin against a variable the cluster did not vouch
+    // for. If the cluster rotated while this member was not running and could
+    // not be asked just now, the variable is right and the pin is behind: the
+    // health server keeps asking and adopts it once the leader answers.
+    if matches!(pin_outcome, PinOutcome::KeptPinned(_))
+        && variables_superuser_pass != config.superuser_pass
+    {
+        health_config.unadopted_variable = Some(UnadoptedVariable {
+            password: variables_superuser_pass,
+            pinned: config.superuser_pass.clone(),
+        });
+    }
     // Whatever this boot pinned (adopted, re-pinned, kept), the volume's copy
     // follows it, so a later wipe of PGDATA still leaves it behind.
     if let Some(pin) = postgres_patroni::patroni::read_credential_pin(&config.data_dir) {

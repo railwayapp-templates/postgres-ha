@@ -1,6 +1,7 @@
 //! Local half of an ordered cluster rotation. SQL is executed in this
 //! container; the control plane owns the etcd change and cluster ordering.
 use super::HealthServerConfig;
+use crate::patroni::cluster_proof::{ask_cluster, Cluster, ClusterAnswer};
 use crate::patroni::{
     read_credential_pin, remove_rotation_journal_copy, sync_credential_pin_copy,
     write_credential_pin, write_rotation_journal_copy, PinnedCredentials,
@@ -415,9 +416,123 @@ fn refusal_reason(error: &anyhow::Error, secrets: &[String]) -> String {
     reason.chars().take(200).collect()
 }
 
-async fn apply(
+/// Move this member's own credentials to `new_password`: patroni.yml, the
+/// passfile, Patroni's running configuration, then the pin. The roles are not
+/// touched here; the caller has established that the cluster's roles carry
+/// the password. `current_password` is one Patroni's REST API may still
+/// enforce. Safe to repeat after an interruption at any point.
+async fn set_member_credentials(
     config: &HealthServerConfig,
     mut yaml: serde_yaml::Value,
+    new_password: &str,
+    current_password: &str,
+) -> Result<()> {
+    let user = text(&yaml["postgresql"]["authentication"]["superuser"]["username"])?.to_string();
+    let replication_user =
+        text(&yaml["postgresql"]["authentication"]["replication"]["username"])?.to_string();
+    let app_user = text(&yaml["postgresql"]["app_user"]["username"])?.to_string();
+    let data_dir = text(&yaml["postgresql"]["data_dir"])?.to_string();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let patroni = format!("http://127.0.0.1:{}", config.patroni_port);
+    // Without an enforced REST credential Patroni accepts any
+    // Authorization on /reload; the superuser name and an empty
+    // password are then only what the request carries.
+    let rest = rest_auth_section(&yaml);
+    let rest_user = match rest {
+        Some(section) => text(&yaml[section]["authentication"]["username"])?.to_string(),
+        None => user.clone(),
+    };
+    let old_rest_password = match rest {
+        Some(section) => text(&yaml[section]["authentication"]["password"])?.to_string(),
+        None => String::new(),
+    };
+    for role in ["superuser", "replication", "rewind"] {
+        if !yaml["postgresql"]["authentication"][role].is_null() {
+            yaml["postgresql"]["authentication"][role]["password"] = new_password.into();
+        }
+    }
+    yaml["postgresql"]["app_user"]["password"] = new_password.into();
+    if etcd_authenticated(&yaml) {
+        yaml["etcd3"]["password"] = new_password.into();
+    }
+    for section in ["restapi", "ctl"] {
+        if !yaml[section]["authentication"].is_null() {
+            yaml[section]["authentication"]["password"] = new_password.into();
+        }
+    }
+    let passfile = text(&yaml["postgresql"]["pgpass"])?;
+    let entries = [&replication_user, &user, &app_user]
+        .map(|u| format!("*:*:*:{}:{}\n", pgpass(u), pgpass(new_password)))
+        .join("");
+    atomic_write(passfile, entries.as_bytes())?;
+    atomic_write(CONFIG, serde_yaml::to_string(&yaml)?.as_bytes())?;
+    // A retry after the file rename can see the new YAML while Patroni
+    // still enforces the previous credential. Both are request facts.
+    let mut reloaded = false;
+    for password in [old_rest_password.as_str(), current_password, new_password] {
+        let response = http
+            .post(format!("{patroni}/reload"))
+            .basic_auth(&rest_user, Some(password))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            reloaded = true;
+            break;
+        }
+    }
+    anyhow::ensure!(reloaded, "reload refused");
+    let reload_started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    // /reload queues SIGHUP processing. Wait for the new REST auth to
+    // be live before persisting success and moving to the next member.
+    loop {
+        if http
+            .post(format!("{patroni}/reload"))
+            .basic_auth(&rest_user, Some(new_password))
+            .send()
+            .await?
+            .status()
+            .is_success()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Authentication alone is not proof Patroni reconnected to DCS.
+    // Wait for its next successful lease/cluster refresh before letting
+    // the coordinator advance to another member.
+    loop {
+        let state: Value = http
+            .get(format!("{patroni}/patroni"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if state["dcs_last_seen"]
+            .as_u64()
+            .is_some_and(|seen| seen > reload_started)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let pin = PinnedCredentials {
+        superuser_pass: new_password.to_string(),
+        repl_pass: new_password.to_string(),
+        app_pass: new_password.to_string(),
+    };
+    write_credential_pin(&data_dir, &pin)?;
+    sync_credential_pin_copy(&data_dir, &volume_root(), &pin);
+    Ok(())
+}
+
+async fn apply(
+    config: &HealthServerConfig,
+    yaml: serde_yaml::Value,
     request: Rotation,
 ) -> Result<Value> {
     let user = text(&yaml["postgresql"]["authentication"]["superuser"]["username"])?.to_string();
@@ -522,103 +637,13 @@ async fn apply(
                 .await?,
                 "role password not replicated"
             );
-            // Without an enforced REST credential Patroni accepts any
-            // Authorization on /reload; the superuser name and an empty
-            // password are then only what the request carries.
-            let rest = rest_auth_section(&yaml);
-            let rest_user = match rest {
-                Some(section) => text(&yaml[section]["authentication"]["username"])?.to_string(),
-                None => user.clone(),
-            };
-            let old_rest_password = match rest {
-                Some(section) => text(&yaml[section]["authentication"]["password"])?.to_string(),
-                None => String::new(),
-            };
-            for role in ["superuser", "replication", "rewind"] {
-                if !yaml["postgresql"]["authentication"][role].is_null() {
-                    yaml["postgresql"]["authentication"][role]["password"] =
-                        request.new_password.clone().into();
-                }
-            }
-            yaml["postgresql"]["app_user"]["password"] = request.new_password.clone().into();
-            if etcd_authenticated(&yaml) {
-                yaml["etcd3"]["password"] = request.new_password.clone().into();
-            }
-            for section in ["restapi", "ctl"] {
-                if !yaml[section]["authentication"].is_null() {
-                    yaml[section]["authentication"]["password"] =
-                        request.new_password.clone().into();
-                }
-            }
-            let passfile = text(&yaml["postgresql"]["pgpass"])?;
-            let entries = [&replication_user, &user, &app_user]
-                .map(|u| format!("*:*:*:{}:{}\n", pgpass(u), pgpass(&request.new_password)))
-                .join("");
-            atomic_write(passfile, entries.as_bytes())?;
-            atomic_write(CONFIG, serde_yaml::to_string(&yaml)?.as_bytes())?;
-            // A retry after the file rename can see the new YAML while Patroni
-            // still enforces the previous credential. Both are request facts.
-            let mut reloaded = false;
-            for password in [
-                &old_rest_password,
-                &request.current_password,
+            set_member_credentials(
+                config,
+                yaml,
                 &request.new_password,
-            ] {
-                let response = http
-                    .post(format!("{patroni}/reload"))
-                    .basic_auth(&rest_user, Some(password))
-                    .send()
-                    .await?;
-                if response.status().is_success() {
-                    reloaded = true;
-                    break;
-                }
-            }
-            anyhow::ensure!(reloaded, "reload refused");
-            let reload_started = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-            // /reload queues SIGHUP processing. Wait for the new REST auth to
-            // be live before persisting success and moving to the next member.
-            loop {
-                if http
-                    .post(format!("{patroni}/reload"))
-                    .basic_auth(&rest_user, Some(&request.new_password))
-                    .send()
-                    .await?
-                    .status()
-                    .is_success()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            // Authentication alone is not proof Patroni reconnected to DCS.
-            // Wait for its next successful lease/cluster refresh before letting
-            // the coordinator advance to another member.
-            loop {
-                let state: Value = http
-                    .get(format!("{patroni}/patroni"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
-                if state["dcs_last_seen"]
-                    .as_u64()
-                    .is_some_and(|seen| seen > reload_started)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            let pin = PinnedCredentials {
-                superuser_pass: request.new_password.clone(),
-                repl_pass: request.new_password.clone(),
-                app_pass: request.new_password.clone(),
-            };
-            write_credential_pin(&data_dir, &pin)?;
-            sync_credential_pin_copy(&data_dir, &volume_root(), &pin);
+                &request.current_password,
+            )
+            .await?;
         }
         Operation::Verify => {
             let client = connect(config, &user, &request.new_password).await?;
@@ -815,9 +840,147 @@ pub(super) async fn reconcile(config: HealthServerConfig) {
     }
 }
 
+/// How soon the cluster is asked again when it did not answer, or when this
+/// member has no reason to ask right now.
+const ASK_AGAIN_SOON: Duration = Duration::from_secs(5);
+/// How long to leave a cluster alone after it refused the variable. A refused
+/// login is a line in the leader's log; an edited variable stays edited.
+const ASK_AGAIN_AFTER_REFUSAL: Duration = Duration::from_secs(300);
+
+/// Where one attempt to adopt the variable's password ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Adoption {
+    /// This member's credentials are the variable's now.
+    Adopted,
+    /// The pin moved by other means (a rotation reached this member): the
+    /// variable this boot started with no longer says anything.
+    Superseded,
+    /// The cluster answered: its roles do not carry the variable's password.
+    Refused,
+    /// Nothing to act on yet.
+    Waiting,
+}
+
+/// A member that was not running while the cluster rotated its password
+/// comes back with the variable already on the new one and the pin still on
+/// the previous one. Its boot asks the cluster and adopts the variable when
+/// the leader vouches for it; when the cluster cannot be asked just then
+/// (etcd down, no leader, the leader unreachable) the boot keeps the pin, and
+/// this member's replication is refused by a leader it has not heard from.
+///
+/// So the question is asked again here, for as long as that boot's pin stands
+/// and this member is a replica that does not stream, and the answer is acted
+/// on the moment it comes: no restart, no second redeploy. The roles are never
+/// changed from here; only this member's own copies of the credential are.
+pub(super) async fn adopt_rotated_variable(config: HealthServerConfig) {
+    let Some(unadopted) = config.unadopted_variable.clone() else {
+        return;
+    };
+    let mut wait = ASK_AGAIN_SOON;
+    loop {
+        tokio::time::sleep(wait).await;
+        let _lock = ROTATION.lock().await;
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(45),
+            adopt_variable_once(&config, &unadopted),
+        )
+        .await;
+        // Never log the error: a driver error can carry a credential.
+        wait = match attempt {
+            Ok(Ok(Adoption::Adopted)) => {
+                info!(
+                    "the cluster's leader carries the password in the variables: adopted it \
+                     (this member was not running when the cluster rotated)"
+                );
+                return;
+            }
+            Ok(Ok(Adoption::Superseded)) => return,
+            Ok(Ok(Adoption::Refused)) => ASK_AGAIN_AFTER_REFUSAL,
+            Ok(Ok(Adoption::Waiting)) | Ok(Err(_)) | Err(_) => ASK_AGAIN_SOON,
+        };
+    }
+}
+
+async fn adopt_variable_once(
+    config: &HealthServerConfig,
+    unadopted: &super::UnadoptedVariable,
+) -> Result<Adoption> {
+    let yaml = load()?;
+    let dir = text(&yaml["postgresql"]["data_dir"])?.to_string();
+    // A staged rotation finishes through its journal (see `reconcile`).
+    if std::path::Path::new(&format!("{dir}/.railway_rotation")).exists() {
+        return Ok(Adoption::Waiting);
+    }
+    let pin = read_credential_pin(&dir).context("pin missing")?;
+    if pin.superuser_pass != unadopted.pinned {
+        return Ok(Adoption::Superseded);
+    }
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let patroni = format!("http://127.0.0.1:{}", config.patroni_port);
+    let local = match http.get(format!("{patroni}/patroni")).send().await {
+        Ok(response) => response.json::<Value>().await.ok(),
+        Err(_) => None,
+    };
+    if !cut_off_from_leader(local.as_ref()) {
+        return Ok(Adoption::Waiting);
+    }
+    let cluster = Cluster {
+        etcd_hosts: text(&yaml["etcd3"]["hosts"])?,
+        scope: text(&yaml["scope"])?,
+        superuser: text(&yaml["postgresql"]["authentication"]["superuser"]["username"])?,
+        replication_user: text(&yaml["postgresql"]["authentication"]["replication"]["username"])?,
+        app_user: text(&yaml["postgresql"]["app_user"]["username"])?,
+    };
+    match ask_cluster(&cluster, &unadopted.password).await {
+        ClusterAnswer::Carries => {}
+        ClusterAnswer::Refuses => return Ok(Adoption::Refused),
+        ClusterAnswer::Silent => return Ok(Adoption::Waiting),
+    }
+    set_member_credentials(config, yaml, &unadopted.password, &unadopted.pinned).await?;
+    Ok(Adoption::Adopted)
+}
+
+/// Whether this member has a reason to ask the cluster about its credentials:
+/// Patroni does not answer, or reports a member that is neither the leader
+/// nor a replica streaming from it. A member that leads or streams is working
+/// with the credentials it holds, and a leader that carries the pin would
+/// only log a refused login for the asking.
+fn cut_off_from_leader(local: Option<&Value>) -> bool {
+    let Some(local) = local else {
+        return true;
+    };
+    let leads = matches!(
+        local["role"].as_str(),
+        Some("primary" | "master" | "standby_leader")
+    );
+    !leads && local["replication_state"].as_str() != Some("streaming")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_member_cut_off_from_the_leader_asks_about_its_credentials() {
+        // Patroni is not answering: nothing says this member is fine.
+        assert!(cut_off_from_leader(None));
+        // The member that was away: a replica the leader refuses.
+        assert!(cut_off_from_leader(Some(
+            &json!({"role": "replica", "state": "running"})
+        )));
+        assert!(cut_off_from_leader(Some(
+            &json!({"role": "replica", "replication_state": "in archive recovery"})
+        )));
+        // An edited variable on a member that works with its pin.
+        assert!(!cut_off_from_leader(Some(
+            &json!({"role": "replica", "replication_state": "streaming"})
+        )));
+        assert!(!cut_off_from_leader(Some(&json!({"role": "primary"}))));
+        assert!(!cut_off_from_leader(Some(&json!({"role": "master"}))));
+    }
+
     #[tokio::test]
     #[ignore = "requires an isolated local PostgreSQL server with loopback trust"]
     async fn live_rotation_with_loopback_trust() {
